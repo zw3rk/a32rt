@@ -71,7 +71,6 @@ int main(int argc, char **argv, char **envp)
         long port = strtol(env_gdb, &endp, 10);
         if (endp && endp != env_gdb && *endp == '\0' && port > 0 && port <= 65535) {
             ctx.gdb_port = (int)port;
-            ctx.gdb_enabled = true;
         }
     }
     const char *env_aot = getenv("A32RT_AOT");
@@ -134,7 +133,6 @@ int main(int argc, char **argv, char **envp)
                 return 1;
             }
             ctx.gdb_port = (int)port;
-            ctx.gdb_enabled = true;
             i += 2;
         } else if (strcmp(argv[i], "--aot") == 0) {
             ctx.aot_mode = true;
@@ -263,8 +261,9 @@ int main(int argc, char **argv, char **envp)
 
     /* 9. Initialize GDB stub if requested */
     if (ctx.gdb_port > 0) {
-        ctx.gdb_enabled = true;
         if (a32_gdb_init(&ctx, ctx.gdb_port) != 0) {
+            ctx.gdb_enabled = false;
+            ctx.single_step = false;
             fprintf(stderr, "a32rt: warning: failed to initialize GDB on port %d\n", ctx.gdb_port);
         }
     }

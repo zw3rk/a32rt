@@ -36,7 +36,7 @@ static a32_ctx_t       *g_vm_root_ctx = NULL;
 static uint32_t         g_vm_brk_base = 0U;
 static uint32_t         g_vm_brk_curr = 0U;
 static uint32_t         g_vm_mmap_cursor = A32_MMAP_BASE_32;
-static a32_region_t     g_vm_regions[A32_MAX_REGIONS];
+static a32_region_t     g_vm_regions[A32_MAX_REGIONS + 4U];
 static size_t           g_vm_region_count = 0U;
 
 static inline void vm_lock_acquire(void)
@@ -77,10 +77,14 @@ static void vm_sync_to_ctx(a32_ctx_t *ctx)
         ctx->brk_base = g_vm_brk_base;
         ctx->brk_curr = g_vm_brk_curr;
     }
+    size_t count = g_vm_region_count;
+    if (count > A32_MAX_REGIONS) {
+        count = A32_MAX_REGIONS;
+    }
     ctx->mmap_cursor  = g_vm_mmap_cursor;
-    ctx->region_count = g_vm_region_count;
-    if (g_vm_region_count > 0U) {
-        memcpy(ctx->regions, g_vm_regions, g_vm_region_count * sizeof(a32_region_t));
+    ctx->region_count = count;
+    if (count > 0U) {
+        memcpy(ctx->regions, g_vm_regions, count * sizeof(a32_region_t));
     }
     if (g_vm_root_ctx && g_vm_root_ctx != ctx) {
         if (g_vm_brk_base != 0U) {
@@ -88,10 +92,10 @@ static void vm_sync_to_ctx(a32_ctx_t *ctx)
             g_vm_root_ctx->brk_curr = g_vm_brk_curr;
         }
         g_vm_root_ctx->mmap_cursor  = g_vm_mmap_cursor;
-        g_vm_root_ctx->region_count = g_vm_region_count;
-        if (g_vm_region_count > 0U) {
+        g_vm_root_ctx->region_count = count;
+        if (count > 0U) {
             memcpy(g_vm_root_ctx->regions, g_vm_regions,
-                   g_vm_region_count * sizeof(a32_region_t));
+                   count * sizeof(a32_region_t));
         }
     }
 }
@@ -111,7 +115,7 @@ static void vm_remove_region_at(size_t idx)
 static int vm_insert_region_raw(uint32_t start, uint32_t end,
                                 uint32_t prot, uint32_t flags, const char *name)
 {
-    if (start >= end || g_vm_region_count >= A32_MAX_REGIONS) {
+    if (start >= end || g_vm_region_count >= A32_MAX_REGIONS + 4U) {
         return -1;
     }
     size_t pos = 0U;
@@ -222,7 +226,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
             continue;
         }
         if (r->start < mp_start && r->end > mp_end) {
-            if (g_vm_region_count + 2U <= A32_MAX_REGIONS) {
+            if (g_vm_region_count + 2U <= A32_MAX_REGIONS + 4U) {
                 uint32_t orig_end   = r->end;
                 uint32_t orig_prot  = r->prot;
                 uint32_t orig_flags = r->flags;
@@ -239,7 +243,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
             continue;
         }
         if (r->start < mp_start) {
-            if (g_vm_region_count + 1U <= A32_MAX_REGIONS) {
+            if (g_vm_region_count + 1U <= A32_MAX_REGIONS + 4U) {
                 uint32_t orig_end   = r->end;
                 uint32_t orig_flags = r->flags;
                 char     orig_name[64];
@@ -252,7 +256,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
                 i++;
             }
         } else {
-            if (g_vm_region_count + 1U <= A32_MAX_REGIONS) {
+            if (g_vm_region_count + 1U <= A32_MAX_REGIONS + 4U) {
                 uint32_t orig_start = r->start;
                 uint32_t orig_flags = r->flags;
                 char     orig_name[64];
@@ -287,7 +291,9 @@ static bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
         return false;
     }
     uint32_t cur = start;
-    bool first = true;
+    bool     first = true;
+    uint32_t first_prot  = 0U;
+    uint32_t first_flags = 0U;
     for (size_t i = 0U; i < g_vm_region_count; i++) {
         const a32_region_t *r = &g_vm_regions[i];
         if (r->end <= cur) {
@@ -297,6 +303,8 @@ static bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
             return false;
         }
         if (first) {
+            first_prot  = r->prot;
+            first_flags = r->flags & 0x23U;
             if (out_prot) {
                 *out_prot = r->prot;
             }
@@ -307,6 +315,10 @@ static bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                 snprintf(out_name, name_sz, "%s", r->name);
             }
             first = false;
+        } else {
+            if (r->prot != first_prot || (r->flags & 0x23U) != first_flags) {
+                return false;
+            }
         }
         if (r->end >= end) {
             return true;
@@ -358,6 +370,10 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
 
 static int try_reserve_window(uint64_t base)
 {
+    if ((base & (A32_PAGE_SIZE - 1ULL)) != 0ULL || base > UINT64_MAX - A32_WINDOW_SIZE) {
+        return -1;
+    }
+
     uint64_t map_start = (base == 0ULL) ? (uint64_t)A32_LOW_GUARD_SIZE : base;
     uint64_t map_len   = (base == 0ULL) ? (A32_WINDOW_SIZE - (uint64_t)A32_LOW_GUARD_SIZE)
                                         : A32_WINDOW_SIZE;
@@ -872,4 +888,14 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
 
     a32_jit_invalidate_range(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
     return new_va;
+}
+
+void a32_vm_sync_ctx(a32_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    vm_lock_acquire();
+    vm_sync_to_ctx(ctx);
+    vm_lock_release();
 }

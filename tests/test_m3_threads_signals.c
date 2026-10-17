@@ -910,6 +910,303 @@ static int test12_chaining_partial_cacheflush(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 13: FUTEX_WAIT_BITSET timeout & FUTEX_CMP_REQUEUE val2 regression
+ * -------------------------------------------------------------------------- */
+struct timespec32_m3 {
+    int32_t tv_sec;
+    int32_t tv_nsec;
+};
+
+static volatile uint32_t g_requeue_f1 = 77U;
+static volatile uint32_t g_requeue_f2 = 0U;
+static volatile uint32_t g_requeue_entered = 0U;
+static volatile uint32_t g_requeue_woken = 0U;
+
+static void requeue_worker_thread(void)
+{
+    g_requeue_entered = 1U;
+    while (g_requeue_f1 == 77U) {
+        sys6(240U /* futex */, (uint32_t)(uintptr_t)&g_requeue_f1,
+             0U | 128U /* FUTEX_WAIT_PRIVATE */, 77U, 0U, 0U, 0U);
+    }
+    g_requeue_woken = 1U;
+}
+
+static int test13_futex_bitset_requeue(void)
+{
+    volatile uint32_t fword = 42U;
+    struct timespec32_m3 ts;
+
+    /*
+     * 13a: Negative — FUTEX_WAIT_BITSET (9 | 128) with bitset == 0 must return
+     * -EINVAL (-22), and mismatched val must return -EAGAIN (-11).
+     */
+    ts.tv_sec = 0;
+    ts.tv_nsec = 1000000;
+    int32_t rc = sys6(240U /* futex */, (uint32_t)(uintptr_t)&fword,
+                      9U | 128U /* FUTEX_WAIT_BITSET_PRIVATE */, 42U,
+                      (uint32_t)(uintptr_t)&ts, 0U, 0U /* bitset == 0 */);
+    if (rc != -22 /* -EINVAL */) {
+        return 112;
+    }
+
+    rc = sys6(240U /* futex */, (uint32_t)(uintptr_t)&fword,
+              9U | 128U /* FUTEX_WAIT_BITSET_PRIVATE */, 43U /* mismatch */,
+              (uint32_t)(uintptr_t)&ts, 0U, 0xFFFFFFFFU);
+    if (rc != -11 /* -EAGAIN */) {
+        return 113;
+    }
+
+    /*
+     * 13b: Positive — FUTEX_WAIT_BITSET (9 | 128) with 1 ms timeout must convert
+     * the 32-bit struct timespec and return -ETIMEDOUT (-110) rather than
+     * passing NULL to the host kernel and blocking forever.
+     */
+    if (sys2(263U /* clock_gettime */, 1U /* CLOCK_MONOTONIC */,
+             (uint32_t)(uintptr_t)&ts) != 0) {
+        return 114;
+    }
+    ts.tv_nsec += 1000000; /* +1 ms */
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+    }
+    rc = sys6(240U /* futex */, (uint32_t)(uintptr_t)&fword,
+              9U | 128U /* FUTEX_WAIT_BITSET_PRIVATE */, 42U,
+              (uint32_t)(uintptr_t)&ts, 0U, 0xFFFFFFFFU);
+    if (rc != -110 /* -ETIMEDOUT */) {
+        return 115;
+    }
+
+    /*
+     * 13c: Negative — FUTEX_CMP_REQUEUE (4 | 128) with wrong expected val3
+     * must return -EAGAIN (-11).
+     */
+    g_requeue_f1 = 77U;
+    g_requeue_f2 = 0U;
+    rc = sys6(240U /* futex */, (uint32_t)(uintptr_t)&g_requeue_f1,
+              4U | 128U /* FUTEX_CMP_REQUEUE_PRIVATE */,
+              1U /* nr_wake */, 2U /* val2 = nr_requeue */,
+              (uint32_t)(uintptr_t)&g_requeue_f2, 99U /* wrong val3 */);
+    if (rc != -11 /* -EAGAIN */) {
+        return 116;
+    }
+
+    /*
+     * 13d: Positive — FUTEX_CMP_REQUEUE (4 | 128) with nr_wake = 0 and
+     * val2 = nr_requeue = 1 on a live waiter thread must requeue 1 waiter from
+     * g_requeue_f1 to g_requeue_f2 (returning 1) and allow waking it via
+     * g_requeue_f2.
+     */
+    g_requeue_entered = 0U;
+    g_requeue_woken = 0U;
+    uint32_t stack_mem = (uint32_t)sys6(192U /* mmap2 */, 0U, 65536U,
+                                        3U /* PROT_READ|PROT_WRITE */,
+                                        0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                        0xFFFFFFFFU, 0U);
+    if (stack_mem > 0xFFFFF000U) {
+        return 117;
+    }
+    uint32_t child_sp = (stack_mem + 65536U) & ~7U;
+    volatile uint32_t parent_tid = 0U;
+    volatile uint32_t child_tid = 1U;
+    uint32_t flags = 0x013D0F00U;
+
+    int clone_rc = arm_clone_trampoline(flags, (void *)(uintptr_t)child_sp,
+                                        (uint32_t *)(uintptr_t)&parent_tid,
+                                        NULL,
+                                        (uint32_t *)(uintptr_t)&child_tid,
+                                        requeue_worker_thread);
+    if (clone_rc <= 0) {
+        sys2(91U /* munmap */, stack_mem, 65536U);
+        return 117;
+    }
+
+    while (g_requeue_entered == 0U) {
+        sys1(158U /* sched_yield */, 0U);
+    }
+
+    int32_t req_rc = 0;
+    for (int attempt = 0; attempt < 2000; attempt++) {
+        req_rc = sys6(240U /* futex */, (uint32_t)(uintptr_t)&g_requeue_f1,
+                      4U | 128U /* FUTEX_CMP_REQUEUE_PRIVATE */,
+                      0U /* nr_wake = 0 */, 1U /* val2 = nr_requeue = 1 */,
+                      (uint32_t)(uintptr_t)&g_requeue_f2, 77U /* val3 */);
+        if (req_rc == 1) {
+            break;
+        }
+        sys1(158U /* sched_yield */, 0U);
+    }
+
+    g_requeue_f1 = 88U;
+    int32_t wake_rc = sys6(240U /* futex */, (uint32_t)(uintptr_t)&g_requeue_f2,
+                           1U | 128U /* FUTEX_WAKE_PRIVATE */, 1U, 0U, 0U, 0U);
+    /* Also wake g_requeue_f1 in case requeue failed so worker never hangs */
+    sys6(240U /* futex */, (uint32_t)(uintptr_t)&g_requeue_f1,
+         1U | 128U /* FUTEX_WAKE_PRIVATE */, 1U, 0U, 0U, 0U);
+
+    while (child_tid != 0U) {
+        sys6(240U /* futex */, (uint32_t)(uintptr_t)&child_tid, 0U /* FUTEX_WAIT */,
+             child_tid, 0U, 0U, 0U);
+    }
+    sys2(91U /* munmap */, stack_mem, 65536U);
+
+    if (req_rc != 1 || wake_rc != 1 || g_requeue_woken != 1U) {
+        return 118;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 14: sigaltstack (SS_ONSTACK, EPERM while active, EINVAL flags)
+ * -------------------------------------------------------------------------- */
+struct stack32_m3 {
+    uint32_t ss_sp;
+    int32_t  ss_flags;
+    uint32_t ss_size;
+};
+
+static volatile uint32_t g_altstack_base = 0U;
+static volatile uint32_t g_altstack_size = 0U;
+static volatile uint32_t g_altstack_result = 0U;
+
+static void altstack_sigusr1_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+
+    uint32_t cur_sp = 0U;
+    __asm__ volatile("mov %0, sp" : "=r"(cur_sp));
+
+    if (cur_sp < g_altstack_base || cur_sp >= g_altstack_base + g_altstack_size) {
+        g_altstack_result = 1U;
+        return;
+    }
+
+    struct stack32_m3 oss = { 0U, 0, 0U };
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0) {
+        g_altstack_result = 2U;
+        return;
+    }
+    if ((oss.ss_flags & 1 /* SS_ONSTACK */) == 0 ||
+        oss.ss_sp != g_altstack_base ||
+        oss.ss_size != g_altstack_size) {
+        g_altstack_result = 3U;
+        return;
+    }
+
+    /* Negative: modifying sigaltstack while executing on it must return -EPERM (-1) */
+    struct stack32_m3 try_ss;
+    try_ss.ss_sp = g_altstack_base;
+    try_ss.ss_flags = 2 /* SS_DISABLE */;
+    try_ss.ss_size = 0U;
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&try_ss, 0U) != -1 /* -EPERM */) {
+        g_altstack_result = 4U;
+        return;
+    }
+
+    g_altstack_result = 100U;
+}
+
+static int test14_sigaltstack(void)
+{
+    /* Negative: invalid ss_flags must return -EINVAL (-22) */
+    struct stack32_m3 bad_ss;
+    bad_ss.ss_sp = 0x10000U;
+    bad_ss.ss_flags = 0x1234;
+    bad_ss.ss_size = 16384U;
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&bad_ss, 0U) != -22 /* -EINVAL */) {
+        return 119;
+    }
+
+    uint32_t alt_mem = (uint32_t)sys6(192U /* mmap2 */, 0U, 16384U,
+                                      3U /* PROT_READ|PROT_WRITE */,
+                                      0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                      0xFFFFFFFFU, 0U);
+    if (alt_mem > 0xFFFFF000U) {
+        return 120;
+    }
+
+    g_altstack_base = alt_mem;
+    g_altstack_size = 16384U;
+    g_altstack_result = 0U;
+
+    struct stack32_m3 ss;
+    ss.ss_sp = alt_mem;
+    ss.ss_flags = 0;
+    ss.ss_size = 16384U;
+    struct stack32_m3 oss = { 0U, 0, 0U };
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss,
+             (uint32_t)(uintptr_t)&oss) != 0) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 121;
+    }
+
+    /* Before signal delivery, SS_ONSTACK (1) must NOT be set */
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        (oss.ss_flags & 1) != 0 || oss.ss_sp != alt_mem || oss.ss_size != 16384U) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 122;
+    }
+
+    struct sigaction32 act;
+    struct sigaction32 old_act;
+    act.sa_handler = (uint32_t)(uintptr_t)altstack_sigusr1_handler;
+    /* SA_ONSTACK (0x08000000) | SA_RESTORER (0x04000000) | SA_SIGINFO (0x4) */
+    act.sa_flags = 0x08000000U | 0x04000000U | 0x00000004U;
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0] = 0U;
+    act.sa_mask[1] = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+             (uint32_t)(uintptr_t)&act, (uint32_t)(uintptr_t)&old_act, 8U) != 0) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 123;
+    }
+
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+    if (sys2(238U /* tkill */, tid, 10U /* SIGUSR1 */) != 0) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 124;
+    }
+
+    sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+
+    if (g_altstack_result != 100U) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 125;
+    }
+
+    /* After rt_sigreturn from alternate stack, SS_ONSTACK (1) must be cleared */
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        (oss.ss_flags & 1) != 0 || oss.ss_sp != alt_mem || oss.ss_size != 16384U) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 126;
+    }
+
+    /* Disable alternate stack via SS_DISABLE (2) */
+    ss.ss_sp = 0U;
+    ss.ss_flags = 2 /* SS_DISABLE */;
+    ss.ss_size = 0U;
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss,
+             (uint32_t)(uintptr_t)&oss) != 0) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 127;
+    }
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        oss.ss_flags != 2 /* SS_DISABLE */) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 128;
+    }
+
+    sys2(91U /* munmap */, alt_mem, 16384U);
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -957,6 +1254,14 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test12_chaining_partial_cacheflush();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test13_futex_bitset_requeue();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test14_sigaltstack();
     if (rc != 0) {
         return rc;
     }

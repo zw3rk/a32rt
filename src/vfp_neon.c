@@ -145,15 +145,33 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
         /* VMRS / VMSR (opc1 == 7, cp10) */
         if (opc1 == 7U && !is_double) {
+            if (((insn >> 16) & 0xFU) != 1U) {
+                return false;
+            }
             if (l_bit) {
                 if (rt == 15U) { /* APSR_nzcv */
                     a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
                     a64_emit_msr_nzcv(b, A64_TMP0);
                 } else {
-                    a64_emit_ldr_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+                    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+                    a64_emit(b, 0xD53B4420U | A64_TMP1); /* MRS xTmp1, FPSR */
+                    a64_emit_mov_imm32(b, A64_TMP2, 0x0800009FU);
+                    a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
+                    a64_emit_orr_reg_w(b, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+                    a64_emit_mov_w(b, rt, A64_TMP0);
                 }
             } else {
+                if (rt == 15U) {
+                    return false;
+                }
                 a64_emit_str_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+                a64_emit_mov_imm32(b, A64_TMP1, 0x07C00000U);
+                a64_emit_and_reg_w(b, false, A64_TMP0, rt, A64_TMP1, A64_SHIFT_LSL, 0U);
+                a64_emit(b, 0xD51B4400U | A64_TMP0); /* MSR FPCR, xTmp0 */
+                a64_emit_mov_imm32(b, A64_TMP1, 0x0800009FU);
+                a64_emit_and_reg_w(b, false, A64_TMP0, rt, A64_TMP1, A64_SHIFT_LSL, 0U);
+                a64_emit(b, 0xD51B4420U | A64_TMP0); /* MSR FPSR, xTmp0 */
             }
             return true;
         }
@@ -457,23 +475,28 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             /* VCMP / VCMPE */
             if (opc2 == 4U || opc2 == 5U) {
                 bool zero = (opc2 == 5U);
+                uint32_t e_bit = n_bit ? 0x00000010U : 0U;
                 a64_emit_mrs_nzcv(b, A64_TMP1);
                 if (is_double) {
                     unsigned d = (d_bit << 4) | vd_b;
                     unsigned m = (m_bit << 4) | vm_b;
                     a64_emit_ldr_d_ctx(b, 0U, d);
-                    if (!zero) {
+                    if (zero) {
+                        a64_emit(b, 0x1E602008U | e_bit | (0U << 5));
+                    } else {
                         a64_emit_ldr_d_ctx(b, 1U, m);
+                        a64_emit(b, 0x1E602000U | e_bit | (1U << 16) | (0U << 5));
                     }
-                    a64_emit_fcmp_d(b, 0U, 1U, zero);
                 } else {
                     unsigned s = (vd_b << 1) | d_bit;
                     unsigned m = (vm_b << 1) | m_bit;
                     a64_emit_ldr_s_ctx(b, 0U, s);
-                    if (!zero) {
+                    if (zero) {
+                        a64_emit(b, 0x1E202008U | e_bit | (0U << 5));
+                    } else {
                         a64_emit_ldr_s_ctx(b, 1U, m);
+                        a64_emit(b, 0x1E202000U | e_bit | (1U << 16) | (0U << 5));
                     }
-                    a64_emit_fcmp_s(b, 0U, 1U, zero);
                 }
                 a64_emit_mrs_nzcv(b, A64_TMP0);
                 a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
@@ -570,6 +593,22 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     uint32_t base = (is_double ? 0x1E580000U : 0x1E180000U) |
                                     (is_unsigned ? 0x00010000U : 0x00000000U);
                     a64_emit(b, base | (scale << 10) | (0U << 5) | A64_TMP0);
+                    if (!n_bit) {
+                        a64_emit_mrs_nzcv(b, A64_TMP3);
+                        if (is_unsigned) {
+                            a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFU);
+                            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                            a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_HI);
+                        } else {
+                            a64_emit_mov_imm32(b, A64_TMP1, 0x7FFFU);
+                            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                            a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_GT);
+                            a64_emit_mov_imm32(b, A64_TMP1, 0xFFFF8000U);
+                            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                            a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_LT);
+                        }
+                        a64_emit_msr_nzcv(b, A64_TMP3);
+                    }
                     a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, ctx_off);
                     if (is_double) {
                         a64_emit_str_imm_w(b, A64_ZR, A64_XCTX, ctx_off + 4U);
@@ -586,30 +625,26 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     unsigned s = (vd_b << 1) | d_bit;
                     unsigned m = (m_bit << 4) | vm_b;
                     a64_emit_ldr_d_ctx(b, 1U, m);
-                    if (round_zero) {
-                        if (is_signed) {
-                            a64_emit_fcvtzs_d_to_w(b, A64_TMP0, 1U);
-                        } else {
-                            a64_emit_fcvtzu_d_to_w(b, A64_TMP0, 1U);
-                        }
+                    if (!round_zero) {
+                        a64_emit(b, 0x1E674000U | (1U << 5) | 1U); /* FRINTX d1, d1 */
+                    }
+                    if (is_signed) {
+                        a64_emit_fcvtzs_d_to_w(b, A64_TMP0, 1U);
                     } else {
-                        uint32_t base = is_signed ? 0x1E600000U : 0x1E610000U;
-                        a64_emit(b, base | (1U << 5) | A64_TMP0);
+                        a64_emit_fcvtzu_d_to_w(b, A64_TMP0, 1U);
                     }
                     a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (s * 4U));
                 } else {
                     unsigned s = (vd_b << 1) | d_bit;
                     unsigned m = (vm_b << 1) | m_bit;
                     a64_emit_ldr_s_ctx(b, 1U, m);
-                    if (round_zero) {
-                        if (is_signed) {
-                            a64_emit_fcvtzs_s_to_w(b, A64_TMP0, 1U);
-                        } else {
-                            a64_emit_fcvtzu_s_to_w(b, A64_TMP0, 1U);
-                        }
+                    if (!round_zero) {
+                        a64_emit(b, 0x1E274000U | (1U << 5) | 1U); /* FRINTX s1, s1 */
+                    }
+                    if (is_signed) {
+                        a64_emit_fcvtzs_s_to_w(b, A64_TMP0, 1U);
                     } else {
-                        uint32_t base = is_signed ? 0x1E200000U : 0x1E210000U;
-                        a64_emit(b, base | (1U << 5) | A64_TMP0);
+                        a64_emit_fcvtzu_s_to_w(b, A64_TMP0, 1U);
                     }
                     a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (s * 4U));
                 }
@@ -620,6 +655,9 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
         }
 
         /* Binary arithmetic operations */
+        if (!(opc1 <= 3U || (opc1 == 8U && !op_bit) || opc1 == 9U || opc1 == 10U)) {
+            return false;
+        }
         unsigned d_reg = 0U;
         if (is_double) {
             d_reg = (d_bit << 4) | vd_b;
@@ -1373,6 +1411,20 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 a64_emit_str_q_ctx(b, 0U, d >> 1);
                 return true;
             }
+
+            /* VCVT.F16.F32 Dd, Qm (op5 == 12) and VCVT.F32.F16 Qd, Dm (op5 == 14) */
+            if (size == 1U && !is_q && (op5 == 12U || op5 == 14U)) {
+                if (op5 == 12U) {
+                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
+                    a64_emit(b, 0x0E216800U | (1U << 5) | 0U);
+                    a64_emit_str_d_ctx(b, 0U, d);
+                } else {
+                    a64_emit_ldr_d_ctx(b, 1U, m);
+                    a64_emit(b, 0x0E217800U | (1U << 5) | 0U);
+                    a64_emit_str_q_ctx(b, 0U, d >> 1);
+                }
+                return true;
+            }
         }
 
         if (opc1 == 3U && size == 2U && op5 >= 8U && op5 <= 15U) {
@@ -1586,6 +1638,8 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 dl_op = (u_bit ? 0x2E20C000U : 0x0E20C000U) | (size << 22);
             } else if (op == 0xDU && !u_bit && (size == 1U || size == 2U)) { /* VQDMULL */
                 dl_op = 0x0E20D000U | (size << 22);
+            } else if (op == 0xEU && !u_bit && size == 0U) { /* VMULL.P8 */
+                dl_op = 0x0E20E000U;
             }
             if (dl_op != 0U) {
                 unsigned qd = ((((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU)) >> 1;
@@ -1773,6 +1827,11 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         /* VMUL.I* */
         else if (!u_bit && op == 0x9U && b4 && size < 3U) {
             a64_op = (is_q ? 0x4E209C00U : 0x0E209C00U) | (size << 22);
+            matched = true;
+        }
+        /* VMUL.P8 */
+        else if (u_bit && op == 0x9U && b4 && size == 0U) {
+            a64_op = is_q ? 0x6E209C00U : 0x2E209C00U;
             matched = true;
         }
         /* VMLA.I* */

@@ -21,13 +21,23 @@ a32_jit_run_block:
     stp     x27, x28, [sp, #80]
 
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
-    mov     x17, x1                 /* x17 = translated block entry */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
 
     /* Restore hardware NZCV from ctx->cpsr (offset 64) */
     ldr     w16, [x19, #64]
     and     w16, w16, #0xf0000000
     msr     nzcv, x16
+
+    /* Restore hardware FPCR / FPSR from ctx->fpscr (offset 352) */
+    ldr     w16, [x19, #352]
+    and     w17, w16, #0x07c00000
+    msr     fpcr, x17
+    movz    w15, #0x009f
+    movk    w15, #0x0800, lsl #16
+    and     w17, w16, w15
+    msr     fpsr, x17
+
+    mov     x17, x1                 /* x17 = translated block entry */
 
     /* Load guest r0..r14 into host w0..w14 */
     ldp     w0,  w1,  [x19, #0]
@@ -65,6 +75,16 @@ a32_jit_run_block:
     and     w17, w17, #0xf0000000
     orr     w0,  w0,  w17
     str     w0,  [x19, #64]
+
+    /* Merge cumulative FPSR bits into ctx->fpscr and reset host FPCR */
+    mrs     x17, fpsr
+    movz    w15, #0x009f
+    movk    w15, #0x0800, lsl #16
+    and     w17, w17, w15
+    ldr     w14, [x19, #352]
+    orr     w14, w14, w17
+    str     w14, [x19, #352]
+    msr     fpcr, xzr
 
     /* Return exit_reason in w0 */
     mov     w0, w16

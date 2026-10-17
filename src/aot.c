@@ -56,6 +56,7 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
     if (ctx != NULL) {
         h = fnv1a_64_step(h, &ctx->elf_base, sizeof(ctx->elf_base));
         h = fnv1a_64_step(h, &ctx->interp_base, sizeof(ctx->interp_base));
+        h = fnv1a_64_step(h, &ctx->elf_entry, sizeof(ctx->elf_entry));
     }
     if (elf_path != NULL) {
         h = fnv1a_64_step(h, elf_path, strlen(elf_path));
@@ -70,10 +71,12 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
             host_path = elf_path;
         }
         if (stat(host_path, &st) == 0) {
-            uint64_t sz = (uint64_t)st.st_size;
-            uint64_t mt = (uint64_t)st.st_mtime;
+            uint64_t sz  = (uint64_t)st.st_size;
+            uint64_t mt  = (uint64_t)st.st_mtime;
+            uint64_t mtn = (uint64_t)st.st_mtim.tv_nsec;
             h = fnv1a_64_step(h, &sz, sizeof(sz));
             h = fnv1a_64_step(h, &mt, sizeof(mt));
+            h = fnv1a_64_step(h, &mtn, sizeof(mtn));
         }
         FILE *f = fopen(host_path, "rb");
         if (f == NULL && host_path != elf_path) {
@@ -81,8 +84,8 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
         }
         if (f != NULL) {
             uint8_t buf[4096];
-            size_t n = fread(buf, 1U, sizeof(buf), f);
-            if (n > 0U) {
+            size_t n;
+            while ((n = fread(buf, 1U, sizeof(buf), f)) > 0U) {
                 h = fnv1a_64_step(h, buf, n);
             }
             fclose(f);
@@ -92,7 +95,7 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
 }
 
 static void resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
-                               char *out_path, size_t out_len)
+                               char *out_path, size_t out_len, bool create_dir)
 {
     uint64_t h = compute_elf_hash(ctx, elf_path);
     const char *dir = ctx->cache_dir;
@@ -103,7 +106,9 @@ static void resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
         dir = getenv("XDG_CACHE_HOME");
     }
     if (dir != NULL && dir[0] != '\0') {
-        (void)mkdir(dir, 0755);
+        if (create_dir) {
+            (void)mkdir(dir, 0755);
+        }
         snprintf(out_path, out_len, "%s/a32rt-cache-%016llx.bin", dir, (unsigned long long)h);
     } else {
         snprintf(out_path, out_len, "/tmp/a32rt-cache-%016llx.bin", (unsigned long long)h);
@@ -175,7 +180,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     char cache_path[512];
-    resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path));
+    resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), true);
 
     char tmp_path[540];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
@@ -226,7 +231,7 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     char cache_path[512];
-    resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path));
+    resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), false);
 
     FILE *f = fopen(cache_path, "rb");
     if (f == NULL) {
@@ -246,7 +251,8 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
 
     static uint32_t           words_buf[A32_AOT_MAX_WORDS];
     static a32_pc_map_stage_t pc_map_buf[A32_AOT_MAX_PC_MAP];
-    for (uint32_t i = 0U; i < hdr.num_blocks; i++) {
+    uint32_t i = 0U;
+    for (; i < hdr.num_blocks; i++) {
         a32_aot_block_header_t bh;
         if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
             break;
@@ -274,6 +280,11 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
     }
 
     fclose(f);
+    if (i < hdr.num_blocks) {
+        (void)a32_jit_flush_batch(ctx);
+        unlink(cache_path);
+        return -1;
+    }
     if (a32_jit_flush_batch(ctx) != 0) {
         return -1;
     }
@@ -356,10 +367,11 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                             }
                             uint32_t tgt = is_blx ? ((((pc + 4U) & ~3U) + (uint32_t)offset) & ~3U)
                                                   : (pc + 4U + (uint32_t)offset);
-                            if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                            if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
+                                tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
                                 add_target(tgt, !is_blx, disc_pcs, disc_thumb, &disc_count);
                             }
-                            if (is_link && pc + 4U < elf_info->text_end) {
+                            if (is_link && pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end) {
                                 add_target(pc + 4U, true, disc_pcs, disc_thumb, &disc_count);
                             }
                         } else if ((hw2 & 0xD000U) == 0x8000U) {
@@ -377,7 +389,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                                     offset |= (int32_t)0xFFE00000U;
                                 }
                                 uint32_t tgt = pc + 4U + (uint32_t)offset;
-                                if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                                if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
+                                    tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
                                     add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                                 }
                             }
@@ -390,14 +403,16 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                 }
 
                 /* Function prologues: PUSH {..., lr} or SUB sp, #imm */
-                if ((hw & 0xFF00U) == 0xB500U || (hw & 0xFF80U) == 0xB080U) {
+                if (((hw & 0xFF00U) == 0xB500U || (hw & 0xFF80U) == 0xB080U) &&
+                    pc <= 0xFFFFFFFCU && pc + 4U <= elf_info->text_end) {
                     add_target(pc, true, disc_pcs, disc_thumb, &disc_count);
                 }
                 /* Branch cond: B<c> */
                 else if ((hw & 0xF000U) == 0xD000U && (hw & 0x0E00U) != 0x0E00U) {
                     int8_t imm8 = (int8_t)(hw & 0xFFU);
                     uint32_t tgt = (uint32_t)((int32_t)pc + 4 + ((int32_t)imm8 << 1));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -408,7 +423,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                         imm11 |= ~0x7FF;
                     }
                     uint32_t tgt = (uint32_t)((int32_t)pc + 4 + (imm11 << 1));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -434,10 +450,12 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                         imm24 |= (int32_t)0xFF000000U;
                     }
                     uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
                         add_target(tgt, false, disc_pcs, disc_thumb, &disc_count);
                     }
-                    if (((insn >> 24U) & 1U) != 0U && pc + 4U < elf_info->text_end) {
+                    if (((insn >> 24U) & 1U) != 0U &&
+                        pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end) {
                         add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -449,10 +467,11 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     }
                     uint32_t h = (insn >> 24U) & 1U;
                     uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2) + (int32_t)(h << 1U));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                     }
-                    if (pc + 4U < elf_info->text_end) {
+                    if (pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end) {
                         add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
                     }
                 }

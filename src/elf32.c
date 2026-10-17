@@ -223,7 +223,7 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             uint32_t shared_len  = shared_end - page_start;
             uint32_t merged_prot = highest_mapped_prot | (uint32_t)host_prot;
 
-            if (a32_vm_mprotect(ctx, page_start, shared_len, PROT_READ | PROT_WRITE) != 0) {
+            if (mprotect(a32_guest_ptr(ctx, page_start), shared_len, PROT_READ | PROT_WRITE) != 0) {
                 fprintf(stderr, "a32rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
                         label, page_start, shared_end, strerror(errno));
                 return -1;
@@ -264,7 +264,7 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
                 restore_prot = (uint32_t)(PROT_READ | PROT_WRITE);
             }
 
-            if (a32_vm_mprotect(ctx, page_start, shared_len, restore_prot) != 0) {
+            if (mprotect(a32_guest_ptr(ctx, page_start), shared_len, (int)restore_prot) != 0) {
                 fprintf(stderr, "a32rt: %s: mprotect failed on shared page [0x%x, 0x%x): %s\n",
                         label, page_start, shared_end, strerror(errno));
                 return -1;

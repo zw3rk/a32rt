@@ -74,7 +74,7 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
                     int guest_argc, char **guest_argv, char **host_envp,
                     uint32_t *out_sp)
 {
-    if (!ctx || !elf_info || !out_sp || guest_argc < 1) {
+    if (!ctx || !elf_info || !out_sp || guest_argc < 1 || !guest_argv || !guest_argv[0]) {
         return -1;
     }
 

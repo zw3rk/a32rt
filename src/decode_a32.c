@@ -363,7 +363,9 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         uint32_t target = pc_val + (uint32_t)(imm24 << 2);
         if (link) {
             a64_emit_mov_imm32(b, 14U, pc + 4U);
-            b->is_call = true;
+            if (cond == A64_COND_AL) {
+                b->is_call = true;
+            }
         }
         a64_emit_exit_branch_imm(b, target, false);
         if (cond == A64_COND_AL) {
@@ -449,7 +451,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 continue;
             }
             if (l_bit) {
-                unsigned dst = (r == 15U) ? A64_TMP0 : r;
+                unsigned dst = (r == 15U) ? A64_TMP0 : ((r == rn) ? A64_TMP1 : r);
                 a64_emit_guest_ldr_w(b, dst, A64_ADDR);
             } else {
                 unsigned src = load_a32_reg(b, r, pc_val, A64_TMP1);
@@ -458,7 +460,9 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 4U, 0U);
         }
 
-        if (w_bit && !(l_bit && (reg_mask & (1U << rn)))) {
+        if (l_bit && (reg_mask & (1U << rn)) != 0U && rn != 15U) {
+            a64_emit_mov_w(b, rn, A64_TMP1);
+        } else if (w_bit) {
             if (u_bit) {
                 a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)total_bytes, 0U);
             } else {
@@ -757,10 +761,16 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 a64_emit_mrs_nzcv(b, A64_TMP3);
                 a64_emit_mov_imm32(b, A64_TMP1, (uint32_t)max_val);
                 a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_GT);
+                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_TMP0, A64_COND_GT);
                 a64_emit_mov_imm32(b, A64_TMP2, (uint32_t)min_val);
-                a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP2, A64_SHIFT_LSL, 0U);
-                a64_emit_csel_w(b, rd, A64_TMP2, A64_TMP0, A64_COND_LT);
+                a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
+                a64_emit_csel_w(b, rd, A64_TMP2, A64_TMP1, A64_COND_LT);
+                a64_emit_sub_reg_w(b, true, A64_ZR, rd, A64_TMP0, A64_SHIFT_LSL, 0U);
+                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
+                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
+                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
                 a64_emit_msr_nzcv(b, A64_TMP3);
             } else {
                 a64_emit_mov_w(b, rd, A64_TMP0);
@@ -787,10 +797,16 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             uint32_t max_val = (sat_bits == 31U) ? 0x7FFFFFFFU : ((1U << sat_bits) - 1U);
             a64_emit_mrs_nzcv(b, A64_TMP3);
             a64_emit_sub_imm_w(b, true, A64_ZR, A64_TMP0, 0U, 0U);
-            a64_emit_csel_w(b, A64_TMP0, A64_ZR, A64_TMP0, A64_COND_LT);
+            a64_emit_csel_w(b, A64_TMP2, A64_ZR, A64_TMP0, A64_COND_LT);
             a64_emit_mov_imm32(b, A64_TMP1, max_val);
-            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-            a64_emit_csel_w(b, rd, A64_TMP1, A64_TMP0, A64_COND_HI);
+            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+            a64_emit_csel_w(b, rd, A64_TMP1, A64_TMP2, A64_COND_HI);
+            a64_emit_sub_reg_w(b, true, A64_ZR, rd, A64_TMP0, A64_SHIFT_LSL, 0U);
+            a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
+            a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
+            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             a64_emit_msr_nzcv(b, A64_TMP3);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06A00F30U) {
@@ -817,8 +833,15 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, A64_ADDR, A64_SHIFT_LSL, 0U);
             a64_emit_csel_w(b, A64_TMP2, A64_ADDR, A64_TMP2, A64_COND_LT);
 
-            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_bfm_w(b, A64_TMP0, A64_TMP2, 16U, 15U);
+            unsigned orig_src = load_a32_reg(b, rn, pc_val, A64_TMP1);
+            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, orig_src, A64_SHIFT_LSL, 0U);
+            a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
+            a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
+            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_mov_w(b, rd, A64_TMP0);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06E00F30U) {
@@ -843,8 +866,15 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
             a64_emit_csel_w(b, A64_TMP2, A64_TMP1, A64_TMP2, A64_COND_HI);
 
-            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_bfm_w(b, A64_TMP0, A64_TMP2, 16U, 15U);
+            unsigned orig_src = load_a32_reg(b, rn, pc_val, A64_TMP1);
+            a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, orig_src, A64_SHIFT_LSL, 0U);
+            a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
+            a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
+            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_mov_w(b, rd, A64_TMP0);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06800FB0U) {
@@ -869,30 +899,47 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06500F90U || (insn & 0x0FF00FF0U) == 0x06500FF0U ||
                    (insn & 0x0FF00FF0U) == 0x06500F10U || (insn & 0x0FF00FF0U) == 0x06500F70U) {
-            /* UADD8 / USUB8 Rd, Rn, Rm */
+            /* UADD8 / USUB8 / UADD16 / USUB16 Rd, Rn, Rm */
+            bool is_16  = ((insn >> 7) & 1U) == 0U;
             bool is_sub = ((insn >> 5) & 3U) != 0U;
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
             a64_emit_mrs_nzcv(b, A64_TMP3);
             a64_emit_ldr_imm_w(b, A64_ADDR, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-            a64_emit_bic_reg_w(b, false, A64_ADDR, A64_ADDR, A64_ZR, A64_SHIFT_LSL, 0U);
             a64_emit_mov_imm32(b, A64_TMP0, 0x000F0000U);
             a64_emit_bic_reg_w(b, false, A64_ADDR, A64_ADDR, A64_TMP0, A64_SHIFT_LSL, 0U);
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
-            for (unsigned i = 0U; i < 4U; i++) {
-                a64_emit_ubfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
-                a64_emit_ubfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
-                if (is_sub) {
-                    a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                } else {
-                    a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                    a64_emit_sub_imm_w(b, true, A64_ZR, A64_TMP0, 256U, 0U);
+            if (is_16) {
+                for (unsigned i = 0U; i < 2U; i++) {
+                    a64_emit_ubfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                        a64_emit_sub_imm_w(b, true, A64_ZR, A64_TMP0, 0x10U, 1U);
+                    }
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 16U)) & 31U, 15U);
+                    a64_emit_mov_imm32(b, A64_TMP1, 3U << (16U + i * 2U));
+                    a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_CS);
+                    a64_emit_orr_reg_w(b, A64_ADDR, A64_ADDR, A64_TMP1, A64_SHIFT_LSL, 0U);
                 }
-                a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
-                a64_emit_mov_imm32(b, A64_TMP1, 1U << (16U + i));
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_CS);
-                a64_emit_orr_reg_w(b, A64_ADDR, A64_ADDR, A64_TMP1, A64_SHIFT_LSL, 0U);
+            } else {
+                for (unsigned i = 0U; i < 4U; i++) {
+                    a64_emit_ubfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                        a64_emit_sub_imm_w(b, true, A64_ZR, A64_TMP0, 256U, 0U);
+                    }
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
+                    a64_emit_mov_imm32(b, A64_TMP1, 1U << (16U + i));
+                    a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_CS);
+                    a64_emit_orr_reg_w(b, A64_ADDR, A64_ADDR, A64_TMP1, A64_SHIFT_LSL, 0U);
+                }
             }
             a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             a64_emit_msr_nzcv(b, A64_TMP3);
@@ -1013,8 +1060,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_mov_w(b, A64_TMP0, target);
             a64_emit_mov_imm32(b, 14U, pc + 4U);
             a64_emit_exit_branch_reg(b, A64_TMP0, true);
-            b->is_call = true;
             if (cond == A64_COND_AL) {
+                b->is_call = true;
                 *out_ends_block = true;
             }
             handled = true;
@@ -1056,6 +1103,10 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 a64_emit_movz_w(b, A64_TMP1, 0xF000U, 1U);
                 a64_emit_and_reg_w(b, false, A64_TMP1, src, A64_TMP1, A64_SHIFT_LSL, 0U);
                 a64_emit_msr_nzcv(b, A64_TMP1);
+                a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_ubfm_w(b, A64_TMP2, src, 27U, 27U);
+                a64_emit_bfm_w(b, A64_TMP1, A64_TMP2, 5U, 0U);
+                a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             }
             if ((mask & 4U) != 0U) {
                 a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
@@ -1072,6 +1123,10 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             if ((mask & 8U) != 0U) {
                 a64_emit_mov_imm32(b, A64_TMP0, imm32 & 0xF0000000U);
                 a64_emit_msr_nzcv(b, A64_TMP0);
+                a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_mov_imm32(b, A64_TMP2, (imm32 >> 27) & 1U);
+                a64_emit_bfm_w(b, A64_TMP1, A64_TMP2, 5U, 0U);
+                a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             }
             if ((mask & 4U) != 0U) {
                 a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
@@ -1164,12 +1219,14 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
             a64_emit_mrs_nzcv(b, A64_TMP3);
+            a64_emit_movz_w(b, A64_ADDR, 0x0800U, 1U);
             a64_emit_mov_w(b, A64_TMP0, rn);
             if (is_double) {
                 a64_emit_add_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP0, A64_SHIFT_LSL, 0U);
                 a64_emit_movz_w(b, A64_TMP2, 0x8000U, 1U);
                 a64_emit_eor_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_ASR, 31U);
                 a64_emit_csel_w(b, A64_TMP0, A64_TMP2, A64_TMP0, A64_COND_VS);
+                a64_emit_csel_w(b, A64_TMP1, A64_ADDR, A64_ZR, A64_COND_VS);
             }
             if (is_sub) {
                 a64_emit_sub_reg_w(b, true, A64_TMP0, rm, A64_TMP0, A64_SHIFT_LSL, 0U);
@@ -1179,6 +1236,10 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_movz_w(b, A64_TMP2, 0x8000U, 1U);
             a64_emit_eor_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_ASR, 31U);
             a64_emit_csel_w(b, rd, A64_TMP2, A64_TMP0, A64_COND_VS);
+            a64_emit_csel_w(b, A64_TMP1, A64_ADDR, is_double ? A64_TMP1 : A64_ZR, A64_COND_VS);
+            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             a64_emit_msr_nzcv(b, A64_TMP3);
             handled = true;
         } else if (op1 == 0U && ((insn & 0x0FF0F090U) == 0x01600080U)) {
@@ -1348,8 +1409,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 a64_emit_mov_w(b, A64_ADDR, base_reg);
                 if (!i_bit && (l_bit || op2 == 2U) &&
                     (rm == rt || (!l_bit && op2 == 2U && rm == ((rt + 1U) & 0xFU)))) {
-                    a64_emit_mov_w(b, A64_TMP1, rm);
-                    post_off_reg = A64_TMP1;
+                    a64_emit_mov_w(b, A64_TMP2, rm);
+                    post_off_reg = A64_TMP2;
                 }
             }
 
@@ -1366,9 +1427,10 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                     a64_emit_guest_strh_w(b, rt, A64_ADDR);
                 } else if (op2 == 2U) {
                     /* LDRD Rt, Rt2, [addr] */
-                    a64_emit_guest_ldr_w(b, rt, A64_ADDR);
+                    a64_emit_guest_ldr_w(b, A64_TMP1, A64_ADDR);
                     a64_emit_add_imm_w(b, false, A64_TMP0, A64_ADDR, 4U, 0U);
                     a64_emit_guest_ldr_w(b, (rt + 1U) & 0xFU, A64_TMP0);
+                    a64_emit_mov_w(b, rt, A64_TMP1);
                 } else {
                     /* STRD Rt, Rt2, [addr] */
                     unsigned src0 = load_a32_reg(b, rt, pc_val, A64_TMP1);
@@ -1392,8 +1454,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                             a64_emit_sub_imm_w(b, false, rn, base_reg, imm8, 0U);
                         }
                     } else {
-                        unsigned off_reg = (post_off_reg == A64_TMP1)
-                                               ? A64_TMP1
+                        unsigned off_reg = (post_off_reg == A64_TMP2)
+                                               ? A64_TMP2
                                                : load_a32_reg(b, post_off_reg, pc_val, A64_TMP1);
                         if (u_bit) {
                             a64_emit_add_reg_w(b, false, rn, base_reg, off_reg, A64_SHIFT_LSL, 0U);
@@ -1583,7 +1645,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 break;
             }
 
-            if (handled && rd == 14U && (opc < 0x8U || opc >= 0xCU) &&
+            if (handled && cond == A64_COND_AL && rd == 14U && (opc < 0x8U || opc >= 0xCU) &&
                 (rn == 15U || (!is_imm && (insn & 0xFU) == 15U))) {
                 b->is_call = true;
             }

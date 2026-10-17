@@ -1901,6 +1901,398 @@ static int run_test(void)
         }
     }
 
+    /*
+     * 25. Regression tests for APSR.Q (sticky saturation bit 27):
+     *     - Clear Q via `msr APSR_nzcvq, r0`, verify `mrs r1, apsr` has bit 27 == 0.
+     *     - Verify non-saturating operations do not set Q (negative tests).
+     *     - Trigger saturation in SSAT, USAT, SSAT16, USAT16, QADD, QSUB, QDADD, QDSUB,
+     *       verifying each sets APSR.Q (bit 27 == 1) and that Q remains sticky across
+     *       non-saturating instructions until cleared by `msr APSR_nzcvq`.
+     */
+    {
+        const uint32_t q_bit = 1U << 27;
+        uint32_t zero = 0U;
+        uint32_t res = 0U;
+        uint32_t flags = 0U;
+
+        /* 25a: Direct clear and set of Q via MSR APSR_nzcvq */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [fl] "=&r"(flags)
+            : [z] "r"(zero)
+            : "cc"
+        );
+        if ((flags & q_bit) != 0U) {
+            return 142;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[qb]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [fl] "=&r"(flags)
+            : [qb] "r"(q_bit)
+            : "cc"
+        );
+        if ((flags & q_bit) != q_bit) {
+            return 143;
+        }
+
+        /* 25b: SSAT (negative non-saturating + positive saturating + stickiness) */
+        int32_t ssat_ok = 42;
+        int32_t ssat_sat = 500;
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "ssat %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [ok] "r"(ssat_ok)
+            : "cc"
+        );
+        if (res != 42U || (flags & q_bit) != 0U) {
+            return 144;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "ssat %[res], #8, %[sat]\n\t"
+            "ssat %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [sat] "r"(ssat_sat), [ok] "r"(ssat_ok)
+            : "cc"
+        );
+        if (res != 42U || (flags & q_bit) != q_bit) {
+            return 145;
+        }
+
+        /* 25c: USAT (negative non-saturating + positive saturating + negative input saturating) */
+        int32_t usat_ok = 100;
+        int32_t usat_sat = 500;
+        int32_t usat_neg = -10;
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "usat %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [ok] "r"(usat_ok)
+            : "cc"
+        );
+        if (res != 100U || (flags & q_bit) != 0U) {
+            return 146;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "usat %[res], #8, %[sat]\n\t"
+            "usat %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [sat] "r"(usat_sat), [ok] "r"(usat_ok)
+            : "cc"
+        );
+        if (res != 100U || (flags & q_bit) != q_bit) {
+            return 147;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "usat %[res], #8, %[neg]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [neg] "r"(usat_neg)
+            : "cc"
+        );
+        if (res != 0U || (flags & q_bit) != q_bit) {
+            return 148;
+        }
+
+        /* 25d: SSAT16 (non-saturating vs saturating + sticky) */
+        uint32_t ssat16_ok = 0x0020FFE0U;  /* hi = +32, lo = -32 (in [-128, 127]) */
+        uint32_t ssat16_sat = 0x012C0010U; /* hi = +300 -> +127, lo = +16 */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "ssat16 %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [ok] "r"(ssat16_ok)
+            : "cc"
+        );
+        if (res != 0x0020FFE0U || (flags & q_bit) != 0U) {
+            return 149;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "ssat16 %[res], #8, %[sat]\n\t"
+            "ssat16 %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [sat] "r"(ssat16_sat), [ok] "r"(ssat16_ok)
+            : "cc"
+        );
+        if (res != 0x0020FFE0U || (flags & q_bit) != q_bit) {
+            return 150;
+        }
+
+        /* 25e: USAT16 (non-saturating vs saturating + sticky) */
+        uint32_t usat16_ok = 0x00800040U;  /* hi = 128, lo = 64 (in [0, 255]) */
+        uint32_t usat16_sat = 0x0010FFFEU; /* hi = 16, lo = -2 -> 0 */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "usat16 %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [ok] "r"(usat16_ok)
+            : "cc"
+        );
+        if (res != 0x00800040U || (flags & q_bit) != 0U) {
+            return 151;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "usat16 %[res], #8, %[sat]\n\t"
+            "usat16 %[res], #8, %[ok]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [sat] "r"(usat16_sat), [ok] "r"(usat16_ok)
+            : "cc"
+        );
+        if (res != 0x00800040U || (flags & q_bit) != q_bit) {
+            return 152;
+        }
+
+        /* 25f: QADD, QSUB, QDADD, QDSUB setting APSR.Q and remaining sticky */
+        int32_t q_100 = 100, q_200 = 200, q_50 = 50;
+        int32_t q_pos_near = 0x7FFFFFF0;
+        int32_t q_neg_near = (int32_t)0x80000010U;
+        int32_t q_big_pos  = 0x50000000;
+
+        /* QADD */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qadd %[res], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [a] "r"(q_100), [b] "r"(q_200)
+            : "cc"
+        );
+        if (res != 300U || (flags & q_bit) != 0U) {
+            return 153;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qadd %[res], %[sat], %[a]\n\t"
+            "qadd %[res], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [sat] "r"(q_pos_near), [a] "r"(q_100), [b] "r"(q_200)
+            : "cc"
+        );
+        if (res != 300U || (flags & q_bit) != q_bit) {
+            return 154;
+        }
+
+        /* QSUB */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qsub %[res], %[b], %[a]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [a] "r"(q_100), [b] "r"(q_200)
+            : "cc"
+        );
+        if (res != 100U || (flags & q_bit) != 0U) {
+            return 155;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qsub %[res], %[neg], %[a]\n\t"
+            "qsub %[res], %[b], %[a]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [neg] "r"(q_neg_near), [a] "r"(q_100), [b] "r"(q_200)
+            : "cc"
+        );
+        if (res != 100U || (flags & q_bit) != q_bit) {
+            return 156;
+        }
+
+        /* QDADD */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qdadd %[res], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [a] "r"(q_100), [b] "r"(q_50)
+            : "cc"
+        );
+        if (res != 200U || (flags & q_bit) != 0U) {
+            return 157;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qdadd %[res], %[a], %[big]\n\t"
+            "qdadd %[res], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [a] "r"(q_100), [b] "r"(q_50), [big] "r"(q_big_pos)
+            : "cc"
+        );
+        if (res != 200U || (flags & q_bit) != q_bit) {
+            return 158;
+        }
+
+        /* QDSUB */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qdsub %[res], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [a] "r"(q_200), [b] "r"(q_50)
+            : "cc"
+        );
+        if (res != 100U || (flags & q_bit) != 0U) {
+            return 159;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "qdsub %[res], %[z], %[big]\n\t"
+            "qdsub %[res], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "msr apsr_nzcvq, %[z]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [a] "r"(q_200), [b] "r"(q_50), [big] "r"(q_big_pos)
+            : "cc"
+        );
+        if (res != 100U || (flags & q_bit) != q_bit) {
+            return 160;
+        }
+    }
+
+    /*
+     * 26. Regression tests for UADD16 and USUB16 + SEL:
+     *     Verify parallel 16-bit unsigned addition and subtraction setting
+     *     GE[1:0] and GE[3:2] (read back via MRS and SEL) while preserving NZCV.
+     */
+    {
+        uint32_t res = 0U, flags = 0U, sel_out = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+        uint32_t sel_a = 0x11223344U;
+        uint32_t sel_b = 0xAABBCCDDU;
+
+        /* 26a: UADD16 with hi carry, lo no carry -> GE = 0b1100 (0xC) */
+        uint32_t ua16_rn1 = 0xF0001234U;
+        uint32_t ua16_rm1 = 0x20002345U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "uadd16 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(ua16_rn1), [rm] "r"(ua16_rm1),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x10003579U || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x600C0000U) {
+            return 161;
+        }
+
+        /* 26b: UADD16 with hi no carry, lo carry -> GE = 0b0011 (0x3) */
+        uint32_t ua16_rn2 = 0x10008000U;
+        uint32_t ua16_rm2 = 0x20009000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "uadd16 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(ua16_rn2), [rm] "r"(ua16_rm2),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x30001000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x80030000U) {
+            return 162;
+        }
+
+        /* 26c: USUB16 with hi borrow, lo no borrow -> GE = 0b0011 (0x3) */
+        uint32_t us16_rn1 = 0x10005000U;
+        uint32_t us16_rm1 = 0x20003000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "usub16 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(us16_rn1), [rm] "r"(us16_rm1),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0xF0002000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x60030000U) {
+            return 163;
+        }
+
+        /* 26d: USUB16 with hi equal (no borrow), lo borrow -> GE = 0b1100 (0xC) */
+        uint32_t us16_rn2 = 0x40000001U;
+        uint32_t us16_rm2 = 0x40000002U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "usub16 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(us16_rn2), [rm] "r"(us16_rm2),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x0000FFFFU || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x800C0000U) {
+            return 164;
+        }
+    }
+
+    /*
+     * 27. Regression test for LDRD r0, r1, [r0] and LDM r0, {r0, r1} where
+     *     base register rn is overwritten by the first loaded word.
+     */
+    {
+        _Alignas(8) uint32_t pair[2] = { 0xDEADBEEFU, 0xCAFEBABEU };
+
+        /* 27a: LDRD r0, r1, [r0] */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&pair[0];
+            register uint32_t r1 __asm__("r1") = 0U;
+            __asm__ volatile("ldrd r0, r1, [r0]" : "+r"(r0), "=r"(r1) : : "memory");
+            if (r0 != 0xDEADBEEFU || r1 != 0xCAFEBABEU) {
+                return 165;
+            }
+        }
+
+        /* 27b: LDM r0, {r0, r1} */
+        pair[0] = 0x11223344U;
+        pair[1] = 0x55667788U;
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&pair[0];
+            register uint32_t r1 __asm__("r1") = 0U;
+            __asm__ volatile("ldm r0, {r0, r1}" : "+r"(r0), "=r"(r1) : : "memory");
+            if (r0 != 0x11223344U || r1 != 0x55667788U) {
+                return 166;
+            }
+        }
+
+#if defined(__thumb__)
+        /* 27c: Thumb-2 32-bit LDM.W r0, {r0, r1} */
+        pair[0] = 0x87654321U;
+        pair[1] = 0xFEDCBA98U;
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&pair[0];
+            register uint32_t r1 __asm__("r1") = 0U;
+            __asm__ volatile("ldm.w r0, {r0, r1}" : "+r"(r0), "=r"(r1) : : "memory");
+            if (r0 != 0x87654321U || r1 != 0xFEDCBA98U) {
+                return 167;
+            }
+        }
+#endif
+    }
+
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

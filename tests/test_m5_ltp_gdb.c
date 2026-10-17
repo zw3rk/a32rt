@@ -1054,6 +1054,247 @@ static int test15_ppoll_sigsetsize(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 16: 32-bit getdents (141) small-buffer pagination & d_off seeking
+ * -------------------------------------------------------------------------- */
+static int m5_streq(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (*a != *b) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static int test16_getdents32_pagination(void)
+{
+    static const char dir_path[] = "/tmp/a32rt_m5_getdents_dir";
+    static const char f_alpha[]  = "/tmp/a32rt_m5_getdents_dir/entry_alpha";
+    static const char f_beta[]   = "/tmp/a32rt_m5_getdents_dir/entry_beta";
+    static const char f_gamma[]  = "/tmp/a32rt_m5_getdents_dir/entry_gamma";
+    static const char f_delta[]  = "/tmp/a32rt_m5_getdents_dir/entry_delta";
+
+    /* Pre-clean in case a previous run left paths behind */
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)f_alpha);
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)f_beta);
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)f_gamma);
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)f_delta);
+    sys1(40U /* rmdir */, (uint32_t)(uintptr_t)dir_path);
+
+    if (sys2(39U /* mkdir */, (uint32_t)(uintptr_t)dir_path, 0755U) != 0) {
+        return 127;
+    }
+
+    const char *files[4] = { f_alpha, f_beta, f_gamma, f_delta };
+    for (int i = 0; i < 4; i++) {
+        /* O_CREAT | O_WRONLY | O_TRUNC = 01101 = 0x241 */
+        int32_t ffd = sys3(5U /* open */, (uint32_t)(uintptr_t)files[i], 0x241U, 0644U);
+        if (ffd < 0) {
+            return 128;
+        }
+        sys1(6U /* close */, (uint32_t)ffd);
+    }
+
+    /* Open directory O_RDONLY | O_DIRECTORY (ARM O_DIRECTORY = 040000 = 0x4000) */
+    int32_t dfd = sys3(5U /* open */, (uint32_t)(uintptr_t)dir_path, 0x4000U, 0U);
+    if (dfd < 0) {
+        return 129;
+    }
+
+    uint8_t buf[48] __attribute__((aligned(4)));
+
+    /*
+     * Negative: buffer too small to hold even one linux_dirent32 entry
+     * must return -EINVAL (-22), and unmapped buffer must return -EFAULT (-14).
+     */
+    if (sys3(141U /* getdents */, (uint32_t)dfd, (uint32_t)(uintptr_t)buf, 4U) != -22) {
+        sys1(6U /* close */, (uint32_t)dfd);
+        return 130;
+    }
+    if (sys3(141U /* getdents */, (uint32_t)dfd, 0x100U, 48U) != -14) {
+        sys1(6U /* close */, (uint32_t)dfd);
+        return 131;
+    }
+
+    /*
+     * Positive: paginate with a small 48-byte buffer (which fits at most 1-2
+     * entries per syscall, forcing multiple getdents(141) calls and partial
+     * host getdents64 buffer rewinds via lseek(last_d_off)). Every created file
+     * must be observed exactly once with none skipped or duplicated.
+     */
+    uint32_t seen_mask = 0U;
+    uint32_t dup_mask  = 0U;
+    uint32_t calls     = 0U;
+
+    for (;;) {
+        int32_t nread = sys3(141U /* getdents */, (uint32_t)dfd,
+                             (uint32_t)(uintptr_t)buf, (uint32_t)sizeof(buf));
+        if (nread < 0) {
+            sys1(6U /* close */, (uint32_t)dfd);
+            return 132;
+        }
+        if (nread == 0) {
+            break;
+        }
+        calls++;
+        int32_t pos = 0;
+        while (pos < nread) {
+            uint16_t d_reclen = *(const uint16_t *)(const void *)(buf + pos + 8);
+            if (d_reclen < 12U || (pos + (int32_t)d_reclen) > nread) {
+                sys1(6U /* close */, (uint32_t)dfd);
+                return 133;
+            }
+            const char *d_name = (const char *)(const void *)(buf + pos + 10);
+            uint32_t bit = 0U;
+            if (m5_streq(d_name, "entry_alpha")) {
+                bit = 1U;
+            } else if (m5_streq(d_name, "entry_beta")) {
+                bit = 2U;
+            } else if (m5_streq(d_name, "entry_gamma")) {
+                bit = 4U;
+            } else if (m5_streq(d_name, "entry_delta")) {
+                bit = 8U;
+            }
+            if (bit != 0U) {
+                if ((seen_mask & bit) != 0U) {
+                    dup_mask |= bit;
+                }
+                seen_mask |= bit;
+            }
+            pos += (int32_t)d_reclen;
+        }
+        if (calls > 32U) {
+            break;
+        }
+    }
+
+    sys1(6U /* close */, (uint32_t)dfd);
+    for (int i = 0; i < 4; i++) {
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)files[i]);
+    }
+    sys1(40U /* rmdir */, (uint32_t)(uintptr_t)dir_path);
+
+    if (calls < 2U || seen_mask != 0xFU || dup_mask != 0U) {
+        return 134;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 17: prctl pointer translation, getgroups32 & set_robust_list/get_robust_list
+ * -------------------------------------------------------------------------- */
+struct robust_list_head32_m5 {
+    uint32_t list;
+    int32_t  futex_offset;
+    uint32_t list_op_pending;
+};
+
+static int test17_prctl_groups_robust(void)
+{
+    /*
+     * 17a: prctl (172) PR_GET_NAME (16) and PR_SET_NAME (15) guest pointer
+     *      translation (+ round-trip, - EFAULT on unmapped/NULL pointer).
+     */
+    char orig_name[16];
+    char new_name[16]  = "a32rt_r4_test";
+    char read_name[16];
+    for (int i = 0; i < 16; i++) {
+        orig_name[i] = '\0';
+        read_name[i] = '\0';
+    }
+
+    if (sys5(172U /* prctl */, 16U /* PR_GET_NAME */,
+             (uint32_t)(uintptr_t)orig_name, 0U, 0U, 0U) != 0) {
+        return 135;
+    }
+    if (sys5(172U /* prctl */, 15U /* PR_SET_NAME */,
+             (uint32_t)(uintptr_t)new_name, 0U, 0U, 0U) != 0) {
+        return 136;
+    }
+    if (sys5(172U /* prctl */, 16U /* PR_GET_NAME */,
+             (uint32_t)(uintptr_t)read_name, 0U, 0U, 0U) != 0) {
+        sys5(172U /* prctl */, 15U /* PR_SET_NAME */,
+             (uint32_t)(uintptr_t)orig_name, 0U, 0U, 0U);
+        return 137;
+    }
+    /* Restore original thread name */
+    sys5(172U /* prctl */, 15U /* PR_SET_NAME */,
+         (uint32_t)(uintptr_t)orig_name, 0U, 0U, 0U);
+
+    if (!m5_streq(read_name, "a32rt_r4_test")) {
+        return 138;
+    }
+
+    /* Negative: PR_GET_NAME / PR_SET_NAME with NULL (0) or unmapped 0x100 -> -EFAULT (-14) */
+    if (sys5(172U /* prctl */, 16U /* PR_GET_NAME */, 0U, 0U, 0U, 0U) != -14 ||
+        sys5(172U /* prctl */, 15U /* PR_SET_NAME */, 0x100U, 0U, 0U, 0U) != -14) {
+        return 139;
+    }
+
+    /*
+     * 17b: getgroups32 (205) positive and negative checks:
+     *      - Negative: size < 0 returns -EINVAL (-22); unmapped list with size > 0
+     *        returns -EFAULT (-14)
+     *      - Positive: getgroups32(0, NULL) returns count >= 0, and
+     *        getgroups32(16, groups) succeeds
+     */
+    if (sys2(205U /* getgroups32 */, 0xFFFFFFFFU /* -1 */, 0U) != -22) {
+        return 140;
+    }
+    int32_t ngroups = sys2(205U /* getgroups32 */, 0U, 0U);
+    if (ngroups < 0) {
+        return 141;
+    }
+    uint32_t gids[16];
+    int32_t ng2 = sys2(205U /* getgroups32 */, 16U, (uint32_t)(uintptr_t)gids);
+    if (ng2 != ngroups) {
+        return 142;
+    }
+    if (ngroups > 0 && sys2(205U /* getgroups32 */, 16U, 0x100U) != -14) {
+        return 143;
+    }
+
+    /*
+     * 17c: set_robust_list (338) & get_robust_list (339):
+     *      - Negative: set_robust_list(&head, 99) -> -EINVAL (-22)
+     *      - Positive: set_robust_list(&head, 12) -> 0, and get_robust_list(0, &hptr, &hlen)
+     *        returns head_ptr == &head and len == 12
+     */
+    struct robust_list_head32_m5 rhead;
+    rhead.list = (uint32_t)(uintptr_t)&rhead;
+    rhead.futex_offset = 0;
+    rhead.list_op_pending = 0U;
+
+    if (sys2(338U /* set_robust_list */, (uint32_t)(uintptr_t)&rhead, 99U) != -22 ||
+        sys2(338U /* set_robust_list */, (uint32_t)(uintptr_t)&rhead, 24U) != -22) {
+        return 144;
+    }
+    if (sys2(338U /* set_robust_list */, (uint32_t)(uintptr_t)&rhead, 12U) != 0) {
+        return 145;
+    }
+
+    uint32_t out_head = 0U;
+    uint32_t out_len  = 0U;
+    if (sys3(339U /* get_robust_list */, 0U,
+             (uint32_t)(uintptr_t)&out_head,
+             (uint32_t)(uintptr_t)&out_len) != 0 ||
+        out_head != (uint32_t)(uintptr_t)&rhead ||
+        out_len != 12U) {
+        return 146;
+    }
+
+    /* Negative: get_robust_list with NULL pointers returns -EFAULT (-14) */
+    if (sys3(339U /* get_robust_list */, 0U, 0U, (uint32_t)(uintptr_t)&out_len) != -14) {
+        return 147;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -1105,6 +1346,14 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test15_ppoll_sigsetsize();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test16_getdents32_pagination();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test17_prctl_groups_robust();
     if (rc != 0) {
         return rc;
     }

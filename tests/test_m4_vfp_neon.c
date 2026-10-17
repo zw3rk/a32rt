@@ -1134,7 +1134,7 @@ static int run_vfp_neon_tests(void)
             "vcvtt.f32.f16 s4, s0\n"
             "vmov %1, s3\n"
             "vmov %2, s4\n"
-            : "=r"(fp16_packed), "=r"(fp16_out_b), "=r"(fp16_out_t)
+            : "=&r"(fp16_packed), "=&r"(fp16_out_b), "=r"(fp16_out_t)
             : "r"(fp16_in_b), "r"(fp16_in_t)
             : "d0", "d1", "d2"
         );
@@ -1154,7 +1154,7 @@ static int run_vfp_neon_tests(void)
             "vmov s1, %3\n"
             "vcvt.f32.s32 s1, s1, #8\n"
             "vmov %1, s1\n"
-            : "=r"(fxp_s32), "=r"(fxp_f32)
+            : "=&r"(fxp_s32), "=r"(fxp_f32)
             : "r"(fxp_in), "r"(fxp_sin)
             : "d0"
         );
@@ -1203,6 +1203,287 @@ static int run_vfp_neon_tests(void)
             ceq_out[0] != 0x00000000U || ceq_out[1] != 0xFFFFFFFFU ||
             clt_out[0] != 0xFFFFFFFFU || clt_out[1] != 0x00000000U) {
             return 61;
+        }
+    }
+
+    /*
+     * 25. FPSCR <-> hardware FPCR/FPSR synchronization (Round 4 regression):
+     *     - 25a: FPSCR.RMode (bits [23:22]) rounding modes with VCVTR.S32.F32:
+     *            0 = RN (Nearest), 1 = RP (+Inf), 2 = RM (-Inf), 3 = RZ (Zero)
+     *     - 25b: Sticky FPSCR.QC (bit 27) readback after NEON saturating ops
+     *            (negative non-saturating check + positive saturating check)
+     */
+    {
+        uint32_t saved_fpscr = 0U;
+        __asm__ volatile("vmrs %0, fpscr" : "=r"(saved_fpscr));
+
+        float pos_v = 1.25f;
+        float neg_v = -1.25f;
+        int32_t r_pos = 0;
+        int32_t r_neg = 0;
+
+        /* RMode = 1 (0x00400000: Round towards +Inf / RP): 1.25 -> +2, -1.25 -> -1 */
+        uint32_t fpscr_rp = (saved_fpscr & ~0x00C00000U) | 0x00400000U;
+        __asm__ volatile(
+            "vmsr fpscr, %2\n"
+            "vldr s0, %3\n"
+            "vldr s1, %4\n"
+            "vcvtr.s32.f32 s2, s0\n"
+            "vcvtr.s32.f32 s3, s1\n"
+            "vmov %0, s2\n"
+            "vmov %1, s3\n"
+            : "=r"(r_pos), "=r"(r_neg)
+            : "r"(fpscr_rp), "m"(pos_v), "m"(neg_v)
+            : "s0", "s1", "s2", "s3"
+        );
+        if (r_pos != 2 || r_neg != -1) {
+            __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+            return 62;
+        }
+
+        /* RMode = 2 (0x00800000: Round towards -Inf / RM): 1.25 -> +1, -1.25 -> -2 */
+        uint32_t fpscr_rm = (saved_fpscr & ~0x00C00000U) | 0x00800000U;
+        __asm__ volatile(
+            "vmsr fpscr, %2\n"
+            "vldr s0, %3\n"
+            "vldr s1, %4\n"
+            "vcvtr.s32.f32 s2, s0\n"
+            "vcvtr.s32.f32 s3, s1\n"
+            "vmov %0, s2\n"
+            "vmov %1, s3\n"
+            : "=r"(r_pos), "=r"(r_neg)
+            : "r"(fpscr_rm), "m"(pos_v), "m"(neg_v)
+            : "s0", "s1", "s2", "s3"
+        );
+        if (r_pos != 1 || r_neg != -2) {
+            __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+            return 63;
+        }
+
+        /* RMode = 3 (0x00C00000: Round towards Zero / RZ): 1.75 -> +1, -1.75 -> -1 */
+        float pos_v2 = 1.75f;
+        float neg_v2 = -1.75f;
+        uint32_t fpscr_rz = (saved_fpscr & ~0x00C00000U) | 0x00C00000U;
+        __asm__ volatile(
+            "vmsr fpscr, %2\n"
+            "vldr s0, %3\n"
+            "vldr s1, %4\n"
+            "vcvtr.s32.f32 s2, s0\n"
+            "vcvtr.s32.f32 s3, s1\n"
+            "vmov %0, s2\n"
+            "vmov %1, s3\n"
+            : "=r"(r_pos), "=r"(r_neg)
+            : "r"(fpscr_rz), "m"(pos_v2), "m"(neg_v2)
+            : "s0", "s1", "s2", "s3"
+        );
+        if (r_pos != 1 || r_neg != -1) {
+            __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+            return 64;
+        }
+
+        /* RMode = 0 (0x00000000: Round to Nearest / RN): 1.75 -> +2, -1.75 -> -2 */
+        uint32_t fpscr_rn = (saved_fpscr & ~0x00C00000U);
+        __asm__ volatile(
+            "vmsr fpscr, %2\n"
+            "vldr s0, %3\n"
+            "vldr s1, %4\n"
+            "vcvtr.s32.f32 s2, s0\n"
+            "vcvtr.s32.f32 s3, s1\n"
+            "vmov %0, s2\n"
+            "vmov %1, s3\n"
+            : "=r"(r_pos), "=r"(r_neg)
+            : "r"(fpscr_rn), "m"(pos_v2), "m"(neg_v2)
+            : "s0", "s1", "s2", "s3"
+        );
+        if (r_pos != 2 || r_neg != -2) {
+            __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+            return 65;
+        }
+
+        /*
+         * 25b: FPSCR.QC (bit 27) sticky saturation flag:
+         *      - Clear QC via VMSR, run non-saturating VQADD.S16 -> QC stays 0
+         *      - Run saturating VQADD.S16 -> QC becomes 1 and stays 1 across
+         *        subsequent non-saturating VQADD.S16
+         */
+        int16_t ns_a[4]  = { 10, -20, 30, -40 };
+        int16_t ns_b[4]  = { 5,  -10, 15, -20 };
+        int16_t sat_a[4] = { 30000, -30000, 100, -100 };
+        int16_t sat_b[4] = { 10000, -10000, 200, -200 };
+        int16_t q_out[4] = { 0, 0, 0, 0 };
+        uint32_t qc_clear = saved_fpscr & ~(1U << 27);
+        uint32_t fpscr_after_ns = 0U;
+        uint32_t fpscr_after_sat = 0U;
+        uint32_t fpscr_after_sticky = 0U;
+
+        __asm__ volatile(
+            "vmsr fpscr, %3\n"
+            "vld1.16 {d0}, [%4]\n"
+            "vld1.16 {d1}, [%5]\n"
+            "vqadd.s16 d2, d0, d1\n"
+            "vmrs %0, fpscr\n"
+            "vld1.16 {d0}, [%6]\n"
+            "vld1.16 {d1}, [%7]\n"
+            "vqadd.s16 d2, d0, d1\n"
+            "vst1.16 {d2}, [%2]\n"
+            "vmrs %1, fpscr\n"
+            : "=&r"(fpscr_after_ns), "=r"(fpscr_after_sat)
+            : "r"(q_out), "r"(qc_clear), "r"(ns_a), "r"(ns_b), "r"(sat_a), "r"(sat_b)
+            : "d0", "d1", "d2", "memory"
+        );
+        if ((fpscr_after_ns & (1U << 27)) != 0U) {
+            __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+            return 66;
+        }
+        if ((fpscr_after_sat & (1U << 27)) == 0U ||
+            q_out[0] != 32767 || q_out[1] != -32768 ||
+            q_out[2] != 300   || q_out[3] != -300) {
+            __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+            return 67;
+        }
+
+        /* Verify QC stays sticky after a non-saturating VQADD.S16, then clears via VMSR */
+        uint32_t fpscr_after_clear = 0U;
+        __asm__ volatile(
+            "vld1.16 {d0}, [%2]\n"
+            "vld1.16 {d1}, [%3]\n"
+            "vqadd.s16 d2, d0, d1\n"
+            "vmrs %0, fpscr\n"
+            "vmsr fpscr, %4\n"
+            "vmrs %1, fpscr\n"
+            : "=&r"(fpscr_after_sticky), "=r"(fpscr_after_clear)
+            : "r"(ns_a), "r"(ns_b), "r"(qc_clear)
+            : "d0", "d1", "d2"
+        );
+        __asm__ volatile("vmsr fpscr, %0" : : "r"(saved_fpscr));
+        if ((fpscr_after_sticky & (1U << 27)) == 0U ||
+            (fpscr_after_clear & (1U << 27)) != 0U) {
+            return 68;
+        }
+    }
+
+    /*
+     * 26. VFPv4 NEON half-precision vector VCVT.F16.F32 / VCVT.F32.F16,
+     *     polynomial multiply VMUL.P8 / VMULL.P8, and 16-bit fixed-point
+     *     VCVT.S16.F32 / VCVT.U16.F32 saturation (Round 4 regression):
+     */
+    {
+        /* 26a: NEON vector VCVT.F16.F32 Dd, Qm & VCVT.F32.F16 Qd, Dm */
+        float f32_in[4]     = { 1.0f, -2.5f, 0.5f, 6.25f };
+        uint16_t f16_mid[4] = { 0U, 0U, 0U, 0U };
+        float f32_out[4]    = { 0.0f, 0.0f, 0.0f, 0.0f };
+        __asm__ volatile(
+            "vld1.32 {d2, d3}, [%2]\n"
+            "vcvt.f16.f32 d0, q1\n"
+            "vst1.16 {d0}, [%0]\n"
+            "vcvt.f32.f16 q2, d0\n"
+            "vst1.32 {d4, d5}, [%1]\n"
+            :
+            : "r"(f16_mid), "r"(f32_out), "r"(f32_in)
+            : "d0", "d2", "d3", "d4", "d5", "memory"
+        );
+        if (f16_mid[0] != 0x3C00U || f16_mid[1] != 0xC100U ||
+            f16_mid[2] != 0x3800U || f16_mid[3] != 0x4640U ||
+            f32_out[0] != 1.0f    || f32_out[1] != -2.5f   ||
+            f32_out[2] != 0.5f    || f32_out[3] != 6.25f) {
+            return 69;
+        }
+
+        /*
+         * 26b: Polynomial multiply over GF(2)[x]: VMUL.P8 (64-bit & 128-bit)
+         *      and widening VMULL.P8 Qd, Dn, Dm
+         *      - 0x03 (x + 1) * 0x03 (x + 1) = x^2 + 1 = 0x05
+         *      - 0x07 (x^2 + x + 1) * 0x03 (x + 1) = x^3 + 1 = 0x09
+         *      - 0xFF * 0x02 = 0x1FE (low byte 0xFE in VMUL.P8, 0x01FE in VMULL.P8)
+         *      - 0x80 * 0x80 = 0x4000 (low byte 0x00 in VMUL.P8, 0x4000 in VMULL.P8)
+         */
+        uint8_t p_a[8]      = { 0x03U, 0x07U, 0xFFU, 0x80U, 0x05U, 0x00U, 0x01U, 0x0FU };
+        uint8_t p_b[8]      = { 0x03U, 0x03U, 0x02U, 0x80U, 0x05U, 0xFFU, 0xABU, 0x0FU };
+        uint8_t pmul_out[8] = { 0U };
+        uint16_t pmull_out[8] = { 0U };
+        __asm__ volatile(
+            "vld1.8 {d0}, [%2]\n"
+            "vld1.8 {d1}, [%3]\n"
+            "vmul.p8 d2, d0, d1\n"
+            "vst1.8 {d2}, [%0]\n"
+            "vmull.p8 q2, d0, d1\n"
+            "vst1.16 {d4, d5}, [%1]\n"
+            :
+            : "r"(pmul_out), "r"(pmull_out), "r"(p_a), "r"(p_b)
+            : "d0", "d1", "d2", "d4", "d5", "memory"
+        );
+        if (pmul_out[0] != 0x05U || pmul_out[1] != 0x09U ||
+            pmul_out[2] != 0xFEU || pmul_out[3] != 0x00U ||
+            pmul_out[4] != 0x11U || pmul_out[5] != 0x00U ||
+            pmul_out[6] != 0xABU || pmul_out[7] != 0x55U) {
+            return 70;
+        }
+        if (pmull_out[0] != 0x0005U || pmull_out[1] != 0x0009U ||
+            pmull_out[2] != 0x01FEU || pmull_out[3] != 0x4000U ||
+            pmull_out[4] != 0x0011U || pmull_out[5] != 0x0000U ||
+            pmull_out[6] != 0x00ABU || pmull_out[7] != 0x0055U) {
+            return 71;
+        }
+
+        /*
+         * 26c: 16-bit fixed-point VCVT.S16.F32 / VCVT.F32.S16 and
+         *      VCVT.U16.F32 / VCVT.F32.U16 (including saturation to
+         *      [-32768, 32767] and [0, 65535])
+         */
+        float s16_in      = 12.5f;   /* 12.5 * 16 = 200 */
+        float s16_pos_sat = 3000.0f; /* 3000 * 16 = 48000 -> saturates to 32767 */
+        float s16_neg_sat = -3000.0f;/* -3000 * 16 = -48000 -> saturates to -32768 */
+        int32_t s16_fxp   = 0;
+        int32_t s16_hi    = 0;
+        int32_t s16_lo    = 0;
+        float s16_rt      = 0.0f;
+        __asm__ volatile(
+            "vldr s0, %4\n"
+            "vcvt.s16.f32 s0, s0, #4\n"
+            "vmov %0, s0\n"
+            "vcvt.f32.s16 s0, s0, #4\n"
+            "vstr s0, %3\n"
+            "vldr s1, %5\n"
+            "vcvt.s16.f32 s1, s1, #4\n"
+            "vmov %1, s1\n"
+            "vldr s2, %6\n"
+            "vcvt.s16.f32 s2, s2, #4\n"
+            "vmov %2, s2\n"
+            : "=&r"(s16_fxp), "=&r"(s16_hi), "=&r"(s16_lo), "=m"(s16_rt)
+            : "m"(s16_in), "m"(s16_pos_sat), "m"(s16_neg_sat)
+            : "s0", "s1", "s2"
+        );
+        if (s16_fxp != 200 || s16_rt != 12.5f ||
+            s16_hi != 32767 || s16_lo != -32768) {
+            return 72;
+        }
+
+        float u16_in      = 25.25f;  /* 25.25 * 16 = 404 */
+        float u16_pos_sat = 5000.0f; /* 5000 * 16 = 80000 -> saturates to 65535 */
+        float u16_neg_sat = -5.0f;   /* negative -> saturates to 0 */
+        uint32_t u16_fxp  = 0U;
+        uint32_t u16_hi   = 0U;
+        uint32_t u16_lo   = 1U;
+        float u16_rt      = 0.0f;
+        __asm__ volatile(
+            "vldr s0, %4\n"
+            "vcvt.u16.f32 s0, s0, #4\n"
+            "vmov %0, s0\n"
+            "vcvt.f32.u16 s0, s0, #4\n"
+            "vstr s0, %3\n"
+            "vldr s1, %5\n"
+            "vcvt.u16.f32 s1, s1, #4\n"
+            "vmov %1, s1\n"
+            "vldr s2, %6\n"
+            "vcvt.u16.f32 s2, s2, #4\n"
+            "vmov %2, s2\n"
+            : "=&r"(u16_fxp), "=&r"(u16_hi), "=&r"(u16_lo), "=m"(u16_rt)
+            : "m"(u16_in), "m"(u16_pos_sat), "m"(u16_neg_sat)
+            : "s0", "s1", "s2"
+        );
+        if (u16_fxp != 404U || u16_rt != 25.25f ||
+            u16_hi != 65535U || u16_lo != 0U) {
+            return 73;
         }
     }
 

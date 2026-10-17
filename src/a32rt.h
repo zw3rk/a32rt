@@ -175,6 +175,7 @@ int      a32_vm_mprotect(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t p
 int      a32_vm_munmap(a32_ctx_t *ctx, uint32_t addr, uint32_t len);
 uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                        uint32_t new_len, uint32_t flags, uint32_t new_addr);
+void     a32_vm_sync_ctx(a32_ctx_t *ctx);
 
 /* ELF32 loader & initial stack (`src/elf32.c`, `src/stack32.c`) */
 typedef struct a32_elf_info {

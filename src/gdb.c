@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdbool.h>
@@ -87,11 +88,27 @@ static uint64_t decode_u64_le(const char *in)
     return val;
 }
 
+static ssize_t gdb_read_byte(int fd, char *out)
+{
+    for (;;) {
+        ssize_t r = read(fd, out, 1U);
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        return r;
+    }
+}
+
 static void send_ack(int fd)
 {
     const char ack = '+';
-    ssize_t res = write(fd, &ack, 1U);
-    (void)res;
+    for (;;) {
+        ssize_t res = write(fd, &ack, 1U);
+        if (res < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
 }
 
 static void send_packet(int fd, const char *payload)
@@ -111,6 +128,9 @@ static void send_packet(int fd, const char *payload)
         size_t written = 0U;
         while (written < total) {
             ssize_t w = write(fd, buf + written, total - written);
+            if (w < 0 && errno == EINTR) {
+                continue;
+            }
             if (w <= 0) {
                 break;
             }
@@ -126,7 +146,7 @@ static int recv_packet(int fd, char *buf, size_t buf_cap)
 
     for (;;) {
         char ch = 0;
-        ssize_t r = read(fd, &ch, 1U);
+        ssize_t r = gdb_read_byte(fd, &ch);
         if (r <= 0) {
             return -1;
         }
@@ -144,7 +164,7 @@ static int recv_packet(int fd, char *buf, size_t buf_cap)
         }
         if (ch == '#') {
             char csum[2] = {0, 0};
-            if (read(fd, &csum[0], 1U) <= 0 || read(fd, &csum[1], 1U) <= 0) {
+            if (gdb_read_byte(fd, &csum[0]) <= 0 || gdb_read_byte(fd, &csum[1]) <= 0) {
                 return -1;
             }
             buf[pos] = '\0';
@@ -172,9 +192,9 @@ int a32_gdb_init(a32_ctx_t *ctx, int port)
         }
     }
 
-    ctx->gdb_enabled = true;
+    ctx->gdb_enabled = false;
     ctx->gdb_port    = port;
-    ctx->single_step = true;
+    ctx->single_step = false;
     g_initial_stop   = true;
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -182,6 +202,8 @@ int a32_gdb_init(a32_ctx_t *ctx, int port)
         fprintf(stderr, "a32rt: failed to create GDB socket: %s\n", strerror(errno));
         return -1;
     }
+    (void)fcntl(s, F_SETFD, FD_CLOEXEC);
+
     int opt = 1;
     if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
         fprintf(stderr, "a32rt: setsockopt SO_REUSEADDR failed: %s\n", strerror(errno));
@@ -207,17 +229,23 @@ int a32_gdb_init(a32_ctx_t *ctx, int port)
     g_server_sock = s;
     fprintf(stderr, "[a32rt] GDB RSP server listening on 127.0.0.1:%d, waiting for connection...\n", port);
 
-    int client = accept(s, NULL, NULL);
+    int client;
+    do {
+        client = accept(s, NULL, NULL);
+    } while (client < 0 && errno == EINTR);
     if (client < 0) {
         fprintf(stderr, "a32rt: GDB accept failed: %s\n", strerror(errno));
         close(s);
         g_server_sock = -1;
         return -1;
     }
+    (void)fcntl(client, F_SETFD, FD_CLOEXEC);
 
     int nodelay = 1;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-    g_client_sock = client;
+    g_client_sock    = client;
+    ctx->gdb_enabled = true;
+    ctx->single_step = true;
     fprintf(stderr, "[a32rt] GDB client connected on 127.0.0.1:%d\n", port);
     return 0;
 }
@@ -238,6 +266,7 @@ static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
     if (!ctx || addr < 0x1000U) {
         return false;
     }
+    a32_vm_sync_ctx((a32_ctx_t *)ctx);
     uint64_t end = (uint64_t)addr + (uint64_t)(len == 0U ? 1U : len);
     if (end > 0x100000000ULL) {
         return false;
@@ -286,8 +315,10 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
         int n = recv_packet(g_client_sock, cmd, sizeof(cmd));
         if (n <= 0) {
             close(g_client_sock);
-            g_client_sock = -1;
+            g_client_sock    = -1;
             ctx->gdb_enabled = false;
+            ctx->single_step = false;
+            memset(g_breakpoints, 0, sizeof(g_breakpoints));
             return 0;
         }
 
@@ -459,7 +490,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                                 restore_prot = (int)(r->prot & 0x7U);
                                 if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
                                     (restore_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
-                                    restore_prot = PROT_READ | PROT_EXEC;
+                                    restore_prot = PROT_READ | PROT_WRITE;
                                 }
                                 break;
                             }
@@ -548,8 +579,10 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             /* Detach */
             send_packet(g_client_sock, "OK");
             close(g_client_sock);
-            g_client_sock = -1;
+            g_client_sock    = -1;
             ctx->gdb_enabled = false;
+            ctx->single_step = false;
+            memset(g_breakpoints, 0, sizeof(g_breakpoints));
             break;
         } else if (cmd[0] == 'k') {
             /* Kill */
