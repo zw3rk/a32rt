@@ -40,8 +40,13 @@ typedef struct a32_cache_entry {
     _Atomic uint32_t                 guest_end_pc;   /* +68 */
     _Atomic uint32_t                 code_bytes;     /* +72 */
     _Atomic bool                     is_call;        /* +76 */
-    size_t                           side_start;
-    size_t                           side_count;
+    uint8_t                          pad_call[3];    /* +77 */
+    _Atomic uint32_t                 ret_key;        /* +80 */
+    _Atomic uint32_t                 ret_epoch;      /* +84 */
+    const void *_Atomic              ret_code;       /* +88 */
+    struct a32_cache_entry *_Atomic  ret_entry;      /* +96 */
+    size_t                           side_start;     /* +104 */
+    size_t                           side_count;     /* +112 */
 } a32_cache_entry_t;
 
 _Static_assert(offsetof(a32_cache_entry_t, key) == 0, "key at 0");
@@ -52,6 +57,10 @@ _Static_assert(offsetof(a32_cache_entry_t, chain_epoch) == 24, "chain_epoch at 2
 _Static_assert(offsetof(a32_cache_entry_t, chain_code) == 32, "chain_code at 32");
 _Static_assert(offsetof(a32_cache_entry_t, chain_entry) == 48, "chain_entry at 48");
 _Static_assert(offsetof(a32_cache_entry_t, is_call) == 76, "is_call at 76");
+_Static_assert(offsetof(a32_cache_entry_t, ret_key) == 80, "ret_key at 80");
+_Static_assert(offsetof(a32_cache_entry_t, ret_epoch) == 84, "ret_epoch at 84");
+_Static_assert(offsetof(a32_cache_entry_t, ret_code) == 88, "ret_code at 88");
+_Static_assert(offsetof(a32_cache_entry_t, ret_entry) == 96, "ret_entry at 96");
 
 typedef struct a32_block_snap {
     const void *code;
@@ -174,11 +183,16 @@ static void reset_cache_locked(a32_ctx_t *ctx)
         atomic_store_explicit(&g_ht[i].guest_end_pc, 0U, memory_order_relaxed);
         atomic_store_explicit(&g_ht[i].code_bytes, 0U, memory_order_relaxed);
         atomic_store_explicit(&g_ht[i].is_call, false, memory_order_relaxed);
+        atomic_store_explicit(&g_ht[i].ret_epoch, 0U, memory_order_release);
+        atomic_store_explicit(&g_ht[i].ret_key, 0U, memory_order_relaxed);
+        atomic_store_explicit(&g_ht[i].ret_code, NULL, memory_order_relaxed);
+        atomic_store_explicit(&g_ht[i].ret_entry, NULL, memory_order_relaxed);
         g_ht[i].side_start = 0U;
         g_ht[i].side_count = 0U;
     }
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras, 0, sizeof(ctx->ras));
         memset(ctx->ras_key, 0, sizeof(ctx->ras_key));
         memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
         memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
@@ -221,6 +235,36 @@ static int flush_batch_locked(a32_ctx_t *ctx)
         flush_icache_range(ctx, (const void *)g_batch_min, g_batch_max - g_batch_min);
         g_batch_min = UINTPTR_MAX;
         g_batch_max = 0U;
+    }
+
+    uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
+    if (cur_epoch != 0U) {
+        for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+            if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != cur_epoch ||
+                !atomic_load_explicit(&g_ht[i].is_call, memory_order_relaxed) ||
+                atomic_load_explicit(&g_ht[i].ret_epoch, memory_order_relaxed) == cur_epoch) {
+                continue;
+            }
+            uint32_t k      = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
+            uint32_t end_pc = atomic_load_explicit(&g_ht[i].guest_end_pc, memory_order_relaxed);
+            uint32_t rk     = (end_pc & ~1U) | (k & 1U);
+            uint32_t r_slot = hash_key(rk);
+            for (size_t probe = 0U; probe < 16U; probe++) {
+                uint32_t r_idx = (r_slot + (uint32_t)probe) & A32_HT_MASK;
+                if (atomic_load_explicit(&g_ht[r_idx].epoch, memory_order_relaxed) == cur_epoch &&
+                    atomic_load_explicit(&g_ht[r_idx].key, memory_order_relaxed) == rk) {
+                    const void *rc = atomic_load_explicit(&g_ht[r_idx].host_code, memory_order_relaxed);
+                    if (rc != NULL) {
+                        atomic_store_explicit(&g_ht[i].ret_epoch, 0U, memory_order_release);
+                        atomic_store_explicit(&g_ht[i].ret_key, rk, memory_order_relaxed);
+                        atomic_store_explicit(&g_ht[i].ret_code, rc, memory_order_relaxed);
+                        atomic_store_explicit(&g_ht[i].ret_entry, &g_ht[r_idx], memory_order_relaxed);
+                        atomic_store_explicit(&g_ht[i].ret_epoch, cur_epoch, memory_order_release);
+                    }
+                    break;
+                }
+            }
+        }
     }
     return 0;
 }
@@ -392,6 +436,7 @@ int a32_jit_init(a32_ctx_t *ctx)
 {
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras, 0, sizeof(ctx->ras));
         memset(ctx->ras_key, 0, sizeof(ctx->ras_key));
         memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
         memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
@@ -459,6 +504,7 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
 
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras, 0, sizeof(ctx->ras));
         memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
         memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
         memset(ctx->ras_entry, 0, sizeof(ctx->ras_entry));
@@ -489,6 +535,10 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
                 atomic_store_explicit(&g_ht[i].chain_key[1], 0U, memory_order_relaxed);
                 atomic_store_explicit(&g_ht[i].chain_code[1], NULL, memory_order_relaxed);
                 atomic_store_explicit(&g_ht[i].chain_entry[1], NULL, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].ret_epoch, 0U, memory_order_release);
+                atomic_store_explicit(&g_ht[i].ret_key, 0U, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].ret_code, NULL, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].ret_entry, NULL, memory_order_relaxed);
             } else {
                 atomic_store_explicit(&g_ht[i].epoch, new_epoch, memory_order_release);
             }
@@ -515,6 +565,21 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
                 atomic_store_explicit(&g_ht[i].chain_entry[c], NULL, memory_order_relaxed);
             }
         }
+        uint32_t re_epoch     = atomic_load_explicit(&g_ht[i].ret_epoch, memory_order_relaxed);
+        uint32_t re_key       = atomic_load_explicit(&g_ht[i].ret_key, memory_order_relaxed);
+        const void *re_code   = atomic_load_explicit(&g_ht[i].ret_code, memory_order_relaxed);
+        a32_cache_entry_t *re = atomic_load_explicit(&g_ht[i].ret_entry, memory_order_relaxed);
+        if (re != NULL && re_code != NULL && re_epoch == old_epoch &&
+            atomic_load_explicit(&re->epoch, memory_order_relaxed) == new_epoch &&
+            atomic_load_explicit(&re->host_code, memory_order_relaxed) == re_code &&
+            atomic_load_explicit(&re->key, memory_order_relaxed) == re_key) {
+            atomic_store_explicit(&g_ht[i].ret_epoch, new_epoch, memory_order_release);
+        } else {
+            atomic_store_explicit(&g_ht[i].ret_epoch, 0U, memory_order_release);
+            atomic_store_explicit(&g_ht[i].ret_key, 0U, memory_order_relaxed);
+            atomic_store_explicit(&g_ht[i].ret_code, NULL, memory_order_relaxed);
+            atomic_store_explicit(&g_ht[i].ret_entry, NULL, memory_order_relaxed);
+        }
     }
     atomic_store_explicit(&g_cache_epoch, new_epoch, memory_order_release);
     jit_lock_release();
@@ -530,6 +595,7 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     atomic_store_explicit(&entry->host_code, NULL, memory_order_release);
     atomic_store_explicit(&entry->chain_epoch[0], 0U, memory_order_release);
     atomic_store_explicit(&entry->chain_epoch[1], 0U, memory_order_release);
+    atomic_store_explicit(&entry->ret_epoch, 0U, memory_order_release);
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&entry->guest_pc, guest_pc, memory_order_relaxed);
     atomic_store_explicit(&entry->guest_end_pc, guest_end_pc, memory_order_relaxed);
@@ -543,6 +609,9 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     atomic_store_explicit(&entry->chain_key[1], 0U, memory_order_relaxed);
     atomic_store_explicit(&entry->chain_code[1], NULL, memory_order_relaxed);
     atomic_store_explicit(&entry->chain_entry[1], NULL, memory_order_relaxed);
+    atomic_store_explicit(&entry->ret_key, 0U, memory_order_relaxed);
+    atomic_store_explicit(&entry->ret_code, NULL, memory_order_relaxed);
+    atomic_store_explicit(&entry->ret_entry, NULL, memory_order_relaxed);
     atomic_store_explicit(&entry->key, key, memory_order_release);
     atomic_store_explicit(&entry->host_code, dst, memory_order_release);
     atomic_store_explicit(&entry->epoch, cur_epoch, memory_order_release);
@@ -1060,17 +1129,28 @@ int a32_jit_run(a32_ctx_t *ctx)
 
         /* 1. Return Address Stack (RAS) prediction for return targets */
         uint32_t r_idx = (ctx->ras_top - 1U) & (A32_RAS_SIZE - 1U);
-        if (key != 0U && ctx->ras_key[r_idx] == key) {
+        uint32_t r_key = ctx->ras[r_idx].key != 0U ? ctx->ras[r_idx].key : ctx->ras_key[r_idx];
+        if (key != 0U && r_key == key) {
+            uint32_t r_epoch = ctx->ras[r_idx].key != 0U ? ctx->ras[r_idx].epoch : ctx->ras_epoch[r_idx];
+            const void *r_code = ctx->ras[r_idx].key != 0U ? ctx->ras[r_idx].host_code : ctx->ras_code[r_idx];
+            void *r_ent = ctx->ras[r_idx].key != 0U ? ctx->ras[r_idx].entry : ctx->ras_entry[r_idx];
             ctx->ras_top        = r_idx;
+            ctx->ras[r_idx].key = 0U;
+            ctx->ras[r_idx].epoch = 0U;
+            ctx->ras[r_idx].host_code = NULL;
+            ctx->ras[r_idx].entry = NULL;
             ctx->ras_key[r_idx] = 0U;
+            ctx->ras_epoch[r_idx] = 0U;
+            ctx->ras_code[r_idx] = NULL;
+            ctx->ras_entry[r_idx] = NULL;
             if (!uncached && epoch != 0U &&
-                ctx->ras_epoch[r_idx] == epoch && ctx->ras_code[r_idx] != NULL) {
-                a32_cache_entry_t *r_entry = (a32_cache_entry_t *)ctx->ras_entry[r_idx];
+                r_epoch == epoch && r_code != NULL) {
+                a32_cache_entry_t *r_entry = (a32_cache_entry_t *)r_ent;
                 if (r_entry != NULL &&
                     atomic_load_explicit(&r_entry->epoch, memory_order_acquire) == epoch &&
                     atomic_load_explicit(&r_entry->key, memory_order_acquire) == key &&
-                    atomic_load_explicit(&r_entry->host_code, memory_order_acquire) == ctx->ras_code[r_idx]) {
-                    code        = ctx->ras_code[r_idx];
+                    atomic_load_explicit(&r_entry->host_code, memory_order_acquire) == r_code) {
+                    code        = r_code;
                     cur_entry   = r_entry;
                     cur_is_call = atomic_load_explicit(&r_entry->is_call, memory_order_relaxed);
                     cur_start   = atomic_load_explicit(&r_entry->guest_pc, memory_order_relaxed);
@@ -1255,49 +1335,60 @@ int a32_jit_run(a32_ctx_t *ctx)
                 uint32_t ret_key = lr_pc | (is_thumb ? 1U : 0U);
                 uint32_t r_ibtc  = ((ret_key >> 1U) ^ (ret_key & 1U)) & (A32_IBTC_SIZE - 1U);
                 uint32_t top     = ctx->ras_top;
+                a32_cache_entry_t *found_e    = NULL;
+                const void        *found_code = NULL;
                 if (ret_key != 0U && epoch != 0U &&
                     ctx->ibtc[r_ibtc].key == ret_key &&
                     ctx->ibtc[r_ibtc].epoch == epoch &&
                     ctx->ibtc[r_ibtc].host_code != NULL) {
-                    ctx->ras_key[top]   = ret_key;
-                    ctx->ras_epoch[top] = epoch;
-                    ctx->ras_code[top]  = ctx->ibtc[r_ibtc].host_code;
-                    ctx->ras_entry[top] = ctx->ibtc[r_ibtc].entry;
-                } else {
-                    a32_cache_entry_t *found_e    = NULL;
-                    const void        *found_code = NULL;
-                    if (ret_key != 0U && epoch != 0U) {
-                        uint32_t r_slot = hash_key(ret_key);
-                        for (size_t probe = 0U; probe < 4U; probe++) {
-                            uint32_t r_idx_ht       = (r_slot + (uint32_t)probe) & A32_HT_MASK;
-                            a32_cache_entry_t *ht_e = &g_ht[r_idx_ht];
-                            if (atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
-                                atomic_load_explicit(&ht_e->key, memory_order_acquire) == ret_key) {
-                                const void *ht_code = atomic_load_explicit(&ht_e->host_code, memory_order_acquire);
-                                atomic_thread_fence(memory_order_acquire);
-                                if (ht_code != NULL &&
-                                    atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
-                                    atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
-                                    atomic_load_explicit(&ht_e->key, memory_order_relaxed) == ret_key &&
-                                    atomic_load_explicit(&ht_e->host_code, memory_order_relaxed) == ht_code) {
-                                    found_e    = ht_e;
-                                    found_code = ht_code;
-                                    break;
-                                }
+                    found_code = ctx->ibtc[r_ibtc].host_code;
+                    found_e    = (a32_cache_entry_t *)ctx->ibtc[r_ibtc].entry;
+                } else if (ret_key != 0U && epoch != 0U) {
+                    uint32_t r_slot = hash_key(ret_key);
+                    for (size_t probe = 0U; probe < 4U; probe++) {
+                        uint32_t r_idx_ht       = (r_slot + (uint32_t)probe) & A32_HT_MASK;
+                        a32_cache_entry_t *ht_e = &g_ht[r_idx_ht];
+                        if (atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
+                            atomic_load_explicit(&ht_e->key, memory_order_acquire) == ret_key) {
+                            const void *ht_code = atomic_load_explicit(&ht_e->host_code, memory_order_acquire);
+                            atomic_thread_fence(memory_order_acquire);
+                            if (ht_code != NULL &&
+                                atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
+                                atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
+                                atomic_load_explicit(&ht_e->key, memory_order_relaxed) == ret_key &&
+                                atomic_load_explicit(&ht_e->host_code, memory_order_relaxed) == ht_code) {
+                                found_e    = ht_e;
+                                found_code = ht_code;
+                                break;
                             }
                         }
                     }
-                    if (found_e != NULL && found_code != NULL) {
-                        ctx->ras_key[top]   = ret_key;
-                        ctx->ras_epoch[top] = epoch;
-                        ctx->ras_code[top]  = found_code;
-                        ctx->ras_entry[top] = found_e;
-                    } else {
-                        ctx->ras_key[top]   = ret_key;
-                        ctx->ras_epoch[top] = 0U;
-                        ctx->ras_code[top]  = NULL;
-                        ctx->ras_entry[top] = NULL;
+                }
+                if (found_e != NULL && found_code != NULL) {
+                    ctx->ras[top].key       = ret_key;
+                    ctx->ras[top].epoch     = epoch;
+                    ctx->ras[top].host_code = found_code;
+                    ctx->ras[top].entry     = found_e;
+                    ctx->ras_key[top]       = ret_key;
+                    ctx->ras_epoch[top]     = epoch;
+                    ctx->ras_code[top]      = found_code;
+                    ctx->ras_entry[top]     = found_e;
+                    if (cur_entry != NULL && !uncached) {
+                        atomic_store_explicit(&cur_entry->ret_epoch, 0U, memory_order_release);
+                        atomic_store_explicit(&cur_entry->ret_key, ret_key, memory_order_relaxed);
+                        atomic_store_explicit(&cur_entry->ret_code, found_code, memory_order_relaxed);
+                        atomic_store_explicit(&cur_entry->ret_entry, found_e, memory_order_relaxed);
+                        atomic_store_explicit(&cur_entry->ret_epoch, epoch, memory_order_release);
                     }
+                } else {
+                    ctx->ras[top].key       = ret_key;
+                    ctx->ras[top].epoch     = 0U;
+                    ctx->ras[top].host_code = NULL;
+                    ctx->ras[top].entry     = NULL;
+                    ctx->ras_key[top]       = ret_key;
+                    ctx->ras_epoch[top]     = 0U;
+                    ctx->ras_code[top]      = NULL;
+                    ctx->ras_entry[top]     = NULL;
                 }
                 ctx->ras_top = (top + 1U) & (A32_RAS_SIZE - 1U);
             }

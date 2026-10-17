@@ -2702,6 +2702,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             child_ctx->altstack_size    = 0U;
             child_ctx->altstack_flags   = 2U; /* SS_DISABLE */
             child_ctx->ras_top          = 0U;
+            memset(child_ctx->ras, 0, sizeof(child_ctx->ras));
             memset(child_ctx->ras_key, 0, sizeof(child_ctx->ras_key));
             memset(child_ctx->ibtc, 0, sizeof(child_ctx->ibtc));
 

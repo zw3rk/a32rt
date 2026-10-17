@@ -104,6 +104,23 @@ static inline int32_t sys5_llseek(uint32_t fd, uint32_t off_hi, uint32_t off_lo,
     return (int32_t)r0;
 }
 
+static inline int32_t sys6(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
+                           uint32_t a3, uint32_t a4, uint32_t a5)
+{
+    register uint32_t r7 __asm__("r7") = nr;
+    register uint32_t r0 __asm__("r0") = a0;
+    register uint32_t r1 __asm__("r1") = a1;
+    register uint32_t r2 __asm__("r2") = a2;
+    register uint32_t r3 __asm__("r3") = a3;
+    register uint32_t r4 __asm__("r4") = a4;
+    register uint32_t r5 __asm__("r5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(r0)
+                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
+                     : "memory", "cc");
+    return (int32_t)r0;
+}
+
 static void my_memset(void *dst, int c, size_t n)
 {
     uint8_t *p = (uint8_t *)dst;
@@ -3474,6 +3491,51 @@ static int run_test(void)
         );
         if (q_out != 0x7F8025F6U || uq_out != 0xFFFF300FU || cond_check != 111U) {
             return 228;
+        }
+    }
+
+    /* 34: File-backed PROT_EXEC mmap2 execution test */
+    {
+        static const char tmp_path[] = "/tmp/a32rt_test_mmap_exec.bin";
+        static uint32_t page_buf[1024];
+        my_memset(page_buf, 0, sizeof(page_buf));
+        page_buf[0] = 0xE30C00DEU; /* movw r0, #0xc0de */
+        page_buf[1] = 0xE3410337U; /* movt r0, #0x1337 */
+        page_buf[2] = 0xE12FFF1EU; /* bx lr */
+
+        (void)sys1(10U /* unlink */, (uint32_t)(uintptr_t)tmp_path);
+
+        /* O_RDWR(2) | O_CREAT(0x40) | O_TRUNC(0x200) = 0x242 */
+        int32_t fd = sys3(5U /* open */, (uint32_t)(uintptr_t)tmp_path, 0x242U, 0700U);
+        if (fd < 0) {
+            return 229;
+        }
+
+        int32_t wr = sys3(4U /* write */, (uint32_t)fd, (uint32_t)(uintptr_t)page_buf, sizeof(page_buf));
+        if (wr != (int32_t)sizeof(page_buf)) {
+            sys1(6U /* close */, (uint32_t)fd);
+            sys1(10U /* unlink */, (uint32_t)(uintptr_t)tmp_path);
+            return 230;
+        }
+
+        /* mmap2(0, 4096, PROT_READ | PROT_EXEC (5), MAP_PRIVATE (2), fd, 0) */
+        int32_t mres = sys6(192U /* mmap2 */, 0U, 4096U, 5U /* PROT_READ|PROT_EXEC */,
+                            2U /* MAP_PRIVATE */, (uint32_t)fd, 0U);
+        if (mres <= 0 || (uint32_t)mres > 0xFFFFF000U) {
+            sys1(6U /* close */, (uint32_t)fd);
+            sys1(10U /* unlink */, (uint32_t)(uintptr_t)tmp_path);
+            return 231;
+        }
+
+        uint32_t (*fn)(void) = (uint32_t (*)(void))(uintptr_t)mres;
+        uint32_t val = fn();
+
+        (void)sys2(91U /* munmap */, (uint32_t)mres, 4096U);
+        sys1(6U /* close */, (uint32_t)fd);
+        (void)sys1(10U /* unlink */, (uint32_t)(uintptr_t)tmp_path);
+
+        if (val != 0x1337C0DEU) {
+            return 232;
         }
     }
 

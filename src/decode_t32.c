@@ -283,6 +283,11 @@ static bool t32_insn_reads_flags(const t32_insn_info_t *info)
         return true;
     }
 
+    /* ARMv8-A VSEL{EQ,VS,GE,GT}.F32/.F64 reads NZCV */
+    if ((hw1 & 0xFF80U) == 0xFE00U && (hw2 & 0x0E50U) == 0x0A00U) {
+        return true;
+    }
+
     return false;
 }
 
@@ -899,7 +904,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
     /* M4: VFPv4-D32 / NEON delegation */
     if ((hw1 & 0xEF00U) == 0xEF00U ||
         (hw1 & 0xFF10U) == 0xF900U ||
-        (((hw1 & 0xEE00U) == 0xEC00U || (hw1 & 0xFF00U) == 0xEE00U) &&
+        (((hw1 & 0xEE00U) == 0xEC00U || (hw1 & 0xFF00U) == 0xEE00U || (hw1 & 0xFF00U) == 0xFE00U) &&
          (((hw2 >> 8) & 0xEU) == 0xAU))) {
         return a32_decode_vfp_neon_t32(ctx, b, hw1, hw2, pc);
     }

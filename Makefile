@@ -180,17 +180,26 @@ test-m1-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m1-armhf $(BUILD_DIR)/test-m1-thumb
 	@printf "M1 musl ld-musl-armhf.so.1 + busybox sh (ls / && echo ok): PASS\n"
 	@printf "\033[32mPASS\033[0m: M1 on Lima\n"
 
-test-m2-hl: $(A32RT_BIN) $(BUILD_DIR)/bench-coremark-armhf $(BUILD_DIR)/bench-coremark-thumb ## Run M2-hl CoreMark CRC & AOT cache verification under hl
+test-m2-hl: $(A32RT_BIN) $(BUILD_DIR)/bench-coremark-armhf $(BUILD_DIR)/bench-coremark-thumb $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M2-hl CoreMark CRC & AOT cache verification under hl
 	@printf "\033[32m▸ Verifying M2-hl (CoreMark A32 + Thumb-2 + AOT)\033[0m under $(HL_BIN)\n"
 	@A32RT_STATS=1 $(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/bench-coremark-armhf)
 	@A32RT_STATS=1 $(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/bench-coremark-thumb)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(SYSROOT_ARMV7)/lib/ld-musl-armhf.so.1)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot --sysroot $(abspath $(SYSROOT_ARMV7)) $(abspath $(SYSROOT_ARMV7)/bin/busybox)
+	@out="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --sysroot $(abspath $(SYSROOT_ARMV7)) $(abspath $(SYSROOT_ARMV7)/bin/busybox) echo aot_interp_ok)"; \
+	rm -f $(BUILD_DIR)/a32rt-*cache-*.bin; \
+	[ "$$out" = "aot_interp_ok" ] || { printf "\033[31mFAIL\033[0m: busybox AOT failed: %s\n" "$$out"; exit 1; }
 	@printf "\033[32mPASS\033[0m: M2-hl\n"
 
-test-m2-lima: $(A32RT_BIN) $(BUILD_DIR)/bench-coremark-armhf $(BUILD_DIR)/bench-coremark-thumb ## Run M2 CoreMark CRC & AOT cache verification inside Lima VM
+test-m2-lima: $(A32RT_BIN) $(BUILD_DIR)/bench-coremark-armhf $(BUILD_DIR)/bench-coremark-thumb $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M2 CoreMark CRC & AOT cache verification inside Lima VM
 	@printf "\033[32m▸ Verifying M2 (CoreMark A32 + Thumb-2 + AOT)\033[0m inside Lima VM ($(LIMA_VM))\n"
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-coremark-armhf)
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-coremark-armhf)
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-coremark-thumb)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot $(abspath $(SYSROOT_ARMV7)/lib/ld-musl-armhf.so.1)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot --sysroot $(abspath $(SYSROOT_ARMV7)) $(abspath $(SYSROOT_ARMV7)/bin/busybox)
+	@out="$$($(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(abspath $(SYSROOT_ARMV7)) $(abspath $(SYSROOT_ARMV7)/bin/busybox) echo aot_interp_ok)"; \
+	[ "$$out" = "aot_interp_ok" ] || { printf "\033[31mFAIL\033[0m: busybox AOT failed: %s\n" "$$out"; exit 1; }
 	@printf "\033[32mPASS\033[0m: M2 on Lima\n"
 
 test-m3-hl: $(A32RT_BIN) $(BUILD_DIR)/test-m3-armhf ## Run M3 threads, futex, signals, and SMC verification under hl
@@ -263,17 +272,18 @@ bench-hl: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite under
 	@printf "\033[36m=== [hyper-linux] 1. Native aarch64-linux ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(BUILD_DIR)/bench-suite-aarch64)
 	@printf "\033[36m=== [hyper-linux] 2. a32rt A32 (Cold JIT, G=4GiB) ===\033[0m\n"
-	@rm -f /tmp/a32rt-cache-*.bin
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@printf "\033[36m=== [hyper-linux] 3. a32rt A32 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
-	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
-	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@printf "\033[36m=== [hyper-linux] 4. a32rt Thumb-2 (Cold JIT, G=4GiB) ===\033[0m\n"
-	@rm -f /tmp/a32rt-cache-*.bin
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
 	@printf "\033[36m=== [hyper-linux] 5. a32rt Thumb-2 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
-	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
-	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
 	@printf "\033[36m=== [hyper-linux] 6. Apple RosettaLinux (x86_64 -> aarch64) ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(BUILD_DIR)/bench-suite-x86_64)
 

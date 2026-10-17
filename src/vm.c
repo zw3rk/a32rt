@@ -684,6 +684,15 @@ uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot
         uint32_t inv_start   = (res >= 4U) ? (res - 4U) : 0U;
         a32_jit_invalidate_range(ctx, inv_start, (uint32_t)((uint64_t)res + aligned_len));
     }
+
+    if (res <= 0xFFFFF000U &&
+        (prot & 0x4U /* PROT_EXEC */) != 0U &&
+        (flags & 0x20U /* MAP_ANONYMOUS */) == 0U &&
+        fd >= 0) {
+        uint32_t load_bias = res - (pgoffset * 4096U);
+        (void)a32_aot_load_fd(ctx, fd, NULL, load_bias);
+    }
+
     return res;
 }
 

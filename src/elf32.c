@@ -147,15 +147,20 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
     }
 
     if (ehdr.e_entry == 0U) {
-        fprintf(stderr, "a32rt: %s: missing entry point (e_entry == 0)\n", label);
-        return -1;
+        if (!(ehdr.e_type == ET_DYN && ctx->aot_mode)) {
+            fprintf(stderr, "a32rt: %s: missing entry point (e_entry == 0)\n", label);
+            return -1;
+        }
     }
 
-    uint64_t entry64 = (uint64_t)ehdr.e_entry + (uint64_t)load_bias;
-    if (entry64 < 0x10000ULL || entry64 >= (uint64_t)A32_KUSER_BASE_32) {
-        fprintf(stderr, "a32rt: %s: entry point 0x%llx out of guest bounds\n",
-                label, (unsigned long long)entry64);
-        return -1;
+    uint64_t entry64 = 0ULL;
+    if (ehdr.e_entry != 0U) {
+        entry64 = (uint64_t)ehdr.e_entry + (uint64_t)load_bias;
+        if (entry64 < 0x10000ULL || entry64 >= (uint64_t)A32_KUSER_BASE_32) {
+            fprintf(stderr, "a32rt: %s: entry point 0x%llx out of guest bounds\n",
+                    label, (unsigned long long)entry64);
+            return -1;
+        }
     }
 
     memset(out, 0, sizeof(*out));
@@ -163,7 +168,7 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
     out->entry     = (uint32_t)entry64;
     out->phent     = ehdr.e_phentsize;
     out->phnum     = ehdr.e_phnum;
-    if ((out->entry & 3U) == 2U) {
+    if (out->entry != 0U && (out->entry & 3U) == 2U) {
         fprintf(stderr, "a32rt: %s: misaligned A32 entry point 0x%x\n", label, out->entry);
         return -1;
     }
@@ -227,12 +232,14 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
         prev_seg_end = (uint32_t)seg_end64;
 
-        uint32_t entry_pc      = (out->entry & 1U) ? (out->entry & ~1U) : (out->entry & ~3U);
-        uint32_t entry_min_len = (out->entry & 1U) ? 2U : 4U;
-        if ((ph->p_flags & PF_X) != 0U &&
-            entry_pc >= seg_vaddr &&
-            (uint64_t)entry_pc + entry_min_len <= seg_vaddr64 + memsz) {
-            entry_in_load = true;
+        if (out->entry != 0U) {
+            uint32_t entry_pc      = (out->entry & 1U) ? (out->entry & ~1U) : (out->entry & ~3U);
+            uint32_t entry_min_len = (out->entry & 1U) ? 2U : 4U;
+            if ((ph->p_flags & PF_X) != 0U &&
+                entry_pc >= seg_vaddr &&
+                (uint64_t)entry_pc + entry_min_len <= seg_vaddr64 + memsz) {
+                entry_in_load = true;
+            }
         }
         uint32_t page_start = page_down(seg_vaddr);
         uint64_t map_end64  = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
@@ -425,6 +432,11 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
     }
     if (out->phdr_vaddr == 0U) {
         out->phdr_vaddr = fallback_phdr_vaddr;
+    }
+
+    if (out->entry == 0U && out->text_start >= 0x10000U && out->text_end > out->text_start) {
+        out->entry    = out->text_start;
+        entry_in_load = true;
     }
 
     if (!entry_in_load) {

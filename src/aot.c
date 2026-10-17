@@ -21,7 +21,7 @@
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
 #define A32_AOT_VERSION    3U
-#define A32_MAX_AOT_SCAN   1024U
+#define A32_MAX_AOT_SCAN   4096U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  2048U
 #define A32_AOT_MAX_PC_MAP 256U
@@ -137,6 +137,108 @@ static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
         return -1;
     }
     return 0;
+}
+
+static uint64_t compute_fd_hash(int fd)
+{
+    if (fd < 0) {
+        return 0ULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        return 0ULL;
+    }
+    uint64_t h = 0xcbf29ce484222325ULL;
+    uint64_t sz  = (uint64_t)st.st_size;
+    uint64_t mt  = (uint64_t)st.st_mtime;
+    uint64_t mtn = (uint64_t)st.st_mtim.tv_nsec;
+    h = fnv1a_64_step(h, &sz, sizeof(sz));
+    h = fnv1a_64_step(h, &mt, sizeof(mt));
+    h = fnv1a_64_step(h, &mtn, sizeof(mtn));
+
+    uint8_t buf[4096];
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        size_t to_read = sizeof(buf);
+        if ((uint64_t)(st.st_size - offset) < to_read) {
+            to_read = (size_t)(st.st_size - offset);
+        }
+        ssize_t n = pread(fd, buf, to_read, offset);
+        if (n <= 0) {
+            break;
+        }
+        h = fnv1a_64_step(h, buf, (size_t)n);
+        offset += (off_t)n;
+    }
+    return (h != 0ULL) ? h : 1ULL;
+}
+
+static int resolve_fd_cache_path(const a32_ctx_t *ctx, uint64_t fd_hash,
+                                 char *out_path, size_t out_size, bool create_dir)
+{
+    if (out_path == NULL || out_size == 0U || fd_hash == 0ULL) {
+        return -1;
+    }
+    const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
+    if (dir == NULL || dir[0] == '\0') {
+        dir = getenv("A32RT_CACHE");
+    }
+    if (dir == NULL || dir[0] == '\0') {
+        dir = getenv("XDG_CACHE_HOME");
+    }
+    int n;
+    if (dir != NULL && dir[0] != '\0') {
+        if (create_dir) {
+            (void)mkdir(dir, 0755);
+        }
+        n = snprintf(out_path, out_size, "%s/a32rt-fdcache-%016llx.bin", dir, (unsigned long long)fd_hash);
+    } else {
+        n = snprintf(out_path, out_size, "/tmp/a32rt-fdcache-%016llx.bin", (unsigned long long)fd_hash);
+    }
+    if (n < 0 || (size_t)n >= out_size) {
+        out_path[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+static void copy_file(const char *src_path, const char *dst_path)
+{
+    int src_fd = open(src_path, O_RDONLY | O_CLOEXEC);
+    if (src_fd < 0) {
+        return;
+    }
+    char tmp_dst[540];
+    int n = snprintf(tmp_dst, sizeof(tmp_dst), "%s.tmp.%d", dst_path, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp_dst)) {
+        close(src_fd);
+        return;
+    }
+    int dst_fd = open(tmp_dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (dst_fd < 0) {
+        close(src_fd);
+        return;
+    }
+    uint8_t buf[4096];
+    ssize_t nr;
+    bool err = false;
+    while ((nr = read(src_fd, buf, sizeof(buf))) > 0) {
+        ssize_t nw = write(dst_fd, buf, (size_t)nr);
+        if (nw != nr) {
+            err = true;
+            break;
+        }
+    }
+    if (nr < 0) {
+        err = true;
+    }
+    close(src_fd);
+    close(dst_fd);
+    if (!err) {
+        (void)rename(tmp_dst, dst_path);
+    } else {
+        (void)unlink(tmp_dst);
+    }
 }
 
 static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
@@ -285,7 +387,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
     hdr.magic      = A32_AOT_MAGIC;
     hdr.version    = A32_AOT_VERSION;
     hdr.num_blocks = count_st.count;
-    hdr.reserved   = 0U;
+    hdr.reserved   = (ctx != NULL) ? ctx->elf_base : 0U;
 
     if (fwrite(&hdr, sizeof(hdr), 1U, f) != 1U) {
         fclose(f);
@@ -310,6 +412,32 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         unlink(tmp_path);
         return -1;
     }
+
+    if (ctx != NULL && ctx->aot_mode) {
+        char resolved_path[PATH_MAX];
+        const char *host_path = elf_path;
+        if (a32_resolve_guest_path(ctx, elf_path, resolved_path, sizeof(resolved_path)) == 0) {
+            host_path = resolved_path;
+        }
+        int efd = open(host_path, O_RDONLY | O_CLOEXEC);
+        if (efd < 0 && host_path != elf_path) {
+            efd = open(elf_path, O_RDONLY | O_CLOEXEC);
+        }
+        if (efd >= 0) {
+            uint64_t fdh = compute_fd_hash(efd);
+            close(efd);
+            if (fdh != 0ULL) {
+                char fd_cache_path[512];
+                if (resolve_fd_cache_path(ctx, fdh, fd_cache_path, sizeof(fd_cache_path), true) == 0) {
+                    (void)unlink(fd_cache_path);
+                    if (link(cache_path, fd_cache_path) != 0) {
+                        copy_file(cache_path, fd_cache_path);
+                    }
+                }
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -400,6 +528,109 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
     return 0;
 }
 
+int a32_aot_load_fd(a32_ctx_t *ctx, int fd, const char *label, uint32_t load_bias)
+{
+    (void)label;
+    if (ctx == NULL || fd < 0) {
+        return -1;
+    }
+    uint64_t fd_hash = compute_fd_hash(fd);
+    if (fd_hash == 0ULL) {
+        return -1;
+    }
+    char cache_path[512];
+    if (resolve_fd_cache_path(ctx, fd_hash, cache_path, sizeof(cache_path), false) != 0) {
+        return -1;
+    }
+
+    int cfd = open(cache_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (cfd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (!(fstat(cfd, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0022) == 0)) {
+        close(cfd);
+        return -1;
+    }
+    FILE *f = fdopen(cfd, "rb");
+    if (f == NULL) {
+        close(cfd);
+        return -1;
+    }
+
+    a32_aot_header_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1U, f) != 1U) {
+        fclose(f);
+        return -1;
+    }
+    if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION ||
+        hdr.num_blocks > A32_AOT_MAX_BLOCKS || hdr.reserved != load_bias) {
+        fclose(f);
+        return -1;
+    }
+
+    uint32_t *words_buf = (uint32_t *)malloc(sizeof(uint32_t) * A32_AOT_MAX_WORDS);
+    a32_pc_map_stage_t *pc_map_buf = (a32_pc_map_stage_t *)malloc(sizeof(a32_pc_map_stage_t) * A32_AOT_MAX_PC_MAP);
+    if (words_buf == NULL || pc_map_buf == NULL) {
+        free(words_buf);
+        free(pc_map_buf);
+        fclose(f);
+        return -1;
+    }
+
+    uint32_t i = 0U;
+    uint32_t installed_count = 0U;
+    for (; i < hdr.num_blocks; i++) {
+        a32_aot_block_header_t bh;
+        if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
+            break;
+        }
+        if ((bh.is_thumb & ~3U) != 0U ||
+            (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
+            (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
+            bh.guest_end_pc <= bh.guest_pc ||
+            bh.guest_end_pc - bh.guest_pc > 512U ||
+            bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
+            bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
+            break;
+        }
+        if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
+            break;
+        }
+        if (bh.pc_map_count > 0U) {
+            if (fread(pc_map_buf, sizeof(a32_pc_map_stage_t), bh.pc_map_count, f) != bh.pc_map_count) {
+                break;
+            }
+        }
+        if (!aot_range_executable(ctx, bh.guest_pc, bh.guest_end_pc - bh.guest_pc)) {
+            continue;
+        }
+        if (a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
+                                      (bh.is_thumb & 1U) != 0U,
+                                      (bh.is_thumb & 2U) != 0U,
+                                      words_buf, (size_t)bh.word_count,
+                                      bh.pc_map_count > 0U ? pc_map_buf : NULL,
+                                      (size_t)bh.pc_map_count) != 0) {
+            break;
+        }
+        installed_count++;
+    }
+
+    bool eof_ok = (i == hdr.num_blocks && fgetc(f) == EOF && ferror(f) == 0);
+    free(words_buf);
+    free(pc_map_buf);
+    fclose(f);
+
+    if (!eof_ok) {
+        (void)a32_jit_flush_batch(ctx);
+        return -1;
+    }
+    if (a32_jit_flush_batch(ctx) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static void add_target(uint32_t pc, bool thumb,
                        uint32_t *pcs, bool *thumbs, size_t *count)
 {
@@ -424,13 +655,16 @@ typedef struct aot_end_scan {
     size_t               *count;
 } aot_end_scan_t;
 
+static void scan_text_range(a32_ctx_t *ctx, uint32_t r_start, uint32_t r_end,
+                            bool prefer_thumb, uint32_t *disc_pcs, bool *disc_thumb,
+                            size_t *disc_count, size_t max_count);
+
 static void collect_end_pc_cb(uint32_t guest_pc, uint32_t guest_end_pc,
                               bool is_thumb, bool is_call,
                               const uint32_t *words, size_t word_count,
                               const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
                               void *arg)
 {
-    (void)guest_pc;
     (void)is_call;
     (void)words;
     (void)word_count;
@@ -438,10 +672,236 @@ static void collect_end_pc_cb(uint32_t guest_pc, uint32_t guest_end_pc,
     (void)pc_map_count;
     aot_end_scan_t *s = (aot_end_scan_t *)arg;
     uint32_t min_len = is_thumb ? 2U : 4U;
-    if (guest_end_pc >= s->elf_info->text_start &&
-        guest_end_pc + min_len <= s->elf_info->text_end &&
+    if (guest_end_pc > guest_pc && guest_end_pc - guest_pc <= 512U) {
+        scan_text_range((a32_ctx_t *)s->ctx, guest_pc, guest_end_pc,
+                        is_thumb, s->pcs, s->thumbs, s->count, A32_MAX_AOT_SCAN);
+    }
+    if (guest_end_pc >= 0x10000U && guest_end_pc <= 0xFFFF0000U - min_len &&
         aot_range_executable(s->ctx, guest_end_pc, min_len)) {
         add_target(guest_end_pc, is_thumb, s->pcs, s->thumbs, s->count);
+    }
+}
+
+static void scan_text_range(a32_ctx_t *ctx, uint32_t r_start, uint32_t r_end,
+                            bool prefer_thumb, uint32_t *disc_pcs, bool *disc_thumb,
+                            size_t *disc_count, size_t max_count)
+{
+    if (r_start == 0U || r_end <= r_start) {
+        return;
+    }
+    if (max_count > A32_MAX_AOT_SCAN) {
+        max_count = A32_MAX_AOT_SCAN;
+    }
+    if (prefer_thumb) {
+        uint32_t scan_start = (r_start + 1U) & ~1U;
+        for (uint32_t pc = scan_start;
+             pc >= scan_start && pc + 2U <= r_end && *disc_count < max_count;
+             pc += 2U) {
+            if (!aot_range_executable(ctx, pc, 2U)) {
+                continue;
+            }
+            const uint16_t *hw_ptr = (const uint16_t *)a32_guest_ptr(ctx, pc);
+            uint16_t hw = *hw_ptr;
+
+            if ((hw >> 11U) >= 0x1DU) {
+                if (pc + 4U > r_end) {
+                    break;
+                }
+                if (!aot_range_executable(ctx, pc + 2U, 2U)) {
+                    continue;
+                }
+                uint16_t hw1 = hw;
+                uint16_t hw2 = hw_ptr[1];
+
+                /* 32-bit prologue: PUSH.W {..., lr} (STMDB sp!, {..., lr}) */
+                if (hw1 == 0xE92DU && (hw2 & 0x4000U) != 0U) {
+                    add_target(pc, true, disc_pcs, disc_thumb, disc_count);
+                } else if (hw1 == 0xE8BDU && (hw2 & 0x8000U) != 0U) {
+                    /* 32-bit epilogue: POP.W {..., pc} -> next function entry */
+                    for (uint32_t next_fn = pc + 4U;
+                         next_fn + 2U <= r_end && next_fn <= pc + 8U;
+                         next_fn += 2U) {
+                        if (aot_range_executable(ctx, next_fn, 2U)) {
+                            add_target(next_fn, true, disc_pcs, disc_thumb, disc_count);
+                            if (*(const uint16_t *)a32_guest_ptr(ctx, next_fn) != 0xBF00U) {
+                                break;
+                            }
+                        }
+                    }
+                } else if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0x8000U) != 0U) {
+                    if ((hw2 & 0xD000U) == 0xD000U || (hw2 & 0xD000U) == 0xC000U ||
+                        (hw2 & 0xD000U) == 0x9000U) {
+                        /* 32-bit BL / BLX / B.W <label> */
+                        bool is_blx    = (hw2 & 0xD000U) == 0xC000U;
+                        bool is_link   = (hw2 & 0x4000U) != 0U;
+                        uint32_t s     = (hw1 >> 10U) & 1U;
+                        uint32_t j1    = (hw2 >> 13U) & 1U;
+                        uint32_t j2    = (hw2 >> 11U) & 1U;
+                        uint32_t i1    = ~(j1 ^ s) & 1U;
+                        uint32_t i2    = ~(j2 ^ s) & 1U;
+                        uint32_t imm10 = hw1 & 0x3FFU;
+                        uint32_t imm11 = hw2 & 0x7FFU;
+                        int32_t offset = (int32_t)((s << 24U) | (i1 << 23U) | (i2 << 22U) |
+                                                   (imm10 << 12U) | (imm11 << 1U));
+                        if (s != 0U) {
+                            offset |= (int32_t)0xFE000000U;
+                        }
+                        uint32_t tgt = is_blx ? ((((pc + 4U) & ~3U) + (uint32_t)offset) & ~3U)
+                                              : (pc + 4U + (uint32_t)offset);
+                        if (tgt >= 0x10000U && tgt <= 0xFFFFFFFCU && tgt + 4U <= 0xFFFF0000U &&
+                            aot_range_executable(ctx, tgt, 4U)) {
+                            add_target(tgt, !is_blx, disc_pcs, disc_thumb, disc_count);
+                        }
+                        if (is_link && pc <= 0xFFFFFFF7U && pc + 8U <= r_end &&
+                            aot_range_executable(ctx, pc + 4U, 4U)) {
+                            add_target(pc + 4U, true, disc_pcs, disc_thumb, disc_count);
+                        }
+                    } else if ((hw2 & 0xD000U) == 0x8000U) {
+                        unsigned cond = (hw1 >> 6U) & 0xFU;
+                        if (cond < 14U) {
+                            /* 32-bit B<cond>.W <label> */
+                            uint32_t s     = (hw1 >> 10U) & 1U;
+                            uint32_t j1    = (hw2 >> 13U) & 1U;
+                            uint32_t j2    = (hw2 >> 11U) & 1U;
+                            uint32_t imm6  = hw1 & 0x3FU;
+                            uint32_t imm11 = hw2 & 0x7FFU;
+                            int32_t offset = (int32_t)((s << 20U) | (j2 << 19U) | (j1 << 18U) |
+                                                       (imm6 << 12U) | (imm11 << 1U));
+                            if (s != 0U) {
+                                offset |= (int32_t)0xFFE00000U;
+                            }
+                            uint32_t tgt = pc + 4U + (uint32_t)offset;
+                            if (tgt >= 0x10000U && tgt <= 0xFFFFFFFCU && tgt + 4U <= 0xFFFF0000U &&
+                                aot_range_executable(ctx, tgt, 4U)) {
+                                add_target(tgt, true, disc_pcs, disc_thumb, disc_count);
+                            }
+                        }
+                    }
+                }
+
+                /* 32-bit Thumb-2 instruction: advance past second halfword */
+                pc += 2U;
+                continue;
+            }
+
+            /* Function prologues: PUSH {..., lr} or SUB sp, #imm */
+            if (((hw & 0xFF00U) == 0xB500U || (hw & 0xFF80U) == 0xB080U) &&
+                pc <= 0xFFFFFFFCU && pc + 4U <= r_end &&
+                aot_range_executable(ctx, pc, 4U)) {
+                add_target(pc, true, disc_pcs, disc_thumb, disc_count);
+            }
+            /* Epilogues: BX lr or POP {..., pc} -> next function entry */
+            else if (hw == 0x4770U || (hw & 0xFF00U) == 0xBD00U) {
+                for (uint32_t next_fn = pc + 2U;
+                     next_fn + 2U <= r_end && next_fn <= pc + 6U;
+                     next_fn += 2U) {
+                    if (aot_range_executable(ctx, next_fn, 2U)) {
+                        add_target(next_fn, true, disc_pcs, disc_thumb, disc_count);
+                        if (*(const uint16_t *)a32_guest_ptr(ctx, next_fn) != 0xBF00U) {
+                            break;
+                        }
+                    }
+                }
+            }
+            /* CBZ / CBNZ Rn, label */
+            else if ((hw & 0xF500U) == 0xB100U) {
+                uint32_t offset = (((hw >> 9U) & 1U) << 6U) | (((hw >> 3U) & 31U) << 1U);
+                uint32_t tgt = pc + 4U + offset;
+                if (tgt >= 0x10000U && tgt + 2U <= 0xFFFF0000U &&
+                    aot_range_executable(ctx, tgt, 2U)) {
+                    add_target(tgt, true, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+            /* SVC #imm8 -> fallthrough block at pc + 2 */
+            else if ((hw & 0xFF00U) == 0xDF00U) {
+                if (pc + 4U <= r_end && aot_range_executable(ctx, pc + 2U, 2U)) {
+                    add_target(pc + 2U, true, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+            /* Branch cond: B<c> */
+            else if ((hw & 0xF000U) == 0xD000U && (hw & 0x0E00U) != 0x0E00U) {
+                int8_t imm8 = (int8_t)(hw & 0xFFU);
+                uint32_t tgt = (uint32_t)((int32_t)pc + 4 + ((int32_t)imm8 << 1));
+                if (tgt >= 0x10000U && tgt <= 0xFFFFFFFCU && tgt + 4U <= 0xFFFF0000U &&
+                    aot_range_executable(ctx, tgt, 4U)) {
+                    add_target(tgt, true, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+            /* Branch uncond: B */
+            else if ((hw & 0xF800U) == 0xE000U) {
+                int32_t imm11 = (int32_t)(hw & 0x7FFU);
+                if ((imm11 & 0x400) != 0) {
+                    imm11 |= ~0x7FF;
+                }
+                uint32_t tgt = (uint32_t)((int32_t)pc + 4 + (imm11 << 1));
+                if (tgt >= 0x10000U && tgt <= 0xFFFFFFFCU && tgt + 4U <= 0xFFFF0000U &&
+                    aot_range_executable(ctx, tgt, 4U)) {
+                    add_target(tgt, true, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+        }
+    } else {
+        uint32_t scan_start = (r_start + 3U) & ~3U;
+        for (uint32_t pc = scan_start;
+             pc >= scan_start && pc + 4U <= r_end && *disc_count < max_count;
+             pc += 4U) {
+            if (!aot_range_executable(ctx, pc, 4U)) {
+                continue;
+            }
+            const uint32_t *insn_ptr = (const uint32_t *)a32_guest_ptr(ctx, pc);
+            uint32_t insn = *insn_ptr;
+
+            /* Function prologues: STMDB sp!, {..., lr} or SUB sp, sp, #imm */
+            if ((insn >> 28U) != 0xFU &&
+                ((insn & 0x0FFF4000U) == 0x092D4000U ||
+                 (insn & 0x0FFF0000U) == 0x024D0000U ||
+                 insn == 0xE52DE004U)) {
+                add_target(pc, false, disc_pcs, disc_thumb, disc_count);
+            }
+            /* SVC #imm24 or return (BX lr / POP {..., pc}) -> fallthrough / next fn at pc + 4 */
+            else if ((insn >> 28U) != 0xFU &&
+                     ((insn & 0x0F000000U) == 0x0F000000U ||
+                      (insn & 0x0FFFFFFFU) == 0x012FFF1EU ||
+                      (insn & 0x0E108000U) == 0x08108000U)) {
+                if (pc + 8U <= r_end && aot_range_executable(ctx, pc + 4U, 4U)) {
+                    add_target(pc + 4U, false, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+            /* Branch / call: B / BL */
+            else if ((insn & 0x0E000000U) == 0x0A000000U) {
+                int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
+                if ((imm24 & 0x00800000) != 0) {
+                    imm24 |= (int32_t)0xFF000000U;
+                }
+                uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2));
+                if (tgt >= 0x10000U && tgt <= 0xFFFFFFFCU && tgt + 4U <= 0xFFFF0000U &&
+                    aot_range_executable(ctx, tgt, 4U)) {
+                    add_target(tgt, false, disc_pcs, disc_thumb, disc_count);
+                }
+                if (((insn >> 24U) & 1U) != 0U &&
+                    pc <= 0xFFFFFFF7U && pc + 8U <= r_end &&
+                    aot_range_executable(ctx, pc + 4U, 4U)) {
+                    add_target(pc + 4U, false, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+            /* Branch with Link and Exchange: BLX (imm) */
+            else if ((insn & 0xFE000000U) == 0xFA000000U) {
+                int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
+                if ((imm24 & 0x00800000) != 0) {
+                    imm24 |= (int32_t)0xFF000000U;
+                }
+                uint32_t h = (insn >> 24U) & 1U;
+                uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2) + (int32_t)(h << 1U));
+                if (tgt >= 0x10000U && tgt <= 0xFFFFFFFCU && tgt + 4U <= 0xFFFF0000U &&
+                    aot_range_executable(ctx, tgt, 4U)) {
+                    add_target(tgt, true, disc_pcs, disc_thumb, disc_count);
+                }
+                if (pc <= 0xFFFFFFF7U && pc + 8U <= r_end &&
+                    aot_range_executable(ctx, pc + 4U, 4U)) {
+                    add_target(pc + 4U, false, disc_pcs, disc_thumb, disc_count);
+                }
+            }
+        }
     }
 }
 
@@ -466,232 +926,52 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
         }
     }
 
-    uint32_t disc_pcs[A32_MAX_AOT_SCAN];
-    bool     disc_thumb[A32_MAX_AOT_SCAN];
-    size_t   disc_count = 0U;
+    static uint32_t disc_pcs[A32_MAX_AOT_SCAN];
+    static bool     disc_thumb[A32_MAX_AOT_SCAN];
+    size_t          disc_count = 0U;
+
+    bool has_aux_exec = false;
+    for (size_t i = 0U; i < ctx->region_count; i++) {
+        const a32_region_t *r = &ctx->regions[i];
+        if ((r->prot & 0x4U) == 0U || r->start < 0x10000U || r->end > 0xFFFF0000U) {
+            continue;
+        }
+        if (elf_info->text_start > 0U && elf_info->text_end > elf_info->text_start &&
+            r->start < elf_info->text_end && r->end > elf_info->text_start) {
+            continue;
+        }
+        has_aux_exec = true;
+        bool     r_thumb = entry_thumb;
+        uint32_t r_entry = r->start;
+        if (ctx->elf_entry != 0U &&
+            (ctx->elf_entry & ~3U) >= r->start && (ctx->elf_entry & ~3U) < r->end) {
+            r_thumb = (ctx->elf_entry & 1U) != 0U;
+            r_entry = ctx->elf_entry & (r_thumb ? ~1U : ~3U);
+        }
+        size_t aux_budget = disc_count + 1024U;
+        if (r_entry > r->start && r_entry < r->end) {
+            scan_text_range(ctx, r_entry, r->end, r_thumb, disc_pcs, disc_thumb, &disc_count, aux_budget);
+            scan_text_range(ctx, r->start, r_entry, r_thumb, disc_pcs, disc_thumb, &disc_count, aux_budget);
+        } else {
+            scan_text_range(ctx, r->start, r->end, r_thumb, disc_pcs, disc_thumb, &disc_count, aux_budget);
+        }
+    }
 
     if (elf_info->text_start > 0U && elf_info->text_end > elf_info->text_start) {
-        if (entry_thumb) {
-            uint32_t scan_start = (elf_info->text_start + 1U) & ~1U;
-            for (uint32_t pc = scan_start;
-                 pc >= scan_start && pc + 2U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
-                 pc += 2U) {
-                if (!aot_range_executable(ctx, pc, 2U)) {
-                    continue;
-                }
-                const uint16_t *hw_ptr = (const uint16_t *)a32_guest_ptr(ctx, pc);
-                uint16_t hw = *hw_ptr;
-
-                if ((hw >> 11U) >= 0x1DU) {
-                    if (pc + 4U > elf_info->text_end) {
-                        break;
-                    }
-                    if (!aot_range_executable(ctx, pc + 2U, 2U)) {
-                        continue;
-                    }
-                    uint16_t hw1 = hw;
-                    uint16_t hw2 = hw_ptr[1];
-
-                    /* 32-bit prologue: PUSH.W {..., lr} (STMDB sp!, {..., lr}) */
-                    if (hw1 == 0xE92DU && (hw2 & 0x4000U) != 0U) {
-                        add_target(pc, true, disc_pcs, disc_thumb, &disc_count);
-                    } else if (hw1 == 0xE8BDU && (hw2 & 0x8000U) != 0U) {
-                        /* 32-bit epilogue: POP.W {..., pc} -> next function entry */
-                        for (uint32_t next_fn = pc + 4U;
-                             next_fn + 2U <= elf_info->text_end && next_fn <= pc + 8U;
-                             next_fn += 2U) {
-                            if (aot_range_executable(ctx, next_fn, 2U)) {
-                                add_target(next_fn, true, disc_pcs, disc_thumb, &disc_count);
-                                if (*(const uint16_t *)a32_guest_ptr(ctx, next_fn) != 0xBF00U) {
-                                    break;
-                                }
-                            }
-                        }
-                    } else if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0x8000U) != 0U) {
-                        if ((hw2 & 0xD000U) == 0xD000U || (hw2 & 0xD000U) == 0xC000U ||
-                            (hw2 & 0xD000U) == 0x9000U) {
-                            /* 32-bit BL / BLX / B.W <label> */
-                            bool is_blx    = (hw2 & 0xD000U) == 0xC000U;
-                            bool is_link   = (hw2 & 0x4000U) != 0U;
-                            uint32_t s     = (hw1 >> 10U) & 1U;
-                            uint32_t j1    = (hw2 >> 13U) & 1U;
-                            uint32_t j2    = (hw2 >> 11U) & 1U;
-                            uint32_t i1    = ~(j1 ^ s) & 1U;
-                            uint32_t i2    = ~(j2 ^ s) & 1U;
-                            uint32_t imm10 = hw1 & 0x3FFU;
-                            uint32_t imm11 = hw2 & 0x7FFU;
-                            int32_t offset = (int32_t)((s << 24U) | (i1 << 23U) | (i2 << 22U) |
-                                                       (imm10 << 12U) | (imm11 << 1U));
-                            if (s != 0U) {
-                                offset |= (int32_t)0xFE000000U;
-                            }
-                            uint32_t tgt = is_blx ? ((((pc + 4U) & ~3U) + (uint32_t)offset) & ~3U)
-                                                  : (pc + 4U + (uint32_t)offset);
-                            if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                                tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
-                                aot_range_executable(ctx, tgt, 4U)) {
-                                add_target(tgt, !is_blx, disc_pcs, disc_thumb, &disc_count);
-                            }
-                            if (is_link && pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end &&
-                                aot_range_executable(ctx, pc + 4U, 4U)) {
-                                add_target(pc + 4U, true, disc_pcs, disc_thumb, &disc_count);
-                            }
-                        } else if ((hw2 & 0xD000U) == 0x8000U) {
-                            unsigned cond = (hw1 >> 6U) & 0xFU;
-                            if (cond < 14U) {
-                                /* 32-bit B<cond>.W <label> */
-                                uint32_t s     = (hw1 >> 10U) & 1U;
-                                uint32_t j1    = (hw2 >> 13U) & 1U;
-                                uint32_t j2    = (hw2 >> 11U) & 1U;
-                                uint32_t imm6  = hw1 & 0x3FU;
-                                uint32_t imm11 = hw2 & 0x7FFU;
-                                int32_t offset = (int32_t)((s << 20U) | (j2 << 19U) | (j1 << 18U) |
-                                                           (imm6 << 12U) | (imm11 << 1U));
-                                if (s != 0U) {
-                                    offset |= (int32_t)0xFFE00000U;
-                                }
-                                uint32_t tgt = pc + 4U + (uint32_t)offset;
-                                if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                                    tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
-                                    aot_range_executable(ctx, tgt, 4U)) {
-                                    add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
-                                }
-                            }
-                        }
-                    }
-
-                    /* 32-bit Thumb-2 instruction: advance past second halfword */
-                    pc += 2U;
-                    continue;
-                }
-
-                /* Function prologues: PUSH {..., lr} or SUB sp, #imm */
-                if (((hw & 0xFF00U) == 0xB500U || (hw & 0xFF80U) == 0xB080U) &&
-                    pc <= 0xFFFFFFFCU && pc + 4U <= elf_info->text_end &&
-                    aot_range_executable(ctx, pc, 4U)) {
-                    add_target(pc, true, disc_pcs, disc_thumb, &disc_count);
-                }
-                /* Epilogues: BX lr or POP {..., pc} -> next function entry */
-                else if (hw == 0x4770U || (hw & 0xFF00U) == 0xBD00U) {
-                    for (uint32_t next_fn = pc + 2U;
-                         next_fn + 2U <= elf_info->text_end && next_fn <= pc + 6U;
-                         next_fn += 2U) {
-                        if (aot_range_executable(ctx, next_fn, 2U)) {
-                            add_target(next_fn, true, disc_pcs, disc_thumb, &disc_count);
-                            if (*(const uint16_t *)a32_guest_ptr(ctx, next_fn) != 0xBF00U) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                /* CBZ / CBNZ Rn, label */
-                else if ((hw & 0xF500U) == 0xB100U) {
-                    uint32_t offset = (((hw >> 9U) & 1U) << 6U) | (((hw >> 3U) & 31U) << 1U);
-                    uint32_t tgt = pc + 4U + offset;
-                    if (tgt >= elf_info->text_start && tgt + 2U <= elf_info->text_end &&
-                        aot_range_executable(ctx, tgt, 2U)) {
-                        add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-                /* SVC #imm8 -> fallthrough block at pc + 2 */
-                else if ((hw & 0xFF00U) == 0xDF00U) {
-                    if (pc + 4U <= elf_info->text_end && aot_range_executable(ctx, pc + 2U, 2U)) {
-                        add_target(pc + 2U, true, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-                /* Branch cond: B<c> */
-                else if ((hw & 0xF000U) == 0xD000U && (hw & 0x0E00U) != 0x0E00U) {
-                    int8_t imm8 = (int8_t)(hw & 0xFFU);
-                    uint32_t tgt = (uint32_t)((int32_t)pc + 4 + ((int32_t)imm8 << 1));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
-                        aot_range_executable(ctx, tgt, 4U)) {
-                        add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-                /* Branch uncond: B */
-                else if ((hw & 0xF800U) == 0xE000U) {
-                    int32_t imm11 = (int32_t)(hw & 0x7FFU);
-                    if ((imm11 & 0x400) != 0) {
-                        imm11 |= ~0x7FF;
-                    }
-                    uint32_t tgt = (uint32_t)((int32_t)pc + 4 + (imm11 << 1));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
-                        aot_range_executable(ctx, tgt, 4U)) {
-                        add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-            }
+        size_t main_budget = has_aux_exec ? (disc_count + 1280U) : (A32_MAX_AOT_SCAN - 512U);
+        if (entry_pc > elf_info->text_start && entry_pc < elf_info->text_end) {
+            scan_text_range(ctx, entry_pc, elf_info->text_end,
+                            entry_thumb, disc_pcs, disc_thumb, &disc_count, main_budget);
+            scan_text_range(ctx, elf_info->text_start, entry_pc,
+                            entry_thumb, disc_pcs, disc_thumb, &disc_count, main_budget);
         } else {
-            uint32_t scan_start = (elf_info->text_start + 3U) & ~3U;
-            for (uint32_t pc = scan_start;
-                 pc >= scan_start && pc + 4U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
-                 pc += 4U) {
-                if (!aot_range_executable(ctx, pc, 4U)) {
-                    continue;
-                }
-                const uint32_t *insn_ptr = (const uint32_t *)a32_guest_ptr(ctx, pc);
-                uint32_t insn = *insn_ptr;
-
-                /* Function prologues: STMDB sp!, {..., lr} or SUB sp, sp, #imm */
-                if ((insn >> 28U) != 0xFU &&
-                    ((insn & 0x0FFF4000U) == 0x092D4000U ||
-                     (insn & 0x0FFF0000U) == 0x024D0000U ||
-                     insn == 0xE52DE004U)) {
-                    add_target(pc, false, disc_pcs, disc_thumb, &disc_count);
-                }
-                /* SVC #imm24 or return (BX lr / POP {..., pc}) -> fallthrough / next fn at pc + 4 */
-                else if ((insn >> 28U) != 0xFU &&
-                         ((insn & 0x0F000000U) == 0x0F000000U ||
-                          (insn & 0x0FFFFFFFU) == 0x012FFF1EU ||
-                          (insn & 0x0E108000U) == 0x08108000U)) {
-                    if (pc + 8U <= elf_info->text_end && aot_range_executable(ctx, pc + 4U, 4U)) {
-                        add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-                /* Branch / call: B / BL */
-                else if ((insn & 0x0E000000U) == 0x0A000000U) {
-                    int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
-                    if ((imm24 & 0x00800000) != 0) {
-                        imm24 |= (int32_t)0xFF000000U;
-                    }
-                    uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
-                        aot_range_executable(ctx, tgt, 4U)) {
-                        add_target(tgt, false, disc_pcs, disc_thumb, &disc_count);
-                    }
-                    if (((insn >> 24U) & 1U) != 0U &&
-                        pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end &&
-                        aot_range_executable(ctx, pc + 4U, 4U)) {
-                        add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-                /* Branch with Link and Exchange: BLX (imm) */
-                else if ((insn & 0xFE000000U) == 0xFA000000U) {
-                    int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
-                    if ((imm24 & 0x00800000) != 0) {
-                        imm24 |= (int32_t)0xFF000000U;
-                    }
-                    uint32_t h = (insn >> 24U) & 1U;
-                    uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2) + (int32_t)(h << 1U));
-                    if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
-                        aot_range_executable(ctx, tgt, 4U)) {
-                        add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
-                    }
-                    if (pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end &&
-                        aot_range_executable(ctx, pc + 4U, 4U)) {
-                        add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
-                    }
-                }
-            }
+            scan_text_range(ctx, elf_info->text_start, elf_info->text_end,
+                            entry_thumb, disc_pcs, disc_thumb, &disc_count, main_budget);
         }
     }
 
     size_t compiled_idx = 0U;
-    for (unsigned pass = 0U; pass < 4U; pass++) {
+    for (unsigned pass = 0U; pass < 6U; pass++) {
         size_t limit = disc_count;
         for (; compiled_idx < limit; compiled_idx++) {
             uint32_t min_len = disc_thumb[compiled_idx] ? 2U : 4U;

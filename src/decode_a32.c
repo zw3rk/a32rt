@@ -195,6 +195,10 @@ static bool a32_insn_reads_flags(uint32_t insn)
         return true;
     }
     if (cond == 15U) {
+        /* ARMv8-A VSEL{EQ,VS,GE,GT}.F32/.F64 reads NZCV despite cond == 15 */
+        if ((insn & 0xFF800E50U) == 0xFE000A00U) {
+            return true;
+        }
         return false;
     }
     if ((insn & 0x0FF000F0U) == 0x07F000F0U) {
@@ -326,7 +330,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             return true;
         }
         /* M4 VFPv4-D32 / NEON unconditional instructions */
-        if ((insn & 0xFE000000U) == 0xF2000000U || (insn & 0xFF100000U) == 0xF4000000U) {
+        if ((insn & 0xFE000000U) == 0xF2000000U || (insn & 0xFF100000U) == 0xF4000000U ||
+            (insn & 0xFE000000U) == 0xFE000000U) {
             return a32_decode_vfp_neon_a32(ctx, b, insn, pc);
         }
         return false;

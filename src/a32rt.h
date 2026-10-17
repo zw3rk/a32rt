@@ -35,7 +35,7 @@
 
 /* Maximum number of tracked guest VMA regions */
 #define A32_MAX_REGIONS 512U
-#define A32_RAS_SIZE    16U
+#define A32_RAS_SIZE    64U
 #define A32_IBTC_SIZE   1024U
 
 typedef struct a32_region {
@@ -65,7 +65,7 @@ typedef a32_pc_map_stage a32_pc_map_stage_t;
 
 /*
  * Architectural + runtime state for a 32-bit ARM guest thread.
- * Field offsets of the first 416 bytes are ABI-locked with `src/trampoline.S`
+ * Field offsets of the first 35248 bytes are ABI-locked with `src/trampoline.S`
  * and `src/a64_emit.h`.
  */
 typedef struct a32_ctx {
@@ -81,7 +81,7 @@ typedef struct a32_ctx {
     uint32_t fpscr;             /* 0x160: VFP/NEON Floating-Point Status and Control Register */
     uint32_t pad0;              /* 0x164: Alignment padding */
 
-    /* ABI-locked fast-dispatch fields for `src/trampoline.S` (offsets 360..416) */
+    /* ABI-locked fast-dispatch fields for `src/trampoline.S` (offsets 360..35248) */
     uint64_t          sig_mask;           /* 0x168 (360) */
     volatile uint64_t pending_signals;    /* 0x170 (368) */
     bool              trace_enabled;      /* 0x178 (376) */
@@ -94,6 +94,16 @@ typedef struct a32_ctx {
     void             *last_exec_entry;    /* 0x190 (400) */
     uint64_t          ibtc_hits;          /* 0x198 (408) */
     a32_ibtc_entry_t  ibtc[A32_IBTC_SIZE];/* 0x1a0 (416) */
+    a32_ibtc_entry_t  ras[A32_RAS_SIZE];  /* 0x81a0 (33184) */
+    uint64_t          ras_hits;           /* 0x89a0 (35232) */
+    uint32_t          ras_top;            /* 0x89a8 (35240) */
+    uint32_t          pad2;               /* 0x89ac (35244) */
+
+    /* Legacy RAS arrays kept for C compatibility if referenced */
+    uint32_t          ras_key[A32_RAS_SIZE];
+    uint32_t          ras_epoch[A32_RAS_SIZE];
+    const void       *ras_code[A32_RAS_SIZE];
+    void             *ras_entry[A32_RAS_SIZE];
 
     /* Guest memory layout & allocator inside [G, G + 4GiB) */
     uint32_t brk_base;
@@ -142,14 +152,6 @@ typedef struct a32_ctx {
     uint64_t    icache_flushes;
     uint64_t    wx_transitions;
     uint64_t    flags_elided;
-
-    /* M2 Return Address Stack (RAS) for O(1) target prediction */
-    uint32_t         ras_key[A32_RAS_SIZE];
-    uint32_t         ras_epoch[A32_RAS_SIZE];
-    const void      *ras_code[A32_RAS_SIZE];
-    void            *ras_entry[A32_RAS_SIZE];
-    uint32_t         ras_top;
-    uint64_t         ras_hits;
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -175,6 +177,9 @@ _Static_assert(offsetof(a32_ctx_t, chain_hits) == 392, "chain_hits must be at of
 _Static_assert(offsetof(a32_ctx_t, last_exec_entry) == 400, "last_exec_entry must be at offset 400");
 _Static_assert(offsetof(a32_ctx_t, ibtc_hits) == 408, "ibtc_hits must be at offset 408");
 _Static_assert(offsetof(a32_ctx_t, ibtc) == 416, "ibtc must be at offset 416");
+_Static_assert(offsetof(a32_ctx_t, ras) == 33184, "ras must be at offset 33184 (0x81a0)");
+_Static_assert(offsetof(a32_ctx_t, ras_hits) == 35232, "ras_hits must be at offset 35232 (0x89a0)");
+_Static_assert(offsetof(a32_ctx_t, ras_top) == 35240, "ras_top must be at offset 35240 (0x89a8)");
 
 static inline void *a32_guest_ptr(const a32_ctx_t *ctx, uint32_t guest_va)
 {
@@ -243,6 +248,7 @@ int         a32_jit_flush_batch(a32_ctx_t *ctx);
 int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char *elf_path);
 int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path);
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path);
+int a32_aot_load_fd(a32_ctx_t *ctx, int fd, const char *label, uint32_t load_bias);
 
 /* Syscalls & signals (`src/syscalls.c`, `src/signals.c`, M0..M5) */
 bool       a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_prot);
