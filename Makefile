@@ -259,7 +259,7 @@ $(BUILD_DIR)/bench-suite-i386: tests/bench_suite.c | $(BUILD_DIR)
 
 bench-bins: $(BENCH_BINS) ## Build cross-architecture benchmark binaries (armhf, thumb, aarch64, x86_64, i386)
 
-bench-hl: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite under hyper-linux (native, a32rt Cold JIT & Warm AOT)
+bench-hl: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite under hyper-linux (native, a32rt Cold JIT & Warm AOT, RosettaLinux)
 	@printf "\033[36m=== [hyper-linux] 1. Native aarch64-linux ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(BUILD_DIR)/bench-suite-aarch64)
 	@printf "\033[36m=== [hyper-linux] 2. a32rt A32 (Cold JIT, G=4GiB) ===\033[0m\n"
@@ -274,6 +274,8 @@ bench-hl: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite under
 	@printf "\033[36m=== [hyper-linux] 5. a32rt Thumb-2 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@printf "\033[36m=== [hyper-linux] 6. Apple RosettaLinux (x86_64 -> aarch64) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(BUILD_DIR)/bench-suite-x86_64)
 
 bench-lima: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite inside Lima VM (native, a32rt, qemu-arm, RosettaLinux, qemu-x86_64, qemu-i386)
 	@printf "\033[36m=== [Lima Linux VM] 1. Native aarch64-linux ===\033[0m\n"

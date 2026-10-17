@@ -296,6 +296,12 @@ void a64_emit_sdiv_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm)
     a64_emit(b, 0x1AC00C00U | ((rm & 31U) << 16) | ((rn & 31U) << 5) | (rd & 31U));
 }
 
+void a64_emit_crc32_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned sz, unsigned c_bit)
+{
+    a64_emit(b, 0x1AC04000U | ((rm & 31U) << 16) | ((c_bit & 1U) << 12) |
+                    ((sz & 3U) << 10) | ((rn & 31U) << 5) | (rd & 31U));
+}
+
 void a64_emit_csel_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond)
 {
     a64_emit(b, 0x1A800000U | ((rm & 31U) << 16) | ((cond & 15U) << 12) |
@@ -783,6 +789,82 @@ void a64_emit_scvtf_w_to_d(a64_buf_t *b, unsigned vd, unsigned rn_w)
 void a64_emit_ucvtf_w_to_d(a64_buf_t *b, unsigned vd, unsigned rn_w)
 {
     a64_emit(b, 0x1E630000U | ((rn_w & 31U) << 5) | (vd & 31U));
+}
+
+/* ARMv8-A Crypto extensions (AES, PMULL, SHA1, SHA256) */
+void a64_emit_aese(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x4E284800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_aesd(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x4E285800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_aesmc(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x4E286800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_aesimc(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x4E287800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_pmull_1q(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x0EE0E000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha1c(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E000000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha1p(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E001000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha1m(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E002000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha1su0(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E003000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha1h(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x5E280800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha1su1(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x5E281800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha256h(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E004000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha256h2(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E005000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha256su0(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x5E282800U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+void a64_emit_sha256su1(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
+{
+    a64_emit(b, 0x5E006000U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
 }
 
 /* Exclusives & barriers */

@@ -2793,6 +2793,102 @@ static int test21_r10_ifetch_sigsegv_sigqueueinfo_tid_address(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 22: VFP_MAGIC (0x56465001) Coprocessor Frame in ucontext.uc_regspace
+ * -------------------------------------------------------------------------- */
+static volatile uint32_t g_vfp_sigframe_ok = 0U;
+
+static void vfp_uc_sigusr1_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    if (ucontext == NULL) {
+        return;
+    }
+    uint8_t *uc = (uint8_t *)ucontext;
+    /* uc_regspace starts at byte offset 120 of arm32 struct ucontext */
+    uint32_t magic = *(uint32_t *)(void *)(uc + 120U);
+    uint32_t size  = *(uint32_t *)(void *)(uc + 124U);
+    uint64_t d0_in  = *(uint64_t *)(void *)(uc + 128U + 0U * 8U);
+    uint64_t d16_in = *(uint64_t *)(void *)(uc + 128U + 16U * 8U);
+    uint32_t fpexc  = *(uint32_t *)(void *)(uc + 128U + 32U * 8U + 4U);
+    uint32_t end_magic = *(uint32_t *)(void *)(uc + 120U + 0x120U);
+
+    /* 123.5 == 0x405EE00000000000ULL, -456.25 == 0xC07C840000000000ULL */
+    if (magic == 0x56465001U && size == 0x120U &&
+        d0_in == 0x405EE00000000000ULL &&
+        d16_in == 0xC07C840000000000ULL &&
+        (fpexc & 0x40000000U) != 0U &&
+        end_magic == 0U) {
+        /* Mutate fpregs[0] = 789.125 (0x4088A90000000000ULL) and
+         * fpregs[16] = 1024.5 (0x4090020000000000ULL) */
+        *(uint64_t *)(void *)(uc + 128U + 0U * 8U)  = 0x4088A90000000000ULL;
+        *(uint64_t *)(void *)(uc + 128U + 16U * 8U) = 0x4090020000000000ULL;
+        g_vfp_sigframe_ok = 1U;
+    }
+}
+
+static int test22_vfp_sigframe_uc_regspace(void)
+{
+    g_vfp_sigframe_ok = 0U;
+
+    struct sigaction32 act;
+    act.sa_handler = (uint32_t)(uintptr_t)vfp_uc_sigusr1_handler;
+    act.sa_flags = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0] = 0U;
+    act.sa_mask[1] = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+             (uint32_t)(uintptr_t)&act, 0U, 8U) != 0) {
+        return 220;
+    }
+
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+    uint64_t in_d0  = 0x405EE00000000000ULL; /* 123.5 */
+    uint64_t in_d16 = 0xC07C840000000000ULL; /* -456.25 */
+    uint64_t out_d0  = 0ULL;
+    uint64_t out_d16 = 0ULL;
+    int32_t tkill_rc = -1;
+
+    const uint64_t *p_in_d0  = &in_d0;
+    const uint64_t *p_in_d16 = &in_d16;
+    uint64_t *p_out_d0  = &out_d0;
+    uint64_t *p_out_d16 = &out_d16;
+
+    __asm__ volatile(
+        "vldmia %1, {d0}\n"
+        "vldmia %2, {d16}\n"
+        "mov r0, %3\n"
+        "mov r1, #10\n"
+        "mov r7, #238\n"
+        "svc #0\n"
+        "mov %0, r0\n"
+        "vstmia %4, {d0}\n"
+        "vstmia %5, {d16}\n"
+        : "=&r"(tkill_rc)
+        : "r"(p_in_d0), "r"(p_in_d16), "r"(tid), "r"(p_out_d0), "r"(p_out_d16)
+        : "r0", "r1", "r7", "d0", "d16", "memory", "cc"
+    );
+
+    struct sigaction32 dfl;
+    dfl.sa_handler = 0U; /* SIG_DFL */
+    dfl.sa_flags = 0U;
+    dfl.sa_restorer = 0U;
+    dfl.sa_mask[0] = 0U;
+    dfl.sa_mask[1] = 0U;
+    sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+         (uint32_t)(uintptr_t)&dfl, 0U, 8U);
+
+    if (tkill_rc != 0 || g_vfp_sigframe_ok != 1U) {
+        return 221;
+    }
+    if (out_d0 != 0x4088A90000000000ULL || out_d16 != 0x4090020000000000ULL) {
+        return 222;
+    }
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -2876,6 +2972,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test21_r10_ifetch_sigsegv_sigqueueinfo_tid_address();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test22_vfp_sigframe_uc_regspace();
     if (rc != 0) {
         return rc;
     }

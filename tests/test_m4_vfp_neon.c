@@ -2181,6 +2181,260 @@ static int run_vfp_neon_tests(void)
         }
     }
 
+    /*
+     * 31. ARMv8-A AArch32 CRC32 (CRC32B/H/W, CRC32CB/H/W) and Crypto
+     *     (AESE.8, AESD.8, AESMC.8, AESIMC.8, VMULL.P64, SHA1*, SHA256*)
+     */
+    {
+#ifdef __thumb__
+#define INSN_CRC32B_R0_R1_R2       ".inst.w 0xfac1f082\n"
+#define INSN_CRC32H_R0_R1_R2       ".inst.w 0xfac1f092\n"
+#define INSN_CRC32W_R0_R1_R2       ".inst.w 0xfac1f0a2\n"
+#define INSN_CRC32CB_R0_R1_R2      ".inst.w 0xfad1f082\n"
+#define INSN_CRC32CH_R0_R1_R2      ".inst.w 0xfad1f092\n"
+#define INSN_CRC32CW_R0_R1_R2      ".inst.w 0xfad1f0a2\n"
+#define INSN_AESE_Q0_Q1            ".inst.w 0xffb00302\n"
+#define INSN_AESD_Q0_Q1            ".inst.w 0xffb00342\n"
+#define INSN_AESMC_Q0_Q1           ".inst.w 0xffb00382\n"
+#define INSN_AESIMC_Q0_Q1          ".inst.w 0xffb003c2\n"
+#define INSN_SHA1H_Q0_Q1           ".inst.w 0xffb902c2\n"
+#define INSN_SHA1SU1_Q0_Q1         ".inst.w 0xffba0382\n"
+#define INSN_SHA256SU0_Q0_Q1       ".inst.w 0xffba03c2\n"
+#define INSN_SHA1C_Q0_Q1_Q2        ".inst.w 0xef020c44\n"
+#define INSN_SHA1P_Q0_Q1_Q2        ".inst.w 0xef120c44\n"
+#define INSN_SHA1M_Q0_Q1_Q2        ".inst.w 0xef220c44\n"
+#define INSN_SHA1SU0_Q0_Q1_Q2      ".inst.w 0xef320c44\n"
+#define INSN_SHA256H_Q0_Q1_Q2      ".inst.w 0xff020c44\n"
+#define INSN_SHA256H2_Q0_Q1_Q2     ".inst.w 0xff120c44\n"
+#define INSN_SHA256SU1_Q0_Q1_Q2    ".inst.w 0xff220c44\n"
+#define INSN_VMULL_P64_Q0_D2_D4    ".inst.w 0xefa20e04\n"
+#else
+#define INSN_CRC32B_R0_R1_R2       ".inst 0xe1010042\n"
+#define INSN_CRC32H_R0_R1_R2       ".inst 0xe1210042\n"
+#define INSN_CRC32W_R0_R1_R2       ".inst 0xe1410042\n"
+#define INSN_CRC32CB_R0_R1_R2      ".inst 0xe1010242\n"
+#define INSN_CRC32CH_R0_R1_R2      ".inst 0xe1210242\n"
+#define INSN_CRC32CW_R0_R1_R2      ".inst 0xe1410242\n"
+#define INSN_AESE_Q0_Q1            ".inst 0xf3b00302\n"
+#define INSN_AESD_Q0_Q1            ".inst 0xf3b00342\n"
+#define INSN_AESMC_Q0_Q1           ".inst 0xf3b00382\n"
+#define INSN_AESIMC_Q0_Q1          ".inst 0xf3b003c2\n"
+#define INSN_SHA1H_Q0_Q1           ".inst 0xf3b902c2\n"
+#define INSN_SHA1SU1_Q0_Q1         ".inst 0xf3ba0382\n"
+#define INSN_SHA256SU0_Q0_Q1       ".inst 0xf3ba03c2\n"
+#define INSN_SHA1C_Q0_Q1_Q2        ".inst 0xf2020c44\n"
+#define INSN_SHA1P_Q0_Q1_Q2        ".inst 0xf2120c44\n"
+#define INSN_SHA1M_Q0_Q1_Q2        ".inst 0xf2220c44\n"
+#define INSN_SHA1SU0_Q0_Q1_Q2      ".inst 0xf2320c44\n"
+#define INSN_SHA256H_Q0_Q1_Q2      ".inst 0xf3020c44\n"
+#define INSN_SHA256H2_Q0_Q1_Q2     ".inst 0xf3120c44\n"
+#define INSN_SHA256SU1_Q0_Q1_Q2    ".inst 0xf3220c44\n"
+#define INSN_VMULL_P64_Q0_D2_D4    ".inst 0xf2a20e04\n"
+#endif
+
+        /* 31a: IEEE 802.3 CRC-32 and Castagnoli CRC-32C over "123456789" */
+        uint32_t crc_out = 0U, crcc_out = 0U;
+        __asm__ volatile(
+            "mov r1, #-1\n"
+            "ldr r2, =0x34333231\n"
+            INSN_CRC32W_R0_R1_R2
+            "mov r1, r0\n"
+            "movw r2, #0x3635\n"
+            INSN_CRC32H_R0_R1_R2
+            "mov r1, r0\n"
+            "mov r2, #0x37\n"
+            INSN_CRC32B_R0_R1_R2
+            "mov r1, r0\n"
+            "movw r2, #0x3938\n"
+            INSN_CRC32H_R0_R1_R2
+            "mvn %0, r0\n"
+            "mov r1, #-1\n"
+            "ldr r2, =0x34333231\n"
+            INSN_CRC32CW_R0_R1_R2
+            "mov r1, r0\n"
+            "movw r2, #0x3635\n"
+            INSN_CRC32CH_R0_R1_R2
+            "mov r1, r0\n"
+            "mov r2, #0x37\n"
+            INSN_CRC32CB_R0_R1_R2
+            "mov r1, r0\n"
+            "movw r2, #0x3938\n"
+            INSN_CRC32CH_R0_R1_R2
+            "mvn %1, r0\n"
+            : "=&r"(crc_out), "=r"(crcc_out)
+            :
+            : "r0", "r1", "r2"
+        );
+        if (crc_out != 0xCBF43926U || crcc_out != 0xE3069283U) {
+            return 95;
+        }
+
+        /* 31b: AES roundtrip: AESD(AESE(state, key), zero) ^ key == state & AESIMC(AESMC(state)) == state */
+        static const uint32_t aes_state[4] = {
+            0x3243F6A8U, 0x885A308DU, 0x313198A2U, 0xE0370734U
+        };
+        static const uint32_t aes_key[4] = {
+            0x2B7E1516U, 0x28AED2A6U, 0xABF71588U, 0x09CF4F3CU
+        };
+        static const uint32_t aes_zero[4] = { 0U, 0U, 0U, 0U };
+        static uint32_t aes_enc[4];
+        static uint32_t aes_rt1[4];
+        static uint32_t aes_rt2[4];
+        __asm__ volatile(
+            /* q0 = AESE(state, key); store encrypted state, then AESD(q0, zero) ^ key -> aes_rt1 */
+            "vld1.32 {d0-d1}, [%3]\n"
+            "vld1.32 {d2-d3}, [%4]\n"
+            INSN_AESE_Q0_Q1
+            "vst1.32 {d0-d1}, [%0]\n"
+            "vld1.32 {d2-d3}, [%5]\n"
+            INSN_AESD_Q0_Q1
+            "vld1.32 {d2-d3}, [%4]\n"
+            "veor q0, q0, q1\n"
+            "vst1.32 {d0-d1}, [%1]\n"
+            /* AESIMC(AESMC(state)) -> aes_rt2 */
+            "vld1.32 {d2-d3}, [%3]\n"
+            INSN_AESMC_Q0_Q1
+            "vmov q1, q0\n"
+            INSN_AESIMC_Q0_Q1
+            "vst1.32 {d0-d1}, [%2]\n"
+            :
+            : "r"(aes_enc), "r"(aes_rt1), "r"(aes_rt2),
+              "r"(aes_state), "r"(aes_key), "r"(aes_zero)
+            : "q0", "q1", "memory"
+        );
+        if (aes_enc[0] == aes_state[0] ||
+            aes_rt1[0] != aes_state[0] || aes_rt1[1] != aes_state[1] ||
+            aes_rt1[2] != aes_state[2] || aes_rt1[3] != aes_state[3] ||
+            aes_rt2[0] != aes_state[0] || aes_rt2[1] != aes_state[1] ||
+            aes_rt2[2] != aes_state[2] || aes_rt2[3] != aes_state[3]) {
+            return 96;
+        }
+
+        /* 31c: VMULL.P64 64x64->128 polynomial multiplication */
+        static const uint64_t pmull_a = 0x0123456789ABCDEFULL;
+        static const uint64_t pmull_b = 0xFEDCBA9876543210ULL;
+        static uint64_t pmull_out[2];
+        __asm__ volatile(
+            "vldr d2, [%1]\n"
+            "vldr d4, [%2]\n"
+            INSN_VMULL_P64_Q0_D2_D4
+            "vst1.64 {d0-d1}, [%0]\n"
+            :
+            : "r"(pmull_out), "r"(&pmull_a), "r"(&pmull_b)
+            : "q0", "d2", "d4", "memory"
+        );
+        if (pmull_out[0] != 0x40A0789828C810F0ULL ||
+            pmull_out[1] != 0x00E038D8688850B0ULL) {
+            return 97;
+        }
+
+        /* 31d: SHA-1 instructions (SHA1H.32, SHA1C.32, SHA1P.32, SHA1M.32, SHA1SU0.32, SHA1SU1.32) */
+        static const uint32_t sha_in0[4] = {
+            0x67452301U, 0xEFCDAB89U, 0x98BADCFEU, 0x10325476U
+        };
+        static const uint32_t sha_in1[4] = {
+            0xC3D2E1F0U, 0x11223344U, 0x55667788U, 0x99AABBCCU
+        };
+        static const uint32_t sha_in2[4] = {
+            0x5A827999U, 0x6ED9EBA1U, 0x8F1BBCDCU, 0xCA62C1D6U
+        };
+        static uint32_t sha1h_out[4];
+        static uint32_t sha1c_out[4];
+        static uint32_t sha1p_out[4];
+        static uint32_t sha1m_out[4];
+        static uint32_t sha1su0_out[4];
+        static uint32_t sha1su1_out[4];
+
+        __asm__ volatile(
+            "vld1.32 {d0-d1}, [%6]\n"
+            "vld1.32 {d2-d3}, [%7]\n"
+            INSN_SHA1H_Q0_Q1
+            "vst1.32 {d0-d1}, [%0]\n"
+
+            "vld1.32 {d0-d1}, [%6]\n"
+            "vld1.32 {d2-d3}, [%7]\n"
+            "vld1.32 {d4-d5}, [%8]\n"
+            INSN_SHA1C_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%1]\n"
+
+            "vld1.32 {d0-d1}, [%6]\n"
+            INSN_SHA1P_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%2]\n"
+
+            "vld1.32 {d0-d1}, [%6]\n"
+            INSN_SHA1M_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%3]\n"
+
+            "vld1.32 {d0-d1}, [%6]\n"
+            INSN_SHA1SU0_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%4]\n"
+
+            "vld1.32 {d0-d1}, [%6]\n"
+            INSN_SHA1SU1_Q0_Q1
+            "vst1.32 {d0-d1}, [%5]\n"
+            :
+            : "r"(sha1h_out), "r"(sha1c_out), "r"(sha1p_out),
+              "r"(sha1m_out), "r"(sha1su0_out), "r"(sha1su1_out),
+              "r"(sha_in0), "r"(sha_in1), "r"(sha_in2)
+            : "q0", "q1", "q2", "memory"
+        );
+        if (sha1h_out[0] != 0x30F4B87CU || sha1h_out[1] != 0U ||
+            sha1h_out[2] != 0U || sha1h_out[3] != 0U ||
+            sha1c_out[0] != 0x52B5EE1AU || sha1c_out[1] != 0xD514B5A8U ||
+            sha1c_out[2] != 0x1C66D562U || sha1c_out[3] != 0xE7ED262CU ||
+            sha1p_out[0] != 0xA023551EU || sha1p_out[1] != 0xD28916A7U ||
+            sha1p_out[2] != 0x72BD2B00U || sha1p_out[3] != 0x9B8FB7ADU ||
+            sha1m_out[0] != 0xFC29787AU || sha1m_out[1] != 0xB620105AU ||
+            sha1m_out[2] != 0x3C64B05BU || sha1m_out[3] != 0xE7ED262CU ||
+            sha1su0_out[0] != 0xA57D8666U || sha1su0_out[1] != 0x9126145EU ||
+            sha1su0_out[2] != 0xD47381D2U || sha1su0_out[3] != 0xCB72A6E4U ||
+            sha1su1_out[0] != 0xECCE208AU || sha1su1_out[1] != 0x7557B803U ||
+            sha1su1_out[2] != 0x0220CE64U || sha1su1_out[3] != 0xF9F8E9F9U) {
+            return 98;
+        }
+
+        /* 31e: SHA-256 instructions (SHA256H.32, SHA256H2.32, SHA256SU0.32, SHA256SU1.32) */
+        static uint32_t sha256h_out[4];
+        static uint32_t sha256h2_out[4];
+        static uint32_t sha256su0_out[4];
+        static uint32_t sha256su1_out[4];
+
+        __asm__ volatile(
+            "vld1.32 {d0-d1}, [%4]\n"
+            "vld1.32 {d2-d3}, [%5]\n"
+            "vld1.32 {d4-d5}, [%6]\n"
+            INSN_SHA256H_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%0]\n"
+
+            "vld1.32 {d0-d1}, [%4]\n"
+            INSN_SHA256H2_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%1]\n"
+
+            "vld1.32 {d0-d1}, [%4]\n"
+            INSN_SHA256SU0_Q0_Q1
+            "vst1.32 {d0-d1}, [%2]\n"
+
+            "vld1.32 {d0-d1}, [%4]\n"
+            INSN_SHA256SU1_Q0_Q1_Q2
+            "vst1.32 {d0-d1}, [%3]\n"
+            :
+            : "r"(sha256h_out), "r"(sha256h2_out),
+              "r"(sha256su0_out), "r"(sha256su1_out),
+              "r"(sha_in0), "r"(sha_in1), "r"(sha_in2)
+            : "q0", "q1", "q2", "memory"
+        );
+        if (sha256h_out[0] != 0x56E908D8U || sha256h_out[1] != 0x9DCC7EDDU ||
+            sha256h_out[2] != 0xC698F62EU || sha256h_out[3] != 0x62DF5964U ||
+            sha256h2_out[0] != 0xCA8E8AD1U || sha256h2_out[1] != 0x050B3C00U ||
+            sha256h2_out[2] != 0x9DDD36ACU || sha256h2_out[3] != 0xCB800675U ||
+            sha256su0_out[0] != 0xCC0978D6U || sha256su0_out[1] != 0x48E73391U ||
+            sha256su0_out[2] != 0x13F68728U || sha256su0_out[3] != 0x51B41D7FU ||
+            sha256su1_out[0] != 0x223D66C6U || sha256su1_out[1] != 0x7E1747DEU ||
+            sha256su1_out[2] != 0x5218F2CAU || sha256su1_out[3] != 0xB5C04327U) {
+            return 99;
+        }
+    }
+
     static const char pass_msg[] = "M4 VFPv4-D32 & NEON: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

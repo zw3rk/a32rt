@@ -1324,9 +1324,82 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 }
                 return true;
             }
+            /* ARMv8-A Crypto: AESE.8, AESD.8, AESMC.8, AESIMC.8 (size == 0, op5 == 6 or 7) */
+            if (((insn >> 24) & 1U) != 0U && size == 0U && (op5 == 6U || op5 == 7U)) {
+                if ((d & 1U) != 0U || (m & 1U) != 0U) {
+                    return false;
+                }
+                unsigned qd = d >> 1;
+                unsigned qm = m >> 1;
+                unsigned opc = (insn >> 6) & 0x1FU;
+                if (opc == 0x0CU) { /* AESE.8 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 0U, qd);
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_aese(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+                if (opc == 0x0DU) { /* AESD.8 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 0U, qd);
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_aesd(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+                if (opc == 0x0EU) { /* AESMC.8 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_aesmc(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+                if (opc == 0x0FU) { /* AESIMC.8 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_aesimc(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+            }
+            /* ARMv8-A Crypto: SHA1H.32, SHA1SU1.32, SHA256SU0.32 (alternate opc1 == 0 encoding) */
+            if (((insn >> 24) & 1U) != 0U && size == 2U && (d & 1U) == 0U && (m & 1U) == 0U) {
+                unsigned qd = d >> 1;
+                unsigned qm = m >> 1;
+                unsigned opc = (insn >> 6) & 0x1FU;
+                if (opc == 0x0AU) { /* SHA1H.32 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_sha1h(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+                if (opc == 0x0BU) { /* SHA1SU1.32 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 0U, qd);
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_sha1su1(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+                if (opc == 0x0CU) { /* SHA256SU0.32 Qd, Qm */
+                    a64_emit_ldr_q_ctx(b, 0U, qd);
+                    a64_emit_ldr_q_ctx(b, 1U, qm);
+                    a64_emit_sha256su0(b, 0U, 1U);
+                    a64_emit_str_q_ctx(b, 0U, qd);
+                    return true;
+                }
+            }
         }
 
         if (opc1 == 1U) {
+            /* ARMv8-A Crypto: SHA1H.32 Qd, Qm (size == 2, opc1 == 1, op5 == 5) */
+            if (((insn >> 24) & 1U) != 0U && size == 2U && op5 == 5U) {
+                if ((d & 1U) != 0U || (m & 1U) != 0U) {
+                    return false;
+                }
+                unsigned qd = d >> 1;
+                unsigned qm = m >> 1;
+                a64_emit_ldr_q_ctx(b, 1U, qm);
+                a64_emit_sha1h(b, 0U, 1U);
+                a64_emit_str_q_ctx(b, 0U, qd);
+                return true;
+            }
             /* Integer compare-with-zero: VCGT (0), VCGE (1), VCEQ (2), VCLE (3), VCLT (4) #0 */
             if (op5 <= 4U && size < 3U) {
                 uint32_t base = ((op5 & 1U) ? 0x2E200800U : 0x0E200800U) |
@@ -1388,6 +1461,24 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         }
 
         if (opc1 == 2U) {
+            /* ARMv8-A Crypto: SHA1SU1.32 & SHA256SU0.32 Qd, Qm (size == 2, opc1 == 2, op5 == 7) */
+            if (((insn >> 24) & 1U) != 0U && size == 2U && op5 == 7U) {
+                if ((d & 1U) != 0U || (m & 1U) != 0U) {
+                    return false;
+                }
+                unsigned qd = d >> 1;
+                unsigned qm = m >> 1;
+                a64_emit_ldr_q_ctx(b, 0U, qd);
+                a64_emit_ldr_q_ctx(b, 1U, qm);
+                if (!is_q) {
+                    a64_emit_sha1su1(b, 0U, 1U);
+                } else {
+                    a64_emit_sha256su0(b, 0U, 1U);
+                }
+                a64_emit_str_q_ctx(b, 0U, qd);
+                return true;
+            }
+
             /* VSWP (op5 == 0, size == 0) */
             if (op5 == 0U && size == 0U) {
                 if (is_q) {
@@ -1645,6 +1736,21 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 a64_emit_str_q_ctx(b, 0U, qd);
                 return true;
             }
+            /* ARMv8-A Crypto: VMULL.P64 Qd, Dn, Dm */
+            if (op == 0xEU && !u_bit && size == 2U) {
+                unsigned d_full = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+                if ((d_full & 1U) != 0U) {
+                    return false;
+                }
+                unsigned qd = d_full >> 1;
+                unsigned dn = (((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU);
+                unsigned dm = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
+                a64_emit_ldr_d_ctx(b, 1U, dn);
+                a64_emit_ldr_d_ctx(b, 2U, dm);
+                a64_emit_pmull_1q(b, 0U, 1U, 2U);
+                a64_emit_str_q_ctx(b, 0U, qd);
+                return true;
+            }
             /* Long 3-register different length: Qd, Dn, Dm */
             uint32_t dl_op = 0U;
             bool dl_acc = false;
@@ -1811,6 +1917,46 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
         if ((insn & 0x00800000U) != 0U) {
             return false;
+        }
+
+        /* ARMv8-A 3-register Crypto: SHA1C/P/M/SU0 & SHA256H/H2/SU1 (op == 0xC, !b4) */
+        if (op == 0xCU && !b4) {
+            unsigned d_full = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+            unsigned n_full = (((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU);
+            unsigned m_full = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
+            if ((d_full & 1U) != 0U || (n_full & 1U) != 0U || (m_full & 1U) != 0U) {
+                return false;
+            }
+            if (u_bit && size == 3U) {
+                return false;
+            }
+            unsigned qd = d_full >> 1;
+            unsigned qn = n_full >> 1;
+            unsigned qm = m_full >> 1;
+            a64_emit_ldr_q_ctx(b, 0U, qd);
+            a64_emit_ldr_q_ctx(b, 1U, qn);
+            a64_emit_ldr_q_ctx(b, 2U, qm);
+            if (!u_bit) {
+                if (size == 0U) {
+                    a64_emit_sha1c(b, 0U, 1U, 2U);
+                } else if (size == 1U) {
+                    a64_emit_sha1p(b, 0U, 1U, 2U);
+                } else if (size == 2U) {
+                    a64_emit_sha1m(b, 0U, 1U, 2U);
+                } else {
+                    a64_emit_sha1su0(b, 0U, 1U, 2U);
+                }
+            } else {
+                if (size == 0U) {
+                    a64_emit_sha256h(b, 0U, 1U, 2U);
+                } else if (size == 1U) {
+                    a64_emit_sha256h2(b, 0U, 1U, 2U);
+                } else {
+                    a64_emit_sha256su1(b, 0U, 1U, 2U);
+                }
+            }
+            a64_emit_str_q_ctx(b, 0U, qd);
+            return true;
         }
 
         uint32_t a64_op = 0U;

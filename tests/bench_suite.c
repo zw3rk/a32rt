@@ -136,7 +136,7 @@ static inline int64_t sys3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2)
 
 static void get_monotonic_time(struct bench_timespec64 *ts)
 {
-    sys2(228U /* SYS_clock_gettime */, 1U /* CLOCK_MONOTONIC */, (uintptr_t)ts);
+    sys2(228U /* SYS_clock_gettime */, 4U /* CLOCK_MONOTONIC_RAW */, (uintptr_t)ts);
 }
 
 static int32_t do_getpid(void)
@@ -442,91 +442,105 @@ static uint16_t crc16_update(uint16_t crc, uint8_t byte)
 static int bench_coremark(uint32_t *out_us)
 {
     const uint32_t iters = 2000U;
-    struct bench_timespec64 t0, t1;
-    get_monotonic_time(&t0);
-
+    uint32_t min_us = 0xFFFFFFFFU;
     uint16_t crc = 0xFFFFU;
-    for (uint32_t it = 0U; it < iters; it++) {
-        int32_t A[4][4];
-        int32_t B[4][4];
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                A[i][j] = (int32_t)((it * 17U + (uint32_t)i * 5U + (uint32_t)j) & 0xFFU);
-                B[i][j] = (int32_t)((it * 13U + (uint32_t)j * 7U + (uint32_t)i) & 0xFFU);
-            }
-        }
-        uint32_t c_sum = 0U;
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                int32_t acc = 0;
-                for (int k = 0; k < 4; k++) {
-                    acc += A[i][k] * B[k][j];
-                }
-                c_sum += (uint32_t)acc;
-            }
-        }
+    bool all_ok = true;
 
-        list_node_t nodes[16];
-        for (uint32_t k = 0U; k < 16U; k++) {
-            nodes[k].next = (k + 1U < 16U) ? &nodes[k + 1U] : NULL;
-            nodes[k].val  = (it * 31U + k * 19U + 7U) & 0xFFU;
-        }
-        for (int pass = 0; pass < 16; pass++) {
-            list_node_t *curr = &nodes[0];
-            while (curr != NULL && curr->next != NULL) {
-                if (curr->val > curr->next->val) {
-                    uint32_t tmp    = curr->val;
-                    curr->val       = curr->next->val;
-                    curr->next->val = tmp;
-                }
-                curr = curr->next;
-            }
-        }
-        uint32_t l_sum = 0U;
-        list_node_t *p = &nodes[0];
-        while (p != NULL) {
-            l_sum += p->val;
-            p = p->next;
-        }
+    for (uint32_t trial = 0U; trial < 5U; trial++) {
+        struct bench_timespec64 t0, t1;
+        get_monotonic_time(&t0);
 
-        static const char text[] = "int a = 123 + 456; /* test */ if (a > 0) a = a - 1;";
-        uint32_t tokens = 0U;
-        int state = 0;
-        for (size_t s = 0U; s < sizeof(text) - 1U; s++) {
-            char ch = text[s];
-            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
-                state = 0;
-            } else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
-                if (state != 1) {
+        crc = 0xFFFFU;
+        for (uint32_t it = 0U; it < iters; it++) {
+            int32_t A[4][4];
+            int32_t B[4][4];
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    A[i][j] = (int32_t)((it * 17U + (uint32_t)i * 5U + (uint32_t)j) & 0xFFU);
+                    B[i][j] = (int32_t)((it * 13U + (uint32_t)j * 7U + (uint32_t)i) & 0xFFU);
+                }
+            }
+            uint32_t c_sum = 0U;
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    int32_t acc = 0;
+                    for (int k = 0; k < 4; k++) {
+                        acc += A[i][k] * B[k][j];
+                    }
+                    c_sum += (uint32_t)acc;
+                }
+            }
+
+            list_node_t nodes[16];
+            for (uint32_t k = 0U; k < 16U; k++) {
+                nodes[k].next = (k + 1U < 16U) ? &nodes[k + 1U] : NULL;
+                nodes[k].val  = (it * 31U + k * 19U + 7U) & 0xFFU;
+            }
+            for (int pass = 0; pass < 16; pass++) {
+                list_node_t *curr = &nodes[0];
+                while (curr != NULL && curr->next != NULL) {
+                    if (curr->val > curr->next->val) {
+                        uint32_t tmp    = curr->val;
+                        curr->val       = curr->next->val;
+                        curr->next->val = tmp;
+                    }
+                    curr = curr->next;
+                }
+            }
+            uint32_t l_sum = 0U;
+            list_node_t *p = &nodes[0];
+            while (p != NULL) {
+                l_sum += p->val;
+                p = p->next;
+            }
+
+            static const char text[] = "int a = 123 + 456; /* test */ if (a > 0) a = a - 1;";
+            uint32_t tokens = 0U;
+            int state = 0;
+            for (size_t s = 0U; s < sizeof(text) - 1U; s++) {
+                char ch = text[s];
+                if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+                    state = 0;
+                } else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+                    if (state != 1) {
+                        tokens++;
+                        state = 1;
+                    }
+                } else if (ch >= '0' && ch <= '9') {
+                    if (state != 2) {
+                        tokens++;
+                        state = 2;
+                    }
+                } else {
                     tokens++;
-                    state = 1;
+                    state = 3;
                 }
-            } else if (ch >= '0' && ch <= '9') {
-                if (state != 2) {
-                    tokens++;
-                    state = 2;
-                }
-            } else {
-                tokens++;
-                state = 3;
             }
+
+            crc = crc16_update(crc, (uint8_t)(c_sum & 0xFFU));
+            crc = crc16_update(crc, (uint8_t)((c_sum >> 8) & 0xFFU));
+            crc = crc16_update(crc, (uint8_t)((c_sum >> 16) & 0xFFU));
+            crc = crc16_update(crc, (uint8_t)((c_sum >> 24) & 0xFFU));
+            crc = crc16_update(crc, (uint8_t)(l_sum & 0xFFU));
+            crc = crc16_update(crc, (uint8_t)((l_sum >> 8) & 0xFFU));
+            crc = crc16_update(crc, (uint8_t)(tokens & 0xFFU));
         }
 
-        crc = crc16_update(crc, (uint8_t)(c_sum & 0xFFU));
-        crc = crc16_update(crc, (uint8_t)((c_sum >> 8) & 0xFFU));
-        crc = crc16_update(crc, (uint8_t)((c_sum >> 16) & 0xFFU));
-        crc = crc16_update(crc, (uint8_t)((c_sum >> 24) & 0xFFU));
-        crc = crc16_update(crc, (uint8_t)(l_sum & 0xFFU));
-        crc = crc16_update(crc, (uint8_t)((l_sum >> 8) & 0xFFU));
-        crc = crc16_update(crc, (uint8_t)(tokens & 0xFFU));
+        get_monotonic_time(&t1);
+        if (crc != 0x41ddU) {
+            all_ok = false;
+        }
+        if (trial >= 1U) {
+            uint32_t us = elapsed_us_between(&t0, &t1);
+            if (us < min_us) {
+                min_us = us;
+            }
+        }
     }
 
-    get_monotonic_time(&t1);
-    uint32_t us = elapsed_us_between(&t0, &t1);
-    *out_us = us;
-    bool ok = (crc == 0x41ddU);
-    report_bench("coremark", iters, us, (uint32_t)crc, ok);
-    return ok ? 0 : 1;
+    *out_us = min_us;
+    report_bench("coremark", iters, min_us, (uint32_t)crc, all_ok);
+    return all_ok ? 0 : 1;
 }
 
 /* ========================================================================= */
@@ -557,35 +571,49 @@ static inline uint32_t rotl32(uint32_t x, unsigned n)
 static int bench_chacha20(uint32_t *out_us)
 {
     const uint32_t blocks = 8000U;
-    struct bench_timespec64 t0, t1;
-    get_monotonic_time(&t0);
-
+    uint32_t min_us = 0xFFFFFFFFU;
     uint32_t acc = 0U;
-    for (uint32_t blk = 0U; blk < blocks; blk++) {
-        uint32_t x0  = 0x61707865U, x1  = 0x3320646eU, x2  = 0x79622d32U, x3  = 0x6b206574U;
-        uint32_t x4  = 0x03020100U, x5  = 0x07060504U, x6  = 0x0b0a0908U, x7  = 0x0f0e0d0cU;
-        uint32_t x8  = 0x13121110U, x9  = 0x17161514U, x10 = 0x1b1a1918U, x11 = 0x1f1e1d1cU;
-        uint32_t x12 = blk ^ acc,   x13 = 0x00000000U, x14 = 0x4a000000U, x15 = 0x00000000U;
+    bool all_ok = true;
 
-        for (int r = 0; r < 10; r++) {
-            CHACHA_QR(x0, x4,  x8, x12);
-            CHACHA_QR(x1, x5,  x9, x13);
-            CHACHA_QR(x2, x6, x10, x14);
-            CHACHA_QR(x3, x7, x11, x15);
-            CHACHA_QR(x0, x5, x10, x15);
-            CHACHA_QR(x1, x6, x11, x12);
-            CHACHA_QR(x2, x7,  x8, x13);
-            CHACHA_QR(x3, x4,  x9, x14);
+    for (uint32_t trial = 0U; trial < 5U; trial++) {
+        struct bench_timespec64 t0, t1;
+        get_monotonic_time(&t0);
+
+        acc = 0U;
+        for (uint32_t blk = 0U; blk < blocks; blk++) {
+            uint32_t x0  = 0x61707865U, x1  = 0x3320646eU, x2  = 0x79622d32U, x3  = 0x6b206574U;
+            uint32_t x4  = 0x03020100U, x5  = 0x07060504U, x6  = 0x0b0a0908U, x7  = 0x0f0e0d0cU;
+            uint32_t x8  = 0x13121110U, x9  = 0x17161514U, x10 = 0x1b1a1918U, x11 = 0x1f1e1d1cU;
+            uint32_t x12 = blk ^ acc,   x13 = 0x00000000U, x14 = 0x4a000000U, x15 = 0x00000000U;
+
+            for (int r = 0; r < 10; r++) {
+                CHACHA_QR(x0, x4,  x8, x12);
+                CHACHA_QR(x1, x5,  x9, x13);
+                CHACHA_QR(x2, x6, x10, x14);
+                CHACHA_QR(x3, x7, x11, x15);
+                CHACHA_QR(x0, x5, x10, x15);
+                CHACHA_QR(x1, x6, x11, x12);
+                CHACHA_QR(x2, x7,  x8, x13);
+                CHACHA_QR(x3, x4,  x9, x14);
+            }
+            acc ^= (x0 + x4 + x8 + x12) ^ (x3 + x7 + x11 + x15);
         }
-        acc ^= (x0 + x4 + x8 + x12) ^ (x3 + x7 + x11 + x15);
+
+        get_monotonic_time(&t1);
+        if (acc != 0x065fe64fU) {
+            all_ok = false;
+        }
+        if (trial >= 1U) {
+            uint32_t us = elapsed_us_between(&t0, &t1);
+            if (us < min_us) {
+                min_us = us;
+            }
+        }
     }
 
-    get_monotonic_time(&t1);
-    uint32_t us = elapsed_us_between(&t0, &t1);
-    *out_us = us;
-    bool ok = (acc == 0x065fe64fU);
-    report_bench("chacha20", blocks, us, acc, ok);
-    return ok ? 0 : 1;
+    *out_us = min_us;
+    report_bench("chacha20", blocks, min_us, acc, all_ok);
+    return all_ok ? 0 : 1;
 }
 
 /* ========================================================================= */
@@ -599,56 +627,69 @@ static int bench_chacha20(uint32_t *out_us)
 static int bench_vfp_simd(uint32_t *out_us)
 {
     const uint32_t iters = 40000U;
-    struct bench_timespec64 t0, t1;
-    get_monotonic_time(&t0);
+    uint32_t min_us = 0xFFFFFFFFU;
+    uint32_t chk = 0U;
+    bool all_ok = true;
 
-    float  mat_a[16] = {
-        1.25f, 0.50f, -0.75f, 2.00f,
-        0.25f, 1.50f,  0.50f, -1.00f,
-       -0.50f, 0.75f,  1.25f, 0.25f,
-        1.00f, -0.25f, 0.50f, 1.75f
-    };
-    float  vec_x[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
-    double m_acc    = 0.0;
+    for (uint32_t trial = 0U; trial < 5U; trial++) {
+        struct bench_timespec64 t0, t1;
+        get_monotonic_time(&t0);
 
-    for (uint32_t it = 0U; it < iters; it++) {
-        uint32_t step = it;
-        __asm__ volatile("" : "+r"(step));
-        float bias = (float)(step & 7U) * 0.015625f;
-        float out[4];
-        for (int r = 0; r < 4; r++) {
-            out[r] = mat_a[r * 4 + 0] * vec_x[0] +
-                     mat_a[r * 4 + 1] * vec_x[1] +
-                     mat_a[r * 4 + 2] * vec_x[2] +
-                     mat_a[r * 4 + 3] * vec_x[3] + bias;
+        float  mat_a[16] = {
+            1.25f, 0.50f, -0.75f, 2.00f,
+            0.25f, 1.50f,  0.50f, -1.00f,
+           -0.50f, 0.75f,  1.25f, 0.25f,
+            1.00f, -0.25f, 0.50f, 1.75f
+        };
+        float  vec_x[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+        double m_acc    = 0.0;
+
+        for (uint32_t it = 0U; it < iters; it++) {
+            uint32_t step = it;
+            __asm__ volatile("" : "+r"(step));
+            float bias = (float)(step & 7U) * 0.015625f;
+            float out[4];
+            for (int r = 0; r < 4; r++) {
+                out[r] = mat_a[r * 4 + 0] * vec_x[0] +
+                         mat_a[r * 4 + 1] * vec_x[1] +
+                         mat_a[r * 4 + 2] * vec_x[2] +
+                         mat_a[r * 4 + 3] * vec_x[3] + bias;
+            }
+            vec_x[0] = out[0] * 0.25f;
+            vec_x[1] = out[1] * 0.25f;
+            vec_x[2] = out[2] * 0.25f;
+            vec_x[3] = out[3] * 0.25f;
+
+            /* 4-iteration FP64 Mandelbrot orbit step */
+            double cr = -0.75 + (double)(step & 15U) * 0.00390625;
+            double ci =  0.25;
+            double zr = cr, zi = ci;
+            for (int k = 0; k < 4; k++) {
+                double zr2 = zr * zr - zi * zi + cr;
+                double zi2 = 2.0 * zr * zi + ci;
+                zr = zr2;
+                zi = zi2;
+            }
+            m_acc += zr + zi;
         }
-        vec_x[0] = out[0] * 0.25f;
-        vec_x[1] = out[1] * 0.25f;
-        vec_x[2] = out[2] * 0.25f;
-        vec_x[3] = out[3] * 0.25f;
 
-        /* 4-iteration FP64 Mandelbrot orbit step */
-        double cr = -0.75 + (double)(step & 15U) * 0.00390625;
-        double ci =  0.25;
-        double zr = cr, zi = ci;
-        for (int k = 0; k < 4; k++) {
-            double zr2 = zr * zr - zi * zi + cr;
-            double zi2 = 2.0 * zr * zi + ci;
-            zr = zr2;
-            zi = zi2;
+        get_monotonic_time(&t1);
+        chk = (uint32_t)(int32_t)(m_acc * 16.0) ^
+              (uint32_t)(int32_t)(vec_x[0] * 1024.0f);
+        if (chk != 0xfffdaf18U) {
+            all_ok = false;
         }
-        m_acc += zr + zi;
+        if (trial >= 1U) {
+            uint32_t us = elapsed_us_between(&t0, &t1);
+            if (us < min_us) {
+                min_us = us;
+            }
+        }
     }
 
-    get_monotonic_time(&t1);
-    uint32_t us = elapsed_us_between(&t0, &t1);
-    *out_us = us;
-
-    uint32_t chk = (uint32_t)(int32_t)(m_acc * 16.0) ^
-                   (uint32_t)(int32_t)(vec_x[0] * 1024.0f);
-    bool ok = (chk == 0xfffdaf18U);
-    report_bench("vfp_simd", iters, us, chk, ok);
-    return ok ? 0 : 1;
+    *out_us = min_us;
+    report_bench("vfp_simd", iters, min_us, chk, all_ok);
+    return all_ok ? 0 : 1;
 }
 
 /* ========================================================================= */
@@ -689,26 +730,40 @@ static uint32_t __attribute__((noinline)) vop_mul(uint32_t x, uint32_t y)
 static int bench_calls_ibtc(uint32_t *out_us)
 {
     const uint32_t vtable_iters = 200000U;
-    struct bench_timespec64 t0, t1;
-    get_monotonic_time(&t0);
+    uint32_t min_us = 0xFFFFFFFFU;
+    uint32_t state = 0U;
+    bool all_ok = true;
 
-    uint32_t f28 = fib_rec(28U); /* 317811 (1,028,457 recursive calls) */
+    for (uint32_t trial = 0U; trial < 5U; trial++) {
+        struct bench_timespec64 t0, t1;
+        get_monotonic_time(&t0);
 
-    vop_fn table[4] = { vop_add, vop_xor, vop_rol, vop_mul };
-    __asm__ volatile("" : "+m"(table));
+        uint32_t f28 = fib_rec(28U); /* 317811 (1,028,457 recursive calls) */
 
-    uint32_t state = f28;
-    for (uint32_t i = 0U; i < vtable_iters; i++) {
-        vop_fn fn = table[(state ^ i) & 3U];
-        state = fn(state, i);
+        vop_fn table[4] = { vop_add, vop_xor, vop_rol, vop_mul };
+        __asm__ volatile("" : "+m"(table));
+
+        state = f28;
+        for (uint32_t i = 0U; i < vtable_iters; i++) {
+            vop_fn fn = table[(state ^ i) & 3U];
+            state = fn(state, i);
+        }
+
+        get_monotonic_time(&t1);
+        if (f28 != 317811U || state != 0xed9c5a0aU) {
+            all_ok = false;
+        }
+        if (trial >= 1U) {
+            uint32_t us = elapsed_us_between(&t0, &t1);
+            if (us < min_us) {
+                min_us = us;
+            }
+        }
     }
 
-    get_monotonic_time(&t1);
-    uint32_t us = elapsed_us_between(&t0, &t1);
-    *out_us = us;
-    bool ok = (f28 == 317811U && state == 0xed9c5a0aU);
-    report_bench("calls_ibtc", 1028457U + vtable_iters, us, state, ok);
-    return ok ? 0 : 1;
+    *out_us = min_us;
+    report_bench("calls_ibtc", 1028457U + vtable_iters, min_us, state, all_ok);
+    return all_ok ? 0 : 1;
 }
 
 /* ========================================================================= */
@@ -718,24 +773,38 @@ static int bench_calls_ibtc(uint32_t *out_us)
 static int bench_syscalls(uint32_t *out_us)
 {
     const uint32_t iters = 4000U;
-    struct bench_timespec64 t0, t1;
-    get_monotonic_time(&t0);
-
+    uint32_t min_us = 0xFFFFFFFFU;
     uint32_t acc = 0U;
-    int32_t first_pid = do_getpid();
-    for (uint32_t i = 0U; i < iters; i++) {
-        int32_t p = do_getpid();
-        if (p == first_pid) {
-            acc++;
+    bool all_ok = true;
+
+    for (uint32_t trial = 0U; trial < 5U; trial++) {
+        struct bench_timespec64 t0, t1;
+        get_monotonic_time(&t0);
+
+        acc = 0U;
+        int32_t first_pid = do_getpid();
+        for (uint32_t i = 0U; i < iters; i++) {
+            int32_t p = do_getpid();
+            if (p == first_pid) {
+                acc++;
+            }
+        }
+
+        get_monotonic_time(&t1);
+        if (acc != iters || first_pid <= 0) {
+            all_ok = false;
+        }
+        if (trial >= 1U) {
+            uint32_t us = elapsed_us_between(&t0, &t1);
+            if (us < min_us) {
+                min_us = us;
+            }
         }
     }
 
-    get_monotonic_time(&t1);
-    uint32_t us = elapsed_us_between(&t0, &t1);
-    *out_us = us;
-    bool ok = (acc == iters && first_pid > 0);
-    report_bench("syscalls", iters, us, acc, ok);
-    return ok ? 0 : 1;
+    *out_us = min_us;
+    report_bench("syscalls", iters, min_us, acc, all_ok);
+    return all_ok ? 0 : 1;
 }
 
 void __attribute__((noreturn)) _start_c(void)

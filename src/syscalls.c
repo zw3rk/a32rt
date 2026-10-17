@@ -392,6 +392,38 @@ struct flock64_arm {
     int32_t  l_pid;
 };
 
+typedef struct arm_ifreq {
+    char    ifr_name[16];
+    uint8_t ifr_ifru[16];
+} arm_ifreq_t;
+
+_Static_assert(sizeof(arm_ifreq_t) == 32, "arm_ifreq_t must be 32 bytes");
+
+typedef struct a64_ifreq {
+    char     ifr_name[16];
+    union {
+        uint8_t  raw[24];
+        uint64_t align64;
+    } ifr_ifru;
+} a64_ifreq_t;
+
+_Static_assert(sizeof(a64_ifreq_t) == 40, "a64_ifreq_t must be 40 bytes");
+
+typedef struct arm_ifconf {
+    int32_t  ifc_len;
+    uint32_t ifc_buf;
+} arm_ifconf_t;
+
+_Static_assert(sizeof(arm_ifconf_t) == 8, "arm_ifconf_t must be 8 bytes");
+
+typedef struct a64_ifconf {
+    int   ifc_len;
+    int   __pad;
+    void *ifc_buf;
+} a64_ifconf_t;
+
+_Static_assert(sizeof(a64_ifconf_t) == 16, "a64_ifconf_t must be 16 bytes");
+
 #define MAX_DIR_COOKIES 4096U
 #define DIR_COOKIE_BASE 0x70000000LL
 
@@ -828,7 +860,56 @@ static int create_proc_cmdline(const a32_ctx_t *ctx)
 
 static int create_proc_auxv(const a32_ctx_t *ctx)
 {
-    return create_anon_file("proc_auxv", ctx->auxv_data, ctx->auxv_bytes);
+    uint32_t auxv_copy[64];
+    size_t bytes = ctx->auxv_bytes;
+    if (bytes > sizeof(auxv_copy)) {
+        bytes = sizeof(auxv_copy);
+    }
+    memcpy(auxv_copy, ctx->auxv_data, bytes);
+    size_t words = bytes / sizeof(uint32_t);
+    for (size_t i = 0U; i + 1U < words; i += 2U) {
+        if (auxv_copy[i] == 0U /* AT_NULL */) {
+            break;
+        }
+        if (auxv_copy[i] == 26U /* AT_HWCAP2 */) {
+            auxv_copy[i + 1U] = 0x1FU;
+        }
+    }
+    return create_anon_file("proc_auxv", auxv_copy, bytes);
+}
+
+static int create_proc_cpuinfo(void)
+{
+    static const char cpuinfo_str[] =
+        "processor\t: 0\n"
+        "model name\t: ARMv8 Processor rev 0 (v8l)\n"
+        "BogoMIPS\t: 48.00\n"
+        "Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae evtstrm aes pmull sha1 sha2 crc32\n"
+        "CPU implementer\t: 0x41\n"
+        "CPU architecture: 8\n"
+        "CPU variant\t: 0x0\n"
+        "CPU part\t: 0xd08\n"
+        "CPU revision\t: 0\n\n";
+    return create_anon_file("proc_cpuinfo", cpuinfo_str, sizeof(cpuinfo_str) - 1U);
+}
+
+static bool match_proc_cpuinfo(const char *path)
+{
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    const char *p = path;
+    while (*p == '/') {
+        p++;
+    }
+    if (strncmp(p, "proc/", 5) != 0) {
+        return false;
+    }
+    p += 5;
+    while (*p == '/') {
+        p++;
+    }
+    return strcmp(p, "cpuinfo") == 0;
 }
 
 static bool match_proc_self(const char *path, const char *leaf)
@@ -1148,7 +1229,7 @@ static void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask, uint6
         uint32_t oldmask32 = (uint32_t)saved_sig_mask;
         memcpy(fp + 156U, &oldmask32, sizeof(oldmask32));
         memcpy(fp + 232U, &saved_sig_mask, sizeof(saved_sig_mask));
-        memcpy(fp + 464U, &saved_sig_mask, sizeof(saved_sig_mask));
+        memcpy(fp + 856U, &saved_sig_mask, sizeof(saved_sig_mask));
     } else {
         ctx->sig_mask = saved_sig_mask;
     }
@@ -1283,6 +1364,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)create_proc_auxv(ctx);
             break;
         }
+        if (match_proc_cpuinfo(guest_path) || match_proc_cpuinfo(resolved)) {
+            ctx->regs[0] = (uint32_t)create_proc_cpuinfo();
+            break;
+        }
         if (match_proc_self(guest_path, "exe") || match_proc_self(resolved, "exe")) {
             const char *ep = get_guest_exe_path(ctx);
             if (a32_resolve_guest_path(ctx, ep, resolved, sizeof(resolved)) < 0) {
@@ -1314,6 +1399,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         }
         if (match_proc_self(guest_path, "auxv") || match_proc_self(resolved, "auxv")) {
             ctx->regs[0] = (uint32_t)create_proc_auxv(ctx);
+            break;
+        }
+        if (match_proc_cpuinfo(guest_path) || match_proc_cpuinfo(resolved)) {
+            ctx->regs[0] = (uint32_t)create_proc_cpuinfo();
             break;
         }
         if (match_proc_self(guest_path, "exe") || match_proc_self(resolved, "exe")) {
@@ -1406,8 +1495,144 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_ioctl: {
+        uint32_t cmd = a1;
+        /* Block device ioctls */
+        if (cmd == 0x1260U /* BLKGETSIZE */) {
+            if (!a32_guest_range_ok(ctx, a2, 4U, 2U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            unsigned long sz64 = 0UL;
+            int r = ioctl((int)a0, (int)0x1260U, &sz64);
+            if (r == 0) {
+                uint32_t sz32 = (uint32_t)sz64;
+                memcpy(a32_guest_ptr(ctx, a2), &sz32, 4U);
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
+        }
+        if (cmd == 0x1268U /* BLKSSZGET */ || cmd == 0x127bU /* BLKPBSZGET */) {
+            if (!a32_guest_range_ok(ctx, a2, 4U, 2U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            int val = 0;
+            int r = ioctl((int)a0, (int)cmd, &val);
+            if (r == 0) {
+                memcpy(a32_guest_ptr(ctx, a2), &val, 4U);
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
+        }
+        if (cmd == 0x80041272U /* BLKGETSIZE64 (arm32) */ ||
+            cmd == 0x80081272U /* BLKGETSIZE64 (aarch64) */) {
+            if (!a32_guest_range_ok(ctx, a2, 8U, 2U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            uint64_t bsz64 = 0ULL;
+            int r = ioctl((int)a0, (int)0x80081272U, &bsz64);
+            if (r == 0) {
+                memcpy(a32_guest_ptr(ctx, a2), &bsz64, 8U);
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
+        }
+        /* Network interface ioctls: struct ifreq (32B arm32 <-> 40B aarch64) */
+        if (cmd == 0x8910U /* SIOCGIFNAME */ ||
+            cmd == 0x8913U /* SIOCGIFFLAGS */ ||
+            cmd == 0x8915U /* SIOCGIFADDR */ ||
+            cmd == 0x8917U /* SIOCGIFDSTADDR */ ||
+            cmd == 0x8919U /* SIOCGIFBRDADDR */ ||
+            cmd == 0x891bU /* SIOCGIFNETMASK */ ||
+            cmd == 0x891dU /* SIOCGIFMETRIC */ ||
+            cmd == 0x8921U /* SIOCGIFMTU */ ||
+            cmd == 0x8927U /* SIOCGIFHWADDR */ ||
+            cmd == 0x8933U /* SIOCGIFINDEX */ ||
+            cmd == 0x8942U /* SIOCGIFTXQLEN */) {
+            if (!a32_guest_range_ok(ctx, a2, (uint32_t)sizeof(arm_ifreq_t), 3U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            arm_ifreq_t ifr32;
+            memcpy(&ifr32, a32_guest_ptr(ctx, a2), sizeof(ifr32));
+            a64_ifreq_t ifr64;
+            memset(&ifr64, 0, sizeof(ifr64));
+            memcpy(ifr64.ifr_name, ifr32.ifr_name, 16U);
+            memcpy(ifr64.ifr_ifru.raw, ifr32.ifr_ifru, 16U);
+            int r = ioctl((int)a0, (int)cmd, &ifr64);
+            if (r == 0) {
+                memcpy(ifr32.ifr_name, ifr64.ifr_name, 16U);
+                memcpy(ifr32.ifr_ifru, ifr64.ifr_ifru.raw, 16U);
+                memcpy(a32_guest_ptr(ctx, a2), &ifr32, sizeof(ifr32));
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
+        }
+        /* Network interface list: struct ifconf (8B arm32 <-> 16B aarch64) */
+        if (cmd == 0x8912U /* SIOCGIFCONF */) {
+            if (!a32_guest_range_ok(ctx, a2, (uint32_t)sizeof(arm_ifconf_t), 3U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            arm_ifconf_t ifc32;
+            memcpy(&ifc32, a32_guest_ptr(ctx, a2), sizeof(ifc32));
+            if (ifc32.ifc_buf == 0U) {
+                a64_ifconf_t ifc64;
+                memset(&ifc64, 0, sizeof(ifc64));
+                int r = ioctl((int)a0, (int)0x8912U, &ifc64);
+                if (r == 0) {
+                    int n = ifc64.ifc_len / (int)sizeof(a64_ifreq_t);
+                    ifc32.ifc_len = n * (int32_t)sizeof(arm_ifreq_t);
+                    memcpy(a32_guest_ptr(ctx, a2), &ifc32, sizeof(ifc32));
+                }
+                ctx->regs[0] = host_ret(r);
+                break;
+            }
+            if (ifc32.ifc_len < 0) {
+                ctx->regs[0] = (uint32_t)(-EINVAL);
+                break;
+            }
+            if (ifc32.ifc_len > 0 &&
+                !a32_guest_range_ok(ctx, ifc32.ifc_buf, (uint32_t)ifc32.ifc_len, 2U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            int max_entries = ifc32.ifc_len / (int)sizeof(arm_ifreq_t);
+            if (max_entries > 64) {
+                max_entries = 64;
+            }
+            a64_ifreq_t buf64[64];
+            memset(buf64, 0, sizeof(buf64));
+            a64_ifconf_t ifc64;
+            memset(&ifc64, 0, sizeof(ifc64));
+            ifc64.ifc_len = max_entries * (int)sizeof(a64_ifreq_t);
+            ifc64.ifc_buf = (max_entries > 0) ? (void *)buf64 : NULL;
+            int r = (max_entries > 0) ? ioctl((int)a0, (int)0x8912U, &ifc64) : 0;
+            if (r == 0) {
+                int n = (max_entries > 0) ? (ifc64.ifc_len / (int)sizeof(a64_ifreq_t)) : 0;
+                uint8_t *dst = (uint8_t *)a32_guest_ptr(ctx, ifc32.ifc_buf);
+                for (int i = 0; i < n; i++) {
+                    arm_ifreq_t entry32;
+                    memcpy(entry32.ifr_name, buf64[i].ifr_name, 16U);
+                    memcpy(entry32.ifr_ifru, buf64[i].ifr_ifru.raw, 16U);
+                    memcpy(dst + (size_t)i * sizeof(arm_ifreq_t), &entry32, sizeof(arm_ifreq_t));
+                }
+                ifc32.ifc_len = n * (int32_t)sizeof(arm_ifreq_t);
+                memcpy(a32_guest_ptr(ctx, a2), &ifc32, sizeof(ifc32));
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
+        }
+        if (cmd != 0x5450U /* FIONCLEX */ && cmd != 0x5451U /* FIOCLEX */ &&
+            cmd != 0x540EU /* TIOCSCTTY */) {
+            if (a2 != 0U && !a32_guest_range_ok(ctx, a2, 1U, 1U)) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+        }
         void *arg_ptr = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
-        ctx->regs[0] = host_ret(ioctl((int)a0, (unsigned long)a1, arg_ptr));
+        ctx->regs[0] = host_ret(ioctl((int)a0, (int)a1, arg_ptr));
         break;
     }
 

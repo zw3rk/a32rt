@@ -136,6 +136,7 @@ void a64_emit_smaddl_x(a64_buf_t *b, unsigned rd_x, unsigned rn_w, unsigned rm_w
 void a64_emit_smsubl_x(a64_buf_t *b, unsigned rd_x, unsigned rn_w, unsigned rm_w, unsigned ra_x);
 void a64_emit_udiv_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm);
 void a64_emit_sdiv_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm);
+void a64_emit_crc32_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned sz, unsigned c_bit);
 
 /* Conditional select & flags */
 void a64_emit_csel_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
@@ -229,6 +230,23 @@ void a64_emit_scvtf_w_to_s(a64_buf_t *b, unsigned vd, unsigned rn_w);
 void a64_emit_ucvtf_w_to_s(a64_buf_t *b, unsigned vd, unsigned rn_w);
 void a64_emit_scvtf_w_to_d(a64_buf_t *b, unsigned vd, unsigned rn_w);
 void a64_emit_ucvtf_w_to_d(a64_buf_t *b, unsigned vd, unsigned rn_w);
+
+/* ARMv8-A Crypto extensions (AES, PMULL, SHA1, SHA256) */
+void a64_emit_aese(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_aesd(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_aesmc(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_aesimc(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_pmull_1q(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha1c(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha1p(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha1m(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha1su0(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha1h(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_sha1su1(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_sha256h(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha256h2(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
+void a64_emit_sha256su0(a64_buf_t *b, unsigned vd, unsigned vn);
+void a64_emit_sha256su1(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
 
 /* Exclusives & barriers */
 void a64_emit_ldxr_b(a64_buf_t *b, unsigned rt_w, unsigned rn_x);

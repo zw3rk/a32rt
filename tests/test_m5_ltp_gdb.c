@@ -2335,6 +2335,141 @@ static int test23_r10_efault_high_unmapped_and_setresuid_rt34(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 24: Extended ioctl (SIOCGIF*, SIOCGIFCONF, BLK*) & AT_HWCAP2 in auxv
+ * -------------------------------------------------------------------------- */
+struct test_ifreq32 {
+    char ifr_name[16];
+    union {
+        int32_t  ivalue;
+        int16_t  flags;
+        uint8_t  raw[16];
+    } ifr_u;
+};
+
+struct test_ifconf32 {
+    int32_t  ifc_len;
+    uint32_t ifc_req;
+};
+
+static int test24_ioctl_siocgif_and_auxv_hwcap2(void)
+{
+    int32_t sock = sys3(281U /* socket */, 2U /* AF_INET */, 2U /* SOCK_DGRAM */, 0U);
+    if (sock < 0) {
+        return 230;
+    }
+
+    /* 1. SIOCGIFINDEX (0x8933) on "lo" */
+    struct test_ifreq32 ifr;
+    for (uint32_t i = 0U; i < 16U; i++) {
+        ifr.ifr_name[i] = '\0';
+        ifr.ifr_u.raw[i] = 0U;
+    }
+    ifr.ifr_name[0] = 'l';
+    ifr.ifr_name[1] = 'o';
+
+    int32_t rc = sys3(54U /* ioctl */, (uint32_t)sock, 0x8933U /* SIOCGIFINDEX */,
+                      (uint32_t)(uintptr_t)&ifr);
+    if (rc != -25 /* -ENOTTY on lightweight hypervisors without netif ioctls */) {
+        if (rc != 0 || ifr.ifr_u.ivalue < 1) {
+            sys1(6U /* close */, (uint32_t)sock);
+            return 231;
+        }
+        int32_t lo_index = ifr.ifr_u.ivalue;
+
+        /* 2. SIOCGIFNAME (0x8910) from lo_index */
+        for (uint32_t i = 0U; i < 16U; i++) {
+            ifr.ifr_name[i] = '\0';
+            ifr.ifr_u.raw[i] = 0U;
+        }
+        ifr.ifr_u.ivalue = lo_index;
+        rc = sys3(54U /* ioctl */, (uint32_t)sock, 0x8910U /* SIOCGIFNAME */,
+                  (uint32_t)(uintptr_t)&ifr);
+        if (rc != 0 || ifr.ifr_name[0] != 'l' || ifr.ifr_name[1] != 'o' ||
+            ifr.ifr_name[2] != '\0') {
+            sys1(6U /* close */, (uint32_t)sock);
+            return 232;
+        }
+
+        /* 3. SIOCGIFFLAGS (0x8913) on "lo" (IFF_LOOPBACK == 0x8) */
+        for (uint32_t i = 0U; i < 16U; i++) {
+            ifr.ifr_u.raw[i] = 0U;
+        }
+        rc = sys3(54U /* ioctl */, (uint32_t)sock, 0x8913U /* SIOCGIFFLAGS */,
+                  (uint32_t)(uintptr_t)&ifr);
+        if (rc != 0 || ((uint16_t)ifr.ifr_u.flags & 0x8U) == 0U) {
+            sys1(6U /* close */, (uint32_t)sock);
+            return 233;
+        }
+
+        /* 4. SIOCGIFCONF (0x8912) with 32-byte arm_ifreq_t entries */
+        struct test_ifreq32 reqs[8];
+        for (uint32_t k = 0U; k < 8U; k++) {
+            for (uint32_t i = 0U; i < 16U; i++) {
+                reqs[k].ifr_name[i] = '\0';
+                reqs[k].ifr_u.raw[i] = 0U;
+            }
+        }
+        struct test_ifconf32 ifc;
+        ifc.ifc_len = (int32_t)sizeof(reqs);
+        ifc.ifc_req = (uint32_t)(uintptr_t)reqs;
+        rc = sys3(54U /* ioctl */, (uint32_t)sock, 0x8912U /* SIOCGIFCONF */,
+                  (uint32_t)(uintptr_t)&ifc);
+        if (rc != 0 || ifc.ifc_len < 0 || ((uint32_t)ifc.ifc_len % 32U) != 0U) {
+            sys1(6U /* close */, (uint32_t)sock);
+            return 234;
+        }
+        if (ifc.ifc_len >= 32 && reqs[0].ifr_name[0] == '\0') {
+            sys1(6U /* close */, (uint32_t)sock);
+            return 235;
+        }
+    }
+
+    /* 5. Negative EFAULT checks for ioctl device families */
+    int32_t ef1 = sys3(54U /* ioctl */, (uint32_t)sock, 0x8933U /* SIOCGIFINDEX */, 0U);
+    int32_t ef2 = sys3(54U /* ioctl */, (uint32_t)sock, 0x8912U /* SIOCGIFCONF */, 0U);
+    int32_t ef3 = sys3(54U /* ioctl */, (uint32_t)sock, 0x1260U /* BLKGETSIZE */, 0U);
+    int32_t ef4 = sys3(54U /* ioctl */, (uint32_t)sock, 0x80041272U /* BLKGETSIZE64 */, 0U);
+    sys1(6U /* close */, (uint32_t)sock);
+    if (ef1 != -14 || ef2 != -14 || ef3 != -14 || ef4 != -14) {
+        return 236;
+    }
+
+    /* 6. Verify AT_HWCAP2 (tag 26) == 0x1f in /proc/self/auxv */
+    static const char auxv_path[] = "/proc/self/auxv";
+    int32_t afd = sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */,
+                       (uint32_t)(uintptr_t)auxv_path, 0U /* O_RDONLY */, 0U);
+    if (afd < 0) {
+        return 237;
+    }
+    uint32_t auxv_buf[64];
+    int32_t nread = sys3(3U /* read */, (uint32_t)afd,
+                         (uint32_t)(uintptr_t)auxv_buf, (uint32_t)sizeof(auxv_buf));
+    sys1(6U /* close */, (uint32_t)afd);
+    if (nread < 16 || ((uint32_t)nread % 8U) != 0U) {
+        return 238;
+    }
+    uint32_t hwcap2_val = 0U;
+    uint32_t found_hwcap2 = 0U;
+    uint32_t count = (uint32_t)nread / 8U;
+    for (uint32_t i = 0U; i < count; i++) {
+        uint32_t tag = auxv_buf[i * 2U];
+        uint32_t val = auxv_buf[i * 2U + 1U];
+        if (tag == 0U /* AT_NULL */) {
+            break;
+        }
+        if (tag == 26U /* AT_HWCAP2 */) {
+            hwcap2_val = val;
+            found_hwcap2 = 1U;
+        }
+    }
+    if (found_hwcap2 != 1U || (hwcap2_val & 0x1FU) != 0x1FU) {
+        return 239;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -2418,6 +2553,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test23_r10_efault_high_unmapped_and_setresuid_rt34();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test24_ioctl_siocgif_and_auxv_hwcap2();
     if (rc != 0) {
         return rc;
     }

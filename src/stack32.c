@@ -54,6 +54,13 @@
 #define ARM_HWCAP_VFPD32    (1U << 19)
 #define ARM_HWCAP_LPAE      (1U << 20)
 
+/* ARMv8 AArch32 HWCAP2 bits */
+#define ARM_HWCAP2_AES      (1U << 0)
+#define ARM_HWCAP2_PMULL    (1U << 1)
+#define ARM_HWCAP2_SHA1     (1U << 2)
+#define ARM_HWCAP2_SHA2     (1U << 3)
+#define ARM_HWCAP2_CRC32    (1U << 4)
+
 static uint32_t push_bytes(a32_ctx_t *ctx, uint32_t *sp, const void *data, size_t len)
 {
     if (*sp < ctx->stack_base || len > (size_t)(*sp - ctx->stack_base)) {
@@ -150,6 +157,8 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
                      ARM_HWCAP_VFPv3 | ARM_HWCAP_TLS | ARM_HWCAP_VFPv4 |
                      ARM_HWCAP_IDIVA | ARM_HWCAP_IDIVT | ARM_HWCAP_VFPD32 |
                      ARM_HWCAP_LPAE;
+    uint32_t hwcap2 = ARM_HWCAP2_AES | ARM_HWCAP2_PMULL | ARM_HWCAP2_SHA1 |
+                      ARM_HWCAP2_SHA2 | ARM_HWCAP2_CRC32;
     uint32_t auxv[40];
     size_t   aux_idx = 0;
 #define PUSH_AUX(k, v) do { auxv[aux_idx++] = (k); auxv[aux_idx++] = (v); } while (0)
@@ -169,7 +178,7 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     PUSH_AUX(AT_CLKTCK,   100U);
     PUSH_AUX(AT_SECURE,   0U);
     PUSH_AUX(AT_RANDOM,   at_random_va);
-    PUSH_AUX(AT_HWCAP2,   0U);
+    PUSH_AUX(AT_HWCAP2,   hwcap2);
     PUSH_AUX(AT_EXECFN,   at_execfn_va);
     PUSH_AUX(AT_NULL,     0U);
 #undef PUSH_AUX

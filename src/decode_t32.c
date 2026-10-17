@@ -1639,6 +1639,17 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             a64_emit_clz_w(b, rd, rm);
             return true;
         }
+        if ((hw1 & 0xFFE0U) == 0xFAC0U && (hw2 & 0xF0C0U) == 0xF080U) {
+            /* CRC32{B,H,W} / CRC32C{B,H,W} Rd, Rn, Rm */
+            unsigned c_bit = (hw1 >> 4) & 1U;
+            unsigned sz    = (hw2 >> 4) & 3U;
+            if (rd == 13U || rd == 15U || rn == 13U || rn == 15U ||
+                rm == 13U || rm == 15U || sz == 3U) {
+                return false;
+            }
+            a64_emit_crc32_w(b, rd, rn, rm, sz, c_bit);
+            return true;
+        }
         if ((hw1 & 0xFFF0U) == 0xFA90U && (hw2 & 0xF0C0U) == 0xF080U) {
             /* REV / REV16 / RBIT / REVSH */
             unsigned subop = (hw2 >> 4) & 3U;

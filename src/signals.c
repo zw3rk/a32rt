@@ -21,6 +21,8 @@
 #include <unistd.h>
 
 #define A32_SIGFRAME_MAGIC 0x53494746U /* "SIGF" */
+#define A32_VFP_MAGIC      0x56465001U /* VFP coprocessor sigframe magic */
+#define A32_FPEXC_EN       0x40000000U /* VFP FPEXC_EN bit */
 
 #define A32_SA_NOCLDSTOP 0x00000001U
 #define A32_SA_NOCLDWAIT 0x00000002U
@@ -74,17 +76,35 @@ typedef struct a32_stack {
     uint32_t ss_size;
 } a32_stack_t;
 
+/* VFP sigframe in uc_regspace: total size = 0x120 (288 bytes) */
+typedef struct a32_vfp_sigframe {
+    uint32_t magic;         /* 0x56465001U (VFP_MAGIC) */
+    uint32_t size;          /* 0x00000120U (288 bytes) */
+    uint64_t fpregs[32];    /* d0..d31 (256 bytes, from ctx->vfp_d[0..31]) */
+    uint32_t fpscr;         /* ctx->fpscr */
+    uint32_t fpexc;         /* 0x40000000U (FPEXC_EN) */
+    uint32_t fpinst;        /* 0 */
+    uint32_t fpinst2;       /* 0 */
+    uint32_t pad[2];        /* 8-byte alignment pad so sizeof == 288 == 0x120 */
+} a32_vfp_sigframe_t;
+
+_Static_assert(sizeof(a32_vfp_sigframe_t) == 0x120,
+               "a32_vfp_sigframe_t must be 288 (0x120) bytes");
+
 typedef struct a32_ucontext {
     uint32_t         uc_flags;
     uint32_t         uc_link;
     a32_stack_t      uc_stack;
     a32_sigcontext_t uc_mcontext;
     uint64_t         uc_sigmask;
-    uint32_t         _pad[32];
+    uint32_t         _pad[2];
+    _Alignas(8) uint32_t uc_regspace[128];
 } a32_ucontext_t;
 
 _Static_assert(offsetof(a32_ucontext_t, uc_mcontext.arm_r0) == 32,
                "arm_r0 must be at offset 32 from start of ucontext");
+_Static_assert(offsetof(a32_ucontext_t, uc_regspace) == 120,
+               "uc_regspace must be at offset 120 from start of ucontext");
 
 typedef struct a32_siginfo {
     int32_t  si_signo;
@@ -106,12 +126,18 @@ typedef struct a32_rt_sigframe {
     uint32_t       saved_pad;
     uint64_t       saved_mask;
     uint64_t       saved_vfp_d[32];
+    uint32_t       saved_altstack_sp;
+    uint32_t       saved_altstack_size;
+    uint32_t       saved_altstack_flags;
+    uint32_t       saved_altstack_pad;
 } a32_rt_sigframe_t;
 
 _Static_assert(offsetof(a32_rt_sigframe_t, info) == 0,
                "rt_sigframe info must be at offset 0");
 _Static_assert(offsetof(a32_rt_sigframe_t, uc) == 128,
                "rt_sigframe uc must be at offset 128");
+_Static_assert(offsetof(a32_rt_sigframe_t, saved_mask) == 856,
+               "rt_sigframe saved_mask must be at offset 856");
 
 static _Thread_local a32_ctx_t *g_tls_ctx = NULL;
 static guest_sigaction_t        g_guest_sigactions[65];
@@ -196,13 +222,13 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     if ((switched_to_altstack || on_altstack) &&
         (act->flags & A32_SA_ONSTACK) != 0U &&
         (ctx->altstack_flags & 0x80000000U) != 0U) {
-        frame->saved_pad    = 1U;
-        frame->uc._pad[0]   = ctx->altstack_sp;
-        frame->uc._pad[1]   = ctx->altstack_size;
-        frame->uc._pad[2]   = ctx->altstack_flags;
-        ctx->altstack_sp    = 0U;
-        ctx->altstack_size  = 0U;
-        ctx->altstack_flags = A32_SS_DISABLE;
+        frame->saved_pad            = 1U;
+        frame->saved_altstack_sp    = ctx->altstack_sp;
+        frame->saved_altstack_size  = ctx->altstack_size;
+        frame->saved_altstack_flags = ctx->altstack_flags;
+        ctx->altstack_sp            = 0U;
+        ctx->altstack_size          = 0U;
+        ctx->altstack_flags         = A32_SS_DISABLE;
     }
 
     frame->uc.uc_mcontext.trap_no       = 0;
@@ -227,6 +253,16 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     frame->uc.uc_mcontext.arm_cpsr      = ctx->cpsr;
     frame->uc.uc_mcontext.fault_address = ctx->fault_addr;
     frame->uc.uc_sigmask                = ctx->sig_mask;
+
+    a32_vfp_sigframe_t *vfp = (a32_vfp_sigframe_t *)(void *)frame->uc.uc_regspace;
+    vfp->magic   = A32_VFP_MAGIC;
+    vfp->size    = (uint32_t)sizeof(a32_vfp_sigframe_t);
+    memcpy(vfp->fpregs, ctx->vfp_d, sizeof(vfp->fpregs));
+    vfp->fpscr   = ctx->fpscr;
+    vfp->fpexc   = A32_FPEXC_EN;
+    vfp->fpinst  = 0U;
+    vfp->fpinst2 = 0U;
+    frame->uc.uc_regspace[sizeof(a32_vfp_sigframe_t) / sizeof(uint32_t)] = 0U;
 
     if (!(act->flags & A32_SA_NODEFER)) {
         ctx->sig_mask |= (1ULL << (sig - 1));
@@ -670,10 +706,10 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     ctx->cpsr     = sc->arm_cpsr;
     ctx->sig_mask = frame->uc.uc_sigmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     if (frame->magic == A32_SIGFRAME_MAGIC) {
-        if (frame->saved_pad == 1U && (frame->uc._pad[2] & 0x80000000U) != 0U) {
-            ctx->altstack_sp    = frame->uc._pad[0];
-            ctx->altstack_size  = frame->uc._pad[1];
-            ctx->altstack_flags = frame->uc._pad[2];
+        if (frame->saved_pad == 1U && (frame->saved_altstack_flags & 0x80000000U) != 0U) {
+            ctx->altstack_sp    = frame->saved_altstack_sp;
+            ctx->altstack_size  = frame->saved_altstack_size;
+            ctx->altstack_flags = frame->saved_altstack_flags;
         }
         ctx->fault_addr = frame->saved_fault;
         uint32_t new_pc   = sc->arm_pc & ~1U;
@@ -693,6 +729,12 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
         memcpy(ctx->vfp_d, frame->saved_vfp_d, sizeof(ctx->vfp_d));
     } else {
         ctx->itstate = 0U;
+    }
+
+    const a32_vfp_sigframe_t *vfp = (const a32_vfp_sigframe_t *)(const void *)frame->uc.uc_regspace;
+    if (vfp->magic == A32_VFP_MAGIC && vfp->size == (uint32_t)sizeof(a32_vfp_sigframe_t)) {
+        memcpy(ctx->vfp_d, vfp->fpregs, sizeof(ctx->vfp_d));
+        ctx->fpscr = vfp->fpscr;
     }
 
     if (ctx->regs[15] & 1U) {

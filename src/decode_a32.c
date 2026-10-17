@@ -1502,6 +1502,17 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             a64_emit_msr_nzcv(b, A64_TMP3);
             handled = true;
+        } else if (op1 == 0U && ((insn & 0x0F900DF0U) == 0x01000040U)) {
+            /* CRC32{B,H,W} / CRC32C{B,H,W} Rd, Rn, Rm */
+            unsigned sz    = (insn >> 21) & 3U;
+            unsigned rn    = (insn >> 16) & 0xFU;
+            unsigned rd    = (insn >> 12) & 0xFU;
+            unsigned c_bit = (insn >> 9) & 1U;
+            unsigned rm    = insn & 0xFU;
+            if (rd != 15U && rn != 15U && rm != 15U && sz != 3U) {
+                a64_emit_crc32_w(b, rd, rn, rm, sz, c_bit);
+                handled = true;
+            }
         } else if (op1 == 0U && ((insn & 0x0FF0F090U) == 0x01600080U)) {
             /* SMUL<x><y> Rd, Rm, Rs */
             unsigned rd = (insn >> 16) & 0xFU;
