@@ -228,8 +228,7 @@ static uint8_t *allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
             g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
         }
     }
-    if (g_code_used + code_bytes > A32_CODE_CACHE_SIZE ||
-        g_side_table_count + MAX_STAGE_PC_MAP > A32_SIDE_TABLE_SIZE) {
+    if (g_code_used + code_bytes > A32_CODE_CACHE_SIZE) {
         reset_cache_locked(ctx);
     }
 
@@ -451,11 +450,9 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
 
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
-        memset(ctx->ras_key, 0, sizeof(ctx->ras_key));
         memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
         memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
         memset(ctx->ras_entry, 0, sizeof(ctx->ras_entry));
-        ctx->ras_top = 0U;
     }
 
     uint32_t new_epoch = old_epoch + 1U;
@@ -644,11 +641,42 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
     return 0;
 }
 
+static bool jit_range_executable(a32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (ctx == NULL || len == 0U || addr + len < addr) {
+        return false;
+    }
+    bool     synced = false;
+    uint32_t cur    = addr;
+    uint32_t end    = addr + len;
+    while (cur < end) {
+        bool found = false;
+        for (size_t i = 0U; i < ctx->region_count; i++) {
+            const a32_region_t *r = &ctx->regions[i];
+            if ((r->prot & 0x4U) != 0U && cur >= r->start && cur < r->end) {
+                cur   = (r->end < end) ? r->end : end;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (!synced) {
+                a32_vm_sync_ctx(ctx);
+                synced = true;
+                cur    = addr;
+                continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, bool is_thumb,
                                                   a32_cache_entry_t *oneshot_entry, bool flush_now,
                                                   a32_block_snap_t *out_snap)
 {
-    uint32_t aligned_pc = pc & ~1U;
+    uint32_t aligned_pc = pc & (is_thumb ? ~1U : ~3U);
     uint32_t key        = aligned_pc | (is_thumb ? 1U : 0U);
     uint32_t slot       = hash_key(key);
     if (!is_thumb || (ctx->itstate & 0x0FU) == 0U) {
@@ -687,18 +715,25 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         }
     }
 
+    if (!jit_range_executable(ctx, aligned_pc, is_thumb ? 2U : 4U)) {
+        ctx->fault_addr  = aligned_pc;
+        ctx->exit_reason = A32_EXIT_FAULT;
+        jit_lock_release();
+        return NULL;
+    }
+
     uint32_t entry_itstate = is_thumb ? ctx->itstate : 0U;
     g_stage_pc_map_count   = 0U;
     a32_jit_record_pc_map(0U, aligned_pc, entry_itstate);
 
-    uint32_t stage_words[1024];
+    uint32_t stage_words[A32_AOT_MAX_WORDS];
     a64_buf_t buf;
-    a64_buf_init(&buf, stage_words, 1024U);
+    a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
 
     if (is_thumb) {
-        a32_translate_t32_block(ctx, &buf, pc & ~1U);
+        a32_translate_t32_block(ctx, &buf, aligned_pc);
     } else {
-        a32_translate_a32_block(ctx, &buf, pc & ~3U);
+        a32_translate_a32_block(ctx, &buf, aligned_pc);
     }
 
     if (buf.overflow) {
@@ -992,7 +1027,7 @@ int a32_jit_run(a32_ctx_t *ctx)
         } else {
             ctx->itstate &= 0xFFU;
         }
-        uint32_t key      = (pc & ~1U) | (is_thumb ? 1U : 0U);
+        uint32_t key      = (pc & (is_thumb ? ~1U : ~3U)) | (is_thumb ? 1U : 0U);
         uint32_t epoch    = atomic_load_explicit(&g_cache_epoch, memory_order_acquire);
         bool     uncached = (ctx->itstate != 0U) || ctx->single_step;
 
@@ -1134,8 +1169,24 @@ int a32_jit_run(a32_ctx_t *ctx)
         /* 3. Otherwise lookup or compile */
         if (code == NULL) {
             a32_block_snap_t snap;
+            ctx->exit_reason = A32_EXIT_NONE;
             cur_entry = lookup_or_compile_entry(ctx, pc, is_thumb, &oneshot_entry, true, &snap);
             if (cur_entry == NULL || snap.code == NULL) {
+                if (ctx->exit_reason == A32_EXIT_FAULT) {
+                    prev_entry = NULL;
+                    if (ctx->gdb_enabled) {
+                        int sig = a32_gdb_handle_stop(ctx, 11);
+                        if (sig == 0) {
+                            continue;
+                        }
+                    }
+                    if (a32_signals_deliver_sync(ctx, 11 /* SIGSEGV */, ctx->fault_addr)) {
+                        a32_signals_check_pending(ctx);
+                        continue;
+                    }
+                    fprintf(stderr, "a32rt: guest fault at 0x%08x\n", ctx->fault_addr);
+                    return 139;
+                }
                 return 1;
             }
             if (snap.epoch != epoch ||
@@ -1290,9 +1341,21 @@ int a32_jit_run(a32_ctx_t *ctx)
             break;
         }
 
-        case A32_EXIT_FAULT:
+        case A32_EXIT_FAULT: {
+            prev_entry = NULL;
+            if (ctx->gdb_enabled) {
+                int sig = a32_gdb_handle_stop(ctx, 11);
+                if (sig == 0) {
+                    continue;
+                }
+            }
+            if (a32_signals_deliver_sync(ctx, 11 /* SIGSEGV */, ctx->fault_addr)) {
+                a32_signals_check_pending(ctx);
+                continue;
+            }
             fprintf(stderr, "a32rt: guest fault at 0x%08x\n", ctx->fault_addr);
             return 139;
+        }
 
         case A32_EXIT_UNDEF: {
             prev_entry = NULL;

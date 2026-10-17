@@ -197,6 +197,10 @@ static bool a32_insn_reads_flags(uint32_t insn)
     if (cond == 15U) {
         return false;
     }
+    if ((insn & 0x0FF000F0U) == 0x07F000F0U) {
+        /* UDF trap must observe architectural NZCV */
+        return true;
+    }
 
     /* cond == 14 (AL): check carry consumers */
     unsigned op1 = (insn >> 25) & 7U;
@@ -600,25 +604,31 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned lsb = (insn >> 7) & 31U;
             unsigned rn = insn & 0xFU;
-            a64_emit_ubfm_w(b, rd, rn, lsb, lsb + widthm1);
-            handled = true;
+            if (lsb + widthm1 <= 31U) {
+                a64_emit_ubfm_w(b, rd, rn, lsb, lsb + widthm1);
+                handled = true;
+            }
         } else if ((insn & 0x0FE00070U) == 0x07A00050U) {
             /* SBFX Rd, Rn, #lsb, #width */
             unsigned widthm1 = (insn >> 16) & 31U;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned lsb = (insn >> 7) & 31U;
             unsigned rn = insn & 0xFU;
-            a64_emit_sbfm_w(b, rd, rn, lsb, lsb + widthm1);
-            handled = true;
+            if (lsb + widthm1 <= 31U) {
+                a64_emit_sbfm_w(b, rd, rn, lsb, lsb + widthm1);
+                handled = true;
+            }
         } else if ((insn & 0x0FE00070U) == 0x07C00010U) {
             /* BFI / BFC Rd, Rn, #lsb, #width */
             unsigned msb = (insn >> 16) & 31U;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned lsb = (insn >> 7) & 31U;
             unsigned rn = insn & 0xFU;
-            unsigned src = (rn == 15U) ? A64_ZR : rn;
-            a64_emit_bfm_w(b, rd, src, (32U - lsb) & 31U, msb - lsb);
-            handled = true;
+            if (msb >= lsb) {
+                unsigned src = (rn == 15U) ? A64_ZR : rn;
+                a64_emit_bfm_w(b, rd, src, (32U - lsb) & 31U, msb - lsb);
+                handled = true;
+            }
         } else if ((insn & 0x0FFF0FF0U) == 0x06BF0F30U) {
             /* REV Rd, Rm */
             a64_emit_rev_w(b, (insn >> 12) & 0xFU, insn & 0xFU);
@@ -1087,9 +1097,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
-            if (flags_live) {
-                a64_emit_mrs_nzcv(b, A64_TMP3);
-            }
+            a64_emit_mrs_nzcv(b, A64_TMP3);
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 a64_emit_mov_imm32(b, A64_ADDR, (uint32_t)-32768);
@@ -1128,9 +1136,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                     a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
                 }
             }
-            if (flags_live) {
-                a64_emit_msr_nzcv(b, A64_TMP3);
-            }
+            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06600F90U || (insn & 0x0FF00FF0U) == 0x06600FF0U ||
@@ -1142,9 +1148,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
-            if (flags_live) {
-                a64_emit_mrs_nzcv(b, A64_TMP3);
-            }
+            a64_emit_mrs_nzcv(b, A64_TMP3);
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 a64_emit_mov_imm32(b, A64_ADDR, 65535U);
@@ -1179,9 +1183,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                     a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
                 }
             }
-            if (flags_live) {
-                a64_emit_msr_nzcv(b, A64_TMP3);
-            }
+            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00090U) == 0x07000010U) {
@@ -1990,6 +1992,11 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
     /* Translation & emission loop */
     for (unsigned i = 0U; i < num_insns; i++) {
         uint32_t cur_pc = pc + (i * 4U);
+        if (i > 0U && b->cap > b->count && b->cap - b->count < 128U) {
+            b->guest_end_pc = cur_pc;
+            a64_emit_exit_branch_imm(b, cur_pc, false);
+            return true;
+        }
         uint32_t insn = block_insns[i];
 
         /* M3 Side-Table PC Recording */

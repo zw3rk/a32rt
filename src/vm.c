@@ -172,7 +172,7 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             continue;
         }
         if (r->start < unmap_start && r->end > unmap_end) {
-            if (g_vm_region_count >= A32_MAX_REGIONS) {
+            if (g_vm_region_count + 1U >= A32_MAX_REGIONS) {
                 size_t before = g_vm_region_count;
                 vm_coalesce_regions_locked();
                 if (g_vm_region_count != before) {
@@ -219,6 +219,10 @@ static int vm_record_region_locked(uint32_t start, uint32_t end,
     uint32_t clean_flags = flags & ~(0x10U | 0x100000U);
     vm_unmap_regions_locked(start, end);
     int rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+    if (rc < 0) {
+        vm_coalesce_regions_locked();
+        rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+    }
     vm_coalesce_regions_locked();
     return rc;
 }
@@ -514,7 +518,8 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
 
-    if (new_brk == 0U || new_brk < g_vm_brk_base || new_brk >= A32_MMAP_BASE_32) {
+    uint32_t brk_limit = (g_vm_brk_base < A32_MMAP_BASE_32) ? A32_MMAP_BASE_32 : A32_MMAP_TOP_32;
+    if (new_brk == 0U || new_brk < g_vm_brk_base || new_brk > brk_limit) {
         uint32_t curr = g_vm_brk_curr;
         vm_sync_to_ctx(ctx);
         vm_lock_release();
@@ -523,7 +528,7 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
 
     uint64_t old_page64 = page_align_up((uint64_t)g_vm_brk_curr);
     uint64_t new_page64 = page_align_up((uint64_t)new_brk);
-    if (new_page64 > (uint64_t)A32_MMAP_BASE_32) {
+    if (new_page64 > (uint64_t)brk_limit) {
         uint32_t curr = g_vm_brk_curr;
         vm_sync_to_ctx(ctx);
         vm_lock_release();
@@ -913,7 +918,8 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             (void)vm_record_region_locked(old_end, (uint32_t)new_end,
                                           prot, keep_flags, region_name);
             uint32_t ext_end = (uint32_t)new_end;
-            if (ext_end > g_vm_mmap_cursor && ext_end <= A32_MMAP_TOP_32) {
+            if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end &&
+                ext_end <= A32_MMAP_TOP_32) {
                 g_vm_mmap_cursor = ext_end;
             }
             vm_sync_to_ctx(ctx);

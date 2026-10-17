@@ -243,6 +243,13 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
         uint32_t map_end   = (uint32_t)map_end64;
         uint32_t map_start = (page_start < highest_mapped_end) ? highest_mapped_end : page_start;
+        for (size_t r = 0U; r < ctx->region_count; r++) {
+            if (map_start < ctx->regions[r].end && map_end > ctx->regions[r].start) {
+                fprintf(stderr, "a32rt: %s: segment [0x%x, 0x%x) overlaps existing region\n",
+                        label, map_start, map_end);
+                return -1;
+            }
+        }
 
         int host_prot = 0;
         if (ph->p_flags & PF_R) {
@@ -484,7 +491,8 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
         }
 
         a32_elf_info_t interp_info;
-        int irc = load_elf32_image(ctx, ifd, 0x3F000000U, out_info->interp_path, &interp_info);
+        uint32_t interp_base = (ctx->brk_base > 0x3F000000U) ? ctx->brk_base : 0x3F000000U;
+        int irc = load_elf32_image(ctx, ifd, interp_base, out_info->interp_path, &interp_info);
         close(ifd);
         if (irc != 0) {
             return -1;

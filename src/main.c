@@ -9,6 +9,7 @@
 #include "a32rt.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,6 +150,8 @@ int main(int argc, char **argv, char **envp)
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
+        } else if (is_binfmt_p && i + 1 < argc) {
+            break;
         } else {
             usage(argv[0]);
             return 1;
@@ -230,7 +233,7 @@ int main(int argc, char **argv, char **envp)
     /* 3. Check AT_EXECFD from host auxiliary vector */
     int exec_fd = -1;
     unsigned long aux_execfd = getauxval(AT_EXECFD);
-    if (aux_execfd != 0UL) {
+    if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
         exec_fd = (int)aux_execfd;
     }
 

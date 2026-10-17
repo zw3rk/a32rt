@@ -3339,6 +3339,144 @@ static int run_test(void)
     }
 #endif
 
+    /*
+     * 33. Round 10 positive & regression tests:
+     *     - 33a: Expansion-heavy basic block splitting: execute a single
+     *            straight-line sequence of 48 uadd8 / qadd8 instructions
+     *            (24 uadd8 + 24 qadd8 interleaved) in inline assembly without
+     *            any intermediate branches, verifying it translates and
+     *            computes the exact expected parallel & saturated result
+     *            without overflowing the JIT staging buffer.
+     *     - 33b: qadd8 and uqadd8 preserving CPSR.NZCV across execution
+     *            (tested across multiple NZCV combinations and verified via
+     *            both MRS APSR and subsequent conditional instructions).
+     */
+    {
+        /*
+         * 33a: 48 straight-line uadd8 / qadd8 instructions in one basic block:
+         *   u starts at 0x10203040, ustep = 0x0102030A (1, 2, 3, 10)
+         *   After 24 uadd8 instructions:
+         *     lane 3: 16 + 24 * 1  = 40  (0x28)
+         *     lane 2: 32 + 24 * 2  = 80  (0x50)
+         *     lane 1: 48 + 24 * 3  = 120 (0x78)
+         *     lane 0: (64 + 24 * 10) & 0xFF = 304 & 0xFF = 48 (0x30)
+         *     -> u == 0x28507830U
+         *   q starts at 0x10EC00FA (+16, -20, 0, -6), qstep = 0x08F802FF (+8, -8, +2, -1)
+         *   After 24 qadd8 instructions:
+         *     lane 3: +16 + 24 * (+8) = +208 -> saturates to +127 (0x7F)
+         *     lane 2: -20 + 24 * (-8) = -212 -> saturates to -128 (0x80)
+         *     lane 1:   0 + 24 * (+2) =  +48 (0x30)
+         *     lane 0:  -6 + 24 * (-1) =  -30 (0xE2)
+         *     -> q == 0x7F8030E2U
+         */
+        uint32_t u_acc  = 0x10203040U;
+        uint32_t u_step = 0x0102030AU;
+        uint32_t q_acc  = 0x10EC00FAU;
+        uint32_t q_step = 0x08F802FFU;
+        uint32_t flags  = 0U;
+        uint32_t psr_in = 0x60000000U; /* N=0, Z=1, C=1, V=0 */
+
+#define R10_PAIR_UADD8_QADD8 \
+        "uadd8 %[u], %[u], %[us]\n\t" \
+        "qadd8 %[q], %[q], %[qs]\n\t"
+#define R10_8_UADD8_QADD8 \
+        R10_PAIR_UADD8_QADD8 \
+        R10_PAIR_UADD8_QADD8 \
+        R10_PAIR_UADD8_QADD8 \
+        R10_PAIR_UADD8_QADD8
+#define R10_48_UADD8_QADD8 \
+        R10_8_UADD8_QADD8 \
+        R10_8_UADD8_QADD8 \
+        R10_8_UADD8_QADD8 \
+        R10_8_UADD8_QADD8 \
+        R10_8_UADD8_QADD8 \
+        R10_8_UADD8_QADD8
+
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[pin]\n\t"
+            R10_48_UADD8_QADD8
+            "mrs %[fl], apsr\n\t"
+            : [u] "+r"(u_acc), [q] "+r"(q_acc), [fl] "=&r"(flags)
+            : [us] "r"(u_step), [qs] "r"(q_step), [pin] "r"(psr_in)
+            : "cc"
+        );
+
+#undef R10_48_UADD8_QADD8
+#undef R10_8_UADD8_QADD8
+#undef R10_PAIR_UADD8_QADD8
+
+        if (u_acc != 0x28507830U || q_acc != 0x7F8030E2U ||
+            (flags & 0xF0000000U) != 0x60000000U) {
+            return 226;
+        }
+
+        /*
+         * 33b: Positive regression test for qadd8 and uqadd8 preserving NZCV
+         *      across all flag states (N, Z, C, V) and conditional execution.
+         */
+        static const uint32_t nzcv_patterns[5] = {
+            0x00000000U, /* N=0, Z=0, C=0, V=0 */
+            0x60000000U, /* N=0, Z=1, C=1, V=0 */
+            0x80000000U, /* N=1, Z=0, C=0, V=0 */
+            0x30000000U, /* N=0, Z=0, C=1, V=1 */
+            0x90000000U  /* N=1, Z=0, C=0, V=1 */
+        };
+        uint32_t qa_rn  = 0x708510F0U; /* +112, -123, +16, -16 */
+        uint32_t qa_rm  = 0x20E01506U; /*  +32,  -32, +21,  +6 -> +127 (0x7F), -128 (0x80), +37 (0x25), -10 (0xF6) */
+        uint32_t uqa_rn = 0xF0801005U; /*  240,  128,  16,   5 */
+        uint32_t uqa_rm = 0x3090200AU; /*   48,  144,  32,  10 ->  255 (0xFF),  255 (0xFF),  48 (0x30),  15 (0x0F) */
+
+        for (uint32_t i = 0U; i < 5U; i++) {
+            uint32_t expected_nzcv = nzcv_patterns[i];
+            uint32_t q_res   = 0U;
+            uint32_t uq_res  = 0U;
+            uint32_t fl_q    = 0U;
+            uint32_t fl_uq   = 0U;
+
+            __asm__ volatile(
+                "msr apsr_nzcvq, %[pin]\n\t"
+                "qadd8 %[qr], %[qrn], %[qrm]\n\t"
+                "mrs %[flq], apsr\n\t"
+                "uqadd8 %[uqr], %[uqrn], %[uqrm]\n\t"
+                "mrs %[fluq], apsr\n\t"
+                : [qr] "=&r"(q_res), [uqr] "=&r"(uq_res),
+                  [flq] "=&r"(fl_q), [fluq] "=&r"(fl_uq)
+                : [pin] "r"(expected_nzcv),
+                  [qrn] "r"(qa_rn), [qrm] "r"(qa_rm),
+                  [uqrn] "r"(uqa_rn), [uqrm] "r"(uqa_rm)
+                : "cc"
+            );
+
+            if (q_res != 0x7F8025F6U || uq_res != 0xFFFF300FU ||
+                (fl_q & 0xF0000000U) != expected_nzcv ||
+                (fl_uq & 0xF0000000U) != expected_nzcv) {
+                return 227;
+            }
+        }
+
+        /* Also verify CMP -> QADD8 -> UQADD8 -> conditional move uses CMP's NZCV */
+        uint32_t c_a = 42U, c_b = 42U;
+        uint32_t q_out = 0U, uq_out = 0U, cond_check = 0U;
+        __asm__ volatile(
+            "cmp %[ca], %[cb]\n\t"
+            "qadd8 %[qo], %[qrn], %[qrm]\n\t"
+            "uqadd8 %[uqo], %[uqrn], %[uqrm]\n\t"
+#if defined(__thumb__)
+            "ite eq\n\t"
+#endif
+            "moveq %[cc], #111\n\t"
+            "movne %[cc], #222\n\t"
+            : [qo] "=&r"(q_out), [uqo] "=&r"(uq_out), [cc] "=&r"(cond_check)
+            : [ca] "r"(c_a), [cb] "r"(c_b),
+              [qrn] "r"(qa_rn), [qrm] "r"(qa_rm),
+              [uqrn] "r"(uqa_rn), [uqrm] "r"(uqa_rm)
+            : "cc"
+        );
+        if (q_out != 0x7F8025F6U || uq_out != 0xFFFF300FU || cond_check != 111U) {
+            return 228;
+        }
+    }
+
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

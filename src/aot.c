@@ -139,11 +139,58 @@ static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
     return 0;
 }
 
+static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (ctx == NULL || len == 0U || addr + len < addr) {
+        return false;
+    }
+    uint32_t cur = addr;
+    uint32_t end = addr + len;
+    while (cur < end) {
+        bool found = false;
+        for (size_t i = 0U; i < ctx->region_count; i++) {
+            const a32_region_t *r = &ctx->regions[i];
+            if ((r->prot & 0x4U) != 0U && cur >= r->start && cur < r->end) {
+                cur   = (r->end < end) ? r->end : end;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
 typedef struct aot_save_state {
-    FILE    *f;
-    uint32_t count;
-    bool     error;
+    const a32_ctx_t *ctx;
+    FILE            *f;
+    uint32_t         count;
+    bool             error;
 } aot_save_state_t;
+
+static bool aot_block_valid(const a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
+                            bool is_thumb, const uint32_t *words, size_t word_count,
+                            const a32_pc_map_stage_t *pc_map, size_t pc_map_count)
+{
+    if (words == NULL || word_count == 0U || word_count > A32_AOT_MAX_WORDS ||
+        words[word_count - 1U] != 0xD65F03C0U) {
+        return false;
+    }
+    if (pc_map == NULL || pc_map_count == 0U || pc_map_count >= A32_AOT_MAX_PC_MAP) {
+        return false;
+    }
+    uint32_t align_mask = is_thumb ? 1U : 3U;
+    if ((guest_pc & align_mask) != 0U || (guest_end_pc & align_mask) != 0U ||
+        guest_end_pc <= guest_pc || (guest_end_pc - guest_pc) > 512U) {
+        return false;
+    }
+    if (!aot_range_executable(ctx, guest_pc, guest_end_pc - guest_pc)) {
+        return false;
+    }
+    return true;
+}
 
 static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
                            bool is_thumb, bool is_call,
@@ -151,15 +198,12 @@ static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
                            const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
                            void *arg)
 {
-    (void)guest_pc;
-    (void)guest_end_pc;
-    (void)is_thumb;
     (void)is_call;
-    (void)words;
-    (void)word_count;
-    (void)pc_map;
-    (void)pc_map_count;
     aot_save_state_t *st = (aot_save_state_t *)arg;
+    if (!aot_block_valid(st->ctx, guest_pc, guest_end_pc, is_thumb,
+                         words, word_count, pc_map, pc_map_count)) {
+        return;
+    }
     st->count++;
 }
 
@@ -173,7 +217,11 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
     if (st->error) {
         return;
     }
-    size_t map_cnt = (pc_map != NULL && pc_map_count < A32_AOT_MAX_PC_MAP) ? pc_map_count : 0U;
+    if (!aot_block_valid(st->ctx, guest_pc, guest_end_pc, is_thumb,
+                         words, word_count, pc_map, pc_map_count)) {
+        return;
+    }
+    size_t map_cnt = pc_map_count;
 
     a32_aot_block_header_t bh;
     bh.guest_pc     = guest_pc;
@@ -204,6 +252,9 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
     if (elf_path == NULL) {
         return -1;
     }
+    if (ctx != NULL) {
+        a32_vm_sync_ctx(ctx);
+    }
     char cache_path[512];
     if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), true) != 0) {
         return -1;
@@ -227,7 +278,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
 
-    aot_save_state_t count_st = { .f = NULL, .count = 0U, .error = false };
+    aot_save_state_t count_st = { .ctx = ctx, .f = NULL, .count = 0U, .error = false };
     a32_jit_iter_blocks(count_block_cb, &count_st);
 
     a32_aot_header_t hdr;
@@ -242,7 +293,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
 
-    aot_save_state_t write_st = { .f = f, .count = 0U, .error = false };
+    aot_save_state_t write_st = { .ctx = ctx, .f = f, .count = 0U, .error = false };
     a32_jit_iter_blocks(write_block_cb, &write_st);
 
     if (write_st.error || write_st.count != count_st.count) {
@@ -260,30 +311,6 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     return 0;
-}
-
-static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
-{
-    if (ctx == NULL || len == 0U || addr + len < addr) {
-        return false;
-    }
-    uint32_t cur = addr;
-    uint32_t end = addr + len;
-    while (cur < end) {
-        bool found = false;
-        for (size_t i = 0U; i < ctx->region_count; i++) {
-            const a32_region_t *r = &ctx->regions[i];
-            if ((r->prot & 0x4U) != 0U && cur >= r->start && cur < r->end) {
-                cur   = (r->end < end) ? r->end : end;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return false;
-        }
-    }
-    return true;
 }
 
 int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)

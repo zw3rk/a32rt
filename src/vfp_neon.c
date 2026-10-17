@@ -817,7 +817,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 {
     (void)pc;
     /* 1. VLD1 / VST1 / VLD2 / VST2 (0xF4...) */
-    if ((insn >> 24) == 0xF4U) {
+    if ((insn & 0xFF100000U) == 0xF4000000U) {
         bool l_bit    = ((insn >> 21) & 1U) != 0U;
         bool d_bit    = ((insn >> 22) & 1U) != 0U;
         unsigned rn   = (insn >> 16) & 0xFU;

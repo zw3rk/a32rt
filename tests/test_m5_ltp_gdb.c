@@ -2183,6 +2183,158 @@ static int test22_r9_mmap_flags_enametoolong_epoll_pwait(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 23: Round 10 regressions —
+ *   23a: Negative LTP EFAULT (-14) regression tests for high pointer
+ *        0xFFFFFFFFU ((void *)-1) and unmapped mid-window pointer (mmap2 +
+ *        munmap) across open (5), openat (322), rt_sigaction (174),
+ *        rt_sigprocmask (175), sigaltstack (186), uname (122), pipe (42),
+ *        and stat64 (195)
+ *   23b: Positive regression test for setresuid32 (164) and setresgid32 (170)
+ *        with (-1, -1, -1) succeeding (0) even after registering a custom
+ *        handler on signal 34 (SIGRTMIN)
+ * -------------------------------------------------------------------------- */
+struct sigaction32_m5 {
+    uint32_t sa_handler;
+    uint32_t sa_flags;
+    uint32_t sa_restorer;
+    uint32_t sa_mask[2];
+};
+
+static volatile uint32_t g_m5_r10_rt34_hits = 0U;
+
+static void m5_r10_rt34_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    g_m5_r10_rt34_hits++;
+}
+
+static int test23_r10_efault_high_unmapped_and_setresuid_rt34(void)
+{
+    static _Alignas(8) uint8_t st64_buf[104];
+    static struct sigaction32_m5 sa34;
+    static struct sigaction32_m5 orig_sa34;
+    const uint32_t high_ptr = 0xFFFFFFFFU;
+
+    /* Allocate a mid-window page via mmap2 and unmap it to get an unmapped VA */
+    uint32_t unmapped_ptr = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                           3U /* PROT_READ | PROT_WRITE */,
+                                           0x22U /* MAP_PRIVATE | MAP_ANONYMOUS */,
+                                           0xFFFFFFFFU, 0U);
+    if (unmapped_ptr > 0xFFFFF000U) {
+        return 215;
+    }
+    if (sys2(91U /* munmap */, unmapped_ptr, 4096U) != 0) {
+        return 216;
+    }
+
+    my_memset(st64_buf, 0, sizeof(st64_buf));
+
+    /* 1. open (5) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys3(5U /* open */, high_ptr, 0U /* O_RDONLY */, 0U) != -14 /* -EFAULT */ ||
+        sys3(5U /* open */, unmapped_ptr, 0U /* O_RDONLY */, 0U) != -14 /* -EFAULT */) {
+        return 217;
+    }
+
+    /* 2. openat (322) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */, high_ptr, 0U, 0U) != -14 /* -EFAULT */ ||
+        sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */, unmapped_ptr, 0U, 0U) != -14 /* -EFAULT */) {
+        return 218;
+    }
+
+    /* 3. rt_sigaction (174) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */, high_ptr, 0U, 8U) != -14 /* -EFAULT */ ||
+        sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */, 0U, high_ptr, 8U) != -14 /* -EFAULT */ ||
+        sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */, unmapped_ptr, 0U, 8U) != -14 /* -EFAULT */ ||
+        sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */, 0U, unmapped_ptr, 8U) != -14 /* -EFAULT */) {
+        return 219;
+    }
+
+    /* 4. rt_sigprocmask (175) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, high_ptr, 0U, 8U) != -14 /* -EFAULT */ ||
+        sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U, high_ptr, 8U) != -14 /* -EFAULT */ ||
+        sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, unmapped_ptr, 0U, 8U) != -14 /* -EFAULT */ ||
+        sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U, unmapped_ptr, 8U) != -14 /* -EFAULT */) {
+        return 220;
+    }
+
+    /* 5. sigaltstack (186) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys2(186U /* sigaltstack */, high_ptr, 0U) != -14 /* -EFAULT */ ||
+        sys2(186U /* sigaltstack */, 0U, high_ptr) != -14 /* -EFAULT */ ||
+        sys2(186U /* sigaltstack */, unmapped_ptr, 0U) != -14 /* -EFAULT */ ||
+        sys2(186U /* sigaltstack */, 0U, unmapped_ptr) != -14 /* -EFAULT */) {
+        return 221;
+    }
+
+    /* 6. uname (122) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys1(122U /* uname */, high_ptr) != -14 /* -EFAULT */ ||
+        sys1(122U /* uname */, unmapped_ptr) != -14 /* -EFAULT */) {
+        return 222;
+    }
+
+    /* 7. pipe (42) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys1(42U /* pipe */, high_ptr) != -14 /* -EFAULT */ ||
+        sys1(42U /* pipe */, unmapped_ptr) != -14 /* -EFAULT */) {
+        return 223;
+    }
+
+    /* 8. stat64 (195) with 0xFFFFFFFFU and unmapped_ptr -> -EFAULT (-14) */
+    if (sys2(195U /* stat64 */, high_ptr, (uint32_t)(uintptr_t)st64_buf) != -14 /* -EFAULT */ ||
+        sys2(195U /* stat64 */, unmapped_ptr, (uint32_t)(uintptr_t)st64_buf) != -14 /* -EFAULT */ ||
+        sys2(195U /* stat64 */, (uint32_t)(uintptr_t)"/", high_ptr) != -14 /* -EFAULT */ ||
+        sys2(195U /* stat64 */, (uint32_t)(uintptr_t)"/", unmapped_ptr) != -14 /* -EFAULT */) {
+        return 224;
+    }
+
+    /*
+     * 23b: Positive regression test for setresuid32 (164) and setresgid32 (170)
+     *      with (-1, -1, -1) succeeding (0) even after registering a handler on
+     *      signal 34 (SIGRTMIN).
+     */
+    g_m5_r10_rt34_hits = 0U;
+    sa34.sa_handler  = (uint32_t)(uintptr_t)m5_r10_rt34_handler;
+    sa34.sa_flags    = 0x00000004U; /* SA_SIGINFO */
+    sa34.sa_restorer = 0U;
+    sa34.sa_mask[0]  = 0U;
+    sa34.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 34U /* SIGRTMIN */,
+             (uint32_t)(uintptr_t)&sa34,
+             (uint32_t)(uintptr_t)&orig_sa34, 8U) != 0) {
+        return 225;
+    }
+
+    int32_t sru16_rc = sys3(164U /* setresuid */,
+                            0xFFFFU /* -1 */,
+                            0xFFFFU /* -1 */,
+                            0xFFFFU /* -1 */);
+    int32_t srg16_rc = sys3(170U /* setresgid */,
+                            0xFFFFU /* -1 */,
+                            0xFFFFU /* -1 */,
+                            0xFFFFU /* -1 */);
+    int32_t sru32_rc = sys3(208U /* setresuid32 */,
+                            0xFFFFFFFFU /* -1 */,
+                            0xFFFFFFFFU /* -1 */,
+                            0xFFFFFFFFU /* -1 */);
+    int32_t srg32_rc = sys3(210U /* setresgid32 */,
+                            0xFFFFFFFFU /* -1 */,
+                            0xFFFFFFFFU /* -1 */,
+                            0xFFFFFFFFU /* -1 */);
+
+    sys4(174U /* rt_sigaction */, 34U /* SIGRTMIN */,
+         (uint32_t)(uintptr_t)&orig_sa34, 0U, 8U);
+
+    if (sru16_rc != 0 || srg16_rc != 0 ||
+        sru32_rc != 0 || srg32_rc != 0 ||
+        g_m5_r10_rt34_hits != 0U) {
+        return 226;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -2262,6 +2414,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test22_r9_mmap_flags_enametoolong_epoll_pwait();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test23_r10_efault_high_unmapped_and_setresuid_rt34();
     if (rc != 0) {
         return rc;
     }

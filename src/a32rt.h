@@ -225,6 +225,7 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path);
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path);
 
 /* Syscalls & signals (`src/syscalls.c`, `src/signals.c`, M0..M5) */
+bool       a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_prot);
 int        a32_resolve_guest_path(const a32_ctx_t *ctx, const char *guest_path,
                                   char *buf, size_t size);
 int        a32_handle_syscall(a32_ctx_t *ctx);
@@ -234,6 +235,9 @@ void       a32_signals_set_thread_ctx(a32_ctx_t *ctx);
 a32_ctx_t *a32_signals_get_thread_ctx(void);
 void       a32_signals_check_pending(a32_ctx_t *ctx);
 bool       a32_signals_deliver_sync(a32_ctx_t *ctx, int sig, uint32_t fault_addr);
+void       a32_signals_ensure_host_handler(int sig);
+void       a32_signals_preset_siginfo(int sig, const void *host_si);
+void       a32_signals_consume_siginfo(int sig, void *guest_si32);
 int        a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
                                 uint32_t oldact_va, uint32_t sigsetsize);
 int        a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,

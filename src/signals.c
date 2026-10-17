@@ -116,6 +116,7 @@ _Static_assert(offsetof(a32_rt_sigframe_t, uc) == 128,
 static _Thread_local a32_ctx_t *g_tls_ctx = NULL;
 static guest_sigaction_t        g_guest_sigactions[65];
 static _Thread_local siginfo_t  g_pending_siginfo[65];
+static siginfo_t                g_preset_siginfo[65];
 static uint64_t                 g_host_handler_installed_mask = 0ULL;
 
 void a32_signals_set_thread_ctx(a32_ctx_t *ctx)
@@ -277,7 +278,10 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
                  (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
                 return;
             }
-            if (info != NULL) {
+            if (g_preset_siginfo[sig].si_signo == sig) {
+                g_pending_siginfo[sig] = g_preset_siginfo[sig];
+                memset(&g_preset_siginfo[sig], 0, sizeof(siginfo_t));
+            } else if (info != NULL) {
                 g_pending_siginfo[sig] = *info;
             } else {
                 memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
@@ -347,7 +351,10 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
              (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
             return;
         }
-        if (info != NULL) {
+        if (g_preset_siginfo[sig].si_signo == sig) {
+            g_pending_siginfo[sig] = g_preset_siginfo[sig];
+            memset(&g_preset_siginfo[sig], 0, sizeof(siginfo_t));
+        } else if (info != NULL) {
             g_pending_siginfo[sig] = *info;
         } else {
             memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
@@ -375,7 +382,7 @@ static int install_host_sigaction(int signum, unsigned long flags)
         g_host_handler_installed_mask |= (1ULL << (signum - 1));
         return 0;
     }
-    if (signum == 34) {
+    if (signum >= 32 && signum <= 34) {
         struct a64_kernel_sigaction ksa;
         memset(&ksa, 0, sizeof(ksa));
         if (syscall(SYS_rt_sigaction, SIGUSR1, NULL, &ksa, (size_t)8) == 0) {
@@ -389,6 +396,55 @@ static int install_host_sigaction(int signum, unsigned long flags)
         }
     }
     return -1;
+}
+
+void a32_signals_ensure_host_handler(int sig)
+{
+    if (sig >= 1 && sig <= 64 && sig != SIGKILL && sig != SIGSTOP) {
+        if (g_guest_sigactions[sig].handler == 0U /* SIG_DFL */ &&
+            (g_host_handler_installed_mask & (1ULL << (sig - 1))) == 0ULL) {
+            (void)install_host_sigaction(sig, (unsigned long)(SA_SIGINFO | SA_NODEFER | SA_RESTART));
+        }
+    }
+}
+
+void a32_signals_preset_siginfo(int sig, const void *host_si)
+{
+    if (sig >= 1 && sig <= 64 && host_si != NULL) {
+        memcpy(&g_preset_siginfo[sig], host_si, sizeof(siginfo_t));
+    }
+}
+
+void a32_signals_consume_siginfo(int sig, void *guest_si32)
+{
+    if (sig < 1 || sig > 64) {
+        return;
+    }
+    if (guest_si32 != NULL) {
+        a32_siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        const siginfo_t *host_info = &g_pending_siginfo[sig];
+        info.si_signo = sig;
+        if (host_info->si_signo != 0) {
+            info.si_errno = host_info->si_errno;
+            info.si_code  = host_info->si_code;
+            if (host_info->si_code < 0) {
+                info._pad[0] = (uint32_t)host_info->si_pid;
+                info._pad[1] = (uint32_t)host_info->si_uid;
+                if (host_info->si_code != -6 /* SI_TKILL */) {
+                    info._pad[2] = (uint32_t)host_info->si_value.sival_int;
+                }
+            } else if (host_info->si_code == 0 || sig == SIGCHLD) {
+                info._pad[0] = (uint32_t)host_info->si_pid;
+                info._pad[1] = (uint32_t)host_info->si_uid;
+                info._pad[2] = (uint32_t)host_info->si_status;
+            }
+        } else {
+            info.si_code = -6; /* SI_TKILL */
+        }
+        memcpy(guest_si32, &info, sizeof(info));
+    }
+    memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
 }
 
 int a32_signals_init(a32_ctx_t *ctx)
@@ -431,15 +487,18 @@ void a32_signals_check_pending(a32_ctx_t *ctx)
             __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_SEQ_CST);
             guest_sigaction_t *act = &g_guest_sigactions[sig];
             if (act->handler == 1U /* SIG_IGN */) {
+                memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
                 continue;
             }
             if (act->handler == 0U /* SIG_DFL */) {
                 if (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT) {
+                    memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
                     continue;
                 }
                 _exit(128 + sig);
             }
             deliver_guest_signal(ctx, sig, act, &g_pending_siginfo[sig]);
+            memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
             break;
         }
     }
@@ -472,7 +531,8 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
     if (sigsetsize != sizeof(uint64_t)) {
         return -EINVAL;
     }
-    if ((act_va != 0U && act_va < 0x1000U) || (oldact_va != 0U && oldact_va < 0x1000U)) {
+    if ((act_va != 0U && !a32_guest_range_ok(ctx, act_va, 20U, 1U /* PROT_READ */)) ||
+        (oldact_va != 0U && !a32_guest_range_ok(ctx, oldact_va, 20U, 2U /* PROT_WRITE */))) {
         return -EFAULT;
     }
 
@@ -527,7 +587,8 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
     if (!ctx || sigsetsize != sizeof(uint64_t)) {
         return -EINVAL;
     }
-    if ((set_va != 0U && set_va < 0x1000U) || (oldset_va != 0U && oldset_va < 0x1000U)) {
+    if ((set_va != 0U && !a32_guest_range_ok(ctx, set_va, 8U, 1U /* PROT_READ */)) ||
+        (oldset_va != 0U && !a32_guest_range_ok(ctx, oldset_va, 8U, 2U /* PROT_WRITE */))) {
         return -EFAULT;
     }
 
@@ -561,8 +622,7 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
                         continue;
                     }
                     if (s == SIGKILL || s == SIGSTOP || s == SIGTSTP ||
-                        s == SIGTTIN || s == SIGTTOU || s == SIGCONT ||
-                        s == 32 || s == 33) {
+                        s == SIGTTIN || s == SIGTTOU || s == SIGCONT) {
                         continue;
                     }
                     (void)install_host_sigaction(s, (unsigned long)(SA_SIGINFO | SA_NODEFER | SA_RESTART));
@@ -585,7 +645,7 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     }
 
     uint32_t sp = ctx->regs[13];
-    if (sp < 0x1000U || (uint64_t)sp + sizeof(a32_rt_sigframe_t) > 0xFFFF0000ULL) {
+    if (!a32_guest_range_ok(ctx, sp, (uint32_t)sizeof(a32_rt_sigframe_t), 1U /* PROT_READ */)) {
         return -EFAULT;
     }
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, sp);
@@ -651,7 +711,8 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
     if (!ctx) {
         return -EINVAL;
     }
-    if ((uss_va != 0U && uss_va < 0x1000U) || (uoss_va != 0U && uoss_va < 0x1000U)) {
+    if ((uss_va != 0U && !a32_guest_range_ok(ctx, uss_va, 12U, 1U /* PROT_READ */)) ||
+        (uoss_va != 0U && !a32_guest_range_ok(ctx, uoss_va, 12U, 2U /* PROT_WRITE */))) {
         return -EFAULT;
     }
 

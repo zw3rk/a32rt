@@ -2506,6 +2506,293 @@ static int test20_r9_sigtimedwait_and_clone_validation(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 21: Round 10 regressions —
+ *   21a: Catchable guest SIGSEGV (11) on instruction fetch to NULL (0x0) and
+ *        to a non-executable PROT_READ | PROT_WRITE page (mmap2 without
+ *        PROT_EXEC), verifying si_signo == 11 and uc_mcontext.arm_pc == target_pc,
+ *        setting uc_mcontext.arm_pc = uc_mcontext.arm_lr, and resuming cleanly
+ *   21b: rt_sigtimedwait (177) with rt_sigqueueinfo (178) on blocked signal 36
+ *        (SIGRTMIN+2, left at SIG_DFL):
+ *        - Negative: rt_sigtimedwait with u_info = 0xFFFFFFFFU returns -EFAULT
+ *          (-14) without losing the queued signal
+ *        - Positive: rt_sigtimedwait with valid out_info returns 36 with
+ *          si_code == -1 (SI_QUEUE), si_pid == getpid(), si_value == 0xCAFEBABE
+ *   21c: set_tid_address (256) with unmapped address (0x25000000U) in a forked
+ *        child calling exit(0), verifying wait4 reports clean exit status == 0
+ * -------------------------------------------------------------------------- */
+struct sigcontext32_m3 {
+    uint32_t trap_no;
+    uint32_t error_code;
+    uint32_t oldmask;
+    uint32_t arm_r0;
+    uint32_t arm_r1;
+    uint32_t arm_r2;
+    uint32_t arm_r3;
+    uint32_t arm_r4;
+    uint32_t arm_r5;
+    uint32_t arm_r6;
+    uint32_t arm_r7;
+    uint32_t arm_r8;
+    uint32_t arm_r9;
+    uint32_t arm_r10;
+    uint32_t arm_fp;
+    uint32_t arm_ip;
+    uint32_t arm_sp;
+    uint32_t arm_lr;
+    uint32_t arm_pc;
+    uint32_t arm_cpsr;
+    uint32_t fault_address;
+};
+
+struct ucontext32_m3 {
+    uint32_t               uc_flags;
+    uint32_t               uc_link;
+    struct stack32_m3      uc_stack;
+    struct sigcontext32_m3 uc_mcontext;
+    uint64_t               uc_sigmask;
+};
+
+_Static_assert(offsetof(struct ucontext32_m3, uc_mcontext.arm_lr) == 88U,
+               "arm_lr must be at byte offset 88 in ucontext32_m3");
+_Static_assert(offsetof(struct ucontext32_m3, uc_mcontext.arm_pc) == 92U,
+               "arm_pc must be at byte offset 92 in ucontext32_m3");
+
+struct siginfo32_rt_m3 {
+    int32_t  si_signo;
+    int32_t  si_errno;
+    int32_t  si_code;
+    int32_t  si_pid;
+    uint32_t si_uid;
+    uint32_t si_value;
+    uint32_t _pad[26];
+};
+
+_Static_assert(sizeof(struct siginfo32_rt_m3) == 128U,
+               "siginfo32_rt_m3 must be 128 bytes");
+_Static_assert(offsetof(struct siginfo32_rt_m3, si_pid) == 12U,
+               "si_pid must be at offset 12 in siginfo32_rt_m3");
+_Static_assert(offsetof(struct siginfo32_rt_m3, si_value) == 20U,
+               "si_value must be at offset 20 in siginfo32_rt_m3");
+
+static volatile uint32_t g_r10_ifetch_hits = 0U;
+static volatile uint32_t g_r10_ifetch_ok = 0U;
+static volatile uint32_t g_r10_ifetch_expected_pc = 0U;
+
+static void r10_ifetch_sigsegv_handler(int sig, void *info, void *uctx_ptr)
+{
+    struct ucontext32_m3 *uc = (struct ucontext32_m3 *)uctx_ptr;
+    const struct siginfo32 *si = (const struct siginfo32 *)info;
+    uint32_t expected_pc = g_r10_ifetch_expected_pc;
+
+    if (sig == 11 && si != NULL &&
+        si->si_signo == 11 &&
+        uc->uc_mcontext.arm_pc == expected_pc &&
+        (uint32_t)(uintptr_t)si->si_addr == expected_pc) {
+        g_r10_ifetch_ok++;
+    }
+
+    /* Resume at caller return address in lr */
+    uc->uc_mcontext.arm_pc = uc->uc_mcontext.arm_lr;
+    g_r10_ifetch_hits++;
+}
+
+static int test21_r10_ifetch_sigsegv_sigqueueinfo_tid_address(void)
+{
+    static struct sigaction32 act_segv;
+    static struct sigaction32 orig_segv;
+
+    /*
+     * 21a: Catchable guest SIGSEGV on instruction fetch to NULL (0x0) and to
+     *      a non-executable PROT_READ | PROT_WRITE page (mmap2 without PROT_EXEC).
+     */
+    act_segv.sa_handler  = (uint32_t)(uintptr_t)r10_ifetch_sigsegv_handler;
+    act_segv.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act_segv.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act_segv.sa_mask[0]  = 0U;
+    act_segv.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 11U /* SIGSEGV */,
+             (uint32_t)(uintptr_t)&act_segv,
+             (uint32_t)(uintptr_t)&orig_segv, 8U) != 0) {
+        return 205;
+    }
+
+    /* 21a-1: Branch via bx to NULL (0x0U), keeping return address in lr */
+    g_r10_ifetch_hits        = 0U;
+    g_r10_ifetch_ok          = 0U;
+    g_r10_ifetch_expected_pc = 0x0U;
+    uint32_t target_null     = 0x0U;
+    volatile uint32_t resumed_null = 0U;
+
+    __asm__ volatile(
+        "mov r0, %[target]\n\t"
+        "adr lr, 1f\n\t"
+        "bx  r0\n"
+        "1:\n\t"
+        "mov %[res], #1\n\t"
+        : [res] "=&r"(resumed_null)
+        : [target] "r"(target_null)
+        : "r0", "lr", "memory", "cc"
+    );
+
+    if (resumed_null != 1U || g_r10_ifetch_hits != 1U || g_r10_ifetch_ok != 1U) {
+        sys4(174U /* rt_sigaction */, 11U, (uint32_t)(uintptr_t)&orig_segv, 0U, 8U);
+        return 206;
+    }
+
+    /* 21a-2: Branch via bx to a non-executable PROT_READ | PROT_WRITE page */
+    uint32_t rw_page = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                      3U /* PROT_READ | PROT_WRITE (no PROT_EXEC) */,
+                                      0x22U /* MAP_PRIVATE | MAP_ANONYMOUS */,
+                                      0xFFFFFFFFU, 0U);
+    if (rw_page > 0xFFFFF000U) {
+        sys4(174U /* rt_sigaction */, 11U, (uint32_t)(uintptr_t)&orig_segv, 0U, 8U);
+        return 207;
+    }
+
+    /* Place valid A32 'mov r0, #99; bx lr' bytes in the RW-only page */
+    volatile uint32_t *rw_words = (volatile uint32_t *)(uintptr_t)rw_page;
+    rw_words[0] = 0xE3A00063U; /* mov r0, #99 */
+    rw_words[1] = 0xE12FFF1EU; /* bx lr */
+
+    g_r10_ifetch_expected_pc = rw_page;
+    volatile uint32_t resumed_nx = 0U;
+
+    __asm__ volatile(
+        "mov r0, %[target]\n\t"
+        "adr lr, 1f\n\t"
+        "bx  r0\n"
+        "1:\n\t"
+        "mov %[res], #1\n\t"
+        : [res] "=&r"(resumed_nx)
+        : [target] "r"(rw_page)
+        : "r0", "lr", "memory", "cc"
+    );
+
+    sys2(91U /* munmap */, rw_page, 4096U);
+    sys4(174U /* rt_sigaction */, 11U, (uint32_t)(uintptr_t)&orig_segv, 0U, 8U);
+
+    if (resumed_nx != 1U || g_r10_ifetch_hits != 2U || g_r10_ifetch_ok != 2U) {
+        return 208;
+    }
+
+    /*
+     * 21b: rt_sigtimedwait (177) with rt_sigqueueinfo (178):
+     *   - Block signal 36 (SIGRTMIN+2) via rt_sigprocmask without registering
+     *     a handler (leaving it SIG_DFL).
+     *   - Send queued signal 36 via rt_sigqueueinfo(getpid(), 36, &uinfo) with
+     *     si_code = -1 (SI_QUEUE), si_pid = getpid(), sival_int = 0xCAFEBABE.
+     *   - Negative: rt_sigtimedwait with u_info = 0xFFFFFFFFU -> -EFAULT (-14)
+     *     and verify queued signal is NOT lost.
+     *   - Positive: rt_sigtimedwait with valid out_info -> returns 36 with
+     *     out_info.si_code == -1, out_info.si_pid == getpid(), and
+     *     out_info.si_value == 0xCAFEBABE.
+     */
+    const uint32_t sigrt36  = 36U; /* SIGRTMIN + 2 */
+    const uint64_t rt36_bit = 1ULL << (sigrt36 - 1U);
+    int32_t my_pid = sys1(20U /* getpid */, 0U);
+    uint32_t my_uid = (uint32_t)sys1(199U /* getuid32 */, 0U);
+
+    static uint64_t orig_mask;
+    static uint64_t wait_set36;
+    static struct siginfo32_rt_m3 uinfo;
+    static struct siginfo32_rt_m3 out_info;
+    static struct timespec32_m3 ts_wait;
+
+    orig_mask  = 0ULL;
+    wait_set36 = rt36_bit;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&wait_set36,
+             (uint32_t)(uintptr_t)&orig_mask, 8U) != 0) {
+        return 209;
+    }
+
+    for (uint32_t i = 0U; i < 26U; i++) {
+        uinfo._pad[i]    = 0U;
+        out_info._pad[i] = 0U;
+    }
+    uinfo.si_signo = (int32_t)sigrt36;
+    uinfo.si_errno = 0;
+    uinfo.si_code  = -1; /* SI_QUEUE */
+    uinfo.si_pid   = my_pid;
+    uinfo.si_uid   = my_uid;
+    uinfo.si_value = 0xCAFEBABEU;
+
+    if (sys3(178U /* rt_sigqueueinfo */, (uint32_t)my_pid, sigrt36,
+             (uint32_t)(uintptr_t)&uinfo) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 210;
+    }
+
+    ts_wait.tv_sec  = 0;
+    ts_wait.tv_nsec = 0;
+
+    /* Negative: u_info = 0xFFFFFFFFU must return -EFAULT (-14) and NOT lose signal 36 */
+    int32_t bad_stw = sys4(177U /* rt_sigtimedwait */,
+                           (uint32_t)(uintptr_t)&wait_set36,
+                           0xFFFFFFFFU /* invalid u_info */,
+                           (uint32_t)(uintptr_t)&ts_wait, 8U);
+    if (bad_stw != -14 /* -EFAULT */) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 211;
+    }
+
+    /* Positive: valid out_info buffer consumes queued signal 36 with full siginfo */
+    out_info.si_signo = 0;
+    out_info.si_errno = -1;
+    out_info.si_code  = 0;
+    out_info.si_pid   = 0;
+    out_info.si_uid   = 0U;
+    out_info.si_value = 0U;
+
+    int32_t ok_stw = sys4(177U /* rt_sigtimedwait */,
+                          (uint32_t)(uintptr_t)&wait_set36,
+                          (uint32_t)(uintptr_t)&out_info,
+                          (uint32_t)(uintptr_t)&ts_wait, 8U);
+
+    sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+         (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+
+    if (ok_stw != (int32_t)sigrt36 ||
+        out_info.si_signo != (int32_t)sigrt36 ||
+        out_info.si_code != -1 /* SI_QUEUE */ ||
+        out_info.si_pid != my_pid ||
+        out_info.si_value != 0xCAFEBABEU) {
+        return 212;
+    }
+
+    /*
+     * 21c: Positive regression test for set_tid_address (256) with an unmapped
+     *      address (0x25000000U) in a forked child calling exit(0), verifying
+     *      wait4 reports clean exit status == 0 (!WIFSIGNALED).
+     */
+    int32_t fpid = sys1(2U /* fork */, 0U);
+    if (fpid < 0) {
+        return 213;
+    }
+    if (fpid == 0) {
+        int32_t ctid = sys1(256U /* set_tid_address */, 0x25000000U);
+        if (ctid <= 0) {
+            sys1(1U /* exit */, 97U);
+        }
+        sys1(1U /* exit */, 0U);
+        __builtin_unreachable();
+    }
+
+    static uint32_t wstatus;
+    wstatus = 0xDEADBEEFU;
+    int32_t wrc = sys4(114U /* wait4 */, (uint32_t)fpid,
+                       (uint32_t)(uintptr_t)&wstatus, 0U, 0U);
+    if (wrc != fpid || wstatus != 0U) {
+        return 214;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -2585,6 +2872,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test20_r9_sigtimedwait_and_clone_validation();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test21_r10_ifetch_sigsegv_sigqueueinfo_tid_address();
     if (rc != 0) {
         return rc;
     }

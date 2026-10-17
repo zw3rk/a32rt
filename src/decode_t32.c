@@ -212,6 +212,10 @@ static bool t32_insn_reads_flags(const t32_insn_info_t *info)
 {
     uint16_t hw1 = info->hw1;
     if (!info->is_32bit) {
+        /* UDF #imm8 */
+        if ((hw1 & 0xFF00U) == 0xDE00U) {
+            return true;
+        }
         /* B<cond> (cond < 14) */
         if ((hw1 >> 12) == 0xDU && ((hw1 >> 8) & 0xFU) < 14U) {
             return true;
@@ -235,6 +239,11 @@ static bool t32_insn_reads_flags(const t32_insn_info_t *info)
     }
 
     uint16_t hw2 = info->hw2;
+
+    /* UDF.W #imm16 */
+    if ((hw1 & 0xFFF0U) == 0xF7F0U && (hw2 & 0xF000U) == 0xA000U) {
+        return true;
+    }
 
     /* B<cond>.W */
     if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U) {
@@ -584,6 +593,9 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         }
         /* BX Rm / BLX Rm (op == 3) */
         bool is_blx = ((insn >> 7) & 1U) != 0U;
+        if ((insn & 7U) != 0U || (is_blx && rm == 15U)) {
+            return false;
+        }
         unsigned src_m = load_t32_reg(b, rm, pc_val, A64_TMP0);
         a64_emit_mov_w(b, A64_TMP0, src_m);
         if (is_blx) {
@@ -1173,6 +1185,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             /* BFI / BFC */
             unsigned lsb = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
             unsigned msb = hw2 & 31U;
+            if (msb < lsb) {
+                return false;
+            }
             unsigned src = (rn == 15U) ? A64_ZR : rn;
             a64_emit_bfm_w(b, rd, src, (32U - lsb) & 31U, msb - lsb);
             return true;
@@ -1181,6 +1196,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             /* SBFX */
             unsigned lsb = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
             unsigned widthm1 = hw2 & 31U;
+            if (lsb + widthm1 > 31U) {
+                return false;
+            }
             a64_emit_sbfm_w(b, rd, rn, lsb, lsb + widthm1);
             return true;
         }
@@ -1188,6 +1206,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             /* UBFX */
             unsigned lsb = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
             unsigned widthm1 = hw2 & 31U;
+            if (lsb + widthm1 > 31U) {
+                return false;
+            }
             a64_emit_ubfm_w(b, rd, rn, lsb, lsb + widthm1);
             return true;
         }
@@ -1839,9 +1860,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             unsigned op1 = (hw1 >> 4) & 7U;
             bool is_16   = (op1 != 0U && op1 != 4U);
             bool is_sub  = (hw1 & 0x0040U) != 0U;
-            if (flags_live) {
-                a64_emit_mrs_nzcv(b, A64_TMP3);
-            }
+            a64_emit_mrs_nzcv(b, A64_TMP3);
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 a64_emit_mov_imm32(b, A64_ADDR, (uint32_t)-32768);
@@ -1880,9 +1899,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                     a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
                 }
             }
-            if (flags_live) {
-                a64_emit_msr_nzcv(b, A64_TMP3);
-            }
+            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_mov_w(b, rd, A64_TMP2);
             return true;
         }
@@ -1894,9 +1911,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             unsigned op1 = (hw1 >> 4) & 7U;
             bool is_16   = (op1 != 0U && op1 != 4U);
             bool is_sub  = (hw1 & 0x0040U) != 0U;
-            if (flags_live) {
-                a64_emit_mrs_nzcv(b, A64_TMP3);
-            }
+            a64_emit_mrs_nzcv(b, A64_TMP3);
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 a64_emit_mov_imm32(b, A64_ADDR, 65535U);
@@ -1931,9 +1946,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                     a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
                 }
             }
-            if (flags_live) {
-                a64_emit_msr_nzcv(b, A64_TMP3);
-            }
+            a64_emit_msr_nzcv(b, A64_TMP3);
             a64_emit_mov_w(b, rd, A64_TMP2);
             return true;
         }
@@ -2162,7 +2175,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             bool l_bit = ((hw1 >> 4) & 1U) != 0U;
             unsigned rn = hw1 & 0xFU;
             uint32_t mask = hw2 & 0xDFFFU;
-            if (mask == 0U || rn == 15U) {
+            if (mask == 0U || rn == 15U || (!l_bit && (hw2 & 0x8000U) != 0U)) {
                 return false;
             }
             unsigned count = 0U;
@@ -2510,7 +2523,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         info->itstate = scan_itstate;
 
         /* Check for 16-bit IT instruction (0xBF00 where mask != 0) */
-        if ((hw1 & 0xFF00U) == 0xBF00U && (hw1 & 0x000FU) != 0U) {
+        if ((hw1 & 0xFF00U) == 0xBF00U && (hw1 & 0x000FU) != 0U && (scan_itstate & 0x0FU) == 0U) {
             unsigned firstcond = (hw1 >> 4) & 0xFU;
             unsigned it_mask = hw1 & 0xFU;
             if (firstcond != 0xFU &&
@@ -2541,9 +2554,19 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
                 uint32_t hw2_pc = scan_pc + 2U;
                 for (size_t r_idx = 0U; r_idx < ctx->region_count; r_idx++) {
                     const a32_region_t *r = &ctx->regions[r_idx];
-                    if (hw2_pc >= r->start && hw2_pc < r->end && (r->prot & 0x5U) != 0U) {
+                    if (hw2_pc >= r->start && hw2_pc < r->end && (r->prot & 0x4U) != 0U) {
                         mapped = true;
                         break;
+                    }
+                }
+                if (!mapped) {
+                    a32_vm_sync_ctx(ctx);
+                    for (size_t r_idx = 0U; r_idx < ctx->region_count; r_idx++) {
+                        const a32_region_t *r = &ctx->regions[r_idx];
+                        if (hw2_pc >= r->start && hw2_pc < r->end && (r->prot & 0x4U) != 0U) {
+                            mapped = true;
+                            break;
+                        }
                     }
                 }
                 if (!mapped) {
@@ -2603,6 +2626,12 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         const t32_insn_info_t *info = &block_insns[idx];
         uint32_t cur_pc = info->pc;
         uint16_t hw1 = info->hw1;
+
+        if (idx > 0U && itstate == 0U && b->cap > b->count && b->cap - b->count < 128U) {
+            b->guest_end_pc = cur_pc;
+            a64_emit_exit_branch_imm(b, cur_pc, false);
+            return true;
+        }
 
         if (info->is_it) {
             itstate = (uint8_t)(hw1 & 0xFFU);

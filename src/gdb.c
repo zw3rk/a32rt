@@ -535,11 +535,11 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     len = 4U;
                 }
             }
-            addr = (uint32_t)strtoul(cmd + 3, NULL, 16);
+            addr = (uint32_t)strtoul(cmd + 3, NULL, 16) & ~1U;
 
             bool inserted = false;
             for (size_t i = 0U; i < GDB_MAX_BREAKPOINTS; i++) {
-                if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == (addr & ~1U)) {
+                if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == addr) {
                     inserted = true;
                     break;
                 }
@@ -568,10 +568,10 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     len = 4U;
                 }
             }
-            addr = (uint32_t)strtoul(cmd + 3, NULL, 16);
+            addr = (uint32_t)strtoul(cmd + 3, NULL, 16) & ~1U;
 
             for (size_t i = 0U; i < GDB_MAX_BREAKPOINTS; i++) {
-                if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == (addr & ~1U)) {
+                if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == addr) {
                     g_breakpoints[i].active = false;
                     break;
                 }
@@ -630,12 +630,16 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             break;
         } else if (strncmp(cmd, "vCont?", 6) == 0) {
             send_packet(g_client_sock, "vCont;c;C;s;S");
-        } else if (strncmp(cmd, "vCont;c", 7) == 0 || strncmp(cmd, "vCont;C", 7) == 0) {
-            ctx->single_step = false;
-            break;
-        } else if (strncmp(cmd, "vCont;s", 7) == 0 || strncmp(cmd, "vCont;S", 7) == 0) {
-            ctx->single_step = true;
-            break;
+        } else if (strncmp(cmd, "vCont;", 6) == 0) {
+            if (strstr(cmd, ";s") != NULL || strstr(cmd, ";S") != NULL) {
+                ctx->single_step = true;
+                break;
+            }
+            if (strstr(cmd, ";c") != NULL || strstr(cmd, ";C") != NULL) {
+                ctx->single_step = false;
+                break;
+            }
+            send_packet(g_client_sock, "");
         } else if (strncmp(cmd, "qSupported", 10) == 0) {
             send_packet(g_client_sock, "PacketSize=4000;swbreak+");
         } else if (cmd[0] == 'D') {

@@ -130,7 +130,10 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
 
     /* Push argv strings in reverse index order so argv[0] < argv[1] < ... */
     uint32_t arg_ptrs[512];
-    int argc = (guest_argc > 511) ? 511 : guest_argc;
+    int argc = 0;
+    while (argc < guest_argc && argc < 511 && guest_argv[argc] != NULL) {
+        argc++;
+    }
     for (int i = argc - 1; i >= 0; i--) {
         arg_ptrs[i] = push_cstring(ctx, &sp, guest_argv[i]);
         if (arg_ptrs[i] == 0U) {
