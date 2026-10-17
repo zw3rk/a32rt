@@ -54,7 +54,7 @@ static unsigned load_t32_reg(a64_buf_t *b, unsigned reg, uint32_t pc_val, unsign
     return reg;
 }
 
-#define T32_MAX_PRESCAN_INSNS 128U
+#define T32_MAX_PRESCAN_INSNS (T32_MAX_BLOCK_INSNS + 8U)
 
 typedef struct {
     uint32_t pc;

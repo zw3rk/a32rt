@@ -51,17 +51,21 @@ typedef struct a32_ibtc_entry {
     uint32_t    epoch;
     const void *host_code;
     void       *entry;
+    uint64_t    pad;
 } a32_ibtc_entry_t;
+
+_Static_assert(sizeof(a32_ibtc_entry_t) == 32, "a32_ibtc_entry_t must be 32 bytes");
 
 typedef struct a32_pc_map_stage {
     uint32_t host_word_idx;
     uint32_t guest_pc;
     uint32_t itstate;
-} a32_pc_map_stage_t;
+} a32_pc_map_stage;
+typedef a32_pc_map_stage a32_pc_map_stage_t;
 
 /*
  * Architectural + runtime state for a 32-bit ARM guest thread.
- * Field offsets of the first 360 bytes are ABI-locked with `src/trampoline.S`
+ * Field offsets of the first 416 bytes are ABI-locked with `src/trampoline.S`
  * and `src/a64_emit.h`.
  */
 typedef struct a32_ctx {
@@ -76,6 +80,20 @@ typedef struct a32_ctx {
     uint64_t vfp_d[32];         /* 0x60: VFPv4-D32 / NEON registers (D0..D31 / S0..S31 / Q0..Q15) */
     uint32_t fpscr;             /* 0x160: VFP/NEON Floating-Point Status and Control Register */
     uint32_t pad0;              /* 0x164: Alignment padding */
+
+    /* ABI-locked fast-dispatch fields for `src/trampoline.S` (offsets 360..416) */
+    uint64_t          sig_mask;           /* 0x168 (360) */
+    volatile uint64_t pending_signals;    /* 0x170 (368) */
+    bool              trace_enabled;      /* 0x178 (376) */
+    bool              gdb_enabled;        /* 0x179 (377) */
+    bool              single_step;        /* 0x17a (378) */
+    volatile bool     sync_sig_delivered; /* 0x17b (379) */
+    uint32_t          pad1;               /* 0x17c (380) */
+    uint64_t          blocks_executed;    /* 0x180 (384) */
+    uint64_t          chain_hits;         /* 0x188 (392) */
+    void             *last_exec_entry;    /* 0x190 (400) */
+    uint64_t          ibtc_hits;          /* 0x198 (408) */
+    a32_ibtc_entry_t  ibtc[A32_IBTC_SIZE];/* 0x1a0 (416) */
 
     /* Guest memory layout & allocator inside [G, G + 4GiB) */
     uint32_t brk_base;
@@ -102,8 +120,6 @@ typedef struct a32_ctx {
     uint32_t          altstack_sp;
     uint32_t          altstack_size;
     uint32_t          altstack_flags;
-    uint64_t          sig_mask;
-    volatile uint64_t pending_signals;
     int               host_tid;
     bool              is_thread_clone;
 
@@ -118,30 +134,22 @@ typedef struct a32_ctx {
     const char *sysroot;
     const char *exec_path;
     const char *cache_dir;
-    bool        trace_enabled;
     bool        stats_enabled;
     bool        aot_mode;
-    bool          gdb_enabled;
-    bool          single_step;
-    volatile bool sync_sig_delivered;
-    int           gdb_port;
+    int         gdb_port;
     uint64_t    blocks_compiled;
-    uint64_t    blocks_executed;
-    uint64_t    chain_hits;
-    uint64_t    ibtc_hits;
     uint64_t    syscalls_executed;
     uint64_t    icache_flushes;
     uint64_t    wx_transitions;
     uint64_t    flags_elided;
 
-    /* M2 Return Address Stack (RAS) & per-thread IBTC for O(1) target prediction */
+    /* M2 Return Address Stack (RAS) for O(1) target prediction */
     uint32_t         ras_key[A32_RAS_SIZE];
     uint32_t         ras_epoch[A32_RAS_SIZE];
     const void      *ras_code[A32_RAS_SIZE];
     void            *ras_entry[A32_RAS_SIZE];
     uint32_t         ras_top;
     uint64_t         ras_hits;
-    a32_ibtc_entry_t ibtc[A32_IBTC_SIZE];
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -156,6 +164,17 @@ _Static_assert(offsetof(a32_ctx_t, svc_imm) == 84, "svc_imm must be at offset 84
 _Static_assert(offsetof(a32_ctx_t, itstate) == 88, "itstate must be at offset 88");
 _Static_assert(offsetof(a32_ctx_t, vfp_d) == 96, "vfp_d must be at offset 96 (0x60)");
 _Static_assert(offsetof(a32_ctx_t, fpscr) == 352, "fpscr must be at offset 352 (0x160)");
+_Static_assert(offsetof(a32_ctx_t, sig_mask) == 360, "sig_mask must be at offset 360");
+_Static_assert(offsetof(a32_ctx_t, pending_signals) == 368, "pending_signals must be at offset 368");
+_Static_assert(offsetof(a32_ctx_t, trace_enabled) == 376, "trace_enabled must be at offset 376");
+_Static_assert(offsetof(a32_ctx_t, gdb_enabled) == 377, "gdb_enabled must be at offset 377");
+_Static_assert(offsetof(a32_ctx_t, single_step) == 378, "single_step must be at offset 378");
+_Static_assert(offsetof(a32_ctx_t, sync_sig_delivered) == 379, "sync_sig_delivered must be at offset 379");
+_Static_assert(offsetof(a32_ctx_t, blocks_executed) == 384, "blocks_executed must be at offset 384");
+_Static_assert(offsetof(a32_ctx_t, chain_hits) == 392, "chain_hits must be at offset 392");
+_Static_assert(offsetof(a32_ctx_t, last_exec_entry) == 400, "last_exec_entry must be at offset 400");
+_Static_assert(offsetof(a32_ctx_t, ibtc_hits) == 408, "ibtc_hits must be at offset 408");
+_Static_assert(offsetof(a32_ctx_t, ibtc) == 416, "ibtc must be at offset 416");
 
 static inline void *a32_guest_ptr(const a32_ctx_t *ctx, uint32_t guest_va)
 {
@@ -208,7 +227,8 @@ typedef void (*a32_block_iter_fn)(uint32_t guest_pc, uint32_t guest_end_pc,
 int         a32_jit_init(a32_ctx_t *ctx);
 int         a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end);
 int         a32_jit_run(a32_ctx_t *ctx);
-uint32_t    a32_jit_run_block(a32_ctx_t *ctx, const void *code_ptr);
+uint32_t    a32_jit_run_block(a32_ctx_t *ctx, const void *code_ptr,
+                              void *cur_entry, const void *epoch_ptr);
 void        a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t itstate);
 bool        a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t *out_itstate);
 const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes);

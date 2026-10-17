@@ -83,14 +83,28 @@ help: ## Show available build and verification targets
 
 all: build tests ## Build a32rt and all arm32 M0-M5 test fixtures
 
+OBJ_DIR  := $(BUILD_DIR)/obj
+C_OBJS   := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+ASM_OBJS := $(patsubst src/%.S,$(OBJ_DIR)/%.o,$(ASM_SRCS))
+OBJS     := $(C_OBJS) $(ASM_OBJS)
+
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
+$(OBJ_DIR):
+	@mkdir -p $(OBJ_DIR)
+
+$(OBJ_DIR)/%.o: src/%.c $(HDRS) | $(OBJ_DIR)
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/%.o: src/%.S $(HDRS) | $(OBJ_DIR)
+	@$(CC) $(CFLAGS) -c $< -o $@
+
 build: $(A32RT_BIN) ## Build static-PIE aarch64-linux a32rt binary
 
-$(A32RT_BIN): $(SRCS) $(ASM_SRCS) $(HDRS) | $(BUILD_DIR)
-	@printf "\033[32m▸ Building\033[0m $@\n"
-	$(CC) $(CFLAGS) $(SRCS) $(ASM_SRCS) $(LDFLAGS) -o $@
+$(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
+	@printf "\033[32m▸ Linking\033[0m $@\n"
+	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
 	@ln -sf a32rt $(BUILD_DIR)/a32rt-binfmt-p
 
 tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M5
@@ -215,6 +229,73 @@ test-m5-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf $(BUILD_DIR)/hello-armhf-s
 test-all-hl: test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl ## Run complete M0..M5 suite under hyper-linux
 
 test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima ## Run complete M0..M5 suite inside Lima VM
+
+BENCH_BINS := $(BUILD_DIR)/bench-suite-armhf \
+              $(BUILD_DIR)/bench-suite-thumb \
+              $(BUILD_DIR)/bench-suite-aarch64 \
+              $(BUILD_DIR)/bench-suite-x86_64 \
+              $(BUILD_DIR)/bench-suite-i386
+
+$(eval $(call BUILD_ARM32_FIXTURE,bench-suite-armhf,bench_suite.c,-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,bench-suite-thumb,bench_suite.c,-mthumb))
+
+$(BUILD_DIR)/bench-suite-aarch64: tests/bench_suite.c | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $@ (aarch64)\n"
+	$(CLANG_RAW) --target=aarch64-unknown-linux-gnu -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+		-ffreestanding -fno-stack-protector -nostdlib -c $< -o $@.o
+	$(LLD_RAW) -m aarch64linux -Bstatic --no-dynamic-linker --image-base=0x00400000 -e _start $@.o -o $@
+
+$(BUILD_DIR)/bench-suite-x86_64: tests/bench_suite.c | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $@ (x86_64)\n"
+	$(CLANG_RAW) --target=x86_64-unknown-linux-gnu -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+		-ffreestanding -fno-stack-protector -nostdlib -c $< -o $@.o
+	$(LLD_RAW) -m elf_x86_64 -Bstatic --no-dynamic-linker --image-base=0x00400000 -e _start $@.o -o $@
+
+$(BUILD_DIR)/bench-suite-i386: tests/bench_suite.c | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $@ (i386)\n"
+	$(CLANG_RAW) --target=i686-unknown-linux-gnu -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+		-ffreestanding -fno-stack-protector -nostdlib -c $< -o $@.o
+	$(LLD_RAW) -m elf_i386 -Bstatic --no-dynamic-linker -e _start $@.o -o $@
+
+bench-bins: $(BENCH_BINS) ## Build cross-architecture benchmark binaries (armhf, thumb, aarch64, x86_64, i386)
+
+bench-hl: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite under hyper-linux (native, a32rt Cold JIT & Warm AOT)
+	@printf "\033[36m=== [hyper-linux] 1. Native aarch64-linux ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(BUILD_DIR)/bench-suite-aarch64)
+	@printf "\033[36m=== [hyper-linux] 2. a32rt A32 (Cold JIT, G=4GiB) ===\033[0m\n"
+	@rm -f /tmp/a32rt-cache-*.bin
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@printf "\033[36m=== [hyper-linux] 3. a32rt A32 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@printf "\033[36m=== [hyper-linux] 4. a32rt Thumb-2 (Cold JIT, G=4GiB) ===\033[0m\n"
+	@rm -f /tmp/a32rt-cache-*.bin
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@printf "\033[36m=== [hyper-linux] 5. a32rt Thumb-2 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+
+bench-lima: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite inside Lima VM (native, a32rt, qemu-arm, RosettaLinux, qemu-x86_64, qemu-i386)
+	@printf "\033[36m=== [Lima Linux VM] 1. Native aarch64-linux ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(BUILD_DIR)/bench-suite-aarch64)
+	@printf "\033[36m=== [Lima Linux VM] 2. a32rt A32 (Warm .a32cache AOT, G=0) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@printf "\033[36m=== [Lima Linux VM] 3. a32rt Thumb-2 (Warm .a32cache AOT, G=0) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@printf "\033[36m=== [Lima Linux VM] 4. qemu-arm 10.1.0 TCG (A32) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- qemu-arm $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@printf "\033[36m=== [Lima Linux VM] 5. qemu-arm 10.1.0 TCG (Thumb-2) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- qemu-arm $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@printf "\033[36m=== [Lima Linux VM] 6. Apple RosettaLinux (x86_64 -> aarch64) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- /mnt/lima-rosetta/rosetta $(abspath $(BUILD_DIR)/bench-suite-x86_64)
+	@printf "\033[36m=== [Lima Linux VM] 7. qemu-x86_64 10.1.0 TCG (x86_64) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- qemu-x86_64 $(abspath $(BUILD_DIR)/bench-suite-x86_64)
+	@printf "\033[36m=== [Lima Linux VM] 8. qemu-i386 10.1.0 TCG (32-bit x86) ===\033[0m\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- qemu-i386 $(abspath $(BUILD_DIR)/bench-suite-i386)
+
+bench: bench-hl bench-lima ## Run complete benchmark suite across hyper-linux and Lima VM
 
 clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR)
