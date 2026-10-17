@@ -24,7 +24,7 @@
 #define A32_CACHE_PAGES     (A32_CODE_CACHE_SIZE / A32_PAGE_SIZE) /* 4096 pages */
 #define A32_HT_SIZE         16384U                                /* Must be a power of 2 */
 #define A32_HT_MASK         (A32_HT_SIZE - 1U)
-#define A32_SIDE_TABLE_SIZE 131072U
+#define A32_SIDE_TABLE_SIZE 262144U
 #define MAX_STAGE_PC_MAP    256U
 #define A32_AOT_MAX_WORDS   2048U
 
@@ -194,7 +194,6 @@ static int flush_batch_locked(a32_ctx_t *ctx)
         }
         size_t start_p = p;
         while (p < A32_CACHE_PAGES && g_page_is_rw[p]) {
-            g_page_is_rw[p] = false;
             p++;
         }
         void  *range_start = g_code_cache + (start_p * A32_PAGE_SIZE);
@@ -202,6 +201,9 @@ static int flush_batch_locked(a32_ctx_t *ctx)
         if (mprotect(range_start, range_len, PROT_READ | PROT_EXEC) != 0) {
             fprintf(stderr, "a32rt: code cache mprotect(RX) failed: %s\n", strerror(errno));
             return -1;
+        }
+        for (size_t q = start_p; q < p; q++) {
+            g_page_is_rw[q] = false;
         }
         ctx->wx_transitions++;
     }
@@ -216,7 +218,7 @@ static int flush_batch_locked(a32_ctx_t *ctx)
 
 static uint8_t *allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
 {
-    if (code_bytes > A32_CODE_CACHE_SIZE) {
+    if (g_code_cache == NULL || code_bytes > A32_CODE_CACHE_SIZE) {
         return NULL;
     }
     if (atomic_load_explicit(&g_multithreaded, memory_order_acquire) &&
@@ -226,7 +228,8 @@ static uint8_t *allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
             g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
         }
     }
-    if (g_code_used + code_bytes > A32_CODE_CACHE_SIZE) {
+    if (g_code_used + code_bytes > A32_CODE_CACHE_SIZE ||
+        g_side_table_count + MAX_STAGE_PC_MAP > A32_SIDE_TABLE_SIZE) {
         reset_cache_locked(ctx);
     }
 
@@ -368,6 +371,9 @@ bool a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t 
 
 int a32_jit_flush_batch(a32_ctx_t *ctx)
 {
+    if (!ctx) {
+        return -1;
+    }
     jit_lock_acquire();
     int ret = flush_batch_locked(ctx);
     jit_lock_release();
@@ -541,13 +547,18 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
                               const uint32_t *words, size_t word_count,
                               const a32_pc_map_stage_t *pc_map, size_t pc_map_count)
 {
+    if (!ctx) {
+        return -1;
+    }
     uint32_t align_mask = is_thumb ? 1U : 3U;
     if (words == NULL || word_count == 0U || word_count > A32_AOT_MAX_WORDS ||
         pc_map_count >= MAX_STAGE_PC_MAP ||
         (pc_map_count > 0U && pc_map == NULL) ||
         (guest_pc & align_mask) != 0U ||
         (guest_end_pc & align_mask) != 0U ||
-        guest_end_pc <= guest_pc) {
+        guest_end_pc <= guest_pc ||
+        guest_end_pc - guest_pc > 512U ||
+        words[word_count - 1U] != 0xD65F03C0U /* RET */) {
         return -1;
     }
 
@@ -780,11 +791,17 @@ static const void *compile_block_internal(a32_ctx_t *ctx, uint32_t guest_pc, boo
 
 const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes)
 {
+    if (!ctx) {
+        return NULL;
+    }
     return compile_block_internal(ctx, pc, is_thumb, out_code_bytes, false);
 }
 
 void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
 {
+    if (!fn) {
+        return;
+    }
     jit_lock_acquire();
     uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     a32_pc_map_stage_t pc_map[MAX_STAGE_PC_MAP];
@@ -915,6 +932,9 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
 
 int a32_jit_run(a32_ctx_t *ctx)
 {
+    if (!ctx) {
+        return -1;
+    }
     jit_lock_acquire();
     if (ctx->is_thread_clone) {
         if (!atomic_load_explicit(&g_multithreaded, memory_order_relaxed)) {
@@ -1161,7 +1181,7 @@ int a32_jit_run(a32_ctx_t *ctx)
             uint32_t lr_pc   = ctx->regs[14] & ~1U;
             uint32_t next_pc = ctx->regs[15] & ~1U;
             if (cur_is_call && ctx->regs[14] != 0xFFFF0FA8U &&
-                 lr_pc > cur_start && lr_pc <= cur_end + 4U && next_pc != lr_pc) {
+                lr_pc > cur_start && lr_pc == cur_end && next_pc != lr_pc) {
                 uint32_t ret_key = lr_pc | (is_thumb ? 1U : 0U);
                 uint32_t r_ibtc  = ((ret_key >> 1U) ^ (ret_key & 1U)) & (A32_IBTC_SIZE - 1U);
                 uint32_t top     = ctx->ras_top;
@@ -1188,7 +1208,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                                 if (ht_code != NULL &&
                                     atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
                                     atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
-                                    atomic_load_explicit(&ht_e->key, memory_order_relaxed) == ret_key) {
+                                    atomic_load_explicit(&ht_e->key, memory_order_relaxed) == ret_key &&
+                                    atomic_load_explicit(&ht_e->host_code, memory_order_relaxed) == ht_code) {
                                     found_e    = ht_e;
                                     found_code = ht_code;
                                     break;
@@ -1291,7 +1312,7 @@ int a32_jit_run(a32_ctx_t *ctx)
             }
             fprintf(stderr, "a32rt: aborting on exit_reason=%u at guest pc=0x%08x\n",
                     reason, ctx->regs[15]);
-            return 127;
+            return 128 + SIGILL;
         }
 
         default:

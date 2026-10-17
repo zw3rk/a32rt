@@ -9,6 +9,7 @@
 #include "a32rt.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,46 +53,57 @@ static uint64_t fnv1a_64_step(uint64_t hash, const void *data, size_t len)
 
 static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
 {
+    if (elf_path == NULL) {
+        return 0ULL;
+    }
     uint64_t h = 0xcbf29ce484222325ULL;
     if (ctx != NULL) {
         h = fnv1a_64_step(h, &ctx->elf_base, sizeof(ctx->elf_base));
         h = fnv1a_64_step(h, &ctx->interp_base, sizeof(ctx->interp_base));
         h = fnv1a_64_step(h, &ctx->elf_entry, sizeof(ctx->elf_entry));
-    }
-    if (elf_path != NULL) {
-        h = fnv1a_64_step(h, elf_path, strlen(elf_path));
-        char resolved_path[PATH_MAX];
-        const char *host_path = elf_path;
-        if (ctx != NULL &&
-            a32_resolve_guest_path(ctx, elf_path, resolved_path, sizeof(resolved_path)) == 0) {
-            host_path = resolved_path;
-        }
-        struct stat st;
-        if (stat(host_path, &st) != 0 && host_path != elf_path) {
-            host_path = elf_path;
-        }
-        if (stat(host_path, &st) == 0) {
-            uint64_t sz  = (uint64_t)st.st_size;
-            uint64_t mt  = (uint64_t)st.st_mtime;
-            uint64_t mtn = (uint64_t)st.st_mtim.tv_nsec;
-            h = fnv1a_64_step(h, &sz, sizeof(sz));
-            h = fnv1a_64_step(h, &mt, sizeof(mt));
-            h = fnv1a_64_step(h, &mtn, sizeof(mtn));
-        }
-        FILE *f = fopen(host_path, "rb");
-        if (f == NULL && host_path != elf_path) {
-            f = fopen(elf_path, "rb");
-        }
-        if (f != NULL) {
-            uint8_t buf[4096];
-            size_t n;
-            while ((n = fread(buf, 1U, sizeof(buf), f)) > 0U) {
-                h = fnv1a_64_step(h, buf, n);
-            }
-            fclose(f);
+        if (ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
+            h = fnv1a_64_step(h, ctx->sysroot, strlen(ctx->sysroot));
         }
     }
-    return h;
+    h = fnv1a_64_step(h, elf_path, strlen(elf_path));
+    char resolved_path[PATH_MAX];
+    const char *host_path = elf_path;
+    if (ctx != NULL &&
+        a32_resolve_guest_path(ctx, elf_path, resolved_path, sizeof(resolved_path)) == 0) {
+        host_path = resolved_path;
+    }
+    struct stat st;
+    if (stat(host_path, &st) != 0) {
+        if (host_path == elf_path || stat(elf_path, &st) != 0) {
+            return 0ULL;
+        }
+        host_path = elf_path;
+    }
+    uint64_t sz  = (uint64_t)st.st_size;
+    uint64_t mt  = (uint64_t)st.st_mtime;
+    uint64_t mtn = (uint64_t)st.st_mtim.tv_nsec;
+    h = fnv1a_64_step(h, &sz, sizeof(sz));
+    h = fnv1a_64_step(h, &mt, sizeof(mt));
+    h = fnv1a_64_step(h, &mtn, sizeof(mtn));
+
+    FILE *f = fopen(host_path, "rb");
+    if (f == NULL && host_path != elf_path) {
+        f = fopen(elf_path, "rb");
+    }
+    if (f == NULL) {
+        return 0ULL;
+    }
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1U, sizeof(buf), f)) > 0U) {
+        h = fnv1a_64_step(h, buf, n);
+    }
+    bool read_err = (ferror(f) != 0);
+    fclose(f);
+    if (read_err) {
+        return 0ULL;
+    }
+    return (h != 0ULL) ? h : 1ULL;
 }
 
 static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
@@ -101,6 +113,9 @@ static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
         return -1;
     }
     uint64_t h = compute_elf_hash(ctx, elf_path);
+    if (h == 0ULL) {
+        return -1;
+    }
     const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
     if (dir == NULL || dir[0] == '\0') {
         dir = getenv("A32RT_CACHE");
@@ -200,8 +215,15 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
 
-    FILE *f = fopen(tmp_path, "wb");
+    (void)unlink(tmp_path);
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    FILE *f = fdopen(fd, "wb");
     if (f == NULL) {
+        close(fd);
+        (void)unlink(tmp_path);
         return -1;
     }
 
@@ -266,7 +288,7 @@ static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t l
 
 int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
 {
-    if (elf_path == NULL) {
+    if (ctx == NULL || elf_path == NULL) {
         return -1;
     }
     char cache_path[512];
@@ -274,8 +296,18 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
 
-    FILE *f = fopen(cache_path, "rb");
+    int fd = open(cache_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (!(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0022) == 0)) {
+        close(fd);
+        return -1;
+    }
+    FILE *f = fdopen(fd, "rb");
     if (f == NULL) {
+        close(fd);
         return -1;
     }
 
@@ -302,6 +334,7 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
             (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
             (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
             bh.guest_end_pc <= bh.guest_pc ||
+            bh.guest_end_pc - bh.guest_pc > 512U ||
             !aot_range_executable(ctx, bh.guest_pc, bh.guest_end_pc - bh.guest_pc) ||
             bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
             bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
@@ -325,8 +358,9 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         }
     }
 
+    bool eof_ok = (i == hdr.num_blocks && fgetc(f) == EOF && ferror(f) == 0);
     fclose(f);
-    if (i < hdr.num_blocks) {
+    if (!eof_ok) {
         (void)a32_jit_flush_batch(ctx);
         (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
         unlink(cache_path);

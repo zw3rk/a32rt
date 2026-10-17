@@ -2041,6 +2041,148 @@ static int test21_r8_itimer_nanosleep_rem(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 22: Round 9 regressions —
+ *   22a: mmap2 (192) with mutually exclusive MAP_SHARED | MAP_PRIVATE (0x23U)
+ *        returning -EINVAL (-22)
+ *   22b: open (5) and stat64 (195) with a 4096-character path (>= PATH_MAX)
+ *        returning -ENAMETOOLONG (-36) while invalid pointer 0x100U still
+ *        returns -EFAULT (-14)
+ *   22c: epoll_wait (252) with maxevents = 0 and events = NULL returning
+ *        -EINVAL (-22, NOT -EFAULT), ppoll (336) and pselect6 (335) with
+ *        invalid tv_nsec = -1 returning -EINVAL (-22), and ppoll / pselect6
+ *        with a static const struct timespec32 in .rodata succeeding (0)
+ *        without crashing on timeout writeback
+ * -------------------------------------------------------------------------- */
+static const struct timespec32 g_r9_rodata_zero_ts    = { 0, 0 };
+static const struct timespec32 g_r9_rodata_subusec_ts = { 0, 1000 };
+
+static int test22_r9_mmap_flags_enametoolong_epoll_pwait(void)
+{
+    static char long_path[4100];
+    static _Alignas(8) uint8_t st64_buf[104];
+    static struct timespec32 bad_ts;
+    static struct pollfd dummy_pfd;
+
+    /*
+     * 22a: Negative mmap2 (192) with mutually exclusive MAP_SHARED | MAP_PRIVATE
+     *      (0x23U = MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS) -> -EINVAL (-22),
+     *      and neither MAP_SHARED nor MAP_PRIVATE (0x20U = MAP_ANONYMOUS) -> -EINVAL (-22).
+     */
+    int32_t mm_both = sys6(192U /* mmap2 */, 0U, 4096U,
+                           3U /* PROT_READ|PROT_WRITE */,
+                           0x23U /* MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS */,
+                           0xFFFFFFFFU, 0U);
+    if (mm_both != -22 /* -EINVAL */) {
+        if ((uint32_t)mm_both <= 0xFFFFF000U) {
+            sys2(91U /* munmap */, (uint32_t)mm_both, 4096U);
+        }
+        return 204;
+    }
+
+    int32_t mm_neither = sys6(192U /* mmap2 */, 0U, 4096U,
+                              3U /* PROT_READ|PROT_WRITE */,
+                              0x20U /* MAP_ANONYMOUS without SHARED/PRIVATE */,
+                              0xFFFFFFFFU, 0U);
+    if (mm_neither != -22 /* -EINVAL */) {
+        if ((uint32_t)mm_neither <= 0xFFFFF000U) {
+            sys2(91U /* munmap */, (uint32_t)mm_neither, 4096U);
+        }
+        return 205;
+    }
+
+    /*
+     * 22b: Negative open (5) and stat64 (195) with a 4096-character path
+     *      (>= PATH_MAX) -> -ENAMETOOLONG (-36), while an invalid pointer
+     *      (0x100U) still returns -EFAULT (-14).
+     */
+    for (uint32_t i = 0U; i < 4096U; i++) {
+        long_path[i] = ((i & 63U) == 0U) ? '/' : 'a';
+    }
+    long_path[4096] = '\0';
+    my_memset(st64_buf, 0, sizeof(st64_buf));
+
+    if (sys3(5U /* open */, (uint32_t)(uintptr_t)long_path, 0U /* O_RDONLY */, 0U) != -36 /* -ENAMETOOLONG */ ||
+        sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */,
+             (uint32_t)(uintptr_t)long_path, 0U /* O_RDONLY */, 0U) != -36 /* -ENAMETOOLONG */ ||
+        sys2(195U /* stat64 */, (uint32_t)(uintptr_t)long_path,
+             (uint32_t)(uintptr_t)st64_buf) != -36 /* -ENAMETOOLONG */) {
+        return 206;
+    }
+
+    if (sys3(5U /* open */, 0x100U, 0U /* O_RDONLY */, 0U) != -14 /* -EFAULT */ ||
+        sys2(195U /* stat64 */, 0x100U, (uint32_t)(uintptr_t)st64_buf) != -14 /* -EFAULT */) {
+        return 207;
+    }
+
+    /*
+     * 22c-1: Negative epoll_wait (252) with maxevents = 0 (and maxevents = -1)
+     *        and events = NULL (0U) must return -EINVAL (-22), NOT -EFAULT (-14).
+     */
+    int32_t epfd = sys1(357U /* epoll_create1 */, 0U);
+    if (epfd < 0) {
+        return 208;
+    }
+    int32_t ep_rc0 = sys4(252U /* epoll_wait */, (uint32_t)epfd,
+                          0U /* events = NULL */, 0U /* maxevents = 0 */, 0U);
+    int32_t ep_rc_neg = sys4(252U /* epoll_wait */, (uint32_t)epfd,
+                             0U /* events = NULL */, 0xFFFFFFFFU /* maxevents = -1 */, 0U);
+    sys1(6U /* close */, (uint32_t)epfd);
+    if (ep_rc0 != -22 /* -EINVAL */ || ep_rc_neg != -22 /* -EINVAL */) {
+        return 209;
+    }
+
+    /*
+     * 22c-2: Negative ppoll (336) and pselect6 (335) with invalid tv_nsec = -1
+     *        (as well as tv_nsec = 1000000000 and tv_sec = -1) -> -EINVAL (-22).
+     */
+    bad_ts.tv_sec  = 0;
+    bad_ts.tv_nsec = -1;
+    if (sys5(336U /* ppoll */, 0U, 0U, (uint32_t)(uintptr_t)&bad_ts, 0U, 8U) != -22 /* -EINVAL */ ||
+        sys6(335U /* pselect6 */, 0U, 0U, 0U, 0U, (uint32_t)(uintptr_t)&bad_ts, 0U) != -22 /* -EINVAL */) {
+        return 210;
+    }
+
+    bad_ts.tv_sec  = 0;
+    bad_ts.tv_nsec = 1000000000;
+    if (sys5(336U /* ppoll */, 0U, 0U, (uint32_t)(uintptr_t)&bad_ts, 0U, 8U) != -22 /* -EINVAL */ ||
+        sys6(335U /* pselect6 */, 0U, 0U, 0U, 0U, (uint32_t)(uintptr_t)&bad_ts, 0U) != -22 /* -EINVAL */) {
+        return 211;
+    }
+
+    bad_ts.tv_sec  = -1;
+    bad_ts.tv_nsec = 0;
+    if (sys5(336U /* ppoll */, 0U, 0U, (uint32_t)(uintptr_t)&bad_ts, 0U, 8U) != -22 /* -EINVAL */ ||
+        sys6(335U /* pselect6 */, 0U, 0U, 0U, 0U, (uint32_t)(uintptr_t)&bad_ts, 0U) != -22 /* -EINVAL */) {
+        return 212;
+    }
+
+    /*
+     * 22c-3: Positive ppoll (336) and pselect6 (335) with a static const
+     *        struct timespec32 in .rodata (read-only memory) must succeed (0)
+     *        without crashing on timeout writeback!
+     */
+    dummy_pfd.fd      = -1;
+    dummy_pfd.events  = 0;
+    dummy_pfd.revents = 0;
+
+    if (sys5(336U /* ppoll */, (uint32_t)(uintptr_t)&dummy_pfd, 1U,
+             (uint32_t)(uintptr_t)&g_r9_rodata_zero_ts, 0U, 8U) != 0 ||
+        sys5(336U /* ppoll */, (uint32_t)(uintptr_t)&dummy_pfd, 1U,
+             (uint32_t)(uintptr_t)&g_r9_rodata_subusec_ts, 0U, 8U) != 0) {
+        return 213;
+    }
+
+    if (sys6(335U /* pselect6 */, 0U, 0U, 0U, 0U,
+             (uint32_t)(uintptr_t)&g_r9_rodata_zero_ts, 0U) != 0 ||
+        sys6(335U /* pselect6 */, 0U, 0U, 0U, 0U,
+             (uint32_t)(uintptr_t)&g_r9_rodata_subusec_ts, 0U) != 0) {
+        return 214;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -2116,6 +2258,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test21_r8_itimer_nanosleep_rem();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test22_r9_mmap_flags_enametoolong_epoll_pwait();
     if (rc != 0) {
         return rc;
     }

@@ -272,13 +272,10 @@ static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         return false;
     }
     uint64_t cur = (uint64_t)addr;
-    uint64_t brk_end = ((uint64_t)ctx->brk_curr + 0xFFFULL) & ~0xFFFULL;
     while (cur < end) {
         uint64_t next = cur;
         if (cur >= 0xFFFF0000ULL && cur < 0xFFFF1000ULL) {
             next = 0xFFFF1000ULL;
-        } else if (ctx->brk_base != 0U && cur >= (uint64_t)ctx->brk_base && cur < brk_end) {
-            next = brk_end;
         } else {
             for (size_t i = 0U; i < ctx->region_count; i++) {
                 const a32_region_t *r = &ctx->regions[i];
@@ -340,12 +337,14 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             send_packet(g_client_sock, resp);
         } else if (cmd[0] == 'G') {
             /* Write GPRs + cpsr */
+            if (strlen(cmd + 1) < 16U * 8U) {
+                send_packet(g_client_sock, "E01");
+                continue;
+            }
             const char *p = cmd + 1;
             for (unsigned r = 0U; r < 16U; r++) {
-                if (strlen(p) >= 8U) {
-                    ctx->regs[r] = decode_u32_le(p);
-                    p += 8U;
-                }
+                ctx->regs[r] = decode_u32_le(p);
+                p += 8U;
             }
             if (strlen(p) >= 8U) {
                 ctx->cpsr = decode_u32_le(p);
@@ -579,10 +578,19 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             }
             a32_jit_invalidate_range(ctx, addr, addr + len);
             send_packet(g_client_sock, "OK");
-        } else if (cmd[0] == 's') {
-            /* Single step: s[addr] */
-            if (cmd[1] != '\0') {
-                uint32_t addr = (uint32_t)strtoul(cmd + 1, NULL, 16);
+        } else if (cmd[0] == 's' || cmd[0] == 'S') {
+            /* Single step: s[addr] or Ssig[;addr] */
+            const char *addr_str = NULL;
+            if (cmd[0] == 's' && cmd[1] != '\0') {
+                addr_str = cmd + 1;
+            } else if (cmd[0] == 'S') {
+                const char *semi = strchr(cmd + 1, ';');
+                if (semi != NULL && semi[1] != '\0') {
+                    addr_str = semi + 1;
+                }
+            }
+            if (addr_str != NULL) {
+                uint32_t addr = (uint32_t)strtoul(addr_str, NULL, 16);
                 ctx->itstate = 0U;
                 if (addr & 1U) {
                     ctx->cpsr |= A32_CPSR_T;
@@ -595,10 +603,19 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             }
             ctx->single_step = true;
             break;
-        } else if (cmd[0] == 'c') {
-            /* Continue: c[addr] */
-            if (cmd[1] != '\0') {
-                uint32_t addr = (uint32_t)strtoul(cmd + 1, NULL, 16);
+        } else if (cmd[0] == 'c' || cmd[0] == 'C') {
+            /* Continue: c[addr] or Csig[;addr] */
+            const char *addr_str = NULL;
+            if (cmd[0] == 'c' && cmd[1] != '\0') {
+                addr_str = cmd + 1;
+            } else if (cmd[0] == 'C') {
+                const char *semi = strchr(cmd + 1, ';');
+                if (semi != NULL && semi[1] != '\0') {
+                    addr_str = semi + 1;
+                }
+            }
+            if (addr_str != NULL) {
+                uint32_t addr = (uint32_t)strtoul(addr_str, NULL, 16);
                 ctx->itstate = 0U;
                 if (addr & 1U) {
                     ctx->cpsr |= A32_CPSR_T;
@@ -612,11 +629,11 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             ctx->single_step = false;
             break;
         } else if (strncmp(cmd, "vCont?", 6) == 0) {
-            send_packet(g_client_sock, "vCont;c;s");
-        } else if (strncmp(cmd, "vCont;c", 7) == 0) {
+            send_packet(g_client_sock, "vCont;c;C;s;S");
+        } else if (strncmp(cmd, "vCont;c", 7) == 0 || strncmp(cmd, "vCont;C", 7) == 0) {
             ctx->single_step = false;
             break;
-        } else if (strncmp(cmd, "vCont;s", 7) == 0) {
+        } else if (strncmp(cmd, "vCont;s", 7) == 0 || strncmp(cmd, "vCont;S", 7) == 0) {
             ctx->single_step = true;
             break;
         } else if (strncmp(cmd, "qSupported", 10) == 0) {

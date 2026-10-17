@@ -452,11 +452,8 @@ bool a32_signals_deliver_sync(a32_ctx_t *ctx, int sig, uint32_t fault_addr)
     }
     ctx->fault_addr = fault_addr;
     guest_sigaction_t *act = &g_guest_sigactions[sig];
-    if (act->handler == 0U /* SIG_DFL */) {
+    if (act->handler == 0U /* SIG_DFL */ || act->handler == 1U /* SIG_IGN */) {
         return false;
-    }
-    if (act->handler == 1U /* SIG_IGN */) {
-        return true;
     }
     siginfo_t si;
     memset(&si, 0, sizeof(si));
@@ -510,7 +507,7 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
             if ((new_words[1] & A32_SA_NOCLDSTOP) != 0U) {
                 sa_flags |= (unsigned long)SA_NOCLDSTOP;
             }
-            if ((new_words[1] & A32_SA_NOCLDWAIT) != 0U) {
+            if ((new_words[1] & A32_SA_NOCLDWAIT) != 0U || new_words[0] == 1U /* SIG_IGN */) {
                 sa_flags |= (unsigned long)SA_NOCLDWAIT;
             }
         }

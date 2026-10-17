@@ -2242,6 +2242,270 @@ static int test19_r8_sigign_sigwinch_and_sigsuspend_mask(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 20: Round 9 regressions —
+ *   20a: rt_sigtimedwait (177) and rt_sigtimedwait_time64 (421) negative
+ *        (-EINVAL on sigsetsize != 8 or invalid timespec, -EFAULT on invalid
+ *        pointers, -EAGAIN on zero-timeout poll with no signal pending) and
+ *        positive (consume pending blocked SIGUSR1, populate siginfo32, and
+ *        clear pending bit in rt_sigpending)
+ *   20b: clone (120) negative flag & pointer validation:
+ *        - CLONE_SIGHAND without CLONE_VM -> -EINVAL (-22)
+ *        - CLONE_THREAD without CLONE_SIGHAND -> -EINVAL (-22)
+ *        - CLONE_VM | CLONE_SIGHAND | CLONE_PARENT_SETTID with ptid = 0x100U
+ *          -> -EFAULT (-14)
+ * -------------------------------------------------------------------------- */
+struct timespec64_m3 {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+_Static_assert(sizeof(struct timespec64_m3) == 16U, "timespec64_m3 must be 16 bytes");
+
+static int test20_r9_sigtimedwait_and_clone_validation(void)
+{
+    const uint32_t sigusr1  = 10U;
+    const uint64_t usr1_bit = 1ULL << (sigusr1 - 1U);
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+
+    static uint64_t orig_mask;
+    static uint64_t wait_set;
+    static uint64_t pend_mask;
+    static struct sigaction32 orig_usr1;
+    static struct sigaction32 sa_usr1;
+    static struct siginfo32 si;
+    static struct timespec32_m3 ts32;
+    static struct timespec64_m3 ts64;
+    static _Alignas(16) uint64_t dummy_clone_stack[64];
+
+    wait_set = usr1_bit;
+    ts32.tv_sec  = 0;
+    ts32.tv_nsec = 0;
+    ts64.tv_sec  = 0;
+    ts64.tv_nsec = 0;
+
+    /*
+     * 20a-1: Negative checks for rt_sigtimedwait (177) and rt_sigtimedwait_time64 (421):
+     *   - sigsetsize != 8 (0, 4) -> -EINVAL (-22)
+     *   - invalid pointers (0, 0x100) -> -EFAULT (-14)
+     *   - invalid timespec (tv_nsec = -1, tv_nsec = 1000000000, tv_sec = -1) -> -EINVAL (-22)
+     */
+    if (sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts32, 0U) != -22 /* -EINVAL */ ||
+        sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts32, 4U) != -22 /* -EINVAL */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts64, 0U) != -22 /* -EINVAL */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts64, 4U) != -22 /* -EINVAL */) {
+        return 189;
+    }
+
+    if (sys4(177U /* rt_sigtimedwait */, 0U,
+             0U, (uint32_t)(uintptr_t)&ts32, 8U) != -14 /* -EFAULT */ ||
+        sys4(177U /* rt_sigtimedwait */, 0x100U,
+             0U, (uint32_t)(uintptr_t)&ts32, 8U) != -14 /* -EFAULT */ ||
+        sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0x100U, (uint32_t)(uintptr_t)&ts32, 8U) != -14 /* -EFAULT */ ||
+        sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0U, 0x100U, 8U) != -14 /* -EFAULT */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, 0U,
+             0U, (uint32_t)(uintptr_t)&ts64, 8U) != -14 /* -EFAULT */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, 0x100U,
+             0U, (uint32_t)(uintptr_t)&ts64, 8U) != -14 /* -EFAULT */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0x100U, (uint32_t)(uintptr_t)&ts64, 8U) != -14 /* -EFAULT */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0U, 0x100U, 8U) != -14 /* -EFAULT */) {
+        return 190;
+    }
+
+    /* Invalid timespec: tv_nsec = -1, tv_nsec = 1000000000, tv_sec = -1 -> -EINVAL (-22) */
+    ts32.tv_sec  = 0;
+    ts32.tv_nsec = -1;
+    ts64.tv_sec  = 0;
+    ts64.tv_nsec = -1;
+    if (sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts32, 8U) != -22 /* -EINVAL */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts64, 8U) != -22 /* -EINVAL */) {
+        return 191;
+    }
+
+    ts32.tv_sec  = 0;
+    ts32.tv_nsec = 1000000000;
+    ts64.tv_sec  = 0;
+    ts64.tv_nsec = 1000000000LL;
+    if (sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts32, 8U) != -22 /* -EINVAL */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts64, 8U) != -22 /* -EINVAL */) {
+        return 192;
+    }
+
+    ts32.tv_sec  = -1;
+    ts32.tv_nsec = 0;
+    ts64.tv_sec  = -1;
+    ts64.tv_nsec = 0;
+    if (sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts32, 8U) != -22 /* -EINVAL */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             0U, (uint32_t)(uintptr_t)&ts64, 8U) != -22 /* -EINVAL */) {
+        return 193;
+    }
+
+    /*
+     * 20a-2: Zero-timeout poll when no signal is pending -> -EAGAIN (-11),
+     *        followed by positive consumption of blocked pending SIGUSR1 (10)
+     *        via both rt_sigtimedwait (177) and rt_sigtimedwait_time64 (421).
+     */
+    orig_mask = 0ULL;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&wait_set,
+             (uint32_t)(uintptr_t)&orig_mask, 8U) != 0) {
+        return 194;
+    }
+
+    g_r8_usr1_hits = 0U;
+    sa_usr1.sa_handler  = (uint32_t)(uintptr_t)r8_usr1_handler;
+    sa_usr1.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    sa_usr1.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    sa_usr1.sa_mask[0]  = 0U;
+    sa_usr1.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, sigusr1,
+             (uint32_t)(uintptr_t)&sa_usr1,
+             (uint32_t)(uintptr_t)&orig_usr1, 8U) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 195;
+    }
+
+    ts32.tv_sec  = 0;
+    ts32.tv_nsec = 0;
+    ts64.tv_sec  = 0;
+    ts64.tv_nsec = 0;
+    if (sys4(177U /* rt_sigtimedwait */, (uint32_t)(uintptr_t)&wait_set,
+             (uint32_t)(uintptr_t)&si, (uint32_t)(uintptr_t)&ts32, 8U) != -11 /* -EAGAIN */ ||
+        sys4(421U /* rt_sigtimedwait_time64 */, (uint32_t)(uintptr_t)&wait_set,
+             (uint32_t)(uintptr_t)&si, (uint32_t)(uintptr_t)&ts64, 8U) != -11 /* -EAGAIN */) {
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 196;
+    }
+
+    /* Positive: rt_sigtimedwait (177) */
+    si.si_signo = 0;
+    si.si_errno = -1;
+    si.si_code  = 0;
+    pend_mask   = 0ULL;
+    if (sys2(238U /* tkill */, tid, sigusr1) != 0 ||
+        sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & usr1_bit) == 0ULL) {
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 197;
+    }
+
+    int32_t stw_rc = sys4(177U /* rt_sigtimedwait */,
+                          (uint32_t)(uintptr_t)&wait_set,
+                          (uint32_t)(uintptr_t)&si,
+                          (uint32_t)(uintptr_t)&ts32, 8U);
+    pend_mask = 0xFFFFFFFFFFFFFFFFULL;
+    if (stw_rc != (int32_t)sigusr1 ||
+        si.si_signo != (int32_t)sigusr1 ||
+        g_r8_usr1_hits != 0U ||
+        sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & usr1_bit) != 0ULL) {
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 198;
+    }
+
+    /* Positive: rt_sigtimedwait_time64 (421) */
+    si.si_signo = 0;
+    si.si_errno = -1;
+    si.si_code  = 0;
+    pend_mask   = 0ULL;
+    if (sys2(238U /* tkill */, tid, sigusr1) != 0 ||
+        sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & usr1_bit) == 0ULL) {
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        return 199;
+    }
+
+    int32_t stw64_rc = sys4(421U /* rt_sigtimedwait_time64 */,
+                            (uint32_t)(uintptr_t)&wait_set,
+                            (uint32_t)(uintptr_t)&si,
+                            (uint32_t)(uintptr_t)&ts64, 8U);
+    pend_mask = 0xFFFFFFFFFFFFFFFFULL;
+    int32_t pend_rc = sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U);
+
+    sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+    sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+         (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+
+    if (stw64_rc != (int32_t)sigusr1 ||
+        si.si_signo != (int32_t)sigusr1 ||
+        g_r8_usr1_hits != 0U ||
+        pend_rc != 0 ||
+        (pend_mask & usr1_bit) != 0ULL) {
+        return 200;
+    }
+
+    /*
+     * 20b: Negative clone (120) flag & pointer validation:
+     *   - CLONE_SIGHAND (0x00000800U) without CLONE_VM (0x00000100U) -> -EINVAL (-22)
+     *   - CLONE_THREAD (0x00010000U) without CLONE_SIGHAND (0x00000800U) -> -EINVAL (-22)
+     *   - CLONE_VM | CLONE_SIGHAND | CLONE_PARENT_SETTID with ptid = 0x100U -> -EFAULT (-14)
+     */
+    uint32_t valid_sp = (uint32_t)(uintptr_t)&dummy_clone_stack[64];
+
+    int32_t c_rc1 = sys6(120U /* clone */, 0x00000800U /* CLONE_SIGHAND */,
+                         valid_sp, 0U, 0U, 0U, 0U);
+    if (c_rc1 == 0) {
+        sys1(1U /* exit */, 99U);
+    }
+    if (c_rc1 != -22 /* -EINVAL */) {
+        return 201;
+    }
+
+    int32_t c_rc2 = sys6(120U /* clone */,
+                         0x00000100U | 0x00010000U /* CLONE_VM | CLONE_THREAD */,
+                         valid_sp, 0U, 0U, 0U, 0U);
+    if (c_rc2 == 0) {
+        sys1(1U /* exit */, 99U);
+    }
+    if (c_rc2 != -22 /* -EINVAL */) {
+        return 202;
+    }
+
+    int32_t c_rc3 = sys6(120U /* clone */, 0x00010000U /* CLONE_THREAD */,
+                         valid_sp, 0U, 0U, 0U, 0U);
+    if (c_rc3 == 0) {
+        sys1(1U /* exit */, 99U);
+    }
+    if (c_rc3 != -22 /* -EINVAL */) {
+        return 203;
+    }
+
+    int32_t c_rc4 = sys6(120U /* clone */,
+                         0x00000100U | 0x00000800U | 0x00100000U /* CLONE_VM | CLONE_SIGHAND | CLONE_PARENT_SETTID */,
+                         valid_sp, 0x100U /* invalid ptid */, 0U, 0U, 0U);
+    if (c_rc4 == 0) {
+        sys1(1U /* exit */, 99U);
+    }
+    if (c_rc4 != -14 /* -EFAULT */) {
+        return 204;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -2317,6 +2581,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test19_r8_sigign_sigwinch_and_sigsuspend_mask();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test20_r9_sigtimedwait_and_clone_validation();
     if (rc != 0) {
         return rc;
     }

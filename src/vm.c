@@ -575,7 +575,7 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
 static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                                 uint32_t flags, int fd, uint32_t pgoffset)
 {
-    if (!ctx || len == 0U || (flags & 0x03U) == 0U) {
+    if (!ctx || len == 0U || (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
         return (uint32_t)(-EINVAL);
     }
 
@@ -663,7 +663,7 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
 uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                       uint32_t flags, int fd, uint32_t pgoffset)
 {
-    if (!ctx || len == 0U || (flags & 0x03U) == 0U) {
+    if (!ctx || len == 0U || (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
         return (uint32_t)(-EINVAL);
     }
 

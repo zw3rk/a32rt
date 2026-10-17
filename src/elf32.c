@@ -234,11 +234,6 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             (uint64_t)entry_pc + entry_min_len <= seg_vaddr64 + memsz) {
             entry_in_load = true;
         }
-        if (out->phdr_vaddr != 0U &&
-            out->phdr_vaddr >= seg_vaddr &&
-            (uint64_t)out->phdr_vaddr + phdr_bytes <= seg_vaddr64 + memsz) {
-            phdr_in_load = true;
-        }
         uint32_t page_start = page_down(seg_vaddr);
         uint64_t map_end64  = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
         if (page_start < 0x10000U || map_end64 > (uint64_t)A32_KUSER_BASE_32) {
@@ -402,9 +397,14 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             }
         }
 
+        uint32_t base_va = (read_file_off < ph->p_offset) ? page_start : seg_vaddr;
+        if (out->phdr_vaddr != 0U &&
+            out->phdr_vaddr >= base_va &&
+            (uint64_t)out->phdr_vaddr + phdr_bytes <= (uint64_t)base_va + (uint64_t)read_file_len) {
+            phdr_in_load = true;
+        }
         if (fallback_phdr_vaddr == 0U && read_file_off <= ehdr.e_phoff &&
             (uint64_t)ehdr.e_phoff + phdr_bytes <= (uint64_t)read_file_off + (uint64_t)read_file_len) {
-            uint32_t base_va = (read_file_off < ph->p_offset) ? page_start : seg_vaddr;
             fallback_phdr_vaddr = base_va + (ehdr.e_phoff - read_file_off);
         }
 

@@ -896,13 +896,6 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             }
             if (size == 3U && l_bit) {
                 /* VLD1..4.<8/16/32> {Dd[], ...}, [Rn] */
-                unsigned dup_size = (insn >> 6) & 3U;
-                if (n_structs == 4U && dup_size == 3U && (insn & 0x10U) != 0U) {
-                    dup_size = 2U;
-                }
-                if (dup_size > 2U) {
-                    return false;
-                }
                 bool t_bit = ((insn >> 5) & 1U) != 0U;
                 uint32_t elem_bytes = 1U << dup_size;
                 if (n_structs == 1U) {
