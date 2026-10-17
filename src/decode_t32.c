@@ -118,7 +118,7 @@ static bool t32_insn_uncond_ends_block(uint16_t hw1, uint16_t hw2)
         return true;
     }
     /* LDR.W pc, ... */
-    if ((hw1 & 0xFE00U) == 0xF800U) {
+    if ((hw1 & 0xFF00U) == 0xF800U) {
         unsigned size = (hw1 >> 5) & 3U;
         bool is_load = ((hw1 >> 4) & 1U) != 0U;
         unsigned rt = (hw2 >> 12) & 0xFU;
@@ -798,7 +798,7 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             *out_ends_block = true;
             return true;
         }
-        if ((insn & 0xFF00U) == 0xBF00U) {
+        if ((insn & 0xFF0FU) == 0xBF00U) {
             /* NOP / hints */
             return true;
         }
@@ -963,6 +963,8 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                     a64_emit_dmb_ish(b);
                 } else if (op == 6U) {
                     a64_emit_isb(b);
+                } else {
+                    return false;
                 }
                 return true;
             }
@@ -1541,7 +1543,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             }
             return true;
         }
-        if ((hw1 & 0xFF80U) == 0xFA00U && (hw2 & 0xF080U) == 0xF080U) {
+        if ((hw1 & 0xFF80U) == 0xFA00U && (hw2 & 0xF0C0U) == 0xF080U) {
             /* SXTH / UXTH / SXTB16 / UXTB16 / SXTB / UXTB (+ add variants) */
             unsigned op = (hw1 >> 4) & 7U;
             if (op > 5U) {
@@ -1738,6 +1740,176 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             }
             a64_emit_str_imm_w(b, A64_ADDR, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
             a64_emit_msr_nzcv(b, A64_TMP3);
+            a64_emit_mov_w(b, rd, A64_TMP2);
+            return true;
+        }
+        if (((hw1 & 0xFFF0U) == 0xFA80U || (hw1 & 0xFFF0U) == 0xFAC0U ||
+             (hw1 & 0xFFF0U) == 0xFA90U || (hw1 & 0xFFF0U) == 0xFAD0U) &&
+            (hw2 & 0xF0F0U) == 0xF020U) {
+            /* SHADD8 / SHSUB8 / SHADD16 / SHSUB16 Rd, Rn, Rm */
+            bool is_16  = (hw1 & 0x0010U) != 0U;
+            bool is_sub = (hw1 & 0x0040U) != 0U;
+            a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
+            if (is_16) {
+                for (unsigned i = 0U; i < 2U; i++) {
+                    a64_emit_sbfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    }
+                    a64_emit_sbfm_w(b, A64_TMP1, A64_TMP1, 1U, 31U);
+                    a64_emit_ubfm_w(b, A64_TMP1, A64_TMP1, 0U, 15U);
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP1, (32U - (i * 16U)) & 31U, 15U);
+                }
+            } else {
+                for (unsigned i = 0U; i < 4U; i++) {
+                    a64_emit_sbfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    }
+                    a64_emit_sbfm_w(b, A64_TMP1, A64_TMP1, 1U, 31U);
+                    a64_emit_ubfm_w(b, A64_TMP1, A64_TMP1, 0U, 7U);
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP1, (32U - (i * 8U)) & 31U, 7U);
+                }
+            }
+            a64_emit_mov_w(b, rd, A64_TMP2);
+            return true;
+        }
+        if (((hw1 & 0xFFF0U) == 0xFA80U || (hw1 & 0xFFF0U) == 0xFAC0U ||
+             (hw1 & 0xFFF0U) == 0xFA90U || (hw1 & 0xFFF0U) == 0xFAD0U) &&
+            (hw2 & 0xF0F0U) == 0xF060U) {
+            /* UHADD8 / UHSUB8 / UHADD16 / UHSUB16 Rd, Rn, Rm */
+            bool is_16  = (hw1 & 0x0010U) != 0U;
+            bool is_sub = (hw1 & 0x0040U) != 0U;
+            a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
+            if (is_16) {
+                for (unsigned i = 0U; i < 2U; i++) {
+                    a64_emit_ubfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    }
+                    a64_emit_ubfm_w(b, A64_TMP1, A64_TMP1, 1U, 16U);
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP1, (32U - (i * 16U)) & 31U, 15U);
+                }
+            } else {
+                for (unsigned i = 0U; i < 4U; i++) {
+                    a64_emit_ubfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    }
+                    a64_emit_ubfm_w(b, A64_TMP1, A64_TMP1, 1U, 8U);
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP1, (32U - (i * 8U)) & 31U, 7U);
+                }
+            }
+            a64_emit_mov_w(b, rd, A64_TMP2);
+            return true;
+        }
+        if (((hw1 & 0xFFF0U) == 0xFA80U || (hw1 & 0xFFF0U) == 0xFAC0U ||
+             (hw1 & 0xFFF0U) == 0xFA90U || (hw1 & 0xFFF0U) == 0xFAD0U) &&
+            (hw2 & 0xF0F0U) == 0xF010U) {
+            /* QADD8 / QSUB8 / QADD16 / QSUB16 Rd, Rn, Rm */
+            bool is_16  = (hw1 & 0x0010U) != 0U;
+            bool is_sub = (hw1 & 0x0040U) != 0U;
+            if (flags_live) {
+                a64_emit_mrs_nzcv(b, A64_TMP3);
+            }
+            a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
+            if (is_16) {
+                a64_emit_mov_imm32(b, A64_ADDR, (uint32_t)-32768);
+                for (unsigned i = 0U; i < 2U; i++) {
+                    a64_emit_sbfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    }
+                    a64_emit_mov_imm32(b, A64_TMP1, 32767U);
+                    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_GT);
+                    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_ADDR, A64_SHIFT_LSL, 0U);
+                    a64_emit_csel_w(b, A64_TMP0, A64_ADDR, A64_TMP0, A64_COND_LT);
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 16U)) & 31U, 15U);
+                }
+            } else {
+                a64_emit_mov_imm32(b, A64_ADDR, (uint32_t)-128);
+                for (unsigned i = 0U; i < 4U; i++) {
+                    a64_emit_sbfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    }
+                    a64_emit_mov_imm32(b, A64_TMP1, 127U);
+                    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                    a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_GT);
+                    a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_ADDR, A64_SHIFT_LSL, 0U);
+                    a64_emit_csel_w(b, A64_TMP0, A64_ADDR, A64_TMP0, A64_COND_LT);
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
+                }
+            }
+            if (flags_live) {
+                a64_emit_msr_nzcv(b, A64_TMP3);
+            }
+            a64_emit_mov_w(b, rd, A64_TMP2);
+            return true;
+        }
+        if (((hw1 & 0xFFF0U) == 0xFA80U || (hw1 & 0xFFF0U) == 0xFAC0U ||
+             (hw1 & 0xFFF0U) == 0xFA90U || (hw1 & 0xFFF0U) == 0xFAD0U) &&
+            (hw2 & 0xF0F0U) == 0xF050U) {
+            /* UQADD8 / UQSUB8 / UQADD16 / UQSUB16 Rd, Rn, Rm */
+            bool is_16  = (hw1 & 0x0010U) != 0U;
+            bool is_sub = (hw1 & 0x0040U) != 0U;
+            if (flags_live) {
+                a64_emit_mrs_nzcv(b, A64_TMP3);
+            }
+            a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
+            if (is_16) {
+                a64_emit_mov_imm32(b, A64_ADDR, 65535U);
+                for (unsigned i = 0U; i < 2U; i++) {
+                    a64_emit_ubfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                        a64_emit_csel_w(b, A64_TMP0, A64_TMP0, A64_ZR, A64_COND_CS);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                        a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_ADDR, A64_SHIFT_LSL, 0U);
+                        a64_emit_csel_w(b, A64_TMP0, A64_ADDR, A64_TMP0, A64_COND_HI);
+                    }
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 16U)) & 31U, 15U);
+                }
+            } else {
+                a64_emit_mov_imm32(b, A64_ADDR, 255U);
+                for (unsigned i = 0U; i < 4U; i++) {
+                    a64_emit_ubfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
+                    if (is_sub) {
+                        a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                        a64_emit_csel_w(b, A64_TMP0, A64_TMP0, A64_ZR, A64_COND_CS);
+                    } else {
+                        a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                        a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_ADDR, A64_SHIFT_LSL, 0U);
+                        a64_emit_csel_w(b, A64_TMP0, A64_ADDR, A64_TMP0, A64_COND_HI);
+                    }
+                    a64_emit_bfm_w(b, A64_TMP2, A64_TMP0, (32U - (i * 8U)) & 31U, 7U);
+                }
+            }
+            if (flags_live) {
+                a64_emit_msr_nzcv(b, A64_TMP3);
+            }
             a64_emit_mov_w(b, rd, A64_TMP2);
             return true;
         }
@@ -2137,13 +2309,17 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         unsigned rn   = hw1 & 0xFU;
         unsigned rt   = (hw2 >> 12) & 0xFU;
 
-        if (size > 2U) {
+        if (size > 2U || (size == 2U && sign_ext)) {
             return false;
         }
-        if (rt == 15U && is_load && size != 2U) {
-            /* PLD / PLI hint */
-            return true;
+        if (rn == 15U && !is_load) {
+            return false;
         }
+
+        bool p_bit = true;
+        bool u_bit = false;
+        bool w_bit = false;
+        uint16_t imm8 = 0U;
 
         if (rn == 15U) {
             /* Literal load [PC, #+/-imm12] */
@@ -2164,13 +2340,16 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             a64_emit_add_reg_w(b, false, A64_ADDR, rn, rm, A64_SHIFT_LSL, shift);
         } else {
             /* 8-bit pre/post/negative immediate [Rn, #+/-imm8] */
-            bool p_bit = ((hw2 >> 10) & 1U) != 0U;
-            bool u_bit = ((hw2 >> 9) & 1U) != 0U;
-            bool w_bit = ((hw2 >> 8) & 1U) != 0U;
+            p_bit = ((hw2 >> 10) & 1U) != 0U;
+            u_bit = ((hw2 >> 9) & 1U) != 0U;
+            w_bit = ((hw2 >> 8) & 1U) != 0U;
             if (!p_bit && !w_bit) {
                 return false;
             }
-            uint16_t imm8 = (uint16_t)(hw2 & 0xFFU);
+            if (rt == 15U && is_load && size != 2U && (hw2 & 0x0F00U) != 0x0C00U) {
+                return false;
+            }
+            imm8 = (uint16_t)(hw2 & 0xFFU);
             if (p_bit) {
                 if (u_bit) {
                     a64_emit_add_imm_w(b, false, A64_ADDR, rn, imm8, 0U);
@@ -2180,50 +2359,10 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             } else {
                 a64_emit_mov_w(b, A64_ADDR, rn);
             }
+        }
 
-            unsigned dst = (is_load && rt == 15U) ? A64_TMP0 : rt;
-            if (is_load) {
-                if (size == 0U) {
-                    if (sign_ext) {
-                        a64_emit_guest_ldrsb_w(b, dst, A64_ADDR);
-                    } else {
-                        a64_emit_guest_ldrb_w(b, dst, A64_ADDR);
-                    }
-                } else if (size == 1U) {
-                    if (sign_ext) {
-                        a64_emit_guest_ldrsh_w(b, dst, A64_ADDR);
-                    } else {
-                        a64_emit_guest_ldrh_w(b, dst, A64_ADDR);
-                    }
-                } else {
-                    a64_emit_guest_ldr_w(b, dst, A64_ADDR);
-                }
-            } else {
-                if (size == 0U) {
-                    a64_emit_guest_strb_w(b, rt, A64_ADDR);
-                } else if (size == 1U) {
-                    a64_emit_guest_strh_w(b, rt, A64_ADDR);
-                } else {
-                    a64_emit_guest_str_w(b, rt, A64_ADDR);
-                }
-            }
-
-            if (!p_bit && (rn != rt || !is_load)) {
-                if (u_bit) {
-                    a64_emit_add_imm_w(b, false, rn, rn, imm8, 0U);
-                } else {
-                    a64_emit_sub_imm_w(b, false, rn, rn, imm8, 0U);
-                }
-            } else if (p_bit && w_bit && (rn != rt || !is_load)) {
-                a64_emit_mov_w(b, rn, A64_ADDR);
-            }
-
-            if (is_load && rt == 15U) {
-                a64_emit_exit_branch_reg(b, A64_TMP0, true);
-                if (is_uncond) {
-                    *out_ends_block = true;
-                }
-            }
+        if (rt == 15U && is_load && size != 2U) {
+            /* PLD / PLI hint */
             return true;
         }
 
@@ -2244,12 +2383,6 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             } else {
                 a64_emit_guest_ldr_w(b, dst, A64_ADDR);
             }
-            if (rt == 15U) {
-                a64_emit_exit_branch_reg(b, A64_TMP0, true);
-                if (is_uncond) {
-                    *out_ends_block = true;
-                }
-            }
         } else {
             if (size == 0U) {
                 a64_emit_guest_strb_w(b, rt, A64_ADDR);
@@ -2257,6 +2390,23 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit_guest_strh_w(b, rt, A64_ADDR);
             } else {
                 a64_emit_guest_str_w(b, rt, A64_ADDR);
+            }
+        }
+
+        if (!p_bit && (rn != rt || !is_load)) {
+            if (u_bit) {
+                a64_emit_add_imm_w(b, false, rn, rn, imm8, 0U);
+            } else {
+                a64_emit_sub_imm_w(b, false, rn, rn, imm8, 0U);
+            }
+        } else if (p_bit && w_bit && (rn != rt || !is_load)) {
+            a64_emit_mov_w(b, rn, A64_ADDR);
+        }
+
+        if (is_load && rt == 15U) {
+            a64_emit_exit_branch_reg(b, A64_TMP0, true);
+            if (is_uncond) {
+                *out_ends_block = true;
             }
         }
         return true;
@@ -2331,12 +2481,17 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 
         /* Check for 16-bit IT instruction (0xBF00 where mask != 0) */
         if ((hw1 & 0xFF00U) == 0xBF00U && (hw1 & 0x000FU) != 0U) {
-            info->is_it = true;
-            info->is_32bit = false;
-            scan_itstate = (uint8_t)(hw1 & 0xFFU);
-            scan_pc += 2U;
-            num_insns++;
-            continue;
+            unsigned firstcond = (hw1 >> 4) & 0xFU;
+            unsigned it_mask = hw1 & 0xFU;
+            if (firstcond != 0xFU &&
+                !(firstcond == 0xEU && (it_mask & (it_mask - 1U)) != 0U)) {
+                info->is_it = true;
+                info->is_32bit = false;
+                scan_itstate = (uint8_t)(hw1 & 0xFFU);
+                scan_pc += 2U;
+                num_insns++;
+                continue;
+            }
         }
 
         info->is_it = false;
@@ -2344,6 +2499,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         info->is_32bit = is_32bit;
 
         bool in_it = (scan_itstate & 0x0FU) != 0U;
+        bool scan_uncond = !in_it || (((scan_itstate >> 4) & 0xFU) == A64_COND_AL);
         bool ends_uncond = false;
 
         if (is_32bit) {
@@ -2373,12 +2529,12 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
             uint16_t hw2 = guest_hw[1];
             info->hw2 = hw2;
             scan_pc += 4U;
-            if (!in_it && t32_insn_uncond_ends_block(hw1, hw2)) {
+            if (scan_uncond && t32_insn_uncond_ends_block(hw1, hw2)) {
                 ends_uncond = true;
             }
         } else {
             scan_pc += 2U;
-            if ((!in_it && t16_insn_uncond_ends_block(hw1)) || (hw1 & 0xFF00U) == 0xBE00U) {
+            if ((scan_uncond && t16_insn_uncond_ends_block(hw1)) || (hw1 & 0xFF00U) == 0xBE00U) {
                 ends_uncond = true;
             }
         }
@@ -2457,12 +2613,13 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
             }
         }
 
+        bool is_uncond = !in_it || (cond == A64_COND_AL);
         bool ends_block = false;
         bool ok = false;
 
         if (info->is_32bit) {
             uint16_t hw2 = info->hw2;
-            ok = translate_t32_insn(ctx, b, cur_pc, hw1, hw2, !in_it, flags_live[idx], &ends_block);
+            ok = translate_t32_insn(ctx, b, cur_pc, hw1, hw2, is_uncond, flags_live[idx], &ends_block);
             if (!ok) {
                 if (ctx->trace_enabled) {
                     fprintf(stderr, "a32rt: unhandled T32 instruction 0x%04x 0x%04x at pc=0x%08x\n",
@@ -2475,7 +2632,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
                 a64_emit_exit_undef(b, cur_pc);
             }
         } else {
-            ok = translate_t16_insn(ctx, b, cur_pc, hw1, in_it, itstate, next_itstate, !in_it, flags_live[idx], &ends_block);
+            ok = translate_t16_insn(ctx, b, cur_pc, hw1, in_it, itstate, next_itstate, is_uncond, flags_live[idx], &ends_block);
             if (!ok) {
                 if (ctx->trace_enabled) {
                     fprintf(stderr, "a32rt: unhandled T16 instruction 0x%04x at pc=0x%08x\n",
@@ -2496,7 +2653,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
             itstate = next_itstate;
         }
 
-        if ((ends_block && itstate == 0U) || (!ok && (!in_it || cond == A64_COND_AL))) {
+        if ((ends_block && (itstate == 0U || is_uncond)) || (!ok && is_uncond)) {
             b->guest_end_pc = cur_pc + (info->is_32bit ? 4U : 2U);
             return true;
         }

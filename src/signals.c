@@ -114,7 +114,7 @@ _Static_assert(offsetof(a32_rt_sigframe_t, uc) == 128,
 
 static _Thread_local a32_ctx_t *g_tls_ctx = NULL;
 static guest_sigaction_t        g_guest_sigactions[65];
-static siginfo_t                g_pending_siginfo[65];
+static _Thread_local siginfo_t  g_pending_siginfo[65];
 
 void a32_signals_set_thread_ctx(a32_ctx_t *ctx)
 {
@@ -134,11 +134,13 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
                         !(ctx->altstack_flags & A32_SS_DISABLE) &&
                         sp >= ctx->altstack_sp &&
                         (sp - ctx->altstack_sp) < ctx->altstack_size);
+    bool switched_to_altstack = false;
     if ((act->flags & A32_SA_ONSTACK) &&
         !on_altstack &&
         ctx->altstack_size > 0U &&
         !(ctx->altstack_flags & A32_SS_DISABLE)) {
         sp = ctx->altstack_sp + ctx->altstack_size;
+        switched_to_altstack = true;
     }
 
     sp = (sp - (uint32_t)sizeof(a32_rt_sigframe_t)) & ~7U;
@@ -182,7 +184,19 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     frame->uc.uc_stack.ss_size  = ctx->altstack_size;
     frame->uc.uc_stack.ss_flags = (int32_t)((ctx->altstack_size == 0U || (ctx->altstack_flags & A32_SS_DISABLE))
                                             ? A32_SS_DISABLE
-                                            : (on_altstack ? A32_SS_ONSTACK : 0U));
+                                            : ((on_altstack ? A32_SS_ONSTACK : 0U) |
+                                               (ctx->altstack_flags & 0x80000000U)));
+    frame->saved_pad  = 1U;
+    frame->uc._pad[0] = ctx->altstack_sp;
+    frame->uc._pad[1] = ctx->altstack_size;
+    frame->uc._pad[2] = ctx->altstack_flags;
+    if ((switched_to_altstack || on_altstack) &&
+        (act->flags & A32_SA_ONSTACK) != 0U &&
+        (ctx->altstack_flags & 0x80000000U) != 0U) {
+        ctx->altstack_sp    = 0U;
+        ctx->altstack_size  = 0U;
+        ctx->altstack_flags = A32_SS_DISABLE;
+    }
 
     frame->uc.uc_mcontext.trap_no       = 0;
     frame->uc.uc_mcontext.error_code    = 0;
@@ -406,7 +420,7 @@ bool a32_signals_deliver_sync(a32_ctx_t *ctx, int sig, uint32_t fault_addr)
 }
 
 int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
-                        uint32_t oldact_va, uint32_t sigsetsize)
+                         uint32_t oldact_va, uint32_t sigsetsize)
 {
     if (!ctx || signum < 1 || signum > 64 || signum == SIGKILL || signum == SIGSTOP) {
         return -EINVAL;
@@ -418,15 +432,12 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
         return -EFAULT;
     }
 
-    if (oldact_va != 0U) {
-        guest_sigaction_t cur = g_guest_sigactions[signum];
-        uint32_t old_words[5];
-        old_words[0] = cur.handler;
-        old_words[1] = cur.flags;
-        old_words[2] = cur.restorer;
-        memcpy(&old_words[3], &cur.mask, sizeof(uint64_t));
-        memcpy(a32_guest_ptr(ctx, oldact_va), old_words, sizeof(old_words));
-    }
+    guest_sigaction_t cur = g_guest_sigactions[signum];
+    uint32_t old_words[5];
+    old_words[0] = cur.handler;
+    old_words[1] = cur.flags;
+    old_words[2] = cur.restorer;
+    memcpy(&old_words[3], &cur.mask, sizeof(uint64_t));
 
     if (act_va != 0U) {
         uint32_t new_words[5];
@@ -438,6 +449,12 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
         g_guest_sigactions[signum].mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
         ctx->sig_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
+        if (g_guest_sigactions[signum].handler == 1U /* SIG_IGN */ ||
+            (g_guest_sigactions[signum].handler == 0U /* SIG_DFL */ &&
+             (signum == SIGCHLD || signum == SIGURG || signum == SIGWINCH || signum == SIGCONT))) {
+            __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (signum - 1)), __ATOMIC_SEQ_CST);
+        }
+
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = host_sig_handler;
@@ -447,6 +464,10 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
         }
         sigfillset(&sa.sa_mask);
         sigaction(signum, &sa, NULL);
+    }
+
+    if (oldact_va != 0U) {
+        memcpy(a32_guest_ptr(ctx, oldact_va), old_words, sizeof(old_words));
     }
 
     return 0;
@@ -462,10 +483,7 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
         return -EFAULT;
     }
 
-    if (oldset_va != 0U) {
-        uint64_t cur = ctx->sig_mask;
-        memcpy(a32_guest_ptr(ctx, oldset_va), &cur, sizeof(cur));
-    }
+    uint64_t old_mask = ctx->sig_mask;
 
     if (set_va != 0U) {
         uint64_t set = 0ULL;
@@ -485,6 +503,10 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
         default:
             return -EINVAL;
         }
+    }
+
+    if (oldset_va != 0U) {
+        memcpy(a32_guest_ptr(ctx, oldset_va), &old_mask, sizeof(old_mask));
     }
 
     return 0;
@@ -522,6 +544,11 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     ctx->cpsr     = sc->arm_cpsr;
     ctx->sig_mask = frame->uc.uc_sigmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     if (frame->magic == A32_SIGFRAME_MAGIC) {
+        if (frame->saved_pad == 1U && (frame->uc._pad[2] & 0x80000000U) != 0U) {
+            ctx->altstack_sp    = frame->uc._pad[0];
+            ctx->altstack_size  = frame->uc._pad[1];
+            ctx->altstack_flags = frame->uc._pad[2];
+        }
         ctx->fault_addr = frame->saved_fault;
         uint32_t new_pc   = sc->arm_pc & ~1U;
         uint32_t saved_pc = frame->saved_regs[15] & ~1U;
@@ -571,7 +598,8 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
     old_st.ss_sp    = ctx->altstack_sp;
     old_st.ss_flags = (int32_t)((ctx->altstack_size == 0U || (ctx->altstack_flags & A32_SS_DISABLE))
                                 ? A32_SS_DISABLE
-                                : (on_altstack ? A32_SS_ONSTACK : 0U));
+                                : ((on_altstack ? A32_SS_ONSTACK : 0U) |
+                                   (ctx->altstack_flags & 0x80000000U)));
     old_st.ss_size  = ctx->altstack_size;
 
     if (uss_va != 0U) {

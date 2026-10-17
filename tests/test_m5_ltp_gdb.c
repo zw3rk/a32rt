@@ -1459,6 +1459,163 @@ static int test18_mprotect_mremap_shared_execve_noexec(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 19: Round 6 regressions —
+ *   19a: madvise (220) negative (-ENOMEM on unmapped page, -EINVAL on
+ *        unaligned address) & positive (0 on mapped page)
+ *   19b: get_robust_list (339) pid validation (pid < 0 -> -EINVAL,
+ *        non-existent pid -> -ESRCH, pid == 0 and pid == gettid() -> 0)
+ *   19c: setsockopt (294) / getsockopt (295) SO_RCVTIMEO_OLD (20) with
+ *        optlen < 8 -> -EINVAL and getsockopt with larger 16-byte optlen
+ *        buffer updating optlen to 8
+ * -------------------------------------------------------------------------- */
+static int test19_r6_madvise_robust_sockopt(void)
+{
+    /*
+     * 19a: madvise (220):
+     *   - Negative: unmapped guest page (0x26000000U, 4096, MADV_NORMAL) -> -ENOMEM (-12)
+     *   - Negative: unaligned address -> -EINVAL (-22)
+     *   - Positive: mapped guest page -> 0
+     */
+    if (sys3(220U /* madvise */, 0x26000000U, 4096U, 0U /* MADV_NORMAL */) != -12 /* -ENOMEM */) {
+        return 160;
+    }
+
+    uint32_t mpage = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                    3U /* PROT_READ|PROT_WRITE */,
+                                    0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                    0xFFFFFFFFU, 0U);
+    if (mpage > 0xFFFFF000U) {
+        return 161;
+    }
+
+    if (sys3(220U /* madvise */, mpage + 1U, 4096U, 0U /* MADV_NORMAL */) != -22 /* -EINVAL */) {
+        sys2(91U /* munmap */, mpage, 4096U);
+        return 162;
+    }
+    if (sys3(220U /* madvise */, mpage, 4096U, 0U /* MADV_NORMAL */) != 0 ||
+        sys3(220U /* madvise */, mpage, 4096U, 4U /* MADV_DONTNEED */) != 0) {
+        sys2(91U /* munmap */, mpage, 4096U);
+        return 163;
+    }
+    sys2(91U /* munmap */, mpage, 4096U);
+
+    /*
+     * 19b: get_robust_list (339):
+     *   - Negative: pid < 0 (-1) -> -EINVAL (-22)
+     *   - Negative: non-existent pid (999999) -> -ESRCH (-3)
+     *   - Positive: pid == 0 and pid == gettid() -> 0
+     */
+    struct robust_list_head32_m5 rhead;
+    rhead.list = (uint32_t)(uintptr_t)&rhead;
+    rhead.futex_offset = -4;
+    rhead.list_op_pending = 0U;
+
+    if (sys2(338U /* set_robust_list */, (uint32_t)(uintptr_t)&rhead, 12U) != 0) {
+        return 164;
+    }
+
+    uint32_t out_head = 0U;
+    uint32_t out_len  = 0U;
+    if (sys3(339U /* get_robust_list */, 0xFFFFFFFFU /* -1 */,
+             (uint32_t)(uintptr_t)&out_head,
+             (uint32_t)(uintptr_t)&out_len) != -22 /* -EINVAL */) {
+        return 165;
+    }
+    if (sys3(339U /* get_robust_list */, 999999U,
+             (uint32_t)(uintptr_t)&out_head,
+             (uint32_t)(uintptr_t)&out_len) != -3 /* -ESRCH */) {
+        return 166;
+    }
+
+    int32_t my_tid = sys1(224U /* gettid */, 0U);
+    if (my_tid <= 0) {
+        return 167;
+    }
+
+    out_head = 0U;
+    out_len  = 0U;
+    if (sys3(339U /* get_robust_list */, 0U,
+             (uint32_t)(uintptr_t)&out_head,
+             (uint32_t)(uintptr_t)&out_len) != 0 ||
+        out_head != (uint32_t)(uintptr_t)&rhead ||
+        out_len != 12U) {
+        return 168;
+    }
+
+    out_head = 0U;
+    out_len  = 0U;
+    if (sys3(339U /* get_robust_list */, (uint32_t)my_tid,
+             (uint32_t)(uintptr_t)&out_head,
+             (uint32_t)(uintptr_t)&out_len) != 0 ||
+        out_head != (uint32_t)(uintptr_t)&rhead ||
+        out_len != 12U) {
+        return 169;
+    }
+
+    /*
+     * 19c: setsockopt (294) / getsockopt (295) SO_RCVTIMEO_OLD (20):
+     *   - Negative: setsockopt with optlen < 8 (4) -> -EINVAL (-22)
+     *   - Positive: setsockopt with optlen == 8 -> 0, and getsockopt with a
+     *     larger 16-byte optlen buffer updates optlen to 8 and writes the
+     *     expected 32-bit timeval without clobbering bytes [8..15].
+     */
+    int sv[2];
+    sv[0] = -1;
+    sv[1] = -1;
+    if (sys4(288U /* socketpair */, 1U /* AF_UNIX */, 1U /* SOCK_STREAM */, 0U,
+             (uint32_t)(uintptr_t)sv) != 0) {
+        return 170;
+    }
+
+    struct timeval32 tv_in;
+    tv_in.tv_sec  = 3;
+    tv_in.tv_usec = 250000;
+
+    if (sys5(294U /* setsockopt */, (uint32_t)sv[0], 1U /* SOL_SOCKET */,
+             20U /* SO_RCVTIMEO_OLD */, (uint32_t)(uintptr_t)&tv_in, 4U) != -22 /* -EINVAL */) {
+        sys1(6U /* close */, (uint32_t)sv[0]);
+        sys1(6U /* close */, (uint32_t)sv[1]);
+        return 171;
+    }
+
+    if (sys5(294U /* setsockopt */, (uint32_t)sv[0], 1U /* SOL_SOCKET */,
+             20U /* SO_RCVTIMEO_OLD */, (uint32_t)(uintptr_t)&tv_in, 8U) != 0) {
+        sys1(6U /* close */, (uint32_t)sv[0]);
+        sys1(6U /* close */, (uint32_t)sv[1]);
+        return 172;
+    }
+
+    struct {
+        struct timeval32 tv;
+        uint32_t         canary[2];
+    } opt_buf;
+    opt_buf.tv.tv_sec  = 0;
+    opt_buf.tv.tv_usec = 0;
+    opt_buf.canary[0]  = 0xDEADBEEFU;
+    opt_buf.canary[1]  = 0xCAFEBABEU;
+    uint32_t optlen = 16U;
+
+    int32_t gso_rc = sys5(295U /* getsockopt */, (uint32_t)sv[0], 1U /* SOL_SOCKET */,
+                          20U /* SO_RCVTIMEO_OLD */,
+                          (uint32_t)(uintptr_t)&opt_buf,
+                          (uint32_t)(uintptr_t)&optlen);
+    sys1(6U /* close */, (uint32_t)sv[0]);
+    sys1(6U /* close */, (uint32_t)sv[1]);
+
+    if (gso_rc != 0 ||
+        optlen != 8U ||
+        opt_buf.tv.tv_sec != 3 ||
+        opt_buf.tv.tv_usec < 200000 ||
+        opt_buf.tv.tv_usec > 300000 ||
+        opt_buf.canary[0] != 0xDEADBEEFU ||
+        opt_buf.canary[1] != 0xCAFEBABEU) {
+        return 173;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -1522,6 +1679,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test18_mprotect_mremap_shared_execve_noexec();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test19_r6_madvise_robust_sockopt();
     if (rc != 0) {
         return rc;
     }

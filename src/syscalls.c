@@ -946,24 +946,42 @@ void a32_cleanup_robust_list(a32_ctx_t *ctx)
     if (!ctx || ctx->robust_list_head < 0x1000U) {
         return;
     }
+    uint32_t self_tid = (ctx->host_tid != 0)
+                        ? (uint32_t)ctx->host_tid
+                        : (uint32_t)syscall(SYS_gettid);
     uint32_t head_va = ctx->robust_list_head;
     uint32_t *head_ptr = (uint32_t *)a32_guest_ptr(ctx, head_va);
     int32_t futex_offset = (int32_t)head_ptr[1];
     uint32_t curr = head_ptr[0];
+    uint32_t pending = head_ptr[2];
 
     size_t limit = 1024U;
     while (curr >= 0x1000U && curr != head_va && limit-- > 0U) {
-        uint32_t futex_va = curr + (uint32_t)futex_offset;
+        uint32_t *node = (uint32_t *)a32_guest_ptr(ctx, curr);
+        uint32_t next = node[0];
+        if (curr != pending) {
+            uint32_t futex_va = curr + (uint32_t)futex_offset;
+            if (futex_va >= 0x1000U) {
+                uint32_t *futex_ptr = (uint32_t *)a32_guest_ptr(ctx, futex_va);
+                uint32_t val = *futex_ptr;
+                if ((val & 0x3FFFFFFFU) == self_tid) {
+                    *futex_ptr = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
+                    syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+                }
+            }
+        }
+        curr = next;
+    }
+    if (pending >= 0x1000U && pending != head_va) {
+        uint32_t futex_va = pending + (uint32_t)futex_offset;
         if (futex_va >= 0x1000U) {
             uint32_t *futex_ptr = (uint32_t *)a32_guest_ptr(ctx, futex_va);
             uint32_t val = *futex_ptr;
-            if ((val & 0x3FFFFFFFU) == (uint32_t)ctx->host_tid) {
+            if ((val & 0x3FFFFFFFU) == self_tid) {
                 *futex_ptr = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
                 syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
             }
         }
-        uint32_t *node = (uint32_t *)a32_guest_ptr(ctx, curr);
-        curr = node[0];
     }
     ctx->robust_list_head = 0U;
 }
@@ -1099,6 +1117,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         return 1;
 
     case ARM_NR_exit_group:
+        a32_cleanup_robust_list(ctx);
         print_stats_if_enabled(ctx);
         syscall(SYS_exit_group, (int)a0);
         return 1;
@@ -1780,6 +1799,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         if (sysinfo(&si) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
+            uint64_t mem_unit = (si.mem_unit > 0U) ? (uint64_t)si.mem_unit : 1ULL;
+            while ((((uint64_t)si.totalram | (uint64_t)si.totalswap) >> 32) != 0ULL &&
+                   (mem_unit << 1) <= 0xFFFFFFFFULL) {
+                mem_unit <<= 1;
+                si.totalram  >>= 1;
+                si.freeram   >>= 1;
+                si.sharedram >>= 1;
+                si.bufferram >>= 1;
+                si.totalswap >>= 1;
+                si.freeswap  >>= 1;
+                si.totalhigh >>= 1;
+                si.freehigh  >>= 1;
+            }
             arm_sysinfo32_t si32;
             memset(&si32, 0, sizeof(si32));
             si32.uptime    = (int32_t)si.uptime;
@@ -1795,7 +1827,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             si32.procs     = (uint16_t)si.procs;
             si32.totalhigh = (uint32_t)si.totalhigh;
             si32.freehigh  = (uint32_t)si.freehigh;
-            si32.mem_unit  = (uint32_t)si.mem_unit;
+            si32.mem_unit  = (uint32_t)mem_unit;
             memcpy(a32_guest_ptr(ctx, a0), &si32, sizeof(si32));
             ctx->regs[0] = 0U;
         }
@@ -2087,6 +2119,8 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             targs.ctid_va   = a4;
             targs.child_tid = 0;
             targs.started   = 0;
+
+            (void)a32_jit_init(child_ctx);
 
             pthread_t pt;
             pthread_attr_t attr;
@@ -2488,25 +2522,31 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         ctx->regs[0] = 0U;
         break;
 
-    case ARM_NR_get_robust_list:
+    case ARM_NR_get_robust_list: {
+        if ((int32_t)a0 < 0) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
         if (a1 < 0x1000U || a2 < 0x1000U) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
-        if (a0 == 0U || (int)a0 == ctx->host_tid || (pid_t)a0 == getpid()) {
-            if (a1 != 0U) {
-                uint32_t h = ctx->robust_list_head;
-                memcpy(a32_guest_ptr(ctx, a1), &h, sizeof(h));
+        int self_tid = (ctx->host_tid != 0) ? ctx->host_tid : (int)getpid();
+        if (a0 != 0U && (int)a0 != self_tid) {
+            if (kill((pid_t)a0, 0) < 0 && errno == ESRCH) {
+                ctx->regs[0] = (uint32_t)(-ESRCH);
+            } else {
+                ctx->regs[0] = (uint32_t)(-EPERM);
             }
-            if (a2 != 0U) {
-                uint32_t l = ctx->robust_list_len;
-                memcpy(a32_guest_ptr(ctx, a2), &l, sizeof(l));
-            }
-            ctx->regs[0] = 0U;
-        } else {
-            ctx->regs[0] = (uint32_t)(-EPERM);
+            break;
         }
+        uint32_t h = ctx->robust_list_head;
+        uint32_t l = (ctx->robust_list_len != 0U) ? ctx->robust_list_len : 12U;
+        memcpy(a32_guest_ptr(ctx, a1), &h, sizeof(h));
+        memcpy(a32_guest_ptr(ctx, a2), &l, sizeof(l));
+        ctx->regs[0] = 0U;
         break;
+    }
 
     case ARM_NR_pread64: {
         if (a2 > 0U && a1 < 0x1000U) {
@@ -2648,14 +2688,49 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         if (a1 == 1U /* SOL_SOCKET */ &&
-            (a2 == 20U /* SO_RCVTIMEO_OLD */ || a2 == 21U /* SO_SNDTIMEO_OLD */) &&
-            a3 != 0U && a4 == sizeof(arm_timeval32_t)) {
+            (a2 == 20U /* SO_RCVTIMEO_OLD */ || a2 == 21U /* SO_SNDTIMEO_OLD */)) {
+            if ((int32_t)a4 < (int32_t)sizeof(arm_timeval32_t)) {
+                ctx->regs[0] = (uint32_t)(-EINVAL);
+                break;
+            }
+            if (a3 < 0x1000U) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
             arm_timeval32_t tv32;
             memcpy(&tv32, a32_guest_ptr(ctx, a3), sizeof(tv32));
+            if (tv32.tv_usec < 0 || tv32.tv_usec >= 1000000) {
+                ctx->regs[0] = (uint32_t)(-EDOM);
+                break;
+            }
             struct timeval tv64;
             tv64.tv_sec  = (time_t)tv32.tv_sec;
             tv64.tv_usec = (suseconds_t)tv32.tv_usec;
             ctx->regs[0] = host_ret(setsockopt((int)a0, (int)a1, (int)a2,
+                                               &tv64, (socklen_t)sizeof(tv64)));
+            break;
+        }
+        if (a1 == 1U /* SOL_SOCKET */ &&
+            (a2 == 66U /* SO_RCVTIMEO_NEW */ || a2 == 67U /* SO_SNDTIMEO_NEW */)) {
+            if ((int32_t)a4 < 16) {
+                ctx->regs[0] = (uint32_t)(-EINVAL);
+                break;
+            }
+            if (a3 < 0x1000U) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            int64_t tv64_in[2];
+            memcpy(tv64_in, a32_guest_ptr(ctx, a3), sizeof(tv64_in));
+            if (tv64_in[1] < 0 || tv64_in[1] >= 1000000) {
+                ctx->regs[0] = (uint32_t)(-EDOM);
+                break;
+            }
+            struct timeval tv64;
+            tv64.tv_sec  = (time_t)tv64_in[0];
+            tv64.tv_usec = (suseconds_t)tv64_in[1];
+            int host_opt = (a2 == 66U) ? 20 : 21;
+            ctx->regs[0] = host_ret(setsockopt((int)a0, 1, host_opt,
                                                &tv64, (socklen_t)sizeof(tv64)));
             break;
         }
@@ -2673,21 +2748,49 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             (a2 == 20U /* SO_RCVTIMEO_OLD */ || a2 == 21U /* SO_SNDTIMEO_OLD */) &&
             a3 != 0U && a4 != 0U) {
             socklen_t guest_len = *(socklen_t *)a32_guest_ptr(ctx, a4);
-            if (guest_len == sizeof(arm_timeval32_t)) {
-                struct timeval tv64;
-                memset(&tv64, 0, sizeof(tv64));
-                socklen_t host_len = (socklen_t)sizeof(tv64);
-                int r = getsockopt((int)a0, (int)a1, (int)a2, &tv64, &host_len);
-                if (r == 0) {
-                    arm_timeval32_t tv32;
-                    tv32.tv_sec  = (int32_t)tv64.tv_sec;
-                    tv32.tv_usec = (int32_t)tv64.tv_usec;
-                    memcpy(a32_guest_ptr(ctx, a3), &tv32, sizeof(tv32));
-                    *(socklen_t *)a32_guest_ptr(ctx, a4) = (socklen_t)sizeof(tv32);
-                }
-                ctx->regs[0] = host_ret(r);
+            if ((int32_t)guest_len < 0) {
+                ctx->regs[0] = (uint32_t)(-EINVAL);
                 break;
             }
+            struct timeval tv64;
+            memset(&tv64, 0, sizeof(tv64));
+            socklen_t host_len = (socklen_t)sizeof(tv64);
+            int r = getsockopt((int)a0, (int)a1, (int)a2, &tv64, &host_len);
+            if (r == 0) {
+                arm_timeval32_t tv32;
+                tv32.tv_sec  = (int32_t)tv64.tv_sec;
+                tv32.tv_usec = (int32_t)tv64.tv_usec;
+                socklen_t copy_len = (guest_len < (socklen_t)sizeof(tv32))
+                                     ? guest_len : (socklen_t)sizeof(tv32);
+                memcpy(a32_guest_ptr(ctx, a3), &tv32, (size_t)copy_len);
+                *(socklen_t *)a32_guest_ptr(ctx, a4) = copy_len;
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
+        }
+        if (a1 == 1U /* SOL_SOCKET */ &&
+            (a2 == 66U /* SO_RCVTIMEO_NEW */ || a2 == 67U /* SO_SNDTIMEO_NEW */) &&
+            a3 != 0U && a4 != 0U) {
+            socklen_t guest_len = *(socklen_t *)a32_guest_ptr(ctx, a4);
+            if ((int32_t)guest_len < 0) {
+                ctx->regs[0] = (uint32_t)(-EINVAL);
+                break;
+            }
+            struct timeval tv64;
+            memset(&tv64, 0, sizeof(tv64));
+            socklen_t host_len = (socklen_t)sizeof(tv64);
+            int host_opt = (a2 == 66U) ? 20 : 21;
+            int r = getsockopt((int)a0, 1, host_opt, &tv64, &host_len);
+            if (r == 0) {
+                int64_t tv64_out[2];
+                tv64_out[0] = (int64_t)tv64.tv_sec;
+                tv64_out[1] = (int64_t)tv64.tv_usec;
+                socklen_t copy_len = (guest_len < 16U) ? guest_len : 16U;
+                memcpy(a32_guest_ptr(ctx, a3), tv64_out, (size_t)copy_len);
+                *(socklen_t *)a32_guest_ptr(ctx, a4) = copy_len;
+            }
+            ctx->regs[0] = host_ret(r);
+            break;
         }
         ctx->regs[0] = host_ret(getsockopt((int)a0, (int)a1, (int)a2,
                                           a3 ? a32_guest_ptr(ctx, a3) : NULL,
@@ -2723,13 +2826,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 const uint8_t *gctl = (const uint8_t *)a32_guest_ptr(ctx, gm->msg_control);
                 uint32_t off32 = 0U;
                 size_t off64 = 0U;
+                bool bad_cmsg = false;
                 while (off32 + 12U <= gm->msg_controllen) {
                     uint32_t len32;
                     int32_t level32, type32;
                     memcpy(&len32, gctl + off32, 4);
                     memcpy(&level32, gctl + off32 + 4U, 4);
                     memcpy(&type32, gctl + off32 + 8U, 4);
-                    if (len32 < 12U || off32 + len32 > gm->msg_controllen) {
+                    if (len32 < 12U || len32 > gm->msg_controllen - off32) {
+                        bad_cmsg = true;
                         break;
                     }
                     size_t payload_len = (size_t)(len32 - 12U);
@@ -2744,6 +2849,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                     memcpy(CMSG_DATA(cm64), gctl + off32 + 12U, payload_len);
                     off64 += space64;
                     off32 += (len32 + 3U) & ~3U;
+                }
+                if (bad_cmsg) {
+                    ctx->regs[0] = (uint32_t)(-EINVAL);
+                    break;
                 }
                 hm.msg_control    = (off64 > 0U) ? cbuf64 : NULL;
                 hm.msg_controllen = off64;
@@ -2818,6 +2927,17 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                         memcpy(gctl_out + off32 + 8U, &type32, 4);
                         memcpy(gctl_out + off32 + 12U, CMSG_DATA(cm64), payload_len);
                         off32 += (off32 + space32 <= gm->msg_controllen) ? space32 : len32;
+                    } else {
+                        if (cm64->cmsg_level == 1 /* SOL_SOCKET */ &&
+                            cm64->cmsg_type == 1 /* SCM_RIGHTS */) {
+                            size_t nfds = payload_len / sizeof(int);
+                            const int *fds = (const int *)(const void *)CMSG_DATA(cm64);
+                            for (size_t fi = 0U; fi < nfds; fi++) {
+                                close(fds[fi]);
+                            }
+                        }
+                        gm->msg_flags |= 0x08U /* MSG_CTRUNC */;
+                        break;
                     }
                     off64 += CMSG_ALIGN(cm64->cmsg_len);
                 }
@@ -3743,16 +3863,48 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
     }
 
-    case ARM_NR_madvise:
-        if ((a0 & 0xFFFU) != 0U || a0 < 0x1000U || (uint64_t)a0 + (uint64_t)a1 > 0xFFFF0000ULL) {
+    case ARM_NR_madvise: {
+        uint64_t aligned_len = ((uint64_t)a1 + 0xFFFULL) & ~0xFFFULL;
+        if ((a0 & 0xFFFU) != 0U || a0 < 0x1000U ||
+            (uint64_t)a0 + (uint64_t)a1 > 0xFFFF0000ULL ||
+            (uint64_t)a0 + aligned_len > 0xFFFF0000ULL) {
             ctx->regs[0] = (uint32_t)(-EINVAL);
             break;
         }
-        if (a2 == 4U /* MADV_DONTNEED */ && a1 > 0U) {
-            a32_jit_invalidate_range(ctx, a0, a0 + a1);
+        if (a1 > 0U) {
+            if (madvise(a32_guest_ptr(ctx, a0), 0U, (int)a2) != 0) {
+                ctx->regs[0] = (uint32_t)(-errno);
+                break;
+            }
+            a32_vm_sync_ctx(ctx);
+            uint32_t end = a0 + (uint32_t)aligned_len;
+            uint32_t cur = a0;
+            bool mapped = false;
+            for (size_t i = 0U; i < ctx->region_count; i++) {
+                const a32_region_t *r = &ctx->regions[i];
+                if (r->end <= cur) {
+                    continue;
+                }
+                if (r->start > cur) {
+                    break;
+                }
+                if (r->end >= end) {
+                    mapped = true;
+                    break;
+                }
+                cur = r->end;
+            }
+            if (!mapped) {
+                ctx->regs[0] = (uint32_t)(-ENOMEM);
+                break;
+            }
+            if (a2 == 4U /* MADV_DONTNEED */) {
+                a32_jit_invalidate_range(ctx, a0, end);
+            }
         }
         ctx->regs[0] = host_ret(madvise(a32_guest_ptr(ctx, a0), (size_t)a1, (int)a2));
         break;
+    }
 
     case ARM_NR_kill:
         ctx->regs[0] = host_ret(kill((pid_t)a0, (int)a1));

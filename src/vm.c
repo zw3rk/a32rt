@@ -435,11 +435,15 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
         const char *env_win = getenv("A32RT_WINDOW");
         if (env_win && env_win[0] != '\0') {
             char *endp = NULL;
+            errno = 0;
             unsigned long long val = strtoull(env_win, &endp, 0);
-            if (endp != env_win && *endp == '\0') {
-                base = (uint64_t)val;
-                has_explicit = true;
+            if (env_win[0] == '-' || errno == ERANGE || !endp ||
+                endp == env_win || *endp != '\0' || (uint64_t)val == UINT64_MAX) {
+                fprintf(stderr, "a32rt: invalid A32RT_WINDOW '%s'\n", env_win);
+                return -1;
             }
+            base = (uint64_t)val;
+            has_explicit = true;
         }
     }
 

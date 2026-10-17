@@ -407,6 +407,11 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     send_packet(g_client_sock, "OK");
                 } else if (reg == 25U && val_len >= 8U) {
                     ctx->cpsr = decode_u32_le(val_str);
+                    if (ctx->cpsr & A32_CPSR_T) {
+                        ctx->regs[15] &= ~1U;
+                    } else {
+                        ctx->regs[15] &= ~3U;
+                    }
                     send_packet(g_client_sock, "OK");
                 } else if (reg >= 26U && reg < 58U && val_len >= 16U) {
                     ctx->vfp_d[reg - 26U] = decode_u64_le(val_str);
@@ -561,11 +566,35 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             a32_jit_invalidate_range(ctx, addr, addr + len);
             send_packet(g_client_sock, "OK");
         } else if (cmd[0] == 's') {
-            /* Single step */
+            /* Single step: s[addr] */
+            if (cmd[1] != '\0') {
+                uint32_t addr = (uint32_t)strtoul(cmd + 1, NULL, 16);
+                ctx->itstate = 0U;
+                if (addr & 1U) {
+                    ctx->cpsr |= A32_CPSR_T;
+                    ctx->regs[15] = addr & ~1U;
+                } else if (ctx->cpsr & A32_CPSR_T) {
+                    ctx->regs[15] = addr & ~1U;
+                } else {
+                    ctx->regs[15] = addr & ~3U;
+                }
+            }
             ctx->single_step = true;
             break;
         } else if (cmd[0] == 'c') {
-            /* Continue */
+            /* Continue: c[addr] */
+            if (cmd[1] != '\0') {
+                uint32_t addr = (uint32_t)strtoul(cmd + 1, NULL, 16);
+                ctx->itstate = 0U;
+                if (addr & 1U) {
+                    ctx->cpsr |= A32_CPSR_T;
+                    ctx->regs[15] = addr & ~1U;
+                } else if (ctx->cpsr & A32_CPSR_T) {
+                    ctx->regs[15] = addr & ~1U;
+                } else {
+                    ctx->regs[15] = addr & ~3U;
+                }
+            }
             ctx->single_step = false;
             break;
         } else if (strncmp(cmd, "vCont?", 6) == 0) {

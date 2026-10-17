@@ -1571,6 +1571,204 @@ static int run_vfp_neon_tests(void)
         }
     }
 
+    /*
+     * 28. Round 6 regressions & positive tests:
+     *     - 28a: VNMLA.F32 / VNMLA.F64 (and VNMLS.F32 / VNMLS.F64) signed-zero
+     *            and negation-before-addition order:
+     *            For d = +1.0, n = -1.0, m = +1.0:
+     *            VNMLA computes (-d) + (-(n * m)) = (-1.0) + (+1.0) = +0.0
+     *            (sign bit == 0), whereas -(d + n*m) = -(+0.0) = -0.0 would
+     *            produce sign bit == 1!
+     *     - 28b: NEON VMLA.F32 and VMLS.F32 (64-bit D and 128-bit Q vector forms,
+     *            plus by-scalar d0, d1, d2[0] / d2[1] and q0, q1, d2[0]).
+     */
+    {
+        /* 28a-1: VNMLA.F32 signed-zero check (d = +1.0f, n = -1.0f, m = +1.0f -> +0.0f) */
+        float f_pos1 = 1.0f;
+        float f_neg1 = -1.0f;
+        uint32_t vnmla_f32_zero_bits = 0xFFFFFFFFU;
+        uint32_t vnmls_f32_zero_bits = 0xFFFFFFFFU;
+        __asm__ volatile(
+            "vldr s0, %2\n"
+            "vldr s1, %3\n"
+            "vldr s2, %2\n"
+            "vnmla.f32 s0, s1, s2\n"
+            "vmov %0, s0\n"
+            "vldr s0, %2\n"
+            "vldr s1, %2\n"
+            "vldr s2, %2\n"
+            "vnmls.f32 s0, s1, s2\n"
+            "vmov %1, s0\n"
+            : "=&r"(vnmla_f32_zero_bits), "=r"(vnmls_f32_zero_bits)
+            : "m"(f_pos1), "m"(f_neg1)
+            : "s0", "s1", "s2"
+        );
+        if (vnmla_f32_zero_bits != 0x00000000U ||
+            vnmls_f32_zero_bits != 0x00000000U) {
+            return 77;
+        }
+
+        /* 28a-2: VNMLA.F64 signed-zero check (d = +1.0, n = -1.0, m = +1.0 -> +0.0) */
+        double d_pos1 = 1.0;
+        double d_neg1 = -1.0;
+        uint64_t vnmla_f64_zero_bits = 0xFFFFFFFFFFFFFFFFULL;
+        uint64_t vnmls_f64_zero_bits = 0xFFFFFFFFFFFFFFFFULL;
+        __asm__ volatile(
+            "vldr d0, %2\n"
+            "vldr d1, %3\n"
+            "vldr d2, %2\n"
+            "vnmla.f64 d0, d1, d2\n"
+            "vstr d0, %0\n"
+            "vldr d0, %2\n"
+            "vldr d1, %2\n"
+            "vldr d2, %2\n"
+            "vnmls.f64 d0, d1, d2\n"
+            "vstr d0, %1\n"
+            : "=m"(vnmla_f64_zero_bits), "=m"(vnmls_f64_zero_bits)
+            : "m"(d_pos1), "m"(d_neg1)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (vnmla_f64_zero_bits != 0x0000000000000000ULL ||
+            vnmls_f64_zero_bits != 0x0000000000000000ULL) {
+            return 78;
+        }
+
+        /* 28a-3: Non-zero VNMLA / VNMLS values (d = 2.0, n = 3.0, m = 4.0) */
+        float f_d = 2.0f, f_n = 3.0f, f_m = 4.0f;
+        float vnmla_f32_val = 0.0f, vnmls_f32_val = 0.0f;
+        double d_d = 2.0, d_n = 3.0, d_m = 4.0;
+        double vnmla_f64_val = 0.0, vnmls_f64_val = 0.0;
+        __asm__ volatile(
+            "vldr s0, %2\n"
+            "vldr s1, %3\n"
+            "vldr s2, %4\n"
+            "vnmla.f32 s0, s1, s2\n"
+            "vstr s0, %0\n"
+            "vldr s0, %2\n"
+            "vnmls.f32 s0, s1, s2\n"
+            "vstr s0, %1\n"
+            : "=m"(vnmla_f32_val), "=m"(vnmls_f32_val)
+            : "m"(f_d), "m"(f_n), "m"(f_m)
+            : "s0", "s1", "s2", "memory"
+        );
+        __asm__ volatile(
+            "vldr d0, %2\n"
+            "vldr d1, %3\n"
+            "vldr d2, %4\n"
+            "vnmla.f64 d0, d1, d2\n"
+            "vstr d0, %0\n"
+            "vldr d0, %2\n"
+            "vnmls.f64 d0, d1, d2\n"
+            "vstr d0, %1\n"
+            : "=m"(vnmla_f64_val), "=m"(vnmls_f64_val)
+            : "m"(d_d), "m"(d_n), "m"(d_m)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (vnmla_f32_val != -14.0f || vnmls_f32_val != 10.0f ||
+            vnmla_f64_val != -14.0  || vnmls_f64_val != 10.0) {
+            return 79;
+        }
+
+        /* 28b-1: NEON 64-bit vector VMLA.F32 d0, d1, d2 and VMLS.F32 d0, d1, d2 */
+        float d_acc_init[2] = { 10.0f, 20.0f };
+        float d_src1[2]     = { 2.5f, -4.0f };
+        float d_src2[2]     = { 4.0f,  3.0f };
+        float d_vmla_out[2] = { 0.0f, 0.0f };
+        float d_vmls_out[2] = { 0.0f, 0.0f };
+        __asm__ volatile(
+            "vld1.32 {d0}, [%2]\n"
+            "vld1.32 {d1}, [%3]\n"
+            "vld1.32 {d2}, [%4]\n"
+            "vmla.f32 d0, d1, d2\n"
+            "vst1.32 {d0}, [%0]\n"
+            "vld1.32 {d0}, [%2]\n"
+            "vmls.f32 d0, d1, d2\n"
+            "vst1.32 {d0}, [%1]\n"
+            :
+            : "r"(d_vmla_out), "r"(d_vmls_out),
+              "r"(d_acc_init), "r"(d_src1), "r"(d_src2)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (d_vmla_out[0] != 20.0f || d_vmla_out[1] != 8.0f ||
+            d_vmls_out[0] != 0.0f  || d_vmls_out[1] != 32.0f) {
+            return 80;
+        }
+
+        /* 28b-2: NEON 128-bit vector VMLA.F32 q0, q1, q2 and VMLS.F32 q0, q1, q2 */
+        float q_acc_init[4] = { 10.0f, 20.0f, -5.0f, 100.0f };
+        float q_src1[4]     = { 2.0f,  -3.0f,  4.0f, 5.0f };
+        float q_src2[4]     = { 3.0f,   5.0f, -2.5f, 8.0f };
+        float q_vmla_out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float q_vmls_out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        __asm__ volatile(
+            "vld1.32 {d0-d1}, [%2]\n"
+            "vld1.32 {d2-d3}, [%3]\n"
+            "vld1.32 {d4-d5}, [%4]\n"
+            "vmla.f32 q0, q1, q2\n"
+            "vst1.32 {d0-d1}, [%0]\n"
+            "vld1.32 {d0-d1}, [%2]\n"
+            "vmls.f32 q0, q1, q2\n"
+            "vst1.32 {d0-d1}, [%1]\n"
+            :
+            : "r"(q_vmla_out), "r"(q_vmls_out),
+              "r"(q_acc_init), "r"(q_src1), "r"(q_src2)
+            : "q0", "q1", "q2", "memory"
+        );
+        if (q_vmla_out[0] != 16.0f || q_vmla_out[1] != 5.0f ||
+            q_vmla_out[2] != -15.0f || q_vmla_out[3] != 140.0f ||
+            q_vmls_out[0] != 4.0f  || q_vmls_out[1] != 35.0f ||
+            q_vmls_out[2] != 5.0f  || q_vmls_out[3] != 60.0f) {
+            return 81;
+        }
+
+        /*
+         * 28b-3: NEON by-scalar VMLA.F32 d0, d1, d2[0], VMLS.F32 d0, d1, d2[0],
+         *        VMLS.F32 d0, d1, d2[1], and VMLS.F32 q0, q1, d2[0]
+         */
+        float sc_d2[2]      = { 3.0f, -2.0f };
+        float sc_d0_mla[2]  = { 0.0f, 0.0f };
+        float sc_d0_mls0[2] = { 0.0f, 0.0f };
+        float sc_d0_mls1[2] = { 0.0f, 0.0f };
+        float sc_q0_mls0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        __asm__ volatile(
+            "vld1.32 {d0}, [%4]\n"
+            "vld1.32 {d1}, [%5]\n"
+            "vld1.32 {d2}, [%6]\n"
+            "vmla.f32 d0, d1, d2[0]\n"
+            "vst1.32 {d0}, [%0]\n"
+            "vld1.32 {d0}, [%4]\n"
+            "vmls.f32 d0, d1, d2[0]\n"
+            "vst1.32 {d0}, [%1]\n"
+            "vld1.32 {d0}, [%4]\n"
+            "vmls.f32 d0, d1, d2[1]\n"
+            "vst1.32 {d0}, [%2]\n"
+            "vld1.32 {d0-d1}, [%7]\n"
+            "vld1.32 {d2}, [%6]\n"
+            "vld1.32 {d4-d5}, [%8]\n"
+            "vmls.f32 q0, q2, d2[0]\n"
+            "vst1.32 {d0-d1}, [%3]\n"
+            :
+            : "r"(sc_d0_mla), "r"(sc_d0_mls0), "r"(sc_d0_mls1), "r"(sc_q0_mls0),
+              "r"(d_acc_init), "r"(d_src1), "r"(sc_d2),
+              "r"(q_acc_init), "r"(q_src1)
+            : "q0", "d2", "q2", "memory"
+        );
+        /*
+         * d_acc_init = {10.0, 20.0}, d_src1 = {2.5, -4.0}, sc_d2 = {3.0, -2.0}:
+         *   vmla d0, d1, d2[0]: {10 + 2.5*3, 20 + (-4)*3}   = {17.5, 8.0}
+         *   vmls d0, d1, d2[0]: {10 - 2.5*3, 20 - (-4)*3}   = {2.5, 32.0}
+         *   vmls d0, d1, d2[1]: {10 - 2.5*(-2), 20 - (-4)*(-2)} = {15.0, 12.0}
+         *   vmls q0, q2, d2[0]: {10 - 2*3, 20 - (-3)*3, -5 - 4*3, 100 - 5*3} = {4.0, 29.0, -17.0, 85.0}
+         */
+        if (sc_d0_mla[0] != 17.5f  || sc_d0_mla[1] != 8.0f   ||
+            sc_d0_mls0[0] != 2.5f  || sc_d0_mls0[1] != 32.0f ||
+            sc_d0_mls1[0] != 15.0f || sc_d0_mls1[1] != 12.0f ||
+            sc_q0_mls0[0] != 4.0f  || sc_q0_mls0[1] != 29.0f ||
+            sc_q0_mls0[2] != -17.0f || sc_q0_mls0[3] != 85.0f) {
+            return 82;
+        }
+    }
+
     static const char pass_msg[] = "M4 VFPv4-D32 & NEON: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

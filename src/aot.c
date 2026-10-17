@@ -172,6 +172,7 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
             return;
         }
     }
+    st->count++;
 }
 
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
@@ -208,7 +209,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
     aot_save_state_t write_st = { .f = f, .count = 0U, .error = false };
     a32_jit_iter_blocks(write_block_cb, &write_st);
 
-    if (write_st.error) {
+    if (write_st.error || write_st.count != count_st.count) {
         fclose(f);
         unlink(tmp_path);
         return -1;
@@ -223,6 +224,30 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     return 0;
+}
+
+static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (ctx == NULL || len == 0U || addr + len < addr) {
+        return false;
+    }
+    uint32_t cur = addr;
+    uint32_t end = addr + len;
+    while (cur < end) {
+        bool found = false;
+        for (size_t i = 0U; i < ctx->region_count; i++) {
+            const a32_region_t *r = &ctx->regions[i];
+            if ((r->prot & 0x4U) != 0U && cur >= r->start && cur < r->end) {
+                cur   = (r->end < end) ? r->end : end;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
 }
 
 int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
@@ -259,6 +284,7 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         }
         if ((bh.is_thumb & ~3U) != 0U ||
             bh.guest_end_pc <= (bh.guest_pc & ~1U) ||
+            !aot_range_executable(ctx, bh.guest_pc & ~1U, bh.guest_end_pc - (bh.guest_pc & ~1U)) ||
             bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
             bh.pc_map_count > A32_AOT_MAX_PC_MAP) {
             break;
@@ -292,30 +318,6 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     return 0;
-}
-
-static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
-{
-    if (ctx == NULL || len == 0U || addr + len < addr) {
-        return false;
-    }
-    uint32_t cur = addr;
-    uint32_t end = addr + len;
-    while (cur < end) {
-        bool found = false;
-        for (size_t i = 0U; i < ctx->region_count; i++) {
-            const a32_region_t *r = &ctx->regions[i];
-            if ((r->prot & 0x4U) != 0U && cur >= r->start && cur < r->end) {
-                cur   = (r->end < end) ? r->end : end;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return false;
-        }
-    }
-    return true;
 }
 
 static void add_target(uint32_t pc, bool thumb,

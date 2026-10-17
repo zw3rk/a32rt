@@ -1398,6 +1398,328 @@ static int test16_async_kill_tgkill_siginfo(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 17: Round 6 regressions —
+ *   17a: In-place aliasing in rt_sigaction(SIGUSR2, &sa, &sa) and
+ *        rt_sigprocmask(SIG_BLOCK, &mask, &mask)
+ *   17b: Pending blocked signal set to SIG_IGN via rt_sigaction is discarded
+ *        and does NOT fire when unblocked via rt_sigprocmask(SIG_UNBLOCK)
+ *   17c: sigaltstack with SS_AUTODISARM (0x80000000U) reports SS_DISABLE
+ *        inside SA_ONSTACK handler and re-arms after rt_sigreturn
+ * -------------------------------------------------------------------------- */
+static volatile uint32_t g_r6_usr2_a_hits = 0U;
+static volatile uint32_t g_r6_usr2_b_hits = 0U;
+static volatile uint32_t g_r6_autodisarm_result = 0U;
+
+static void r6_usr2_handler_a(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    g_r6_usr2_a_hits++;
+}
+
+static void r6_usr2_handler_b(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    g_r6_usr2_b_hits++;
+}
+
+static void r6_autodisarm_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+
+    uint32_t cur_sp = 0U;
+    __asm__ volatile("mov %0, sp" : "=r"(cur_sp));
+
+    if (cur_sp < g_altstack_base || cur_sp >= g_altstack_base + g_altstack_size) {
+        g_r6_autodisarm_result = 1U;
+        return;
+    }
+
+    struct stack32_m3 oss = { 0U, 0, 0U };
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0) {
+        g_r6_autodisarm_result = 2U;
+        return;
+    }
+    /* Inside handler with SS_AUTODISARM, sigaltstack must report SS_DISABLE (2) */
+    if (oss.ss_flags != 2 /* SS_DISABLE */) {
+        g_r6_autodisarm_result = 3U;
+        return;
+    }
+
+    g_r6_autodisarm_result = 100U;
+}
+
+static int test17_r6_signal_aliasing_ign_autodisarm(void)
+{
+    const uint32_t sigusr2 = 12U;
+    const uint64_t usr2_bit = 1ULL << (sigusr2 - 1U);
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+
+    /* Ensure SIGUSR2 starts unblocked */
+    uint64_t saved_mask = 0ULL;
+    if (sys4(175U /* rt_sigprocmask */, 1U /* SIG_UNBLOCK */,
+             (uint32_t)(uintptr_t)&usr2_bit,
+             (uint32_t)(uintptr_t)&saved_mask, 8U) != 0) {
+        return 138;
+    }
+
+    /*
+     * 17a-1: rt_sigaction(SIGUSR2, &sa, &sa) in-place aliasing (act_va == oldact_va)
+     */
+    struct sigaction32 orig_sa;
+    struct sigaction32 sa;
+    sa.sa_handler  = (uint32_t)(uintptr_t)r6_usr2_handler_a;
+    sa.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    sa.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    sa.sa_mask[0]  = 0U;
+    sa.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, sigusr2,
+             (uint32_t)(uintptr_t)&sa, (uint32_t)(uintptr_t)&orig_sa, 8U) != 0) {
+        return 139;
+    }
+
+    /* Now replace handler_a with handler_b using the SAME struct for act and oldact */
+    struct sigaction32 sa_inplace;
+    sa_inplace.sa_handler  = (uint32_t)(uintptr_t)r6_usr2_handler_b;
+    sa_inplace.sa_flags    = 0x04000004U;
+    sa_inplace.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    sa_inplace.sa_mask[0]  = 0U;
+    sa_inplace.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, sigusr2,
+             (uint32_t)(uintptr_t)&sa_inplace,
+             (uint32_t)(uintptr_t)&sa_inplace, 8U) != 0) {
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 140;
+    }
+    /* Verify old handler (handler_a) was written back into sa_inplace */
+    if (sa_inplace.sa_handler != (uint32_t)(uintptr_t)r6_usr2_handler_a) {
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 141;
+    }
+
+    /* Verify new handler (handler_b) was actually installed and fires on tkill */
+    g_r6_usr2_a_hits = 0U;
+    g_r6_usr2_b_hits = 0U;
+    if (sys2(238U /* tkill */, tid, sigusr2) != 0 ||
+        g_r6_usr2_a_hits != 0U || g_r6_usr2_b_hits != 1U) {
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 142;
+    }
+
+    /*
+     * 17a-2: rt_sigprocmask(SIG_BLOCK, &mask, &mask) in-place aliasing (set_va == oldset_va)
+     */
+    uint64_t mask_inplace = usr2_bit;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&mask_inplace,
+             (uint32_t)(uintptr_t)&mask_inplace, 8U) != 0) {
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 143;
+    }
+    /* Previous mask must have had SIGUSR2 unblocked */
+    if ((mask_inplace & usr2_bit) != 0ULL) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 144;
+    }
+
+    /* Query current mask and verify SIGUSR2 is now blocked */
+    uint64_t cur_mask = 0ULL;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U,
+             (uint32_t)(uintptr_t)&cur_mask, 8U) != 0 ||
+        (cur_mask & usr2_bit) == 0ULL) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 145;
+    }
+
+    /*
+     * 17b: Setting a pending blocked signal to SIG_IGN via rt_sigaction must
+     *      discard the pending signal so it does NOT fire when unblocked.
+     */
+    g_r6_usr2_b_hits = 0U;
+    /* Send SIGUSR2 while it is blocked */
+    if (sys2(238U /* tkill */, tid, sigusr2) != 0 || g_r6_usr2_b_hits != 0U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 146;
+    }
+
+    /* Set disposition to SIG_IGN (1) while SIGUSR2 is pending and blocked */
+    struct sigaction32 sa_ign;
+    sa_ign.sa_handler  = 1U; /* SIG_IGN */
+    sa_ign.sa_flags    = 0U;
+    sa_ign.sa_restorer = 0U;
+    sa_ign.sa_mask[0]  = 0U;
+    sa_ign.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, sigusr2,
+             (uint32_t)(uintptr_t)&sa_ign, 0U, 8U) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 147;
+    }
+
+    /* Unblock SIGUSR2 in-place (&unblock_mask, &unblock_mask): must NOT fire */
+    uint64_t unblock_inplace = usr2_bit;
+    if (sys4(175U /* rt_sigprocmask */, 1U /* SIG_UNBLOCK */,
+             (uint32_t)(uintptr_t)&unblock_inplace,
+             (uint32_t)(uintptr_t)&unblock_inplace, 8U) != 0 ||
+        (unblock_inplace & usr2_bit) == 0ULL ||
+        g_r6_usr2_b_hits != 0U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 148;
+    }
+
+    /*
+     * Also verify that if SIGUSR2 is blocked, queued via tkill, set to SIG_IGN
+     * (discarding the pending signal), and then re-bound to handler_b BEFORE
+     * unblocking, unblocking still does NOT fire handler_b!
+     */
+    struct sigaction32 sa_b;
+    sa_b.sa_handler  = (uint32_t)(uintptr_t)r6_usr2_handler_b;
+    sa_b.sa_flags    = 0x04000004U;
+    sa_b.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    sa_b.sa_mask[0]  = 0U;
+    sa_b.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&sa_b, 0U, 8U) != 0 ||
+        sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&usr2_bit, 0U, 8U) != 0 ||
+        sys2(238U /* tkill */, tid, sigusr2) != 0 ||
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&sa_ign, 0U, 8U) != 0 ||
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&sa_b, 0U, 8U) != 0 ||
+        sys4(175U /* rt_sigprocmask */, 1U /* SIG_UNBLOCK */,
+             (uint32_t)(uintptr_t)&usr2_bit, 0U, 8U) != 0 ||
+        g_r6_usr2_b_hits != 0U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+        return 149;
+    }
+
+    /* Restore SIGUSR2 disposition and signal mask */
+    sys4(174U /* rt_sigaction */, sigusr2, (uint32_t)(uintptr_t)&orig_sa, 0U, 8U);
+    sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+         (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+
+    /*
+     * 17c: sigaltstack with SS_AUTODISARM (0x80000000U):
+     *      - Inside SA_ONSTACK signal handler, sigaltstack(NULL, &oss) must
+     *        report SS_DISABLE (2)
+     *      - After returning via rt_sigreturn, sigaltstack(NULL, &oss) must
+     *        report the re-armed alternate stack with SS_AUTODISARM (0x80000000U)
+     */
+    uint32_t alt_mem = (uint32_t)sys6(192U /* mmap2 */, 0U, 16384U,
+                                      3U /* PROT_READ|PROT_WRITE */,
+                                      0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                      0xFFFFFFFFU, 0U);
+    if (alt_mem > 0xFFFFF000U) {
+        return 150;
+    }
+
+    g_altstack_base = alt_mem;
+    g_altstack_size = 16384U;
+    g_r6_autodisarm_result = 0U;
+
+    struct stack32_m3 ss;
+    ss.ss_sp = alt_mem;
+    ss.ss_flags = (int32_t)0x80000000U; /* SS_AUTODISARM */
+    ss.ss_size = 16384U;
+    struct stack32_m3 oss = { 0U, 0, 0U };
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss,
+             (uint32_t)(uintptr_t)&oss) != 0) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 151;
+    }
+
+    /* Verify sigaltstack query before signal reports SS_AUTODISARM */
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        oss.ss_sp != alt_mem || oss.ss_size != 16384U ||
+        (uint32_t)oss.ss_flags != 0x80000000U) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 152;
+    }
+
+    struct sigaction32 act_ad;
+    struct sigaction32 old_usr1;
+    act_ad.sa_handler  = (uint32_t)(uintptr_t)r6_autodisarm_handler;
+    act_ad.sa_flags    = 0x08000000U | 0x04000000U | 0x00000004U; /* SA_ONSTACK | SA_RESTORER | SA_SIGINFO */
+    act_ad.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act_ad.sa_mask[0]  = 0U;
+    act_ad.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+             (uint32_t)(uintptr_t)&act_ad, (uint32_t)(uintptr_t)&old_usr1, 8U) != 0) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 153;
+    }
+
+    if (sys2(238U /* tkill */, tid, 10U /* SIGUSR1 */) != 0) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_usr1, 0U, 8U);
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 154;
+    }
+
+    sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_usr1, 0U, 8U);
+
+    if (g_r6_autodisarm_result != 100U) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 155;
+    }
+
+    /* After rt_sigreturn, alternate stack must be re-armed with SS_AUTODISARM */
+    oss.ss_sp = 0U;
+    oss.ss_flags = 0;
+    oss.ss_size = 0U;
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        oss.ss_sp != alt_mem || oss.ss_size != 16384U ||
+        (uint32_t)oss.ss_flags != 0x80000000U) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 156;
+    }
+
+    /* Clean up alternate stack */
+    ss.ss_sp = 0U;
+    ss.ss_flags = 2 /* SS_DISABLE */;
+    ss.ss_size = 0U;
+    sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+    sys2(91U /* munmap */, alt_mem, 16384U);
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -1461,6 +1783,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test16_async_kill_tgkill_siginfo();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test17_r6_signal_aliasing_ign_autodisarm();
     if (rc != 0) {
         return rc;
     }

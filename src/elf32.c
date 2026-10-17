@@ -146,6 +146,11 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         load_bias = default_pie_base;
     }
 
+    if (ehdr.e_entry == 0U) {
+        fprintf(stderr, "a32rt: %s: missing entry point (e_entry == 0)\n", label);
+        return -1;
+    }
+
     uint64_t entry64 = (uint64_t)ehdr.e_entry + (uint64_t)load_bias;
     if (entry64 < 0x10000ULL || entry64 >= (uint64_t)A32_KUSER_BASE_32) {
         fprintf(stderr, "a32rt: %s: entry point 0x%llx out of guest bounds\n",
@@ -177,6 +182,7 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
 
     uint32_t highest_mapped_end  = 0U;
     uint32_t highest_mapped_prot = 0U;
+    bool     entry_in_load       = false;
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const elf32_phdr_t *ph = &phdrs[i];
@@ -200,6 +206,9 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
 
         uint32_t seg_vaddr  = (uint32_t)seg_vaddr64;
+        if ((out->entry & ~1U) >= seg_vaddr && (out->entry & ~1U) < seg_vaddr + ph->p_memsz) {
+            entry_in_load = true;
+        }
         uint32_t page_start = page_down(seg_vaddr);
         uint64_t seg_end64  = seg_vaddr64 + memsz;
         uint64_t map_end64  = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
@@ -373,6 +382,12 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         if (map_end > out->max_vaddr) {
             out->max_vaddr = map_end;
         }
+    }
+
+    if (!entry_in_load) {
+        fprintf(stderr, "a32rt: %s: entry point 0x%x is not within any PT_LOAD segment\n",
+                label, out->entry);
+        return -1;
     }
 
     return 0;

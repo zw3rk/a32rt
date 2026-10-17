@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "a32rt.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,13 +97,15 @@ int main(int argc, char **argv, char **envp)
             i++;
             break;
         } else if (strcmp(argv[i], "--window") == 0) {
-            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
                 usage(argv[0]);
                 return 1;
             }
             char *endp = NULL;
+            errno = 0;
             requested_window = (uint64_t)strtoull(argv[i + 1], &endp, 0);
-            if (!endp || endp == argv[i + 1] || *endp != '\0') {
+            if (errno == ERANGE || !endp || endp == argv[i + 1] || *endp != '\0' ||
+                requested_window == UINT64_MAX) {
                 usage(argv[0]);
                 return 1;
             }
