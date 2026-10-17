@@ -171,7 +171,10 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const elf32_phdr_t *ph = &phdrs[i];
         if (ph->p_type == PT_PHDR) {
-            out->phdr_vaddr = ph->p_vaddr + load_bias;
+            uint64_t phdr_va64 = (uint64_t)load_bias + (uint64_t)ph->p_vaddr;
+            if (phdr_va64 + phdr_bytes <= (uint64_t)A32_KUSER_BASE_32) {
+                out->phdr_vaddr = (uint32_t)phdr_va64;
+            }
         } else if (ph->p_type == PT_INTERP) {
             if (ph->p_filesz == 0U || ph->p_filesz >= sizeof(out->interp_path)) {
                 fprintf(stderr, "a32rt: %s: invalid PT_INTERP filesz %u\n", label, ph->p_filesz);
@@ -181,13 +184,18 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
                 return -1;
             }
             out->interp_path[ph->p_filesz] = '\0';
+            if (out->interp_path[0] == '\0') {
+                return -1;
+            }
         }
     }
 
     uint32_t highest_mapped_end  = 0U;
     uint32_t highest_mapped_prot = 0U;
     uint32_t prev_seg_end        = 0U;
+    uint32_t fallback_phdr_vaddr = 0U;
     bool     entry_in_load       = false;
+    bool     phdr_in_load        = false;
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const elf32_phdr_t *ph = &phdrs[i];
@@ -225,6 +233,11 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             entry_pc >= seg_vaddr &&
             (uint64_t)entry_pc + entry_min_len <= seg_vaddr64 + memsz) {
             entry_in_load = true;
+        }
+        if (out->phdr_vaddr != 0U &&
+            out->phdr_vaddr >= seg_vaddr &&
+            (uint64_t)out->phdr_vaddr + phdr_bytes <= seg_vaddr64 + memsz) {
+            phdr_in_load = true;
         }
         uint32_t page_start = page_down(seg_vaddr);
         uint64_t map_end64  = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
@@ -389,15 +402,22 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             }
         }
 
-        if (out->phdr_vaddr == 0U && read_file_off <= ehdr.e_phoff &&
+        if (fallback_phdr_vaddr == 0U && read_file_off <= ehdr.e_phoff &&
             (uint64_t)ehdr.e_phoff + phdr_bytes <= (uint64_t)read_file_off + (uint64_t)read_file_len) {
             uint32_t base_va = (read_file_off < ph->p_offset) ? page_start : seg_vaddr;
-            out->phdr_vaddr = base_va + (ehdr.e_phoff - read_file_off);
+            fallback_phdr_vaddr = base_va + (ehdr.e_phoff - read_file_off);
         }
 
         if (map_end > out->max_vaddr) {
             out->max_vaddr = map_end;
         }
+    }
+
+    if (!phdr_in_load) {
+        out->phdr_vaddr = 0U;
+    }
+    if (out->phdr_vaddr == 0U) {
+        out->phdr_vaddr = fallback_phdr_vaddr;
     }
 
     if (!entry_in_load) {
@@ -472,6 +492,11 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
         out_info->interp_base = interp_info.load_bias;
         ctx->interp_base      = interp_info.load_bias;
         ctx->elf_entry        = interp_info.entry;
+        uint32_t interp_end   = page_up(interp_info.max_vaddr);
+        if (ctx->brk_base >= interp_info.load_bias && ctx->brk_base < interp_end) {
+            ctx->brk_base = interp_end;
+            ctx->brk_curr = ctx->brk_base;
+        }
     }
 
     return 0;

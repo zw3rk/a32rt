@@ -430,7 +430,12 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             char *comma = strchr(cmd + 1, ',');
             if (comma != NULL) {
                 *comma = '\0';
-                uint32_t addr = (uint32_t)strtoul(cmd + 1, NULL, 16);
+                unsigned long raw_addr = strtoul(cmd + 1, NULL, 16);
+                if (raw_addr > 0xFFFFFFFFUL) {
+                    send_packet(g_client_sock, "E14");
+                    continue;
+                }
+                uint32_t addr = (uint32_t)raw_addr;
                 size_t len    = (size_t)strtoul(comma + 1, NULL, 16);
                 if (len > 1024U) {
                     len = 1024U;
@@ -458,10 +463,19 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             if (comma != NULL && colon != NULL && comma < colon) {
                 *comma = '\0';
                 *colon = '\0';
-                uint32_t addr = (uint32_t)strtoul(cmd + 1, NULL, 16);
+                unsigned long raw_addr = strtoul(cmd + 1, NULL, 16);
+                if (raw_addr > 0xFFFFFFFFUL) {
+                    send_packet(g_client_sock, "E14");
+                    continue;
+                }
+                uint32_t addr = (uint32_t)raw_addr;
                 size_t len    = (size_t)strtoul(comma + 1, NULL, 16);
                 if (len > 1024U) {
                     len = 1024U;
+                }
+                if (strlen(colon + 1) < len * 2U) {
+                    send_packet(g_client_sock, "E01");
+                    continue;
                 }
                 if (!gdb_range_mapped(ctx, addr, (uint32_t)len) ||
                     (uint64_t)addr + (uint64_t)len > 0xFFFF0000ULL) {

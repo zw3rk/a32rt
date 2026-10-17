@@ -26,6 +26,7 @@
 #define A32_HT_MASK         (A32_HT_SIZE - 1U)
 #define A32_SIDE_TABLE_SIZE 131072U
 #define MAX_STAGE_PC_MAP    256U
+#define A32_AOT_MAX_WORDS   2048U
 
 typedef struct a32_cache_entry {
     _Atomic uint32_t                 key;        /* (guest_pc & ~1u) | T; 0 = empty */
@@ -540,23 +541,31 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
                               const uint32_t *words, size_t word_count,
                               const a32_pc_map_stage_t *pc_map, size_t pc_map_count)
 {
-    if (words == NULL || word_count == 0U ||
-        pc_map_count > MAX_STAGE_PC_MAP ||
-        (pc_map_count > 0U && pc_map == NULL)) {
+    uint32_t align_mask = is_thumb ? 1U : 3U;
+    if (words == NULL || word_count == 0U || word_count > A32_AOT_MAX_WORDS ||
+        pc_map_count >= MAX_STAGE_PC_MAP ||
+        (pc_map_count > 0U && pc_map == NULL) ||
+        (guest_pc & align_mask) != 0U ||
+        (guest_end_pc & align_mask) != 0U ||
+        guest_end_pc <= guest_pc) {
         return -1;
     }
 
-    uint32_t aligned_pc = guest_pc & (is_thumb ? ~1U : ~3U);
-    uint32_t end_pc     = (guest_end_pc > aligned_pc) ? guest_end_pc : (aligned_pc + 4U);
+    uint32_t aligned_pc = guest_pc;
+    uint32_t end_pc     = guest_end_pc;
 
     if (pc_map != NULL && pc_map_count > 0U) {
         for (size_t i = 0U; i < pc_map_count; i++) {
+            uint32_t it = pc_map[i].itstate;
             if (pc_map[i].host_word_idx >= word_count ||
                 (i > 0U && pc_map[i].host_word_idx < pc_map[i - 1U].host_word_idx) ||
                 pc_map[i].guest_pc < aligned_pc ||
                 pc_map[i].guest_pc >= end_pc ||
-                (pc_map[i].guest_pc & (is_thumb ? 1U : 3U)) != 0U ||
-                (!is_thumb && pc_map[i].itstate != 0U)) {
+                (pc_map[i].guest_pc & align_mask) != 0U ||
+                (!is_thumb && it != 0U) ||
+                (is_thumb && ((it & ~0xFFU) != 0U ||
+                              (it != 0U && (it & 0x0FU) == 0U) ||
+                              (it & 0xF0U) == 0xF0U))) {
                 return -1;
             }
         }
@@ -631,6 +640,11 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     uint32_t aligned_pc = pc & ~1U;
     uint32_t key        = aligned_pc | (is_thumb ? 1U : 0U);
     uint32_t slot       = hash_key(key);
+    if (!is_thumb || (ctx->itstate & 0x0FU) == 0U) {
+        ctx->itstate = 0U;
+    } else {
+        ctx->itstate &= 0xFFU;
+    }
     bool     uncached   = (ctx->itstate != 0U) || ctx->single_step;
 
     jit_lock_acquire();
@@ -793,7 +807,7 @@ void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
 
             if (g_side_table_count >= g_ht[i].side_start + g_ht[i].side_count &&
                 g_side_table_count - g_ht[i].side_start <= A32_SIDE_TABLE_SIZE) {
-                for (size_t s = 0U; s < g_ht[i].side_count && map_count < MAX_STAGE_PC_MAP; s++) {
+                for (size_t s = 0U; s < g_ht[i].side_count && map_count < MAX_STAGE_PC_MAP - 1U; s++) {
                     size_t st_idx = (g_ht[i].side_start + s) % A32_SIDE_TABLE_SIZE;
                     if (g_side_table[st_idx].host_pc_start >= base &&
                         g_side_table[st_idx].host_pc_start < end) {
@@ -820,12 +834,34 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
     if (prev_entry == NULL || prev_key == 0U || cur_entry == NULL || code == NULL) {
         return;
     }
-    if (atomic_load_explicit(&prev_entry->chain_epoch[0], memory_order_acquire) == epoch &&
-        atomic_load_explicit(&prev_entry->chain_code[0], memory_order_relaxed) != NULL &&
-        (atomic_load_explicit(&prev_entry->chain_key[0], memory_order_relaxed) == key ||
-         (atomic_load_explicit(&prev_entry->chain_epoch[1], memory_order_acquire) == epoch &&
-          atomic_load_explicit(&prev_entry->chain_code[1], memory_order_relaxed) != NULL))) {
-        return;
+    uint32_t           e0  = atomic_load_explicit(&prev_entry->chain_epoch[0], memory_order_acquire);
+    const void        *c0  = atomic_load_explicit(&prev_entry->chain_code[0], memory_order_relaxed);
+    uint32_t           k0  = atomic_load_explicit(&prev_entry->chain_key[0], memory_order_relaxed);
+    a32_cache_entry_t *ce0 = atomic_load_explicit(&prev_entry->chain_entry[0], memory_order_relaxed);
+    bool slot0_live = (e0 == epoch && c0 != NULL && ce0 != NULL &&
+                       atomic_load_explicit(&ce0->epoch, memory_order_acquire) == epoch &&
+                       atomic_load_explicit(&ce0->key, memory_order_relaxed) == k0 &&
+                       atomic_load_explicit(&ce0->host_code, memory_order_relaxed) == c0);
+    if (slot0_live) {
+        if (k0 == key) {
+            if (c0 == code && ce0 == cur_entry) {
+                return;
+            }
+        } else {
+            uint32_t           e1  = atomic_load_explicit(&prev_entry->chain_epoch[1], memory_order_acquire);
+            const void        *c1  = atomic_load_explicit(&prev_entry->chain_code[1], memory_order_relaxed);
+            uint32_t           k1  = atomic_load_explicit(&prev_entry->chain_key[1], memory_order_relaxed);
+            a32_cache_entry_t *ce1 = atomic_load_explicit(&prev_entry->chain_entry[1], memory_order_relaxed);
+            bool slot1_live = (e1 == epoch && c1 != NULL && ce1 != NULL &&
+                               atomic_load_explicit(&ce1->epoch, memory_order_acquire) == epoch &&
+                               atomic_load_explicit(&ce1->key, memory_order_relaxed) == k1 &&
+                               atomic_load_explicit(&ce1->host_code, memory_order_relaxed) == c1);
+            if (slot1_live) {
+                if (k1 != key || (c1 == code && ce1 == cur_entry)) {
+                    return;
+                }
+            }
+        }
     }
     jit_lock_acquire();
     uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
@@ -836,26 +872,41 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
         atomic_load_explicit(&cur_entry->epoch, memory_order_relaxed) == epoch &&
         atomic_load_explicit(&cur_entry->key, memory_order_relaxed) == key &&
         atomic_load_explicit(&cur_entry->host_code, memory_order_relaxed) == code) {
-        uint32_t e0    = atomic_load_explicit(&prev_entry->chain_epoch[0], memory_order_relaxed);
-        const void *c0 = atomic_load_explicit(&prev_entry->chain_code[0], memory_order_relaxed);
-        uint32_t k0    = atomic_load_explicit(&prev_entry->chain_key[0], memory_order_relaxed);
-        if (c0 == NULL || e0 != epoch) {
-            atomic_store_explicit(&prev_entry->chain_epoch[0], 0U, memory_order_release);
-            atomic_thread_fence(memory_order_release);
-            atomic_store_explicit(&prev_entry->chain_key[0], key, memory_order_relaxed);
-            atomic_store_explicit(&prev_entry->chain_code[0], code, memory_order_relaxed);
-            atomic_store_explicit(&prev_entry->chain_entry[0], cur_entry, memory_order_relaxed);
-            atomic_store_explicit(&prev_entry->chain_epoch[0], epoch, memory_order_release);
-        } else if (k0 != key) {
-            uint32_t e1    = atomic_load_explicit(&prev_entry->chain_epoch[1], memory_order_relaxed);
-            const void *c1 = atomic_load_explicit(&prev_entry->chain_code[1], memory_order_relaxed);
-            if (c1 == NULL || e1 != epoch) {
-                atomic_store_explicit(&prev_entry->chain_epoch[1], 0U, memory_order_release);
+        e0  = atomic_load_explicit(&prev_entry->chain_epoch[0], memory_order_relaxed);
+        c0  = atomic_load_explicit(&prev_entry->chain_code[0], memory_order_relaxed);
+        k0  = atomic_load_explicit(&prev_entry->chain_key[0], memory_order_relaxed);
+        ce0 = atomic_load_explicit(&prev_entry->chain_entry[0], memory_order_relaxed);
+        uint32_t           e1  = atomic_load_explicit(&prev_entry->chain_epoch[1], memory_order_relaxed);
+        const void        *c1  = atomic_load_explicit(&prev_entry->chain_code[1], memory_order_relaxed);
+        uint32_t           k1  = atomic_load_explicit(&prev_entry->chain_key[1], memory_order_relaxed);
+        a32_cache_entry_t *ce1 = atomic_load_explicit(&prev_entry->chain_entry[1], memory_order_relaxed);
+        bool c0_dead = (c0 == NULL || e0 != epoch || ce0 == NULL ||
+                        atomic_load_explicit(&ce0->epoch, memory_order_relaxed) != epoch ||
+                        atomic_load_explicit(&ce0->key, memory_order_relaxed) != k0 ||
+                        atomic_load_explicit(&ce0->host_code, memory_order_relaxed) != c0);
+        if (k0 == key || (c0_dead && k1 != key)) {
+            if (c0_dead || c0 != code || ce0 != cur_entry) {
+                atomic_store_explicit(&prev_entry->chain_epoch[0], 0U, memory_order_release);
                 atomic_thread_fence(memory_order_release);
-                atomic_store_explicit(&prev_entry->chain_key[1], key, memory_order_relaxed);
-                atomic_store_explicit(&prev_entry->chain_code[1], code, memory_order_relaxed);
-                atomic_store_explicit(&prev_entry->chain_entry[1], cur_entry, memory_order_relaxed);
-                atomic_store_explicit(&prev_entry->chain_epoch[1], epoch, memory_order_release);
+                atomic_store_explicit(&prev_entry->chain_key[0], key, memory_order_relaxed);
+                atomic_store_explicit(&prev_entry->chain_code[0], code, memory_order_relaxed);
+                atomic_store_explicit(&prev_entry->chain_entry[0], cur_entry, memory_order_relaxed);
+                atomic_store_explicit(&prev_entry->chain_epoch[0], epoch, memory_order_release);
+            }
+        } else {
+            bool c1_dead = (c1 == NULL || e1 != epoch || ce1 == NULL ||
+                            atomic_load_explicit(&ce1->epoch, memory_order_relaxed) != epoch ||
+                            atomic_load_explicit(&ce1->key, memory_order_relaxed) != k1 ||
+                            atomic_load_explicit(&ce1->host_code, memory_order_relaxed) != c1);
+            if (c1_dead || k1 == key) {
+                if (c1_dead || c1 != code || ce1 != cur_entry) {
+                    atomic_store_explicit(&prev_entry->chain_epoch[1], 0U, memory_order_release);
+                    atomic_thread_fence(memory_order_release);
+                    atomic_store_explicit(&prev_entry->chain_key[1], key, memory_order_relaxed);
+                    atomic_store_explicit(&prev_entry->chain_code[1], code, memory_order_relaxed);
+                    atomic_store_explicit(&prev_entry->chain_entry[1], cur_entry, memory_order_relaxed);
+                    atomic_store_explicit(&prev_entry->chain_epoch[1], epoch, memory_order_release);
+                }
             }
         }
     }
@@ -864,19 +915,17 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
 
 int a32_jit_run(a32_ctx_t *ctx)
 {
+    jit_lock_acquire();
     if (ctx->is_thread_clone) {
-        jit_lock_acquire();
         if (!atomic_load_explicit(&g_multithreaded, memory_order_relaxed)) {
             atomic_store_explicit(&g_multithreaded, true, memory_order_release);
-            if (g_batch_max > g_batch_min) {
-                (void)flush_batch_locked(ctx);
-            }
             g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
-        } else if (g_batch_max > g_batch_min) {
-            (void)flush_batch_locked(ctx);
         }
-        jit_lock_release();
     }
+    if (g_batch_max > g_batch_min) {
+        (void)flush_batch_locked(ctx);
+    }
+    jit_lock_release();
 
     a32_cache_entry_t *prev_entry        = NULL;
     uint32_t           prev_key          = 0U;
@@ -886,7 +935,12 @@ int a32_jit_run(a32_ctx_t *ctx)
 
     for (;;) {
         if ((ctx->pending_signals & ~ctx->sig_mask) != 0ULL) {
+            uint32_t pre_stop_pc    = ctx->regs[15];
+            ctx->sync_sig_delivered = false;
             a32_signals_check_pending(ctx);
+            if (ctx->sync_sig_delivered || ctx->regs[15] != pre_stop_pc) {
+                gdb_stopped_at_pc = false;
+            }
             prev_entry = NULL;
         }
 
@@ -913,6 +967,11 @@ int a32_jit_run(a32_ctx_t *ctx)
                     ctx->regs[0], ctx->regs[1], ctx->regs[2], ctx->regs[13], ctx->regs[14]);
         }
 
+        if (!is_thumb || (ctx->itstate & 0x0FU) == 0U) {
+            ctx->itstate = 0U;
+        } else {
+            ctx->itstate &= 0xFFU;
+        }
         uint32_t key      = (pc & ~1U) | (is_thumb ? 1U : 0U);
         uint32_t epoch    = atomic_load_explicit(&g_cache_epoch, memory_order_acquire);
         bool     uncached = (ctx->itstate != 0U) || ctx->single_step;
@@ -954,7 +1013,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                     cur_start   = atomic_load_explicit(&r_entry->guest_pc, memory_order_relaxed);
                     cur_end     = atomic_load_explicit(&r_entry->guest_end_pc, memory_order_relaxed);
                     atomic_thread_fence(memory_order_acquire);
-                    if (atomic_load_explicit(&r_entry->epoch, memory_order_acquire) == epoch &&
+                    if (atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
+                        atomic_load_explicit(&r_entry->epoch, memory_order_acquire) == epoch &&
                         atomic_load_explicit(&r_entry->host_code, memory_order_relaxed) == code) {
                         ctx->ras_hits++;
                     } else {
@@ -984,7 +1044,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                     cur_start   = atomic_load_explicit(&e0->guest_pc, memory_order_relaxed);
                     cur_end     = atomic_load_explicit(&e0->guest_end_pc, memory_order_relaxed);
                     atomic_thread_fence(memory_order_acquire);
-                    if (atomic_load_explicit(&e0->epoch, memory_order_acquire) == epoch &&
+                    if (atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
+                        atomic_load_explicit(&e0->epoch, memory_order_acquire) == epoch &&
                         atomic_load_explicit(&e0->host_code, memory_order_relaxed) == code) {
                         ctx->chain_hits++;
                     } else {
@@ -1006,7 +1067,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                     cur_start   = atomic_load_explicit(&e1->guest_pc, memory_order_relaxed);
                     cur_end     = atomic_load_explicit(&e1->guest_end_pc, memory_order_relaxed);
                     atomic_thread_fence(memory_order_acquire);
-                    if (atomic_load_explicit(&e1->epoch, memory_order_acquire) == epoch &&
+                    if (atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
+                        atomic_load_explicit(&e1->epoch, memory_order_acquire) == epoch &&
                         atomic_load_explicit(&e1->host_code, memory_order_relaxed) == code) {
                         ctx->chain_hits++;
                     } else {
@@ -1034,7 +1096,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                     cur_start   = atomic_load_explicit(&i_entry->guest_pc, memory_order_relaxed);
                     cur_end     = atomic_load_explicit(&i_entry->guest_end_pc, memory_order_relaxed);
                     atomic_thread_fence(memory_order_acquire);
-                    if (atomic_load_explicit(&i_entry->epoch, memory_order_acquire) == epoch &&
+                    if (atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
+                        atomic_load_explicit(&i_entry->epoch, memory_order_acquire) == epoch &&
                         atomic_load_explicit(&i_entry->host_code, memory_order_relaxed) == code) {
                         ctx->ibtc_hits++;
                         if (!is_ras_return) {
@@ -1098,7 +1161,7 @@ int a32_jit_run(a32_ctx_t *ctx)
             uint32_t lr_pc   = ctx->regs[14] & ~1U;
             uint32_t next_pc = ctx->regs[15] & ~1U;
             if (cur_is_call && ctx->regs[14] != 0xFFFF0FA8U &&
-                lr_pc > cur_start && lr_pc <= cur_end + 4U && next_pc != lr_pc) {
+                 lr_pc > cur_start && lr_pc <= cur_end + 4U && next_pc != lr_pc) {
                 uint32_t ret_key = lr_pc | (is_thumb ? 1U : 0U);
                 uint32_t r_ibtc  = ((ret_key >> 1U) ^ (ret_key & 1U)) & (A32_IBTC_SIZE - 1U);
                 uint32_t top     = ctx->ras_top;
@@ -1121,8 +1184,11 @@ int a32_jit_run(a32_ctx_t *ctx)
                             if (atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
                                 atomic_load_explicit(&ht_e->key, memory_order_acquire) == ret_key) {
                                 const void *ht_code = atomic_load_explicit(&ht_e->host_code, memory_order_acquire);
+                                atomic_thread_fence(memory_order_acquire);
                                 if (ht_code != NULL &&
-                                    atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch) {
+                                    atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == epoch &&
+                                    atomic_load_explicit(&ht_e->epoch, memory_order_acquire) == epoch &&
+                                    atomic_load_explicit(&ht_e->key, memory_order_relaxed) == ret_key) {
                                     found_e    = ht_e;
                                     found_code = ht_code;
                                     break;
@@ -1170,39 +1236,54 @@ int a32_jit_run(a32_ctx_t *ctx)
         case A32_EXIT_SVC: {
             prev_entry = NULL;
             ctx->syscalls_executed++;
-            bool is_bkpt_svc = (ctx->regs[7] == 0x0f0001U ||
-                                (ctx->svc_imm & 0x0fffffU) == 0x0f0001U);
+            uint32_t pre_stop_pc = ctx->regs[15];
+            bool     is_bkpt_svc = (ctx->regs[7] == 0x0f0001U);
             if (a32_handle_syscall(ctx) != 0) {
                 return (int)ctx->regs[0];
             }
             if (ctx->gdb_enabled && is_bkpt_svc) {
-                gdb_stopped_at_pc = true;
-                gdb_stopped_pc    = ctx->regs[15];
+                if (ctx->regs[15] == pre_stop_pc) {
+                    gdb_stopped_at_pc = true;
+                    gdb_stopped_pc    = pre_stop_pc;
+                } else {
+                    gdb_stopped_at_pc = false;
+                }
             }
             break;
         }
 
-        case A32_EXIT_BKPT:
+        case A32_EXIT_BKPT: {
             prev_entry = NULL;
             if (ctx->gdb_enabled) {
+                uint32_t pre_stop_pc = ctx->regs[15];
                 a32_gdb_handle_stop(ctx, 5 /* SIGTRAP */);
-                gdb_stopped_at_pc = true;
-                gdb_stopped_pc    = ctx->regs[15];
+                if (ctx->regs[15] == pre_stop_pc) {
+                    gdb_stopped_at_pc = true;
+                    gdb_stopped_pc    = pre_stop_pc;
+                } else {
+                    gdb_stopped_at_pc = false;
+                }
             } else if (!a32_signals_deliver_sync(ctx, 5 /* SIGTRAP */, ctx->regs[15])) {
                 raise(5 /* SIGTRAP */);
             }
             break;
+        }
 
         case A32_EXIT_FAULT:
             fprintf(stderr, "a32rt: guest fault at 0x%08x\n", ctx->fault_addr);
             return 139;
 
-        case A32_EXIT_UNDEF:
+        case A32_EXIT_UNDEF: {
             prev_entry = NULL;
             if (ctx->gdb_enabled) {
+                uint32_t pre_stop_pc = ctx->regs[15];
                 a32_gdb_handle_stop(ctx, 4 /* SIGILL */);
-                gdb_stopped_at_pc = true;
-                gdb_stopped_pc    = ctx->regs[15];
+                if (ctx->regs[15] == pre_stop_pc) {
+                    gdb_stopped_at_pc = true;
+                    gdb_stopped_pc    = pre_stop_pc;
+                } else {
+                    gdb_stopped_at_pc = false;
+                }
                 break;
             }
             if (a32_signals_deliver_sync(ctx, 4 /* SIGILL */, ctx->regs[15])) {
@@ -1211,6 +1292,7 @@ int a32_jit_run(a32_ctx_t *ctx)
             fprintf(stderr, "a32rt: aborting on exit_reason=%u at guest pc=0x%08x\n",
                     reason, ctx->regs[15]);
             return 127;
+        }
 
         default:
             fprintf(stderr, "a32rt: aborting on exit_reason=%u at guest pc=0x%08x\n",

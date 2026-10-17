@@ -421,68 +421,63 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         bool l_bit = ((insn >> 20) & 1U) != 0U;
         unsigned rn = (insn >> 16) & 0xFU;
         uint32_t reg_mask = insn & 0xFFFFU;
-        if (reg_mask == 0U || rn == 15U) {
-            if (cond != A64_COND_AL) {
-                b->count = cond_skip;
+        if (reg_mask != 0U && rn != 15U) {
+            unsigned count = 0U;
+            for (unsigned i = 0U; i < 16U; i++) {
+                if (reg_mask & (1U << i)) {
+                    count++;
+                }
             }
-            return false;
-        }
-
-        unsigned count = 0U;
-        for (unsigned i = 0U; i < 16U; i++) {
-            if (reg_mask & (1U << i)) {
-                count++;
-            }
-        }
-        uint32_t total_bytes = count * 4U;
-        uint32_t start_offset = 0U;
-        if (!u_bit) {
-            start_offset = total_bytes - (p_bit ? 0U : 4U);
-        } else {
-            start_offset = p_bit ? 4U : 0U;
-        }
-
-        /* Compute starting guest address into A64_ADDR (w22) */
-        if (!u_bit) {
-            a64_emit_sub_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
-        } else if (start_offset != 0U) {
-            a64_emit_add_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
-        } else {
-            a64_emit_mov_w(b, A64_ADDR, rn);
-        }
-
-        bool loads_pc = l_bit && ((reg_mask & (1U << 15)) != 0U);
-        for (unsigned r = 0U; r < 16U; r++) {
-            if ((reg_mask & (1U << r)) == 0U) {
-                continue;
-            }
-            if (l_bit) {
-                unsigned dst = (r == 15U) ? A64_TMP0 : ((r == rn) ? A64_TMP1 : r);
-                a64_emit_guest_ldr_w(b, dst, A64_ADDR);
+            uint32_t total_bytes = count * 4U;
+            uint32_t start_offset = 0U;
+            if (!u_bit) {
+                start_offset = total_bytes - (p_bit ? 0U : 4U);
             } else {
-                unsigned src = load_a32_reg(b, r, pc_val, A64_TMP1);
-                a64_emit_guest_str_w(b, src, A64_ADDR);
+                start_offset = p_bit ? 4U : 0U;
             }
-            a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 4U, 0U);
-        }
 
-        if (l_bit && (reg_mask & (1U << rn)) != 0U && rn != 15U) {
-            a64_emit_mov_w(b, rn, A64_TMP1);
-        } else if (w_bit) {
-            if (u_bit) {
-                a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)total_bytes, 0U);
+            /* Compute starting guest address into A64_ADDR (w22) */
+            if (!u_bit) {
+                a64_emit_sub_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
+            } else if (start_offset != 0U) {
+                a64_emit_add_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
             } else {
-                a64_emit_sub_imm_w(b, false, rn, rn, (uint16_t)total_bytes, 0U);
+                a64_emit_mov_w(b, A64_ADDR, rn);
             }
-        }
 
-        if (loads_pc) {
-            a64_emit_exit_branch_reg(b, A64_TMP0, true);
-            if (cond == A64_COND_AL) {
-                *out_ends_block = true;
+            bool loads_pc = l_bit && ((reg_mask & (1U << 15)) != 0U);
+            for (unsigned r = 0U; r < 16U; r++) {
+                if ((reg_mask & (1U << r)) == 0U) {
+                    continue;
+                }
+                if (l_bit) {
+                    unsigned dst = (r == 15U) ? A64_TMP0 : ((r == rn) ? A64_TMP1 : r);
+                    a64_emit_guest_ldr_w(b, dst, A64_ADDR);
+                } else {
+                    unsigned src = load_a32_reg(b, r, pc_val, A64_TMP1);
+                    a64_emit_guest_str_w(b, src, A64_ADDR);
+                }
+                a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 4U, 0U);
             }
+
+            if (l_bit && (reg_mask & (1U << rn)) != 0U && rn != 15U) {
+                a64_emit_mov_w(b, rn, A64_TMP1);
+            } else if (w_bit) {
+                if (u_bit) {
+                    a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)total_bytes, 0U);
+                } else {
+                    a64_emit_sub_imm_w(b, false, rn, rn, (uint16_t)total_bytes, 0U);
+                }
+            }
+
+            if (loads_pc) {
+                a64_emit_exit_branch_reg(b, A64_TMP0, true);
+                if (cond == A64_COND_AL) {
+                    *out_ends_block = true;
+                }
+            }
+            handled = true;
         }
-        handled = true;
     }
     /* 4. Single Data Transfer LDR / STR / LDRB / STRB & Media (op1 == 2 or op1 == 3) */
     else if (op1 == 2U || (op1 == 3U && ((insn & 0x10U) == 0U))) {

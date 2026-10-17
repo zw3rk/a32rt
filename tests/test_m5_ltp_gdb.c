@@ -1264,7 +1264,7 @@ static int test17_prctl_groups_robust(void)
      *      - Positive: set_robust_list(&head, 12) -> 0, and get_robust_list(0, &hptr, &hlen)
      *        returns head_ptr == &head and len == 12
      */
-    struct robust_list_head32_m5 rhead;
+    static struct robust_list_head32_m5 rhead;
     rhead.list = (uint32_t)(uintptr_t)&rhead;
     rhead.futex_offset = 0;
     rhead.list_op_pending = 0U;
@@ -1506,7 +1506,7 @@ static int test19_r6_madvise_robust_sockopt(void)
      *   - Negative: non-existent pid (999999) -> -ESRCH (-3)
      *   - Positive: pid == 0 and pid == gettid() -> 0
      */
-    struct robust_list_head32_m5 rhead;
+    static struct robust_list_head32_m5 rhead;
     rhead.list = (uint32_t)(uintptr_t)&rhead;
     rhead.futex_offset = -4;
     rhead.list_op_pending = 0U;
@@ -1789,6 +1789,258 @@ static int test20_r7_truncate_affinity_gettimeofday(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 21: Round 8 regressions —
+ *   21a: setitimer (104) and getitimer (105) positive (ITIMER_REAL arm,
+ *        query, in-place aliasing disarm, 16-byte struct canary check) and
+ *        negative (-EFAULT on 0x100 pointer, -EINVAL on bad which or
+ *        tv_usec < 0 / tv_usec >= 1000000 without clobbering old_value)
+ *   21b: nanosleep (162) and clock_nanosleep (265) regression test verifying
+ *        that when failing with -EINVAL (e.g. req.tv_nsec = -1 or 1000000000),
+ *        the guest rem struct is NOT overwritten with stack garbage
+ * -------------------------------------------------------------------------- */
+struct itimerval32 {
+    struct timeval32 it_interval;
+    struct timeval32 it_value;
+};
+
+_Static_assert(sizeof(struct itimerval32) == 16U, "itimerval32 must be 16 bytes");
+
+struct itimerval32_canary {
+    struct itimerval32 itv;
+    uint32_t           canary[2];
+};
+
+static int test21_r8_itimer_nanosleep_rem(void)
+{
+    static struct itimerval32 arm_itv;
+    static struct itimerval32 bad_itv;
+    static struct itimerval32_canary old_buf;
+    static struct itimerval32_canary cur_buf;
+
+    /* 21a-1: Negative checks for getitimer (105) and setitimer (104) */
+    if (sys2(105U /* getitimer */, 0U /* ITIMER_REAL */, 0U) != -14 /* -EFAULT */ ||
+        sys2(105U /* getitimer */, 0U /* ITIMER_REAL */, 0x100U) != -14 /* -EFAULT */ ||
+        sys2(105U /* getitimer */, 99U /* invalid which */,
+             (uint32_t)(uintptr_t)&cur_buf.itv) != -22 /* -EINVAL */) {
+        return 189;
+    }
+
+    arm_itv.it_interval.tv_sec  = 0;
+    arm_itv.it_interval.tv_usec = 0;
+    arm_itv.it_value.tv_sec     = 0;
+    arm_itv.it_value.tv_usec    = 0;
+
+    if (sys3(104U /* setitimer */, 0U /* ITIMER_REAL */, 0x100U, 0U) != -14 /* -EFAULT */ ||
+        sys3(104U /* setitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&arm_itv, 0x100U) != -14 /* -EFAULT */ ||
+        sys3(104U /* setitimer */, 99U /* invalid which */,
+             (uint32_t)(uintptr_t)&arm_itv, 0U) != -22 /* -EINVAL */) {
+        return 190;
+    }
+
+    /* Negative: tv_usec >= 1000000 or < 0 must return -EINVAL without clobbering old_value */
+    old_buf.itv.it_interval.tv_sec  = 0x11112222;
+    old_buf.itv.it_interval.tv_usec = 0x33334444;
+    old_buf.itv.it_value.tv_sec     = 0x55556666;
+    old_buf.itv.it_value.tv_usec    = 0x77778888;
+    old_buf.canary[0]               = 0xDEADBEEFU;
+    old_buf.canary[1]               = 0xCAFEBABEU;
+
+    bad_itv.it_interval.tv_sec  = 0;
+    bad_itv.it_interval.tv_usec = 0;
+    bad_itv.it_value.tv_sec     = 1;
+    bad_itv.it_value.tv_usec    = 1000000;
+    if (sys3(104U /* setitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&bad_itv,
+             (uint32_t)(uintptr_t)&old_buf.itv) != -22 /* -EINVAL */) {
+        return 191;
+    }
+
+    bad_itv.it_value.tv_usec = -1;
+    if (sys3(104U /* setitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&bad_itv,
+             (uint32_t)(uintptr_t)&old_buf.itv) != -22 /* -EINVAL */) {
+        return 192;
+    }
+
+    bad_itv.it_value.tv_usec    = 0;
+    bad_itv.it_interval.tv_usec = -1;
+    if (sys3(104U /* setitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&bad_itv,
+             (uint32_t)(uintptr_t)&old_buf.itv) != -22 /* -EINVAL */) {
+        return 193;
+    }
+    if (old_buf.itv.it_interval.tv_sec != 0x11112222 ||
+        old_buf.itv.it_interval.tv_usec != 0x33334444 ||
+        old_buf.itv.it_value.tv_sec != 0x55556666 ||
+        old_buf.itv.it_value.tv_usec != 0x77778888 ||
+        old_buf.canary[0] != 0xDEADBEEFU ||
+        old_buf.canary[1] != 0xCAFEBABEU) {
+        return 194;
+    }
+
+    /* 21a-2: Positive arm, query via getitimer, and in-place disarm via setitimer */
+    arm_itv.it_interval.tv_sec  = 10;
+    arm_itv.it_interval.tv_usec = 250000;
+    arm_itv.it_value.tv_sec     = 60;
+    arm_itv.it_value.tv_usec    = 500000;
+
+    if (sys3(104U /* setitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&arm_itv,
+             (uint32_t)(uintptr_t)&old_buf.itv) != 0 ||
+        old_buf.canary[0] != 0xDEADBEEFU ||
+        old_buf.canary[1] != 0xCAFEBABEU) {
+        return 195;
+    }
+
+    cur_buf.itv.it_interval.tv_sec  = -1;
+    cur_buf.itv.it_interval.tv_usec = -1;
+    cur_buf.itv.it_value.tv_sec     = -1;
+    cur_buf.itv.it_value.tv_usec    = -1;
+    cur_buf.canary[0]               = 0xDEADBEEFU;
+    cur_buf.canary[1]               = 0xCAFEBABEU;
+
+    if (sys2(105U /* getitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&cur_buf.itv) != 0 ||
+        cur_buf.itv.it_interval.tv_sec != 10 ||
+        cur_buf.itv.it_interval.tv_usec != 250000 ||
+        cur_buf.itv.it_value.tv_sec < 50 ||
+        cur_buf.itv.it_value.tv_sec > 60 ||
+        cur_buf.itv.it_value.tv_usec < 0 ||
+        cur_buf.itv.it_value.tv_usec >= 1000000 ||
+        cur_buf.canary[0] != 0xDEADBEEFU ||
+        cur_buf.canary[1] != 0xCAFEBABEU) {
+        /* Ensure timer is disarmed before failing */
+        arm_itv.it_interval.tv_sec  = 0;
+        arm_itv.it_interval.tv_usec = 0;
+        arm_itv.it_value.tv_sec     = 0;
+        arm_itv.it_value.tv_usec    = 0;
+        sys3(104U /* setitimer */, 0U, (uint32_t)(uintptr_t)&arm_itv, 0U);
+        return 196;
+    }
+
+    /* Disarm using in-place aliasing (new_value == old_value) */
+    old_buf.itv.it_interval.tv_sec  = 0;
+    old_buf.itv.it_interval.tv_usec = 0;
+    old_buf.itv.it_value.tv_sec     = 0;
+    old_buf.itv.it_value.tv_usec    = 0;
+    old_buf.canary[0]               = 0xDEADBEEFU;
+    old_buf.canary[1]               = 0xCAFEBABEU;
+
+    if (sys3(104U /* setitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&old_buf.itv,
+             (uint32_t)(uintptr_t)&old_buf.itv) != 0 ||
+        old_buf.itv.it_interval.tv_sec != 10 ||
+        old_buf.itv.it_interval.tv_usec != 250000 ||
+        old_buf.itv.it_value.tv_sec < 50 ||
+        old_buf.itv.it_value.tv_sec > 60 ||
+        old_buf.canary[0] != 0xDEADBEEFU ||
+        old_buf.canary[1] != 0xCAFEBABEU) {
+        arm_itv.it_interval.tv_sec  = 0;
+        arm_itv.it_interval.tv_usec = 0;
+        arm_itv.it_value.tv_sec     = 0;
+        arm_itv.it_value.tv_usec    = 0;
+        sys3(104U /* setitimer */, 0U, (uint32_t)(uintptr_t)&arm_itv, 0U);
+        return 197;
+    }
+
+    /* Verify getitimer now reports disarmed (0, 0) */
+    if (sys2(105U /* getitimer */, 0U /* ITIMER_REAL */,
+             (uint32_t)(uintptr_t)&cur_buf.itv) != 0 ||
+        cur_buf.itv.it_interval.tv_sec != 0 ||
+        cur_buf.itv.it_interval.tv_usec != 0 ||
+        cur_buf.itv.it_value.tv_sec != 0 ||
+        cur_buf.itv.it_value.tv_usec != 0 ||
+        cur_buf.canary[0] != 0xDEADBEEFU ||
+        cur_buf.canary[1] != 0xCAFEBABEU) {
+        return 198;
+    }
+
+    /*
+     * 21b: Regression test for nanosleep (162) and clock_nanosleep (265)
+     *      with invalid req.tv_nsec = -1 (or >= 1000000000, or tv_sec < 0):
+     *      verify that when the syscall fails with -EINVAL (-22), the guest
+     *      rem struct is NOT overwritten with uninitialized stack garbage!
+     */
+    static struct timespec32 req_ts;
+    static struct {
+        struct timespec32 rem;
+        uint32_t          canary[2];
+    } rem_buf;
+
+    rem_buf.rem.tv_sec  = 0x13572468;
+    rem_buf.rem.tv_nsec = 0x24681357;
+    rem_buf.canary[0]   = 0xDEADBEEFU;
+    rem_buf.canary[1]   = 0xCAFEBABEU;
+
+    /* Invalid req.tv_nsec = -1 */
+    req_ts.tv_sec  = 0;
+    req_ts.tv_nsec = -1;
+    if (sys2(162U /* nanosleep */,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != -22 /* -EINVAL */ ||
+        rem_buf.rem.tv_sec != 0x13572468 ||
+        rem_buf.rem.tv_nsec != 0x24681357 ||
+        rem_buf.canary[0] != 0xDEADBEEFU ||
+        rem_buf.canary[1] != 0xCAFEBABEU) {
+        return 199;
+    }
+
+    if (sys4(265U /* clock_nanosleep */, 1U /* CLOCK_MONOTONIC */, 0U,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != -22 /* -EINVAL */ ||
+        rem_buf.rem.tv_sec != 0x13572468 ||
+        rem_buf.rem.tv_nsec != 0x24681357 ||
+        rem_buf.canary[0] != 0xDEADBEEFU ||
+        rem_buf.canary[1] != 0xCAFEBABEU) {
+        return 200;
+    }
+
+    /* Invalid req.tv_nsec = 1000000000 and req.tv_sec = -1 */
+    req_ts.tv_sec  = 0;
+    req_ts.tv_nsec = 1000000000;
+    if (sys2(162U /* nanosleep */,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != -22 /* -EINVAL */ ||
+        sys4(265U /* clock_nanosleep */, 1U /* CLOCK_MONOTONIC */, 0U,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != -22 /* -EINVAL */ ||
+        rem_buf.rem.tv_sec != 0x13572468 ||
+        rem_buf.rem.tv_nsec != 0x24681357) {
+        return 201;
+    }
+
+    req_ts.tv_sec  = -1;
+    req_ts.tv_nsec = 0;
+    if (sys2(162U /* nanosleep */,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != -22 /* -EINVAL */ ||
+        sys4(265U /* clock_nanosleep */, 1U /* CLOCK_MONOTONIC */, 0U,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != -22 /* -EINVAL */ ||
+        rem_buf.rem.tv_sec != 0x13572468 ||
+        rem_buf.rem.tv_nsec != 0x24681357) {
+        return 202;
+    }
+
+    /* Positive short sleep (1 us) for nanosleep and clock_nanosleep */
+    req_ts.tv_sec  = 0;
+    req_ts.tv_nsec = 1000;
+    if (sys2(162U /* nanosleep */,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != 0 ||
+        sys4(265U /* clock_nanosleep */, 1U /* CLOCK_MONOTONIC */, 0U,
+             (uint32_t)(uintptr_t)&req_ts,
+             (uint32_t)(uintptr_t)&rem_buf.rem) != 0 ||
+        rem_buf.canary[0] != 0xDEADBEEFU ||
+        rem_buf.canary[1] != 0xCAFEBABEU) {
+        return 203;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -1860,6 +2112,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test20_r7_truncate_affinity_gettimeofday();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test21_r8_itimer_nanosleep_rem();
     if (rc != 0) {
         return rc;
     }

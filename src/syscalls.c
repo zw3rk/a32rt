@@ -88,6 +88,8 @@ extern char **environ;
 #define ARM_NR_ftruncate         93U
 #define ARM_NR_fchmod            94U
 #define ARM_NR_fchown            95U
+#define ARM_NR_setitimer         104U
+#define ARM_NR_getitimer         105U
 #define ARM_NR_wait4             114U
 #define ARM_NR_sysinfo           116U
 #define ARM_NR_fsync             118U
@@ -949,49 +951,89 @@ static bool is_arm32_elf_file(const char *path)
     return false;
 }
 
+static bool guest_range_mapped(const a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_prot)
+{
+    uint32_t end = va + len;
+    uint32_t cur = va;
+    for (size_t i = 0U; i < ctx->region_count; i++) {
+        const a32_region_t *r = &ctx->regions[i];
+        if (r->end <= cur) {
+            continue;
+        }
+        if (r->start > cur || (r->prot & req_prot) != req_prot) {
+            return false;
+        }
+        if (r->end >= end) {
+            return true;
+        }
+        cur = r->end;
+    }
+    return false;
+}
+
 void a32_cleanup_robust_list(a32_ctx_t *ctx)
 {
-    if (!ctx || ctx->robust_list_head < 0x1000U) {
+    if (!ctx) {
+        return;
+    }
+    uint32_t head_va = ctx->robust_list_head;
+    ctx->robust_list_head = 0U;
+    if (head_va < 0x1000U || head_va > 0xFFFF0000U - 12U || (head_va & 3U) != 0U) {
+        return;
+    }
+    a32_vm_sync_ctx(ctx);
+    if (!guest_range_mapped(ctx, head_va, 12U, 1U /* PROT_READ */)) {
         return;
     }
     uint32_t self_tid = (ctx->host_tid != 0)
                         ? (uint32_t)ctx->host_tid
                         : (uint32_t)syscall(SYS_gettid);
-    uint32_t head_va = ctx->robust_list_head;
     uint32_t *head_ptr = (uint32_t *)a32_guest_ptr(ctx, head_va);
     int32_t futex_offset = (int32_t)head_ptr[1];
     uint32_t curr = head_ptr[0];
     uint32_t pending = head_ptr[2];
 
     size_t limit = 1024U;
-    while (curr >= 0x1000U && curr != head_va && limit-- > 0U) {
+    while (curr >= 0x1000U && curr <= 0xFFFF0000U - 4U &&
+           (curr & 3U) == 0U && curr != head_va && limit-- > 0U &&
+           guest_range_mapped(ctx, curr, 4U, 1U /* PROT_READ */)) {
         uint32_t *node = (uint32_t *)a32_guest_ptr(ctx, curr);
         uint32_t next = node[0];
         if (curr != pending) {
             uint32_t futex_va = curr + (uint32_t)futex_offset;
-            if (futex_va >= 0x1000U) {
+            if (futex_va >= 0x1000U && futex_va <= 0xFFFF0000U - 4U &&
+                (futex_va & 3U) == 0U && guest_range_mapped(ctx, futex_va, 4U, 3U /* PROT_READ|PROT_WRITE */)) {
                 uint32_t *futex_ptr = (uint32_t *)a32_guest_ptr(ctx, futex_va);
-                uint32_t val = *futex_ptr;
-                if ((val & 0x3FFFFFFFU) == self_tid) {
-                    *futex_ptr = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
-                    syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+                uint32_t val = __atomic_load_n(futex_ptr, __ATOMIC_SEQ_CST);
+                while ((val & 0x3FFFFFFFU) == self_tid) {
+                    uint32_t new_val = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
+                    if (__atomic_compare_exchange_n(futex_ptr, &val, new_val, false,
+                                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                        syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+                        break;
+                    }
                 }
             }
         }
         curr = next;
     }
-    if (pending >= 0x1000U && pending != head_va) {
+    if (pending >= 0x1000U && pending <= 0xFFFF0000U - 4U &&
+        (pending & 3U) == 0U && pending != head_va) {
         uint32_t futex_va = pending + (uint32_t)futex_offset;
-        if (futex_va >= 0x1000U) {
+        if (futex_va >= 0x1000U && futex_va <= 0xFFFF0000U - 4U &&
+            (futex_va & 3U) == 0U && guest_range_mapped(ctx, futex_va, 4U, 3U /* PROT_READ|PROT_WRITE */)) {
             uint32_t *futex_ptr = (uint32_t *)a32_guest_ptr(ctx, futex_va);
-            uint32_t val = *futex_ptr;
-            if ((val & 0x3FFFFFFFU) == self_tid) {
-                *futex_ptr = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
-                syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+            uint32_t val = __atomic_load_n(futex_ptr, __ATOMIC_SEQ_CST);
+            while ((val & 0x3FFFFFFFU) == self_tid) {
+                uint32_t new_val = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
+                if (__atomic_compare_exchange_n(futex_ptr, &val, new_val, false,
+                                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                    syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+                    break;
+                }
             }
         }
     }
-    ctx->robust_list_head = 0U;
 }
 
 typedef struct child_thread_args {
@@ -1058,19 +1100,8 @@ static void print_stats_if_enabled(const a32_ctx_t *ctx)
 
 static void check_pwait_signals(a32_ctx_t *ctx, uint64_t temp_mask)
 {
-    uint64_t pending = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
-    if ((pending & ~temp_mask) == 0ULL) {
-        return;
-    }
-    uint64_t blocked = pending & temp_mask;
-    if (blocked != 0ULL) {
-        __atomic_fetch_and(&ctx->pending_signals, ~blocked, __ATOMIC_SEQ_CST);
-    }
-    ctx->sig_mask = 0ULL;
+    ctx->sig_mask = temp_mask;
     a32_signals_check_pending(ctx);
-    if (blocked != 0ULL) {
-        __atomic_fetch_or(&ctx->pending_signals, blocked, __ATOMIC_SEQ_CST);
-    }
 }
 
 static void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask, uint64_t temp_mask)
@@ -1082,7 +1113,6 @@ static void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask, uint6
         memcpy(fp + 156U, &oldmask32, sizeof(oldmask32));
         memcpy(fp + 232U, &saved_sig_mask, sizeof(saved_sig_mask));
         memcpy(fp + 464U, &saved_sig_mask, sizeof(saved_sig_mask));
-        ctx->sig_mask |= saved_sig_mask;
     } else {
         ctx->sig_mask = saved_sig_mask;
     }
@@ -1309,7 +1339,14 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         if (res < 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else if ((uint64_t)res >= (uint64_t)DIR_COOKIE_BASE) {
-            ctx->regs[0] = (uint32_t)map_dir_cookie((int)a0, (uint64_t)res);
+            struct stat st;
+            if (fstat((int)a0, &st) == 0 && S_ISDIR(st.st_mode)) {
+                ctx->regs[0] = (uint32_t)map_dir_cookie((int)a0, (uint64_t)res);
+            } else if (res > 0x7FFFFFFFL) {
+                ctx->regs[0] = (uint32_t)(-EOVERFLOW);
+            } else {
+                ctx->regs[0] = (uint32_t)res;
+            }
         } else {
             ctx->regs[0] = (uint32_t)res;
         }
@@ -1331,7 +1368,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         } else {
             uint64_t ures = (uint64_t)res;
             if (ures >= (uint64_t)DIR_COOKIE_BASE) {
-                ures = (uint64_t)map_dir_cookie((int)a0, ures);
+                struct stat st;
+                if (fstat((int)a0, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    ures = (uint64_t)map_dir_cookie((int)a0, ures);
+                }
             }
             memcpy(a32_guest_ptr(ctx, a3), &ures, sizeof(ures));
             ctx->regs[0] = 0U;
@@ -1760,25 +1800,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         uint64_t temp_mask      = 0ULL;
         memcpy(&temp_mask, a32_guest_ptr(ctx, a0), sizeof(temp_mask));
         temp_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-        ctx->sig_mask = temp_mask;
-        ctx->regs[0]  = (uint32_t)(-EINTR);
-        if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & ~temp_mask) != 0ULL) {
+        ctx->regs[0] = (uint32_t)(-EINTR);
+        for (;;) {
             check_pwait_signals(ctx, temp_mask);
             if (ctx->exit_reason == A32_EXIT_BRANCH) {
-                restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
                 break;
             }
-            ctx->sig_mask = temp_mask;
-        }
-        while ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & ~temp_mask) == 0ULL) {
             struct timespec poll_ts = { 0, 1000000L };
-            long pr = syscall(SYS_ppoll, NULL, 0, &poll_ts, &temp_mask, 8);
-            if (pr < 0 && errno == EINTR) {
-                break;
-            }
+            (void)syscall(SYS_ppoll, NULL, 0, &poll_ts, &temp_mask, (size_t)8);
         }
-        ctx->regs[0] = (uint32_t)(-EINTR);
-        check_pwait_signals(ctx, temp_mask);
         restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
         break;
     }
@@ -2080,6 +2110,70 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             if (a1 != 0U) {
                 int32_t tz32[2] = { (int32_t)tz.tz_minuteswest, (int32_t)tz.tz_dsttime };
                 memcpy(a32_guest_ptr(ctx, a1), tz32, sizeof(tz32));
+            }
+            ctx->regs[0] = 0U;
+        }
+        break;
+    }
+
+    case ARM_NR_getitimer: {
+        if (a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        struct itimerval itv;
+        memset(&itv, 0, sizeof(itv));
+        if (getitimer((int)a0, &itv) != 0) {
+            ctx->regs[0] = (uint32_t)(-errno);
+        } else {
+            if (itv.it_value.tv_sec == 0 && itv.it_value.tv_usec == 0) {
+                itv.it_interval.tv_sec  = 0;
+                itv.it_interval.tv_usec = 0;
+            }
+            int32_t out[4] = {
+                (int32_t)itv.it_interval.tv_sec,
+                (int32_t)itv.it_interval.tv_usec,
+                (int32_t)itv.it_value.tv_sec,
+                (int32_t)itv.it_value.tv_usec
+            };
+            memcpy(a32_guest_ptr(ctx, a1), out, sizeof(out));
+            ctx->regs[0] = 0U;
+        }
+        break;
+    }
+
+    case ARM_NR_setitimer: {
+        if ((a1 != 0U && a1 < 0x1000U) || (a2 != 0U && a2 < 0x1000U)) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        struct itimerval new_itv;
+        struct itimerval old_itv;
+        memset(&new_itv, 0, sizeof(new_itv));
+        memset(&old_itv, 0, sizeof(old_itv));
+        if (a1 != 0U) {
+            int32_t in[4];
+            memcpy(in, a32_guest_ptr(ctx, a1), sizeof(in));
+            if (in[1] < 0 || in[1] > 999999 || in[3] < 0 || in[3] > 999999) {
+                ctx->regs[0] = (uint32_t)(-EINVAL);
+                break;
+            }
+            new_itv.it_interval.tv_sec  = (time_t)in[0];
+            new_itv.it_interval.tv_usec = (suseconds_t)in[1];
+            new_itv.it_value.tv_sec     = (time_t)in[2];
+            new_itv.it_value.tv_usec    = (suseconds_t)in[3];
+        }
+        if (setitimer((int)a0, (a1 != 0U) ? &new_itv : NULL, (a2 != 0U) ? &old_itv : NULL) != 0) {
+            ctx->regs[0] = (uint32_t)(-errno);
+        } else {
+            if (a2 != 0U) {
+                int32_t out[4] = {
+                    (int32_t)old_itv.it_interval.tv_sec,
+                    (int32_t)old_itv.it_interval.tv_usec,
+                    (int32_t)old_itv.it_value.tv_sec,
+                    (int32_t)old_itv.it_value.tv_usec
+                };
+                memcpy(a32_guest_ptr(ctx, a2), out, sizeof(out));
             }
             ctx->regs[0] = 0U;
         }
@@ -3316,9 +3410,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->sig_mask = temp_mask;
             ctx->regs[0]  = orig_r0;
         }
-        const sigset_t *sig_ptr = has_temp_mask ? (const sigset_t *)&temp_mask : NULL;
-        ctx->regs[0] = host_ret(ppoll((a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL,
-                                     (nfds_t)a1, ts_ptr, sig_ptr));
+        struct pollfd *fds = (a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL;
+        long r = syscall(SYS_ppoll, fds, (nfds_t)a1, ts_ptr,
+                         has_temp_mask ? &temp_mask : NULL, (size_t)8);
+        if (a2 != 0U && (r >= 0 || errno == EINTR)) {
+            arm_timespec32_t *ts32 = (arm_timespec32_t *)a32_guest_ptr(ctx, a2);
+            ts32->tv_sec  = (int32_t)host_ts.tv_sec;
+            ts32->tv_nsec = (int32_t)host_ts.tv_nsec;
+        }
+        ctx->regs[0] = host_ret(r);
         if (has_temp_mask) {
             check_pwait_signals(ctx, temp_mask);
             restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
@@ -3366,9 +3466,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->sig_mask = temp_mask;
             ctx->regs[0]  = orig_r0;
         }
-        const sigset_t *sig_ptr = has_temp_mask ? (const sigset_t *)&temp_mask : NULL;
-        ctx->regs[0] = host_ret(ppoll((a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL,
-                                     (nfds_t)a1, ts_ptr, sig_ptr));
+        struct pollfd *fds = (a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL;
+        long r = syscall(SYS_ppoll, fds, (nfds_t)a1, ts_ptr,
+                         has_temp_mask ? &temp_mask : NULL, (size_t)8);
+        if (a2 != 0U && (r >= 0 || errno == EINTR)) {
+            arm_timespec64_t *ts64 = (arm_timespec64_t *)a32_guest_ptr(ctx, a2);
+            ts64->tv_sec  = (int64_t)host_ts.tv_sec;
+            ts64->tv_nsec = (int64_t)host_ts.tv_nsec;
+        }
+        ctx->regs[0] = host_ret(r);
         if (has_temp_mask) {
             check_pwait_signals(ctx, temp_mask);
             restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
@@ -3428,9 +3534,11 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->sig_mask = temp_mask;
             ctx->regs[0]  = orig_r0;
         }
-        ctx->regs[0] = host_ret(epoll_pwait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
-                                           (int)a2, (int)a3,
-                                           has_temp_mask ? (const sigset_t *)&temp_mask : NULL));
+        struct epoll_event *host_evs = (struct epoll_event *)a32_guest_ptr(ctx, a1);
+        int maxevents = (int)a2;
+        long r = syscall(SYS_epoll_pwait, (int)a0, host_evs, maxevents, (int)a3,
+                         has_temp_mask ? &temp_mask : NULL, (size_t)8);
+        ctx->regs[0] = host_ret(r);
         if (has_temp_mask) {
             check_pwait_signals(ctx, temp_mask);
             restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
@@ -3936,11 +4044,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         }
         const arm_timespec32_t *req = (const arm_timespec32_t *)a32_guest_ptr(ctx, a0);
         struct timespec host_req = { (time_t)req->tv_sec, (long)req->tv_nsec };
-        struct timespec host_rem;
-        int r = nanosleep(&host_req, a1 ? &host_rem : NULL);
+        struct timespec host_rem = { 0, 0 };
+        int r = nanosleep(&host_req, (a1 != 0U) ? &host_rem : NULL);
         if (r < 0) {
-            ctx->regs[0] = (uint32_t)(-errno);
-            if (a1 != 0U) {
+            int err = errno;
+            ctx->regs[0] = (uint32_t)(-err);
+            if (err == EINTR && a1 != 0U) {
                 arm_timespec32_t *rem = (arm_timespec32_t *)a32_guest_ptr(ctx, a1);
                 rem->tv_sec  = (int32_t)host_rem.tv_sec;
                 rem->tv_nsec = (int32_t)host_rem.tv_nsec;
@@ -3952,17 +4061,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_clock_nanosleep: {
-        if (a2 < 0x1000U || (a3 != 0U && a3 < 0x1000U)) {
+        bool abstime = (((int)a1 & TIMER_ABSTIME) != 0);
+        if (a2 < 0x1000U || (!abstime && a3 != 0U && a3 < 0x1000U)) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
         const arm_timespec32_t *req = (const arm_timespec32_t *)a32_guest_ptr(ctx, a2);
         struct timespec host_req = { (time_t)req->tv_sec, (long)req->tv_nsec };
-        struct timespec host_rem;
-        int r = clock_nanosleep((clockid_t)a0, (int)a1, &host_req, a3 ? &host_rem : NULL);
+        struct timespec host_rem = { 0, 0 };
+        int r = clock_nanosleep((clockid_t)a0, (int)a1, &host_req,
+                                (!abstime && a3 != 0U) ? &host_rem : NULL);
         if (r != 0) {
             ctx->regs[0] = (uint32_t)(-r);
-            if (a3 != 0U && (int)a1 == 0) {
+            if (r == EINTR && !abstime && a3 != 0U) {
                 arm_timespec32_t *rem = (arm_timespec32_t *)a32_guest_ptr(ctx, a3);
                 rem->tv_sec  = (int32_t)host_rem.tv_sec;
                 rem->tv_nsec = (int32_t)host_rem.tv_nsec;
@@ -3974,17 +4085,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_clock_nanosleep64: {
-        if (a2 < 0x1000U || (a3 != 0U && a3 < 0x1000U)) {
+        bool abstime = (((int)a1 & TIMER_ABSTIME) != 0);
+        if (a2 < 0x1000U || (!abstime && a3 != 0U && a3 < 0x1000U)) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
         const arm_timespec64_t *req = (const arm_timespec64_t *)a32_guest_ptr(ctx, a2);
         struct timespec host_req = { (time_t)req->tv_sec, (long)req->tv_nsec };
-        struct timespec host_rem;
-        int r = clock_nanosleep((clockid_t)a0, (int)a1, &host_req, a3 ? &host_rem : NULL);
+        struct timespec host_rem = { 0, 0 };
+        int r = clock_nanosleep((clockid_t)a0, (int)a1, &host_req,
+                                (!abstime && a3 != 0U) ? &host_rem : NULL);
         if (r != 0) {
             ctx->regs[0] = (uint32_t)(-r);
-            if (a3 != 0U && (int)a1 == 0) {
+            if (r == EINTR && !abstime && a3 != 0U) {
                 arm_timespec64_t *rem = (arm_timespec64_t *)a32_guest_ptr(ctx, a3);
                 rem->tv_sec  = (int64_t)host_rem.tv_sec;
                 rem->tv_nsec = (int64_t)host_rem.tv_nsec;

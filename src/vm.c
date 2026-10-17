@@ -36,7 +36,7 @@ static a32_ctx_t       *g_vm_root_ctx = NULL;
 static uint32_t         g_vm_brk_base = 0U;
 static uint32_t         g_vm_brk_curr = 0U;
 static uint32_t         g_vm_mmap_cursor = A32_MMAP_BASE_32;
-static a32_region_t     g_vm_regions[A32_MAX_REGIONS + 4U];
+static a32_region_t     g_vm_regions[A32_MAX_REGIONS];
 static size_t           g_vm_region_count = 0U;
 
 static inline void vm_lock_acquire(void)
@@ -115,7 +115,7 @@ static void vm_remove_region_at(size_t idx)
 static int vm_insert_region_raw(uint32_t start, uint32_t end,
                                 uint32_t prot, uint32_t flags, const char *name)
 {
-    if (start >= end || g_vm_region_count >= A32_MAX_REGIONS + 4U) {
+    if (start >= end || g_vm_region_count >= A32_MAX_REGIONS) {
         return -1;
     }
     size_t pos = 0U;
@@ -172,7 +172,7 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             continue;
         }
         if (r->start < unmap_start && r->end > unmap_end) {
-            if (g_vm_region_count >= A32_MAX_REGIONS + 3U) {
+            if (g_vm_region_count >= A32_MAX_REGIONS) {
                 size_t before = g_vm_region_count;
                 vm_coalesce_regions_locked();
                 if (g_vm_region_count != before) {
@@ -185,9 +185,13 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             uint32_t right_flags = r->flags;
             char     right_name[64];
             memcpy(right_name, r->name, sizeof(right_name));
-            r->end = unmap_start;
-            (void)vm_insert_region_raw(unmap_end, right_end, right_prot, right_flags, right_name);
-            i += 2U;
+            if (vm_insert_region_raw(unmap_end, right_end,
+                                     right_prot, right_flags, right_name) == 0) {
+                g_vm_regions[i].end = unmap_start;
+                i += 2U;
+            } else {
+                i++;
+            }
             continue;
         }
         if (r->start < unmap_start) {
@@ -234,7 +238,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
             continue;
         }
         if (r->start < mp_start && r->end > mp_end) {
-            if (g_vm_region_count + 2U <= A32_MAX_REGIONS + 4U) {
+            if (g_vm_region_count + 2U <= A32_MAX_REGIONS) {
                 uint32_t orig_end   = r->end;
                 uint32_t orig_prot  = r->prot;
                 uint32_t orig_flags = r->flags;
@@ -251,29 +255,28 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
             continue;
         }
         if (r->start < mp_start) {
-            if (g_vm_region_count + 1U <= A32_MAX_REGIONS + 4U) {
-                uint32_t orig_end   = r->end;
-                uint32_t orig_flags = r->flags;
-                char     orig_name[64];
-                memcpy(orig_name, r->name, sizeof(orig_name));
-                r->end = mp_start;
-                (void)vm_insert_region_raw(mp_start, orig_end, prot, orig_flags, orig_name);
+            uint32_t orig_end   = r->end;
+            uint32_t orig_flags = r->flags;
+            char     orig_name[64];
+            memcpy(orig_name, r->name, sizeof(orig_name));
+            if (vm_insert_region_raw(mp_start, orig_end, prot, orig_flags, orig_name) == 0) {
+                g_vm_regions[i].end = mp_start;
                 i += 2U;
             } else {
                 r->prot = prot;
                 i++;
             }
         } else {
-            if (g_vm_region_count + 1U <= A32_MAX_REGIONS + 4U) {
-                uint32_t orig_start = r->start;
-                uint32_t orig_flags = r->flags;
-                char     orig_name[64];
-                memcpy(orig_name, r->name, sizeof(orig_name));
-                r->start = mp_end;
-                (void)vm_insert_region_raw(orig_start, mp_end, prot, orig_flags, orig_name);
+            uint32_t orig_start = r->start;
+            uint32_t orig_flags = r->flags;
+            char     orig_name[64];
+            memcpy(orig_name, r->name, sizeof(orig_name));
+            r->start = mp_end;
+            if (vm_insert_region_raw(orig_start, mp_end, prot, orig_flags, orig_name) == 0) {
                 i += 2U;
             } else {
-                r->prot = prot;
+                r->start = orig_start;
+                r->prot  = prot;
                 i++;
             }
         }
@@ -563,7 +566,8 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
     vm_lock_release();
 
     if (new_page < old_page) {
-        a32_jit_invalidate_range(ctx, new_page, old_page);
+        uint32_t inv_start = (new_page >= 4U) ? (new_page - 4U) : 0U;
+        a32_jit_invalidate_range(ctx, inv_start, old_page);
     }
     return new_brk;
 }
@@ -617,7 +621,7 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         uint32_t hint_va = page_align_down(addr);
         if (addr != 0U &&
             hint_va >= A32_MMAP_BASE_32 &&
-            (uint64_t)hint_va + aligned_len <= (uint64_t)A32_KUSER_BASE_32 &&
+            (uint64_t)hint_va + aligned_len <= (uint64_t)A32_MMAP_TOP_32 &&
             !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + aligned_len))) {
             target_va = hint_va;
         } else if (vm_find_free_gap_locked(aligned_len, &target_va) != 0) {
@@ -669,9 +673,11 @@ uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 
-    if (res <= 0xFFFFF000U && (flags & (0x10U | 0x100000U)) != 0U) {
+    if (res <= 0xFFFFF000U &&
+        ((flags & (0x10U | 0x100000U)) != 0U || (prot & (uint32_t)PROT_EXEC) != 0U)) {
         uint64_t aligned_len = page_align_up((uint64_t)len);
-        a32_jit_invalidate_range(ctx, res, (uint32_t)((uint64_t)res + aligned_len));
+        uint32_t inv_start   = (res >= 4U) ? (res - 4U) : 0U;
+        a32_jit_invalidate_range(ctx, inv_start, (uint32_t)((uint64_t)res + aligned_len));
     }
     return res;
 }
@@ -736,7 +742,8 @@ int a32_vm_mprotect(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot)
 
     if (rc == 0) {
         uint64_t aligned_len = page_align_up((uint64_t)len);
-        a32_jit_invalidate_range(ctx, addr, (uint32_t)((uint64_t)addr + aligned_len));
+        uint32_t inv_start   = (addr >= 4U) ? (addr - 4U) : 0U;
+        a32_jit_invalidate_range(ctx, inv_start, (uint32_t)((uint64_t)addr + aligned_len));
     }
     return rc;
 }
@@ -782,7 +789,8 @@ int a32_vm_munmap(a32_ctx_t *ctx, uint32_t addr, uint32_t len)
 
     if (rc == 0) {
         uint64_t aligned_len = page_align_up((uint64_t)len);
-        a32_jit_invalidate_range(ctx, addr, (uint32_t)((uint64_t)addr + aligned_len));
+        uint32_t inv_start   = (addr >= 4U) ? (addr - 4U) : 0U;
+        a32_jit_invalidate_range(ctx, inv_start, (uint32_t)((uint64_t)addr + aligned_len));
     }
     return rc;
 }
@@ -843,7 +851,8 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             if (rc != 0) {
                 return (uint32_t)rc;
             }
-            a32_jit_invalidate_range(ctx, unmap_addr, unmap_addr + unmap_len);
+            uint32_t inv_start = (unmap_addr >= 4U) ? (unmap_addr - 4U) : 0U;
+            a32_jit_invalidate_range(ctx, inv_start, unmap_addr + unmap_len);
             return old_addr;
         }
     }
@@ -885,8 +894,10 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         vm_sync_to_ctx(ctx);
         vm_lock_release();
 
-        a32_jit_invalidate_range(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
-        a32_jit_invalidate_range(ctx, mapped, (uint32_t)((uint64_t)mapped + new_aligned));
+        uint32_t inv_old = (old_addr >= 4U) ? (old_addr - 4U) : 0U;
+        uint32_t inv_new = (mapped >= 4U) ? (mapped - 4U) : 0U;
+        a32_jit_invalidate_range(ctx, inv_old, (uint32_t)((uint64_t)old_addr + old_aligned));
+        a32_jit_invalidate_range(ctx, inv_new, (uint32_t)((uint64_t)mapped + new_aligned));
         return mapped;
     }
 
@@ -907,6 +918,10 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             }
             vm_sync_to_ctx(ctx);
             vm_lock_release();
+            if ((prot & (uint32_t)PROT_EXEC) != 0U) {
+                uint32_t inv_ext = (old_end >= 4U) ? (old_end - 4U) : 0U;
+                a32_jit_invalidate_range(ctx, inv_ext, (uint32_t)new_end);
+            }
             return old_addr;
         }
     }
@@ -940,7 +955,12 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 
-    a32_jit_invalidate_range(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
+    uint32_t inv_old = (old_addr >= 4U) ? (old_addr - 4U) : 0U;
+    a32_jit_invalidate_range(ctx, inv_old, (uint32_t)((uint64_t)old_addr + old_aligned));
+    if ((prot & (uint32_t)PROT_EXEC) != 0U) {
+        uint32_t inv_new = (new_va >= 4U) ? (new_va - 4U) : 0U;
+        a32_jit_invalidate_range(ctx, inv_new, (uint32_t)((uint64_t)new_va + new_aligned));
+    }
     return new_va;
 }
 

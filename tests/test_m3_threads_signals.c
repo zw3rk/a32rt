@@ -1982,6 +1982,266 @@ static int test18_r7_rt_sigpending_sigsuspend_autodisarm(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 19: Round 8 regressions —
+ *   19a: SIG_IGN (SIGUSR1 = 10) and default-ignored SIGWINCH (28) while
+ *        blocked in rt_sigprocmask must NOT become pending in rt_sigpending
+ *        and must NOT fire when later given a handler and unblocked
+ *   19b: rt_sigsuspend (179) active signal mask inside the signal handler
+ *        (temp_mask + sa_mask + sig bit) and restoration of saved_mask on return
+ * -------------------------------------------------------------------------- */
+static volatile uint32_t g_r8_usr1_hits = 0U;
+static volatile uint32_t g_r8_winch_hits = 0U;
+static volatile int32_t  g_r8_handler_mask_rc = -1;
+static volatile uint64_t g_r8_handler_mask = 0ULL;
+
+static void r8_usr1_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    g_r8_usr1_hits++;
+}
+
+static void r8_winch_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    g_r8_winch_hits++;
+}
+
+static void r8_sigsuspend_usr1_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+    static uint64_t cur_mask;
+    cur_mask = 0ULL;
+    g_r8_handler_mask_rc = sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+                                0U, (uint32_t)(uintptr_t)&cur_mask, 8U);
+    g_r8_handler_mask = cur_mask;
+    g_r8_usr1_hits++;
+}
+
+static int test19_r8_sigign_sigwinch_and_sigsuspend_mask(void)
+{
+    const uint32_t sigusr1  = 10U;
+    const uint32_t sigusr2  = 12U;
+    const uint32_t sigwinch = 28U;
+    const uint64_t usr1_bit  = 1ULL << (sigusr1 - 1U);  /* 1ULL << 9  */
+    const uint64_t usr2_bit  = 1ULL << (sigusr2 - 1U);  /* 1ULL << 11 */
+    const uint64_t winch_bit = 1ULL << (sigwinch - 1U); /* 1ULL << 27 */
+
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+    static uint64_t orig_mask;
+    static uint64_t block_mask;
+    static uint64_t pend_mask;
+    static struct sigaction32 orig_usr1;
+    static struct sigaction32 orig_winch;
+    static struct sigaction32 sa;
+
+    orig_mask = 0ULL;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U,
+             (uint32_t)(uintptr_t)&orig_mask, 8U) != 0) {
+        return 173;
+    }
+    if (sys4(174U /* rt_sigaction */, sigusr1, 0U,
+             (uint32_t)(uintptr_t)&orig_usr1, 8U) != 0 ||
+        sys4(174U /* rt_sigaction */, sigwinch, 0U,
+             (uint32_t)(uintptr_t)&orig_winch, 8U) != 0) {
+        return 174;
+    }
+
+    /*
+     * 19a: Set SIGUSR1 (10) to SIG_IGN (1) and SIGWINCH (28) to SIG_DFL (0,
+     *      whose default action is ignore). Block both via rt_sigprocmask,
+     *      send both via tkill, and verify rt_sigpending reports NEITHER as
+     *      pending. Then install handlers for both and unblock both, verifying
+     *      neither handler fires.
+     */
+    sa.sa_handler  = 1U; /* SIG_IGN */
+    sa.sa_flags    = 0U;
+    sa.sa_restorer = 0U;
+    sa.sa_mask[0]  = 0U;
+    sa.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&sa, 0U, 8U) != 0) {
+        return 175;
+    }
+
+    sa.sa_handler = 0U; /* SIG_DFL (default-ignored for SIGWINCH) */
+    if (sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&sa, 0U, 8U) != 0) {
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        return 176;
+    }
+
+    block_mask = usr1_bit | winch_bit;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&block_mask, 0U, 8U) != 0) {
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 177;
+    }
+
+    /* Send both SIGUSR1 (SIG_IGN) and SIGWINCH (SIG_DFL == ignore) while blocked */
+    if (sys2(238U /* tkill */, tid, sigusr1) != 0 ||
+        sys2(238U /* tkill */, tid, sigwinch) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 178;
+    }
+
+    /* Verify rt_sigpending reports NEITHER SIGUSR1 nor SIGWINCH as pending */
+    pend_mask = 0xFFFFFFFFFFFFFFFFULL;
+    if (sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & (usr1_bit | winch_bit)) != 0ULL) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 179;
+    }
+
+    /* Install handlers for SIGUSR1 and SIGWINCH, then unblock both: must NOT fire */
+    g_r8_usr1_hits = 0U;
+    g_r8_winch_hits = 0U;
+    sa.sa_handler  = (uint32_t)(uintptr_t)r8_usr1_handler;
+    sa.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    sa.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    sa.sa_mask[0]  = 0U;
+    sa.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&sa, 0U, 8U) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 180;
+    }
+    sa.sa_handler = (uint32_t)(uintptr_t)r8_winch_handler;
+    if (sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&sa, 0U, 8U) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 181;
+    }
+
+    if (sys4(175U /* rt_sigprocmask */, 1U /* SIG_UNBLOCK */,
+             (uint32_t)(uintptr_t)&block_mask, 0U, 8U) != 0 ||
+        g_r8_usr1_hits != 0U ||
+        g_r8_winch_hits != 0U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 182;
+    }
+
+    /*
+     * Positive check: now that SIGWINCH has a custom handler installed, blocking
+     * SIGWINCH and sending it via tkill MUST mark it pending in rt_sigpending
+     * and deliver it upon SIG_UNBLOCK.
+     */
+    block_mask = winch_bit;
+    pend_mask = 0ULL;
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&block_mask, 0U, 8U) != 0 ||
+        sys2(238U /* tkill */, tid, sigwinch) != 0 ||
+        sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & winch_bit) == 0ULL ||
+        sys4(175U /* rt_sigprocmask */, 1U /* SIG_UNBLOCK */,
+             (uint32_t)(uintptr_t)&block_mask, 0U, 8U) != 0 ||
+        g_r8_winch_hits != 1U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 183;
+    }
+
+    /*
+     * 19b: Regression test for rt_sigsuspend (179) active signal mask inside
+     *      the handler:
+     *      - Block SIGUSR1 (10) and unblock SIGUSR2 (12) in normal sig_mask
+     *      - Queue SIGUSR1 via tkill while blocked
+     *      - Call rt_sigsuspend with temp_mask that blocks SIGUSR2 (12) and
+     *        unblocks SIGUSR1 (10)
+     *      - Verify inside the SIGUSR1 handler that SIGUSR2 (12) IS blocked
+     *        ((g_r8_handler_mask & usr2_bit) != 0)
+     *      - Verify after rt_sigsuspend returns -EINTR (-4) that the original
+     *        mask (SIGUSR1 blocked, SIGUSR2 unblocked) is restored!
+     */
+    sa.sa_handler  = (uint32_t)(uintptr_t)r8_sigsuspend_usr1_handler;
+    sa.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    sa.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    sa.sa_mask[0]  = 0U;
+    sa.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&sa, 0U, 8U) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 184;
+    }
+
+    static uint64_t normal_mask;
+    static uint64_t temp_mask;
+    static uint64_t post_mask;
+    normal_mask = (orig_mask | usr1_bit) & ~usr2_bit;
+    if (sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&normal_mask, 0U, 8U) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 185;
+    }
+
+    g_r8_usr1_hits = 0U;
+    g_r8_handler_mask_rc = -1;
+    g_r8_handler_mask = 0ULL;
+
+    /* Send SIGUSR1 while blocked in normal_mask */
+    if (sys2(238U /* tkill */, tid, sigusr1) != 0 || g_r8_usr1_hits != 0U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+        sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+        return 186;
+    }
+
+    /* temp_mask blocks SIGUSR2 (12) and unblocks SIGUSR1 (10) */
+    temp_mask = (orig_mask & ~usr1_bit) | usr2_bit;
+    int32_t susp_rc = sys2(179U /* rt_sigsuspend */,
+                           (uint32_t)(uintptr_t)&temp_mask, 8U);
+    post_mask = 0ULL;
+    int32_t pm_rc = sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U,
+                         (uint32_t)(uintptr_t)&post_mask, 8U);
+
+    /* Restore original dispositions and signal mask */
+    sys4(174U /* rt_sigaction */, sigusr1, (uint32_t)(uintptr_t)&orig_usr1, 0U, 8U);
+    sys4(174U /* rt_sigaction */, sigwinch, (uint32_t)(uintptr_t)&orig_winch, 0U, 8U);
+    sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+         (uint32_t)(uintptr_t)&orig_mask, 0U, 8U);
+
+    if (susp_rc != -4 /* -EINTR */ ||
+        g_r8_usr1_hits != 1U ||
+        g_r8_handler_mask_rc != 0 ||
+        (g_r8_handler_mask & usr2_bit) == 0ULL ||
+        (g_r8_handler_mask & usr1_bit) == 0ULL) {
+        return 187;
+    }
+    if (pm_rc != 0 ||
+        (post_mask & usr1_bit) == 0ULL ||
+        (post_mask & usr2_bit) != 0ULL) {
+        return 188;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -2053,6 +2313,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test18_r7_rt_sigpending_sigsuspend_autodisarm();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test19_r8_sigign_sigwinch_and_sigsuspend_mask();
     if (rc != 0) {
         return rc;
     }

@@ -94,25 +94,34 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
     return h;
 }
 
-static void resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
-                               char *out_path, size_t out_len, bool create_dir)
+static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
+                              char *out_path, size_t out_size, bool create_dir)
 {
+    if (out_path == NULL || out_size == 0U) {
+        return -1;
+    }
     uint64_t h = compute_elf_hash(ctx, elf_path);
-    const char *dir = ctx->cache_dir;
+    const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
     if (dir == NULL || dir[0] == '\0') {
         dir = getenv("A32RT_CACHE");
     }
     if (dir == NULL || dir[0] == '\0') {
         dir = getenv("XDG_CACHE_HOME");
     }
+    int n;
     if (dir != NULL && dir[0] != '\0') {
         if (create_dir) {
             (void)mkdir(dir, 0755);
         }
-        snprintf(out_path, out_len, "%s/a32rt-cache-%016llx.bin", dir, (unsigned long long)h);
+        n = snprintf(out_path, out_size, "%s/a32rt-cache-%016llx.bin", dir, (unsigned long long)h);
     } else {
-        snprintf(out_path, out_len, "/tmp/a32rt-cache-%016llx.bin", (unsigned long long)h);
+        n = snprintf(out_path, out_size, "/tmp/a32rt-cache-%016llx.bin", (unsigned long long)h);
     }
+    if (n < 0 || (size_t)n >= out_size) {
+        out_path[0] = '\0';
+        return -1;
+    }
+    return 0;
 }
 
 typedef struct aot_save_state {
@@ -149,7 +158,7 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
     if (st->error) {
         return;
     }
-    size_t map_cnt = (pc_map != NULL && pc_map_count <= A32_AOT_MAX_PC_MAP) ? pc_map_count : 0U;
+    size_t map_cnt = (pc_map != NULL && pc_map_count < A32_AOT_MAX_PC_MAP) ? pc_map_count : 0U;
 
     a32_aot_block_header_t bh;
     bh.guest_pc     = guest_pc;
@@ -181,10 +190,15 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     char cache_path[512];
-    resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), true);
+    if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), true) != 0) {
+        return -1;
+    }
 
     char tmp_path[540];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+        return -1;
+    }
 
     FILE *f = fopen(tmp_path, "wb");
     if (f == NULL) {
@@ -256,7 +270,9 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     char cache_path[512];
-    resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), false);
+    if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), false) != 0) {
+        return -1;
+    }
 
     FILE *f = fopen(cache_path, "rb");
     if (f == NULL) {
@@ -283,10 +299,12 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
             break;
         }
         if ((bh.is_thumb & ~3U) != 0U ||
-            bh.guest_end_pc <= (bh.guest_pc & ~1U) ||
-            !aot_range_executable(ctx, bh.guest_pc & ~1U, bh.guest_end_pc - (bh.guest_pc & ~1U)) ||
+            (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
+            (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
+            bh.guest_end_pc <= bh.guest_pc ||
+            !aot_range_executable(ctx, bh.guest_pc, bh.guest_end_pc - bh.guest_pc) ||
             bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
-            bh.pc_map_count > A32_AOT_MAX_PC_MAP) {
+            bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
             break;
         }
         if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
@@ -315,6 +333,7 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     if (a32_jit_flush_batch(ctx) != 0) {
+        (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
         return -1;
     }
     return 0;

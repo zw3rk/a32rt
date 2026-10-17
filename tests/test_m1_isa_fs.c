@@ -3292,6 +3292,53 @@ static int run_test(void)
         }
     }
 
+#ifndef __thumb__
+    /*
+     * 32. Round 8 regression test for false-condition A32 LDM / STM with
+     *     empty register list (reg_mask == 0):
+     *     Verify that in A32 mode a false-condition LDMNE/STMNE/LDMEQ/STMEQ
+     *     with register_list == 0 (e.g. .inst 0x18900000 when Z == 1 after
+     *     cmp r0, r0) is skipped as a no-op without raising SIGILL, without
+     *     performing any memory access or base writeback, and while preserving
+     *     CPSR.NZCV.
+     */
+    {
+        /* 32a: Z == 1 (cmp r0, r0): LDMIANE r0, {} (0x18900000) & LDMIANE r0!, {} (0x18B00000) */
+        register uint32_t r0 __asm__("r0") = 0x12345678U;
+        uint32_t flags = 0U;
+        __asm__ volatile(
+            "cmp r0, r0\n\t"
+            ".inst 0x18900000\n\t" /* ldmiane r0, {} */
+            ".inst 0x18B00000\n\t" /* ldmiane r0!, {} */
+            ".inst 0x18800000\n\t" /* stmiane r0, {} */
+            "mrs %[fl], apsr\n\t"
+            : "+r"(r0), [fl] "=&r"(flags)
+            :
+            : "cc"
+        );
+        if (r0 != 0x12345678U || (flags & 0xF0000000U) != 0x60000000U) {
+            return 224;
+        }
+
+        /* 32b: Z == 0 (cmp r0, r1 with 10 < 20): LDMIAEQ r0!, {} (0x08B00000) & STMIAEQ r0!, {} (0x08A00000) */
+        r0 = 10U;
+        register uint32_t r1 __asm__("r1") = 20U;
+        flags = 0U;
+        __asm__ volatile(
+            "cmp r0, r1\n\t"
+            ".inst 0x08B00000\n\t" /* ldmiaeq r0!, {} */
+            ".inst 0x08A00000\n\t" /* stmiaeq r0!, {} */
+            "mrs %[fl], apsr\n\t"
+            : "+r"(r0), [fl] "=&r"(flags)
+            : "r"(r1)
+            : "cc"
+        );
+        if (r0 != 10U || (flags & 0xF0000000U) != 0x80000000U) {
+            return 225;
+        }
+    }
+#endif
+
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

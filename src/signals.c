@@ -271,6 +271,12 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
                          sig == SIGFPE  || sig == SIGTRAP);
     if (!is_sync_trap || (info != NULL && info->si_code <= 0)) {
         if (sig >= 1 && sig <= 64) {
+            guest_sigaction_t *act = &g_guest_sigactions[sig];
+            if (act->handler == 1U /* SIG_IGN */ ||
+                (act->handler == 0U /* SIG_DFL */ &&
+                 (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
+                return;
+            }
             if (info != NULL) {
                 g_pending_siginfo[sig] = *info;
             } else {
@@ -335,6 +341,12 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     }
 
     if (sig >= 1 && sig <= 64) {
+        guest_sigaction_t *act = &g_guest_sigactions[sig];
+        if (act->handler == 1U /* SIG_IGN */ ||
+            (act->handler == 0U /* SIG_DFL */ &&
+             (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
+            return;
+        }
         if (info != NULL) {
             g_pending_siginfo[sig] = *info;
         } else {
