@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 static bool ends_with(const char *str, const char *suffix)
 {
@@ -41,6 +43,7 @@ int main(int argc, char **argv, char **envp)
 
     static a32_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.host_tid = (int)syscall(SYS_gettid);
 
     uint64_t requested_window = UINT64_MAX;
     const char *env_sysroot = getenv("A32RT_SYSROOT");
@@ -59,7 +62,10 @@ int main(int argc, char **argv, char **envp)
     if (env_cache && env_cache[0] != '\0') {
         ctx.cache_dir = env_cache;
     }
-    const char *env_gdb = getenv("A32RT_GDB_PORT");
+    const char *env_gdb = getenv("A32RT_GDB");
+    if (!env_gdb || env_gdb[0] == '\0') {
+        env_gdb = getenv("A32RT_GDB_PORT");
+    }
     if (env_gdb && env_gdb[0] != '\0') {
         ctx.gdb_port = (int)strtol(env_gdb, NULL, 10);
         if (ctx.gdb_port > 0) {
@@ -81,77 +87,75 @@ int main(int argc, char **argv, char **envp)
         is_binfmt_p = true;
     }
 
-    if (is_binfmt_p) {
-        if (argc < 3) {
+    int i = 1;
+    bool explicit_sep = false;
+    while (i < argc && argv[i][0] == '-') {
+        if (strcmp(argv[i], "--") == 0) {
+            explicit_sep = true;
+            i++;
+            break;
+        } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
+            char *endp = NULL;
+            requested_window = (uint64_t)strtoull(argv[i + 1], &endp, 0);
+            i += 2;
+        } else if (strcmp(argv[i], "--sysroot") == 0 && i + 1 < argc) {
+            ctx.sysroot = argv[i + 1];
+            i += 2;
+        } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
+            ctx.cache_dir = argv[i + 1];
+            i += 2;
+        } else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
+            ctx.gdb_port = (int)strtol(argv[i + 1], NULL, 10);
+            if (ctx.gdb_port > 0) {
+                ctx.gdb_enabled = true;
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "--aot") == 0) {
+            ctx.aot_mode = true;
+            i++;
+        } else if (strcmp(argv[i], "--stats") == 0) {
+            ctx.stats_enabled = true;
+            i++;
+        } else if (strcmp(argv[i], "--trace") == 0) {
+            ctx.trace_enabled = true;
+            i++;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            break;
+        }
+    }
+
+    if (explicit_sep) {
+        if (i >= argc) {
             usage(argv[0]);
             return 1;
         }
-        exec_path  = argv[1];
-        guest_argc = argc - 2;
-        guest_argv = &argv[2];
-    } else {
-        int i = 1;
-        bool explicit_sep = false;
-        while (i < argc && argv[i][0] == '-') {
-            if (strcmp(argv[i], "--") == 0) {
-                explicit_sep = true;
-                i++;
-                break;
-            } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
-                char *endp = NULL;
-                requested_window = (uint64_t)strtoull(argv[i + 1], &endp, 0);
-                i += 2;
-            } else if (strcmp(argv[i], "--sysroot") == 0 && i + 1 < argc) {
-                ctx.sysroot = argv[i + 1];
-                i += 2;
-            } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
-                ctx.cache_dir = argv[i + 1];
-                i += 2;
-            } else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
-                ctx.gdb_port = (int)strtol(argv[i + 1], NULL, 10);
-                if (ctx.gdb_port > 0) {
-                    ctx.gdb_enabled = true;
-                }
-                i += 2;
-            } else if (strcmp(argv[i], "--aot") == 0) {
-                ctx.aot_mode = true;
-                i++;
-            } else if (strcmp(argv[i], "--stats") == 0) {
-                ctx.stats_enabled = true;
-                i++;
-            } else if (strcmp(argv[i], "--trace") == 0) {
-                ctx.trace_enabled = true;
-                i++;
-            } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-                usage(argv[0]);
-                return 0;
-            } else {
-                break;
-            }
-        }
-
-        if (explicit_sep) {
-            if (i >= argc) {
-                usage(argv[0]);
-                return 1;
-            }
-            exec_path = argv[i];
-            if (i + 1 < argc) {
-                guest_argc = argc - (i + 1);
-                guest_argv = &argv[i + 1];
-            } else {
-                guest_argc = 1;
-                guest_argv = &argv[i];
-            }
+        exec_path = argv[i];
+        if (i + 1 < argc) {
+            guest_argc = argc - (i + 1);
+            guest_argv = &argv[i + 1];
         } else {
-            if (i >= argc) {
-                usage(argv[0]);
-                return 1;
-            }
-            exec_path  = argv[i];
-            guest_argc = argc - i;
+            guest_argc = 1;
             guest_argv = &argv[i];
         }
+    } else if (is_binfmt_p) {
+        if (i + 1 >= argc) {
+            usage(argv[0]);
+            return 1;
+        }
+        exec_path  = argv[i];
+        guest_argc = argc - (i + 1);
+        guest_argv = &argv[i + 1];
+    } else {
+        if (i >= argc) {
+            usage(argv[0]);
+            return 1;
+        }
+        exec_path  = argv[i];
+        guest_argc = argc - i;
+        guest_argv = &argv[i];
     }
 
     ctx.exec_path = exec_path;

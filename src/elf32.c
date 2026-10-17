@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,48 +162,135 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
     }
 
+    uint32_t highest_mapped_end  = 0U;
+    uint32_t highest_mapped_prot = 0U;
+
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const elf32_phdr_t *ph = &phdrs[i];
         if (ph->p_type != PT_LOAD || ph->p_memsz == 0U) {
             continue;
         }
+        if (ph->p_filesz > ph->p_memsz) {
+            fprintf(stderr, "a32rt: %s: invalid segment filesz (0x%x) > memsz (0x%x)\n",
+                    label, ph->p_filesz, ph->p_memsz);
+            return -1;
+        }
 
         uint32_t seg_vaddr = ph->p_vaddr + load_bias;
         uint32_t map_start = page_down(seg_vaddr);
-        uint32_t map_end   = page_up(seg_vaddr + ph->p_memsz);
-        uint32_t map_len   = map_end - map_start;
-
-        void *host_map = a32_guest_ptr(ctx, map_start);
-        void *res = mmap(host_map, map_len, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (res == MAP_FAILED) {
-            fprintf(stderr, "a32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
-                    label, map_start, map_end, strerror(errno));
+        uint64_t seg_end64 = (uint64_t)seg_vaddr + (uint64_t)ph->p_memsz;
+        uint64_t map_end64 = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
+        if (map_start < 0x10000U || map_end64 > 0xFFFF0000ULL) {
+            fprintf(stderr, "a32rt: %s: segment [0x%x, 0x%llx) out of guest bounds\n",
+                    label, map_start, (unsigned long long)map_end64);
             return -1;
         }
+        uint32_t map_end = (uint32_t)map_end64;
 
-        if (ph->p_filesz > 0U) {
-            void *host_seg = a32_guest_ptr(ctx, seg_vaddr);
-            if (pread_full(fd, host_seg, ph->p_filesz, (off_t)ph->p_offset) != 0) {
-                fprintf(stderr, "a32rt: %s: failed to read segment payload\n", label);
-                return -1;
-            }
-        }
-
-        int final_prot = 0;
+        int host_prot = 0;
         if (ph->p_flags & PF_R) {
-            final_prot |= PROT_READ;
+            host_prot |= PROT_READ;
         }
         if (ph->p_flags & PF_W) {
-            final_prot |= PROT_WRITE;
+            host_prot |= PROT_WRITE;
         }
         if (ph->p_flags & PF_X) {
-            final_prot |= PROT_EXEC;
+            host_prot |= PROT_EXEC;
         }
-        if (mprotect(host_map, map_len, final_prot) != 0) {
-            fprintf(stderr, "a32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
-                    label, map_start, map_end, strerror(errno));
-            return -1;
+
+        uint32_t read_file_off = ph->p_offset;
+        uint32_t read_file_len = ph->p_filesz;
+
+        if (map_start < highest_mapped_end) {
+            uint32_t shared_end  = (map_end < highest_mapped_end) ? map_end : highest_mapped_end;
+            uint32_t shared_len  = shared_end - map_start;
+            uint32_t merged_prot = highest_mapped_prot | (uint32_t)host_prot;
+
+            if (mprotect(a32_guest_ptr(ctx, map_start), shared_len, PROT_READ | PROT_WRITE) != 0) {
+                fprintf(stderr, "a32rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
+                        label, map_start, shared_end, strerror(errno));
+                return -1;
+            }
+
+            if (map_end > highest_mapped_end) {
+                uint32_t new_len = map_end - highest_mapped_end;
+                void *res = mmap(a32_guest_ptr(ctx, highest_mapped_end), new_len,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (res == MAP_FAILED) {
+                    fprintf(stderr, "a32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                            label, highest_mapped_end, map_end, strerror(errno));
+                    return -1;
+                }
+            }
+
+            if (ph->p_filesz > 0U) {
+                void *host_seg = a32_guest_ptr(ctx, seg_vaddr);
+                if (pread_full(fd, host_seg, ph->p_filesz, (off_t)ph->p_offset) != 0) {
+                    fprintf(stderr, "a32rt: %s: failed to read segment payload\n", label);
+                    return -1;
+                }
+            }
+
+            if (mprotect(a32_guest_ptr(ctx, map_start), shared_len, (int)merged_prot) != 0) {
+                fprintf(stderr, "a32rt: %s: mprotect failed on shared page [0x%x, 0x%x): %s\n",
+                        label, map_start, shared_end, strerror(errno));
+                return -1;
+            }
+            a32_vm_record_region(ctx, map_start, shared_end, merged_prot, 0x12U, label);
+
+            if (map_end > highest_mapped_end) {
+                uint32_t new_len = map_end - highest_mapped_end;
+                if (mprotect(a32_guest_ptr(ctx, highest_mapped_end), new_len, host_prot) != 0) {
+                    fprintf(stderr, "a32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
+                            label, highest_mapped_end, map_end, strerror(errno));
+                    return -1;
+                }
+                a32_vm_record_region(ctx, highest_mapped_end, map_end,
+                                     (uint32_t)host_prot, 0x12U, label);
+                highest_mapped_end  = map_end;
+                highest_mapped_prot = (uint32_t)host_prot;
+            } else {
+                highest_mapped_prot = merged_prot;
+            }
+        } else {
+            uint32_t map_len = map_end - map_start;
+            void *host_map = a32_guest_ptr(ctx, map_start);
+            void *res = mmap(host_map, map_len, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (res == MAP_FAILED) {
+                fprintf(stderr, "a32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                        label, map_start, map_end, strerror(errno));
+                return -1;
+            }
+
+            if (ph->p_filesz > 0U) {
+                uint32_t page_off = ph->p_vaddr & 0xFFFU;
+                if (page_off != 0U && ph->p_offset >= page_off) {
+                    read_file_off = ph->p_offset - page_off;
+                    read_file_len = ph->p_filesz + page_off;
+                    if (pread_full(fd, host_map, read_file_len, (off_t)read_file_off) != 0) {
+                        fprintf(stderr, "a32rt: %s: failed to read segment payload\n", label);
+                        return -1;
+                    }
+                } else {
+                    void *host_seg = a32_guest_ptr(ctx, seg_vaddr);
+                    if (pread_full(fd, host_seg, ph->p_filesz, (off_t)ph->p_offset) != 0) {
+                        fprintf(stderr, "a32rt: %s: failed to read segment payload\n", label);
+                        return -1;
+                    }
+                }
+            }
+
+            if (mprotect(host_map, map_len, host_prot) != 0) {
+                fprintf(stderr, "a32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
+                        label, map_start, map_end, strerror(errno));
+                return -1;
+            }
+
+            a32_vm_record_region(ctx, map_start, map_end, (uint32_t)host_prot, 0x12U, label);
+            highest_mapped_end  = map_end;
+            highest_mapped_prot = (uint32_t)host_prot;
         }
 
         if (ph->p_flags & PF_X) {
@@ -214,11 +302,10 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             }
         }
 
-        a32_vm_record_region(ctx, map_start, map_end, ph->p_flags, 0x12U, label);
-
-        if (out->phdr_vaddr == 0U && ph->p_offset <= ehdr.e_phoff &&
-            ehdr.e_phoff + phdr_bytes <= ph->p_offset + ph->p_filesz) {
-            out->phdr_vaddr = seg_vaddr + (ehdr.e_phoff - ph->p_offset);
+        if (out->phdr_vaddr == 0U && read_file_off <= ehdr.e_phoff &&
+            (uint64_t)ehdr.e_phoff + phdr_bytes <= (uint64_t)read_file_off + (uint64_t)read_file_len) {
+            uint32_t base_va = (read_file_off < ph->p_offset) ? map_start : seg_vaddr;
+            out->phdr_vaddr = base_va + (ehdr.e_phoff - read_file_off);
         }
 
         if (map_end > out->max_vaddr) {
@@ -236,7 +323,6 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
     }
 
     int fd = exec_fd;
-    bool close_fd = false;
     if (fd < 0) {
         if (!path) {
             return -1;
@@ -246,13 +332,10 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
             fprintf(stderr, "a32rt: cannot open '%s': %s\n", path, strerror(errno));
             return -1;
         }
-        close_fd = true;
     }
 
     int rc = load_elf32_image(ctx, fd, 0x00400000U, path ? path : "[guest]", out_info);
-    if (close_fd) {
-        close(fd);
-    }
+    close(fd);
     if (rc != 0) {
         return -1;
     }
@@ -264,16 +347,47 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
 
     /* Load PT_INTERP if present */
     if (out_info->interp_path[0] != '\0') {
-        char resolved_interp[512];
+        char resolved_interp[PATH_MAX];
         if (ctx->sysroot && ctx->sysroot[0] != '\0' && out_info->interp_path[0] == '/') {
             snprintf(resolved_interp, sizeof(resolved_interp), "%s%s",
                      ctx->sysroot, out_info->interp_path);
+            for (int depth = 0; depth < 8; depth++) {
+                char link_target[PATH_MAX];
+                ssize_t ln = readlink(resolved_interp, link_target, sizeof(link_target) - 1U);
+                if (ln <= 0) {
+                    break;
+                }
+                link_target[ln] = '\0';
+                if (link_target[0] == '/') {
+                    char cand[PATH_MAX];
+                    int n = snprintf(cand, sizeof(cand), "%s%s", ctx->sysroot, link_target);
+                    if (n > 0 && (size_t)n < sizeof(cand)) {
+                        snprintf(resolved_interp, sizeof(resolved_interp), "%s", cand);
+                    } else {
+                        break;
+                    }
+                } else {
+                    char *slash = strrchr(resolved_interp, '/');
+                    if (!slash) {
+                        break;
+                    }
+                    size_t dir_len = (size_t)(slash - resolved_interp);
+                    char cand[PATH_MAX];
+                    int n = snprintf(cand, sizeof(cand), "%.*s/%s",
+                                     (int)dir_len, resolved_interp, link_target);
+                    if (n > 0 && (size_t)n < sizeof(cand)) {
+                        snprintf(resolved_interp, sizeof(resolved_interp), "%s", cand);
+                    } else {
+                        break;
+                    }
+                }
+            }
         } else {
             snprintf(resolved_interp, sizeof(resolved_interp), "%s", out_info->interp_path);
         }
 
         int ifd = open(resolved_interp, O_RDONLY | O_CLOEXEC);
-        if (ifd < 0 && resolved_interp != out_info->interp_path) {
+        if (ifd < 0 && strcmp(resolved_interp, out_info->interp_path) != 0) {
             ifd = open(out_info->interp_path, O_RDONLY | O_CLOEXEC);
         }
         if (ifd < 0) {
@@ -283,7 +397,7 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
         }
 
         a32_elf_info_t interp_info;
-        int irc = load_elf32_image(ctx, ifd, 0x7F000000U, out_info->interp_path, &interp_info);
+        int irc = load_elf32_image(ctx, ifd, 0x3F000000U, out_info->interp_path, &interp_info);
         close(ifd);
         if (irc != 0) {
             return -1;
@@ -423,6 +537,7 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         return -1;
     }
 
-    a32_vm_record_region(ctx, kuser_va, kuser_va + 4096U, PF_R | PF_X, 0x12U, "[vectors]");
+    a32_vm_record_region(ctx, kuser_va, kuser_va + 4096U,
+                         (uint32_t)(PROT_READ | PROT_EXEC), 0x12U, "[vectors]");
     return 0;
 }

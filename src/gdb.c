@@ -368,6 +368,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     dst[i] = (uint8_t)((hex_val(hex_data[i * 2U]) << 4U) |
                                        hex_val(hex_data[i * 2U + 1U]));
                 }
+                a32_jit_invalidate_range(ctx, addr, addr + (uint32_t)len);
                 send_packet(g_client_sock, "OK");
             } else {
                 send_packet(g_client_sock, "E01");
@@ -376,8 +377,13 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             /* Insert breakpoint: Z0,<addr>,<kind> */
             char *comma1 = strchr(cmd + 3, ',');
             uint32_t addr;
+            uint32_t len = 4U;
             if (comma1 != NULL) {
                 *comma1 = '\0';
+                len = (uint32_t)strtoul(comma1 + 1, NULL, 16);
+                if (len == 0U) {
+                    len = 4U;
+                }
             }
             addr = (uint32_t)strtoul(cmd + 3, NULL, 16);
 
@@ -398,13 +404,19 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     }
                 }
             }
+            a32_jit_invalidate_range(ctx, addr, addr + len);
             send_packet(g_client_sock, inserted ? "OK" : "E01");
         } else if (cmd[0] == 'z' && cmd[1] == '0') {
             /* Remove breakpoint: z0,<addr>,<kind> */
             char *comma1 = strchr(cmd + 3, ',');
             uint32_t addr;
+            uint32_t len = 4U;
             if (comma1 != NULL) {
                 *comma1 = '\0';
+                len = (uint32_t)strtoul(comma1 + 1, NULL, 16);
+                if (len == 0U) {
+                    len = 4U;
+                }
             }
             addr = (uint32_t)strtoul(cmd + 3, NULL, 16);
 
@@ -414,6 +426,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     break;
                 }
             }
+            a32_jit_invalidate_range(ctx, addr, addr + len);
             send_packet(g_client_sock, "OK");
         } else if (cmd[0] == 's') {
             /* Single step */

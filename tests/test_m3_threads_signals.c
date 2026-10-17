@@ -15,6 +15,17 @@ struct sigaction32 {
     uint32_t sa_mask[2];
 };
 
+struct siginfo32 {
+    int32_t  si_signo;
+    int32_t  si_errno;
+    int32_t  si_code;
+    void    *si_addr;
+    uint32_t _pad[28];
+};
+
+_Static_assert(offsetof(struct siginfo32, si_addr) == 12,
+               "si_addr must be at byte offset 12 in 32-bit siginfo_t");
+
 __asm__(
     ".text\n"
     ".globl __aeabi_uidiv\n"
@@ -220,25 +231,47 @@ static int test2_signals(void)
 }
 
 /* --------------------------------------------------------------------------
- * Test 3: Synchronous SIGSEGV Recovery via Side Table & ucontext
+ * Test 3: Synchronous SIGSEGV Recovery, si_addr & VFP d0-d31 Preservation
  * -------------------------------------------------------------------------- */
 static volatile uint32_t g_sigsegv_handled = 0U;
+static volatile uint32_t g_sigsegv_si_addr_ok = 0U;
 static volatile uint32_t g_fault_page_addr = 0U;
+static uint64_t g_vfp_init[32];
+static uint64_t g_vfp_clobber[32];
+static uint64_t g_vfp_after[32];
 
 static void sigsegv_handler(int sig, void *info, void *uctx_ptr)
 {
-    (void)sig;
-    (void)info;
-    g_sigsegv_handled = 1U;
     uint8_t *uc = (uint8_t *)uctx_ptr;
     uint32_t arm_pc = *(uint32_t *)(uc + 92);
     uint32_t fault_addr = *(uint32_t *)(uc + 100);
 
-    if (fault_addr != g_fault_page_addr) {
-        return;
-    }
-    /* Skip the faulting 4-byte instruction */
+    /* Always advance past the 4-byte faulting ldr so we never infinite-loop */
     *(uint32_t *)(uc + 92) = arm_pc + 4U;
+
+    const struct siginfo32 *si = (const struct siginfo32 *)info;
+    if (sig == 11 && si != NULL && si->si_signo == 11 &&
+        (uint32_t)(uintptr_t)si->si_addr == g_fault_page_addr &&
+        fault_addr == g_fault_page_addr) {
+        g_sigsegv_si_addr_ok = 1U;
+    }
+
+    /* Clobber all 32 VFP double registers d0-d31 inside the signal handler */
+    const uint64_t *clob_lo = &g_vfp_clobber[0];
+    const uint64_t *clob_hi = &g_vfp_clobber[16];
+    __asm__ volatile(
+        "vldmia %0, {d0-d15}\n"
+        "vldmia %1, {d16-d31}\n"
+        :
+        : "r"(clob_lo), "r"(clob_hi)
+        : "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
+          "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15",
+          "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23",
+          "d24", "d25", "d26", "d27", "d28", "d29", "d30", "d31",
+          "memory"
+    );
+
+    g_sigsegv_handled = 1U;
 }
 
 static int test3_sigsegv_recovery(void)
@@ -248,7 +281,16 @@ static int test3_sigsegv_recovery(void)
     if (page > 0xFFFFF000U) {
         return 30;
     }
-    g_fault_page_addr = page;
+    uint32_t fault_target = page + 0x128U;
+    g_fault_page_addr = fault_target;
+    g_sigsegv_handled = 0U;
+    g_sigsegv_si_addr_ok = 0U;
+
+    for (uint32_t i = 0U; i < 32U; i++) {
+        g_vfp_init[i] = 0x3FF0000000000000ULL | ((uint64_t)(i + 1U) << 32) | (uint64_t)(0x1000U + i);
+        g_vfp_clobber[i] = 0x7FE00000DEAD0000ULL | (uint64_t)i;
+        g_vfp_after[i] = 0ULL;
+    }
 
     struct sigaction32 act;
     act.sa_handler = (uint32_t)(uintptr_t)sigsegv_handler;
@@ -258,23 +300,46 @@ static int test3_sigsegv_recovery(void)
     act.sa_mask[1] = 0U;
 
     if (sys4(174U /* rt_sigaction */, 11U /* SIGSEGV */, (uint32_t)(uintptr_t)&act, 0U, 8U) != 0) {
+        sys2(91U /* munmap */, page, 4096U);
         return 31;
     }
 
+    const uint64_t *init_lo = &g_vfp_init[0];
+    const uint64_t *init_hi = &g_vfp_init[16];
+    uint64_t *out_lo = &g_vfp_after[0];
+    uint64_t *out_hi = &g_vfp_after[16];
     volatile uint32_t post_fault_reached = 0U;
     __asm__ volatile(
+        "vldmia %2, {d0-d15}\n"
+        "vldmia %3, {d16-d31}\n"
         "ldr r0, [%1]\n"
+        "vstmia %4, {d0-d15}\n"
+        "vstmia %5, {d16-d31}\n"
         "mov %0, #1\n"
-        : "=r"(post_fault_reached)
-        : "r"(page)
-        : "r0", "memory"
+        : "=&r"(post_fault_reached)
+        : "r"(fault_target), "r"(init_lo), "r"(init_hi), "r"(out_lo), "r"(out_hi)
+        : "r0",
+          "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
+          "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15",
+          "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23",
+          "d24", "d25", "d26", "d27", "d28", "d29", "d30", "d31",
+          "memory"
     );
+
+    sys2(91U /* munmap */, page, 4096U);
 
     if (g_sigsegv_handled != 1U || post_fault_reached != 1U) {
         return 32;
     }
+    if (g_sigsegv_si_addr_ok != 1U) {
+        return 33;
+    }
+    for (uint32_t i = 0U; i < 32U; i++) {
+        if (g_vfp_after[i] != g_vfp_init[i]) {
+            return 34;
+        }
+    }
 
-    sys2(91U /* munmap */, page, 4096U);
     return 0;
 }
 
@@ -329,6 +394,134 @@ static int test4_smc_cacheflush(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 5: mremap (163) positive (grow/shrink) & negative (unaligned) tests
+ * -------------------------------------------------------------------------- */
+static int test5_mremap(void)
+{
+    uint32_t addr = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                   3U /* PROT_READ|PROT_WRITE */,
+                                   0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                   0xFFFFFFFFU, 0U);
+    if (addr > 0xFFFFF000U) {
+        return 50;
+    }
+
+    volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)addr;
+    p[0] = 0xCAFEBABEU;
+    p[1023] = 0xDEADBEEFU;
+
+    /* Grow 4 KiB -> 16 KiB with MREMAP_MAYMOVE (1) */
+    uint32_t new_addr = (uint32_t)sys4(163U /* mremap */, addr, 4096U, 16384U,
+                                       1U /* MREMAP_MAYMOVE */);
+    if (new_addr > 0xFFFFF000U || (new_addr & 0xFFFU) != 0U) {
+        sys2(91U /* munmap */, addr, 4096U);
+        return 51;
+    }
+
+    volatile uint32_t *np = (volatile uint32_t *)(uintptr_t)new_addr;
+    if (np[0] != 0xCAFEBABEU || np[1023] != 0xDEADBEEFU) {
+        sys2(91U /* munmap */, new_addr, 16384U);
+        return 52;
+    }
+
+    /* Verify newly grown pages are valid and writable */
+    np[1024] = 0x11223344U;
+    np[4095] = 0x55667788U;
+    if (np[1024] != 0x11223344U || np[4095] != 0x55667788U) {
+        sys2(91U /* munmap */, new_addr, 16384U);
+        return 53;
+    }
+
+    /* Shrink 16 KiB -> 8 KiB in-place (flags = 0) */
+    uint32_t shrunk_addr = (uint32_t)sys4(163U /* mremap */, new_addr, 16384U, 8192U, 0U);
+    if (shrunk_addr != new_addr) {
+        sys2(91U /* munmap */, new_addr, 16384U);
+        return 54;
+    }
+
+    volatile uint32_t *sp = (volatile uint32_t *)(uintptr_t)shrunk_addr;
+    if (sp[0] != 0xCAFEBABEU || sp[1023] != 0xDEADBEEFU || sp[1024] != 0x11223344U) {
+        sys2(91U /* munmap */, shrunk_addr, 8192U);
+        return 55;
+    }
+
+    if (sys2(91U /* munmap */, shrunk_addr, 8192U) != 0) {
+        return 56;
+    }
+
+    /* Negative: unaligned address (0x12345) must return -EINVAL (-22) */
+    int32_t bad_rc = sys4(163U /* mremap */, 0x12345U, 4096U, 8192U, 1U /* MREMAP_MAYMOVE */);
+    if (bad_rc != -22 /* -EINVAL */) {
+        return 57;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 6: Negative brk & mmap2 overflow / boundary protection tests
+ * -------------------------------------------------------------------------- */
+static int test6_vm_boundaries(void)
+{
+    uint32_t cur_brk = (uint32_t)sys1(45U /* brk */, 0U);
+    if (cur_brk == 0U) {
+        return 60;
+    }
+
+    /* Negative: brk(0xFFFFFFFFU) overflow must return current brk unchanged */
+    uint32_t brk_ovf = (uint32_t)sys1(45U /* brk */, 0xFFFFFFFFU);
+    if (brk_ovf != cur_brk) {
+        return 61;
+    }
+
+    /* Negative: brk(0x00000100U) below brk_base must return current brk unchanged */
+    uint32_t brk_low = (uint32_t)sys1(45U /* brk */, 0x00000100U);
+    if (brk_low != cur_brk) {
+        return 62;
+    }
+
+    /* Positive: grow brk by 4 KiB, write/read, and shrink back to cur_brk */
+    uint32_t grown_brk = (uint32_t)sys1(45U /* brk */, cur_brk + 4096U);
+    if (grown_brk != cur_brk + 4096U) {
+        return 63;
+    }
+    volatile uint32_t *bp = (volatile uint32_t *)(uintptr_t)cur_brk;
+    bp[0] = 0xA5A55A5AU;
+    if (bp[0] != 0xA5A55A5AU) {
+        return 64;
+    }
+    if ((uint32_t)sys1(45U /* brk */, cur_brk) != cur_brk) {
+        return 65;
+    }
+
+    /* Negative: mmap2 MAP_FIXED at 0x0U (low guard page) must fail with -EINVAL/-ENOMEM */
+    int32_t map_zero = sys6(192U /* mmap2 */, 0x0U, 4096U,
+                            3U /* PROT_READ|PROT_WRITE */,
+                            0x32U /* MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED */,
+                            0xFFFFFFFFU, 0U);
+    if (map_zero != -22 /* -EINVAL */ && map_zero != -12 /* -ENOMEM */) {
+        return 66;
+    }
+
+    /* Negative: mmap2 MAP_FIXED at 0xFFFF0000U (kuser page) must fail without clobbering kuser */
+    int32_t map_kuser = sys6(192U /* mmap2 */, 0xFFFF0000U, 4096U,
+                             3U /* PROT_READ|PROT_WRITE */,
+                             0x32U /* MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED */,
+                             0xFFFFFFFFU, 0U);
+    if (map_kuser != -22 /* -EINVAL */ && map_kuser != -12 /* -ENOMEM */) {
+        return 67;
+    }
+
+    /* Verify kuser helper version at 0xFFFF0FFCU is still 5 */
+    uint32_t kuser_ver = *(const volatile uint32_t *)(uintptr_t)0xFFFF0FFCU;
+    if (kuser_ver != 5U) {
+        return 68;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -344,6 +537,14 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test4_smc_cacheflush();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test5_mremap();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test6_vm_boundaries();
     if (rc != 0) {
         return rc;
     }

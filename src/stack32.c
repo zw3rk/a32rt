@@ -54,6 +54,9 @@
 
 static uint32_t push_bytes(a32_ctx_t *ctx, uint32_t *sp, const void *data, size_t len)
 {
+    if (*sp < ctx->stack_base || len > (size_t)(*sp - ctx->stack_base)) {
+        return 0U;
+    }
     *sp -= (uint32_t)len;
     memcpy(a32_guest_ptr(ctx, *sp), data, len);
     return *sp;
@@ -81,7 +84,10 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
         fprintf(stderr, "a32rt: failed to map guest stack: %s\n", strerror(errno));
         return -1;
     }
-    a32_vm_record_region(ctx, stack_base, A32_STACK_TOP, 0x3U, 0x12U, "[stack]");
+    ctx->stack_top  = A32_STACK_TOP;
+    ctx->stack_base = stack_base;
+    a32_vm_record_region(ctx, stack_base, A32_STACK_TOP,
+                         (uint32_t)(PROT_READ | PROT_WRITE), 0x12U, "[stack]");
 
     uint32_t sp = A32_STACK_TOP - 64U;
 
@@ -93,26 +99,41 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
         }
     }
     uint32_t at_random_va = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
+    if (at_random_va == 0U) {
+        return -1;
+    }
 
     /* Push AT_PLATFORM ("v8l") and AT_EXECFN */
     uint32_t at_platform_va = push_cstring(ctx, &sp, "v8l");
     const char *execfn_str = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : guest_argv[0];
     uint32_t at_execfn_va = push_cstring(ctx, &sp, execfn_str);
+    if (at_platform_va == 0U || at_execfn_va == 0U) {
+        return -1;
+    }
 
-    /* Count and push environment strings (filtering internal A32RT_* vars if desired) */
+    /* Count and push environment strings in reverse index order so envp[0] < envp[1] < ... */
     uint32_t env_ptrs[512];
     int envc = 0;
     if (host_envp) {
-        for (int i = 0; host_envp[i] != NULL && envc < 511; i++) {
-            env_ptrs[envc++] = push_cstring(ctx, &sp, host_envp[i]);
+        while (host_envp[envc] != NULL && envc < 511) {
+            envc++;
+        }
+        for (int i = envc - 1; i >= 0; i--) {
+            env_ptrs[i] = push_cstring(ctx, &sp, host_envp[i]);
+            if (env_ptrs[i] == 0U) {
+                return -1;
+            }
         }
     }
 
-    /* Push argv strings */
+    /* Push argv strings in reverse index order so argv[0] < argv[1] < ... */
     uint32_t arg_ptrs[512];
     int argc = (guest_argc > 511) ? 511 : guest_argc;
-    for (int i = 0; i < argc; i++) {
+    for (int i = argc - 1; i >= 0; i--) {
         arg_ptrs[i] = push_cstring(ctx, &sp, guest_argv[i]);
+        if (arg_ptrs[i] == 0U) {
+            return -1;
+        }
     }
 
     /* Align string table bottom to 16 bytes */
@@ -154,6 +175,9 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
      */
     size_t total_words = 1U + ((size_t)argc + 1U) + ((size_t)envc + 1U) + aux_idx;
     uint32_t frame_bytes = (uint32_t)(total_words * sizeof(uint32_t));
+    if (sp < ctx->stack_base || (sp - ctx->stack_base) < frame_bytes + 16U) {
+        return -1;
+    }
     uint32_t final_sp = (sp - frame_bytes) & ~0xFU;
 
     uint32_t *w = (uint32_t *)a32_guest_ptr(ctx, final_sp);
@@ -171,8 +195,6 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
         w[pos++] = auxv[i];
     }
 
-    ctx->stack_top  = A32_STACK_TOP;
-    ctx->stack_base = stack_base;
     ctx->guest_argc = argc;
     ctx->guest_argv = guest_argv;
     ctx->host_envp  = host_envp;

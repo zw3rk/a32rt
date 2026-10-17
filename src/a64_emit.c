@@ -422,7 +422,7 @@ void a64_emit_str_imm_x(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_
 /* VFPv4-D32 / NEON context & guest memory loads/stores (M4) */
 void a64_emit_ldr_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx)
 {
-    if (!b->in_cond_branch && s_idx < 16U) {
+    if (b->cond_branch_depth == 0U && s_idx < 16U) {
         if ((b->s_cached_mask & (1U << s_idx)) != 0U) {
             a64_emit_fmov_s(b, vt, 16U + s_idx);
             return;
@@ -442,7 +442,7 @@ void a64_emit_str_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx)
     uint32_t byte_offset = A32_CTX_VFP_OFFSET + (s_idx * 4U);
     a64_emit(b, 0xBD000000U | (((byte_offset / 4U) & 0xFFFU) << 10) | (A64_XCTX << 5) | (vt & 31U));
     if (s_idx < 16U) {
-        if (!b->in_cond_branch) {
+        if (b->cond_branch_depth == 0U) {
             a64_emit_fmov_s(b, 16U + s_idx, vt);
             b->s_cached_mask |= (uint16_t)(1U << s_idx);
         } else {
@@ -791,8 +791,8 @@ void a64_emit_isb(a64_buf_t *b)
 
 size_t a64_emit_b_cond_placeholder(a64_buf_t *b, unsigned cond)
 {
-    b->s_cached_mask  = 0U;
-    b->in_cond_branch = true;
+    b->s_cached_mask = 0U;
+    b->cond_branch_depth++;
     size_t idx = b->count;
     a64_emit(b, 0x54000000U | (cond & 15U));
     return idx;
@@ -800,14 +800,40 @@ size_t a64_emit_b_cond_placeholder(a64_buf_t *b, unsigned cond)
 
 void a64_patch_b_cond(a64_buf_t *b, size_t patch_idx, size_t target_idx)
 {
-    b->s_cached_mask  = 0U;
-    b->in_cond_branch = false;
+    b->s_cached_mask = 0U;
+    if (b->cond_branch_depth > 0U) {
+        b->cond_branch_depth--;
+    }
     if (patch_idx >= b->count) {
         return;
     }
     int32_t disp = (int32_t)target_idx - (int32_t)patch_idx;
     uint32_t cond = b->words[patch_idx] & 15U;
     b->words[patch_idx] = 0x54000000U | (((uint32_t)disp & 0x7FFFFU) << 5) | cond;
+}
+
+size_t a64_emit_cbz_w_placeholder(a64_buf_t *b, bool is_cbnz, unsigned rt)
+{
+    b->s_cached_mask = 0U;
+    b->cond_branch_depth++;
+    size_t idx = b->count;
+    uint32_t base = is_cbnz ? 0x35000000U : 0x34000000U;
+    a64_emit(b, base | (rt & 31U));
+    return idx;
+}
+
+void a64_patch_cbz_w(a64_buf_t *b, size_t patch_idx, size_t target_idx)
+{
+    b->s_cached_mask = 0U;
+    if (b->cond_branch_depth > 0U) {
+        b->cond_branch_depth--;
+    }
+    if (patch_idx >= b->count) {
+        return;
+    }
+    int32_t disp = (int32_t)target_idx - (int32_t)patch_idx;
+    uint32_t op_rt = b->words[patch_idx] & 0xFF00001FU;
+    b->words[patch_idx] = op_rt | (((uint32_t)disp & 0x7FFFFU) << 5);
 }
 
 void a64_emit_b(a64_buf_t *b, int32_t offset_words)

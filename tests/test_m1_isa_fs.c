@@ -88,6 +88,22 @@ static inline int32_t sys4(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2, u
     return (int32_t)r0;
 }
 
+static inline int32_t sys5_llseek(uint32_t fd, uint32_t off_hi, uint32_t off_lo,
+                                  uint64_t *res, uint32_t whence)
+{
+    register uint32_t r7 __asm__("r7") = 140U /* _llseek */;
+    register uint32_t r0 __asm__("r0") = fd;
+    register uint32_t r1 __asm__("r1") = off_hi;
+    register uint32_t r2 __asm__("r2") = off_lo;
+    register uint32_t r3 __asm__("r3") = (uint32_t)(uintptr_t)res;
+    register uint32_t r4 __asm__("r4") = whence;
+    __asm__ volatile("svc #0"
+                     : "+r"(r0)
+                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4)
+                     : "memory", "cc");
+    return (int32_t)r0;
+}
+
 static void my_memset(void *dst, int c, size_t n)
 {
     uint8_t *p = (uint8_t *)dst;
@@ -125,6 +141,27 @@ static const char *my_strstr(const char *haystack, const char *needle)
         }
     }
     return NULL;
+}
+
+static uint32_t __attribute__((noinline)) arm_lsl_reg(uint32_t val, uint32_t sh)
+{
+    uint32_t out;
+    __asm__ volatile("lsl %0, %1, %2" : "=r"(out) : "r"(val), "r"(sh));
+    return out;
+}
+
+static uint32_t __attribute__((noinline)) arm_lsr_reg(uint32_t val, uint32_t sh)
+{
+    uint32_t out;
+    __asm__ volatile("lsr %0, %1, %2" : "=r"(out) : "r"(val), "r"(sh));
+    return out;
+}
+
+static uint32_t __attribute__((noinline)) arm_asr_reg(uint32_t val, uint32_t sh)
+{
+    uint32_t out;
+    __asm__ volatile("asr %0, %1, %2" : "=r"(out) : "r"(val), "r"(sh));
+    return out;
 }
 
 static int run_test(void)
@@ -210,7 +247,7 @@ static int run_test(void)
     /* 6. readlinkat / readlink on /proc/self/exe */
     char exe_path[256];
     my_memset(exe_path, 0, sizeof(exe_path));
-    int32_t len = sys4(328U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD (-100) */,
+    int32_t len = sys4(332U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD (-100) */,
                        (uint32_t)(uintptr_t)"/proc/self/exe",
                        (uint32_t)(uintptr_t)exe_path, (uint32_t)(sizeof(exe_path) - 1U));
     if (len <= 0) {
@@ -221,7 +258,7 @@ static int run_test(void)
         return 16;
     }
 
-    /* 7. openat + read on /proc/self/maps */
+    /* 7. openat + read on /proc/self/maps (including rw-p vs -wxp check) */
     int32_t mfd = sys4(322U /* openat */, 0xFFFFFF9CU,
                        (uint32_t)(uintptr_t)"/proc/self/maps", 0U, 0U);
     if (mfd < 0) {
@@ -250,8 +287,12 @@ static int run_test(void)
     if (!my_strstr(maps_buf, "ffff0000-ffff1000") && !my_strstr(maps_buf, "[vectors]")) {
         return 19;
     }
+    /* Verify stack / anonymous RW mappings are formatted as rw-p and never -wxp */
+    if (!my_strstr(maps_buf, " rw-p ") || my_strstr(maps_buf, "-wxp")) {
+        return 31;
+    }
 
-    /* 8. openat + getdents64 (217) on /tmp or . */
+    /* 8. openat + getdents64 (217) on /tmp and . + lseek after getdents64 */
     int32_t dfd = sys4(322U /* openat */, 0xFFFFFF9CU,
                        (uint32_t)(uintptr_t)"/tmp", 0U, 0U);
     if (dfd < 0) {
@@ -279,6 +320,70 @@ static int run_test(void)
     }
     if (entries_found == 0) {
         return 23;
+    }
+
+    /* Also read getdents64 on "." to ensure ext4 64-bit directory cookies are populated */
+    int32_t dot_dfd = sys4(322U /* openat */, 0xFFFFFF9CU,
+                           (uint32_t)(uintptr_t)".", 0U, 0U);
+    if (dot_dfd >= 0) {
+        (void)sys3(217U /* getdents64 */, (uint32_t)dot_dfd,
+                   (uint32_t)(uintptr_t)d_buf, (uint32_t)sizeof(d_buf));
+        sys1(6U /* close */, (uint32_t)dot_dfd);
+    }
+
+    /*
+     * Regression test: open a regular file after getdents64 and verify
+     * lseek(fd, 1, SEEK_SET) and lseek(fd, 2, SEEK_SET) return 1 and 2
+     * (and do not corrupt small offsets into 64-bit directory cookies).
+     */
+    {
+        int32_t rfd = sys4(322U /* openat */, 0xFFFFFF9CU,
+                           (uint32_t)(uintptr_t)"/proc/self/maps", 0U, 0U);
+        if (rfd < 0) {
+            return 32;
+        }
+        char hdr4[4];
+        my_memset(hdr4, 0, sizeof(hdr4));
+        if (sys3(3U /* read */, (uint32_t)rfd, (uint32_t)(uintptr_t)hdr4, 4U) != 4) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 33;
+        }
+        int32_t pos1 = sys3(19U /* lseek */, (uint32_t)rfd, 1U, 0U /* SEEK_SET */);
+        if (pos1 != 1) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 34;
+        }
+        char sub3[3];
+        my_memset(sub3, 0, sizeof(sub3));
+        if (sys3(3U /* read */, (uint32_t)rfd, (uint32_t)(uintptr_t)sub3, 3U) != 3 ||
+            my_memcmp(sub3, hdr4 + 1, 3U) != 0) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 35;
+        }
+        int32_t pos2 = sys3(19U /* lseek */, (uint32_t)rfd, 2U, 0U /* SEEK_SET */);
+        if (pos2 != 2) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 36;
+        }
+        char sub2[2];
+        my_memset(sub2, 0, sizeof(sub2));
+        if (sys3(3U /* read */, (uint32_t)rfd, (uint32_t)(uintptr_t)sub2, 2U) != 2 ||
+            my_memcmp(sub2, hdr4 + 2, 2U) != 0) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 37;
+        }
+        uint64_t ll_res = 0xDEADBEEFCAFEBABEULL;
+        if (sys5_llseek((uint32_t)rfd, 0U, 1U, &ll_res, 0U /* SEEK_SET */) != 0 ||
+            ll_res != 1ULL) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 38;
+        }
+        if (sys5_llseek((uint32_t)rfd, 0U, 2U, &ll_res, 0U /* SEEK_SET */) != 0 ||
+            ll_res != 2ULL) {
+            sys1(6U /* close */, (uint32_t)rfd);
+            return 39;
+        }
+        sys1(6U /* close */, (uint32_t)rfd);
     }
 
     /* 9. pipe2 (359) + fork (2) + write/read + wait4 (114) */
@@ -323,6 +428,700 @@ static int run_test(void)
     }
     if (((wait_status >> 8) & 0xFF) != 42) {
         return 30;
+    }
+
+    /*
+     * 10. Flag liveness across MOVT and CLZ:
+     * Verify SUBS / ADDS setting NZCV followed immediately by MOVT or CLZ
+     * does NOT clobber or elide the preceding NZCV flags before a conditional
+     * move (moveq/movne/movmi/movpl) or conditional branch (b.cond).
+     */
+    {
+        /* 10a: SUBS sets Z=1 (after prior CMP set Z=0), followed by MOVT, then MOVEQ/MOVNE */
+        uint32_t target = 0x00005678U;
+        uint32_t cond_out = 0U;
+        uint32_t a = 42U, b = 42U;
+        __asm__ volatile(
+            "cmp %[a], #0\n\t"
+            "subs %[a], %[a], %[b]\n\t"
+            "movt %[t], #0x1234\n\t"
+#if defined(__thumb__)
+            "ite eq\n\t"
+#endif
+            "moveq %[out], #100\n\t"
+            "movne %[out], #200\n\t"
+            : [t] "+r"(target), [out] "=&r"(cond_out), [a] "+r"(a)
+            : [b] "r"(b)
+            : "cc"
+        );
+        if (target != 0x12345678U || cond_out != 100U || a != 0U) {
+            return 40;
+        }
+
+        /* 10b: SUBS sets Z=0, N=1 (after prior CMP set Z=1, N=0), followed by MOVT, then MOVMI/MOVPL */
+        target = 0x0000ABCDU;
+        cond_out = 0U;
+        a = 10U;
+        b = 25U;
+        __asm__ volatile(
+            "cmp %[a], %[a]\n\t"
+            "subs %[a], %[a], %[b]\n\t"
+            "movt %[t], #0xDEAD\n\t"
+#if defined(__thumb__)
+            "ite mi\n\t"
+#endif
+            "movmi %[out], #77\n\t"
+            "movpl %[out], #88\n\t"
+            : [t] "+r"(target), [out] "=&r"(cond_out), [a] "+r"(a)
+            : [b] "r"(b)
+            : "cc"
+        );
+        if (target != 0xDEADABCDU || cond_out != 77U || a != (uint32_t)(-15)) {
+            return 41;
+        }
+
+        /* 10c: ADDS sets V=1 (after prior CMP set V=0, Z=1), followed by MOVT, then BVS */
+        target = 0x00001111U;
+        uint32_t branch_taken = 0U;
+        a = 0x7FFFFFFFU;
+        b = 1U;
+        __asm__ volatile(
+            "cmp %[a], %[a]\n\t"
+            "adds %[a], %[a], %[b]\n\t"
+            "movt %[t], #0x2222\n\t"
+            "bvs 1f\n\t"
+            "mov %[br], #0\n\t"
+            "b 2f\n"
+            "1:\n\t"
+            "mov %[br], #1\n"
+            "2:\n\t"
+            : [t] "+r"(target), [br] "=&r"(branch_taken), [a] "+r"(a)
+            : [b] "r"(b)
+            : "cc"
+        );
+        if (target != 0x22221111U || branch_taken != 1U || a != 0x80000000U) {
+            return 42;
+        }
+
+        /* 10d: SUBS sets Z=1 (after prior CMP set Z=0), followed by CLZ, then MOVEQ/MOVNE */
+        uint32_t clz_in = 0x00080000U;
+        uint32_t clz_out = 0U;
+        cond_out = 0U;
+        a = 123U;
+        b = 123U;
+        __asm__ volatile(
+            "cmp %[a], #0\n\t"
+            "subs %[a], %[a], %[b]\n\t"
+            "clz %[co], %[ci]\n\t"
+#if defined(__thumb__)
+            "ite eq\n\t"
+#endif
+            "moveq %[out], #55\n\t"
+            "movne %[out], #66\n\t"
+            : [co] "=&r"(clz_out), [out] "=&r"(cond_out), [a] "+r"(a)
+            : [ci] "r"(clz_in), [b] "r"(b)
+            : "cc"
+        );
+        if (clz_out != 12U || cond_out != 55U || a != 0U) {
+            return 43;
+        }
+
+        /* 10e: SUBS sets Z=0 (after prior CMP set Z=1), followed by CLZ, then MOVNE/MOVEQ */
+        clz_in = 0U;
+        clz_out = 0U;
+        cond_out = 0U;
+        a = 50U;
+        b = 43U;
+        __asm__ volatile(
+            "cmp %[a], %[a]\n\t"
+            "subs %[a], %[a], %[b]\n\t"
+            "clz %[co], %[ci]\n\t"
+#if defined(__thumb__)
+            "ite ne\n\t"
+#endif
+            "movne %[out], #99\n\t"
+            "moveq %[out], #11\n\t"
+            : [co] "=&r"(clz_out), [out] "=&r"(cond_out), [a] "+r"(a)
+            : [ci] "r"(clz_in), [b] "r"(b)
+            : "cc"
+        );
+        if (clz_out != 32U || cond_out != 99U || a != 7U) {
+            return 44;
+        }
+
+        /* 10f: ADDS sets C=1 (after prior CMP set C=0), followed by CLZ, then BCS */
+        clz_in = 0x00000001U;
+        clz_out = 0U;
+        branch_taken = 0U;
+        a = 0xFFFFFFFFU;
+        b = 2U;
+        __asm__ volatile(
+            "cmp %[b], %[a]\n\t"
+            "adds %[a], %[a], %[b]\n\t"
+            "clz %[co], %[ci]\n\t"
+            "bcs 1f\n\t"
+            "mov %[br], #0\n\t"
+            "b 2f\n"
+            "1:\n\t"
+            "mov %[br], #1\n"
+            "2:\n\t"
+            : [co] "=&r"(clz_out), [br] "=&r"(branch_taken), [a] "+r"(a)
+            : [ci] "r"(clz_in), [b] "r"(b)
+            : "cc"
+        );
+        if (clz_out != 31U || branch_taken != 1U || a != 1U) {
+            return 45;
+        }
+    }
+
+    /*
+     * 11. PKHBT and PKHTB (including rd == rn and rd == rm aliasing):
+     * PKHBT Rd, Rn, Rm, LSL #imm: Rd[15:0] = Rn[15:0], Rd[31:16] = (Rm << imm)[31:16]
+     * PKHTB Rd, Rn, Rm, ASR #imm: Rd[31:16] = Rn[31:16], Rd[15:0] = (Rm ASR imm)[15:0]
+     */
+    {
+        uint32_t rn = 0x12345678U;
+        uint32_t rm = 0x9ABCDEF0U;
+        uint32_t rd = 0U;
+
+        /* 11a: PKHBT with rd != rn */
+        __asm__ volatile("pkhbt %0, %1, %2, lsl #4" : "=r"(rd) : "r"(rn), "r"(rm));
+        if (rd != 0xABCD5678U) {
+            return 46;
+        }
+        __asm__ volatile("pkhbt %0, %1, %2" : "=r"(rd) : "r"(rn), "r"(rm));
+        if (rd != 0x9ABC5678U) {
+            return 47;
+        }
+
+        /* 11b: PKHBT with rd == rn aliasing (pkhbt r0, r0, r1, lsl #4) */
+        {
+            register uint32_t r0 __asm__("r0") = 0x12345678U;
+            register uint32_t r1 __asm__("r1") = 0x9ABCDEF0U;
+            __asm__ volatile("pkhbt r0, r0, r1, lsl #4" : "+r"(r0) : "r"(r1));
+            if (r0 != 0xABCD5678U) {
+                return 48;
+            }
+        }
+
+        /* 11c: PKHBT with rd == rm aliasing (pkhbt r1, r0, r1, lsl #4) */
+        {
+            register uint32_t r0 __asm__("r0") = 0x12345678U;
+            register uint32_t r1 __asm__("r1") = 0x9ABCDEF0U;
+            __asm__ volatile("pkhbt r1, r0, r1, lsl #4" : "+r"(r1) : "r"(r0));
+            if (r1 != 0xABCD5678U) {
+                return 49;
+            }
+        }
+
+        /* 11d: PKHTB with rd != rn */
+        __asm__ volatile("pkhtb %0, %1, %2, asr #4" : "=r"(rd) : "r"(rn), "r"(rm));
+        if (rd != 0x1234CDEFU) {
+            return 50;
+        }
+
+        /* 11e: PKHTB with rd == rn aliasing (pkhtb r0, r0, r1, asr #4) */
+        {
+            register uint32_t r0 __asm__("r0") = 0x12345678U;
+            register uint32_t r1 __asm__("r1") = 0x9ABCDEF0U;
+            __asm__ volatile("pkhtb r0, r0, r1, asr #4" : "+r"(r0) : "r"(r1));
+            if (r0 != 0x1234CDEFU) {
+                return 51;
+            }
+        }
+
+        /* 11f: PKHTB with rd == rm aliasing (pkhtb r1, r0, r1, asr #4) */
+        {
+            register uint32_t r0 __asm__("r0") = 0x12345678U;
+            register uint32_t r1 __asm__("r1") = 0x9ABCDEF0U;
+            __asm__ volatile("pkhtb r1, r0, r1, asr #4" : "+r"(r1) : "r"(r0));
+            if (r1 != 0x1234CDEFU) {
+                return 52;
+            }
+        }
+
+        /* 11g: PKHTB with ASR #20 verifying arithmetic sign-extension of negative & positive Rm */
+        {
+            uint32_t rn2 = 0xCAFEBABEU;
+            uint32_t rm_neg = 0x87654321U;
+            uint32_t rm_pos = 0x76543210U;
+            __asm__ volatile("pkhtb %0, %1, %2, asr #20" : "=r"(rd) : "r"(rn2), "r"(rm_neg));
+            if (rd != 0xCAFEF876U) {
+                return 53;
+            }
+            __asm__ volatile("pkhtb %0, %1, %2, asr #20" : "=r"(rd) : "r"(rn2), "r"(rm_pos));
+            if (rd != 0xCAFE0765U) {
+                return 54;
+            }
+        }
+    }
+
+    /*
+     * 12. SSAT, USAT, and SEL preserving NZCV:
+     * Set CPSR.NZCV via CMP, execute SSAT, USAT, and SEL, and verify
+     * both result correctness and that NZCV bits [31:28] remain untouched.
+     */
+    {
+        uint32_t res = 0U;
+        uint32_t flags = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+
+        /* 12a: SSAT positive saturation with Z=1, C=1, N=0, V=0 (0x60000000) */
+        int32_t s_in = 500;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "ssat %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [in] "r"(s_in)
+            : "cc"
+        );
+        if (res != 127U || (flags & 0xF0000000U) != 0x60000000U) {
+            return 55;
+        }
+
+        /* 12b: SSAT negative saturation with N=1, Z=0, C=0, V=0 (0x80000000) */
+        s_in = -500;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "ssat %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [in] "r"(s_in)
+            : "cc"
+        );
+        if (res != (uint32_t)(-128) || (flags & 0xF0000000U) != 0x80000000U) {
+            return 56;
+        }
+
+        /* 12c: SSAT non-saturating with V=1, C=1, N=0, Z=0 (0x30000000) */
+        s_in = -42;
+        uint32_t ov_a = 0x80000000U, ov_b = 1U;
+        __asm__ volatile(
+            "cmp %[oa], %[ob]\n\t"
+            "ssat %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [oa] "r"(ov_a), [ob] "r"(ov_b), [in] "r"(s_in)
+            : "cc"
+        );
+        if (res != (uint32_t)(-42) || (flags & 0xF0000000U) != 0x30000000U) {
+            return 57;
+        }
+
+        /* 12d: USAT positive saturation with Z=1, C=1, N=0, V=0 (0x60000000) */
+        s_in = 1000;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "usat %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [in] "r"(s_in)
+            : "cc"
+        );
+        if (res != 255U || (flags & 0xF0000000U) != 0x60000000U) {
+            return 58;
+        }
+
+        /* 12e: USAT negative saturation to 0 with N=1, Z=0, C=0, V=0 (0x80000000) */
+        s_in = -50;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "usat %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [in] "r"(s_in)
+            : "cc"
+        );
+        if (res != 0U || (flags & 0xF0000000U) != 0x80000000U) {
+            return 59;
+        }
+
+        /* 12f: USAT non-saturating with V=1, C=1, N=0, Z=0 (0x30000000) */
+        s_in = 123;
+        __asm__ volatile(
+            "cmp %[oa], %[ob]\n\t"
+            "usat %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [oa] "r"(ov_a), [ob] "r"(ov_b), [in] "r"(s_in)
+            : "cc"
+        );
+        if (res != 123U || (flags & 0xF0000000U) != 0x30000000U) {
+            return 60;
+        }
+
+        /* 12g: SEL preserving NZCV (both 0x60000000 and 0x80000000) */
+        uint32_t sel_a = 0x11223344U;
+        uint32_t sel_b = 0xAABBCCDDU;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "sel %[res], %[sa], %[sb]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if ((flags & 0xF0000000U) != 0x60000000U) {
+            return 61;
+        }
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "sel %[res], %[sa], %[sb]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if ((flags & 0xF0000000U) != 0x80000000U) {
+            return 62;
+        }
+    }
+
+#if defined(__thumb__)
+    /*
+     * 13. T16 CBZ / CBNZ preserving NZCV (when compiled as Thumb):
+     * Verify both taken and not-taken paths of cbz and cbnz preserve NZCV.
+     */
+    {
+        uint32_t flags = 0U;
+        uint32_t taken = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+
+        /* 13a: CBZ not-taken (r0 != 0) preserves Z=1, C=1, N=0, V=0 (0x60000000) */
+        {
+            register uint32_t r0 __asm__("r0") = 0x80000001U;
+            taken = 0U;
+            __asm__ volatile(
+                "cmp %[c1], %[c1]\n\t"
+                "cbz r0, 1f\n\t"
+                "mrs %[fl], apsr\n\t"
+                "b 2f\n"
+                "1:\n\t"
+                "mov %[tk], #1\n"
+                "2:\n\t"
+                : [fl] "=&r"(flags), [tk] "+r"(taken)
+                : "r"(r0), [c1] "r"(c1)
+                : "cc"
+            );
+            if (taken != 0U || (flags & 0xF0000000U) != 0x60000000U) {
+                return 63;
+            }
+        }
+
+        /* 13b: CBZ taken (r0 == 0) preserves N=1, Z=0, C=0, V=0 (0x80000000) */
+        {
+            register uint32_t r0 __asm__("r0") = 0U;
+            taken = 0U;
+            __asm__ volatile(
+                "cmp %[c1], %[c2]\n\t"
+                "cbz r0, 1f\n\t"
+                "b 2f\n"
+                "1:\n\t"
+                "mrs %[fl], apsr\n\t"
+                "mov %[tk], #1\n"
+                "2:\n\t"
+                : [fl] "=&r"(flags), [tk] "+r"(taken)
+                : "r"(r0), [c1] "r"(c1), [c2] "r"(c2)
+                : "cc"
+            );
+            if (taken != 1U || (flags & 0xF0000000U) != 0x80000000U) {
+                return 64;
+            }
+        }
+
+        /* 13c: CBNZ not-taken (r0 == 0) preserves N=1, Z=0, C=0, V=0 (0x80000000) */
+        {
+            register uint32_t r0 __asm__("r0") = 0U;
+            taken = 0U;
+            __asm__ volatile(
+                "cmp %[c1], %[c2]\n\t"
+                "cbnz r0, 1f\n\t"
+                "mrs %[fl], apsr\n\t"
+                "b 2f\n"
+                "1:\n\t"
+                "mov %[tk], #1\n"
+                "2:\n\t"
+                : [fl] "=&r"(flags), [tk] "+r"(taken)
+                : "r"(r0), [c1] "r"(c1), [c2] "r"(c2)
+                : "cc"
+            );
+            if (taken != 0U || (flags & 0xF0000000U) != 0x80000000U) {
+                return 65;
+            }
+        }
+
+        /* 13d: CBNZ taken (r0 != 0) preserves Z=1, C=1, N=0, V=0 (0x60000000) */
+        {
+            register uint32_t r0 __asm__("r0") = 0x80000001U;
+            taken = 0U;
+            __asm__ volatile(
+                "cmp %[c1], %[c1]\n\t"
+                "cbnz r0, 1f\n\t"
+                "b 2f\n"
+                "1:\n\t"
+                "mrs %[fl], apsr\n\t"
+                "mov %[tk], #1\n"
+                "2:\n\t"
+                : [fl] "=&r"(flags), [tk] "+r"(taken)
+                : "r"(r0), [c1] "r"(c1)
+                : "cc"
+            );
+            if (taken != 1U || (flags & 0xF0000000U) != 0x60000000U) {
+                return 66;
+            }
+        }
+    }
+#endif
+
+    /*
+     * 14. Register-specified shifts with Rs[7:0] >= 32 (LSL, LSR, ASR):
+     * Test shift amounts 0, 31, 32, 33, 64, 255 (and 256 where Rs[7:0] == 0).
+     */
+    {
+        uint32_t val = 0x87654321U;
+        if (arm_lsl_reg(val, 0U) != val ||
+            arm_lsl_reg(val, 31U) != 0x80000000U ||
+            arm_lsl_reg(val, 32U) != 0U ||
+            arm_lsl_reg(val, 33U) != 0U ||
+            arm_lsl_reg(val, 64U) != 0U ||
+            arm_lsl_reg(val, 255U) != 0U ||
+            arm_lsl_reg(val, 256U) != val) {
+            return 67;
+        }
+        if (arm_lsr_reg(val, 0U) != val ||
+            arm_lsr_reg(val, 31U) != 1U ||
+            arm_lsr_reg(val, 32U) != 0U ||
+            arm_lsr_reg(val, 33U) != 0U ||
+            arm_lsr_reg(val, 64U) != 0U ||
+            arm_lsr_reg(val, 255U) != 0U ||
+            arm_lsr_reg(val, 256U) != val) {
+            return 68;
+        }
+        uint32_t neg_val = 0x80001234U;
+        uint32_t pos_val = 0x7FFF1234U;
+        if (arm_asr_reg(neg_val, 0U) != neg_val ||
+            arm_asr_reg(neg_val, 31U) != 0xFFFFFFFFU ||
+            arm_asr_reg(neg_val, 32U) != 0xFFFFFFFFU ||
+            arm_asr_reg(neg_val, 33U) != 0xFFFFFFFFU ||
+            arm_asr_reg(neg_val, 64U) != 0xFFFFFFFFU ||
+            arm_asr_reg(neg_val, 255U) != 0xFFFFFFFFU ||
+            arm_asr_reg(neg_val, 256U) != neg_val) {
+            return 69;
+        }
+        if (arm_asr_reg(pos_val, 0U) != pos_val ||
+            arm_asr_reg(pos_val, 31U) != 0U ||
+            arm_asr_reg(pos_val, 32U) != 0U ||
+            arm_asr_reg(pos_val, 33U) != 0U ||
+            arm_asr_reg(pos_val, 64U) != 0U ||
+            arm_asr_reg(pos_val, 255U) != 0U ||
+            arm_asr_reg(pos_val, 256U) != pos_val) {
+            return 70;
+        }
+    }
+
+#if !defined(__thumb__)
+    /*
+     * 15. 64-bit multiply with flags (UMULLS, SMULLS) in A32:
+     * Verify Z=1 on 0 64-bit result, Z=0 when only RdLo is 0, and N=1 on negative 64-bit result.
+     */
+    {
+        uint32_t rlo = 0U, rhi = 0U, flags = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+
+        /* 15a: UMULLS 0 * 0x12345678 = 0 -> Z=1, N=0 */
+        uint32_t u_zero = 0U, u_val = 0x12345678U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "umulls %[lo], %[hi], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [lo] "=&r"(rlo), [hi] "=&r"(rhi), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [a] "r"(u_zero), [b] "r"(u_val)
+            : "cc"
+        );
+        if (rlo != 0U || rhi != 0U || (flags & 0xC0000000U) != 0x40000000U) {
+            return 71;
+        }
+
+        /* 15b: UMULLS 0x80000000 * 2 = 0x00000001_00000000 (lo=0, hi=1) -> Z=0, N=0 */
+        uint32_t u_half = 0x80000000U, u_two = 2U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "umulls %[lo], %[hi], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [lo] "=&r"(rlo), [hi] "=&r"(rhi), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [a] "r"(u_half), [b] "r"(u_two)
+            : "cc"
+        );
+        if (rlo != 0U || rhi != 1U || (flags & 0xC0000000U) != 0x00000000U) {
+            return 72;
+        }
+
+        /* 15c: UMULLS 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE_00000001 -> N=1, Z=0 */
+        uint32_t u_max = 0xFFFFFFFFU;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "umulls %[lo], %[hi], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [lo] "=&r"(rlo), [hi] "=&r"(rhi), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [a] "r"(u_max), [b] "r"(u_max)
+            : "cc"
+        );
+        if (rlo != 1U || rhi != 0xFFFFFFFEU || (flags & 0xC0000000U) != 0x80000000U) {
+            return 73;
+        }
+
+        /* 15d: SMULLS 0 * -42 = 0 -> Z=1, N=0 */
+        int32_t s_zero = 0, s_neg = -42;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "smulls %[lo], %[hi], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [lo] "=&r"(rlo), [hi] "=&r"(rhi), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [a] "r"(s_zero), [b] "r"(s_neg)
+            : "cc"
+        );
+        if (rlo != 0U || rhi != 0U || (flags & 0xC0000000U) != 0x40000000U) {
+            return 74;
+        }
+
+        /* 15e: SMULLS -3 * 5 = -15 (0xFFFFFFFF_FFFFFFF1) -> N=1, Z=0 */
+        int32_t s_m3 = -3, s_p5 = 5;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "smulls %[lo], %[hi], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [lo] "=&r"(rlo), [hi] "=&r"(rhi), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [a] "r"(s_m3), [b] "r"(s_p5)
+            : "cc"
+        );
+        if (rlo != 0xFFFFFFF1U || rhi != 0xFFFFFFFFU || (flags & 0xC0000000U) != 0x80000000U) {
+            return 75;
+        }
+
+        /* 15f: SMULLS -3 * -5 = +15 -> N=0, Z=0 */
+        int32_t s_m5 = -5;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "smulls %[lo], %[hi], %[a], %[b]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [lo] "=&r"(rlo), [hi] "=&r"(rhi), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [a] "r"(s_m3), [b] "r"(s_m5)
+            : "cc"
+        );
+        if (rlo != 15U || rhi != 0U || (flags & 0xC0000000U) != 0x00000000U) {
+            return 76;
+        }
+    }
+#endif
+
+    /*
+     * 16. LDRH / LDRSB / LDRSH post-index & pre-index writeback aliasing (rn == rt):
+     * Verify loaded value in Rt is not overwritten by base register writeback when Rn == Rt.
+     * Note: raw instruction encodings (.word for A32, .hword for T32) are used for the
+     * Rn == Rt writeback cases because assemblers reject Rn == Rt writeback mnemonics.
+     */
+    {
+        uint16_t hbuf[4] = { 0xBEEFU, 0xCAFEU, 0x1234U, 0x8001U };
+        int8_t   bbuf[4] = { -42, -100, 55, -1 };
+
+        /* 16a: LDRH post-index r0, [r0], #2 */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&hbuf[0];
+#if defined(__thumb__)
+            __asm__ volatile(".hword 0xF830, 0x0B02" : "+r"(r0) : : "memory");
+#else
+            __asm__ volatile(".word 0xE0D000B2" : "+r"(r0) : : "memory");
+#endif
+            if (r0 != 0x0000BEEFU) {
+                return 77;
+            }
+        }
+
+        /* 16b: LDRH pre-index r0, [r0, #2]! */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&hbuf[0];
+#if defined(__thumb__)
+            __asm__ volatile(".hword 0xF830, 0x0F02" : "+r"(r0) : : "memory");
+#else
+            __asm__ volatile(".word 0xE1F000B2" : "+r"(r0) : : "memory");
+#endif
+            if (r0 != 0x0000CAFEU) {
+                return 78;
+            }
+        }
+
+        /* 16c: LDRSB post-index r0, [r0], #1 */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&bbuf[0];
+#if defined(__thumb__)
+            __asm__ volatile(".hword 0xF910, 0x0B01" : "+r"(r0) : : "memory");
+#else
+            __asm__ volatile(".word 0xE0D000D1" : "+r"(r0) : : "memory");
+#endif
+            if (r0 != (uint32_t)(int32_t)(-42)) {
+                return 79;
+            }
+        }
+
+        /* 16d: LDRSB pre-index r0, [r0, #1]! */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&bbuf[0];
+#if defined(__thumb__)
+            __asm__ volatile(".hword 0xF910, 0x0F01" : "+r"(r0) : : "memory");
+#else
+            __asm__ volatile(".word 0xE1F000D1" : "+r"(r0) : : "memory");
+#endif
+            if (r0 != (uint32_t)(int32_t)(-100)) {
+                return 80;
+            }
+        }
+
+        /* 16e: LDRSH post-index r0, [r0], #2 */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&hbuf[0];
+#if defined(__thumb__)
+            __asm__ volatile(".hword 0xF930, 0x0B02" : "+r"(r0) : : "memory");
+#else
+            __asm__ volatile(".word 0xE0D000F2" : "+r"(r0) : : "memory");
+#endif
+            if (r0 != 0xFFFFBEEFU) {
+                return 81;
+            }
+        }
+
+        /* 16f: LDRSH pre-index r0, [r0, #2]! */
+        {
+            register uint32_t r0 __asm__("r0") = (uint32_t)(uintptr_t)&hbuf[0];
+#if defined(__thumb__)
+            __asm__ volatile(".hword 0xF930, 0x0F02" : "+r"(r0) : : "memory");
+#else
+            __asm__ volatile(".word 0xE1F000F2" : "+r"(r0) : : "memory");
+#endif
+            if (r0 != 0xFFFFCAFEU) {
+                return 82;
+            }
+        }
+
+        /* 16g: Positive check when rn != rt: verify both loaded value and base writeback */
+        {
+            const uint16_t *p = &hbuf[0];
+            uint32_t val_h = 0U;
+            __asm__ volatile("ldrh %[v], [%[p]], #2"
+                             : [v] "=&r"(val_h), [p] "+r"(p)
+                             :
+                             : "memory");
+            if (val_h != 0x0000BEEFU || p != &hbuf[1]) {
+                return 83;
+            }
+            __asm__ volatile("ldrsh %[v], [%[p], #2]!"
+                             : [v] "=&r"(val_h), [p] "+r"(p)
+                             :
+                             : "memory");
+            if (val_h != 0x00001234U || p != &hbuf[2]) {
+                return 84;
+            }
+        }
     }
 
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";

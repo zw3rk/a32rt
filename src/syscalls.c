@@ -95,12 +95,14 @@ extern char **environ;
 #define ARM_NR_fchdir            133U
 #define ARM_NR__llseek           140U
 #define ARM_NR_getdents          141U
+#define ARM_NR__newselect        142U
 #define ARM_NR_readv             145U
 #define ARM_NR_writev            146U
 #define ARM_NR_getsid            147U
 #define ARM_NR_fdatasync         148U
 #define ARM_NR_sched_yield       158U
 #define ARM_NR_nanosleep         162U
+#define ARM_NR_mremap            163U
 #define ARM_NR_poll              168U
 #define ARM_NR_prctl             172U
 #define ARM_NR_rt_sigreturn      173U
@@ -119,6 +121,7 @@ extern char **environ;
 #define ARM_NR_stat64            195U
 #define ARM_NR_lstat64           196U
 #define ARM_NR_fstat64           197U
+#define ARM_NR_lchown32          198U
 #define ARM_NR_getuid32          199U
 #define ARM_NR_getgid32          200U
 #define ARM_NR_geteuid32         201U
@@ -172,6 +175,7 @@ extern char **environ;
 #define ARM_NR_recvmsg           297U
 #define ARM_NR_openat            322U
 #define ARM_NR_mkdirat           323U
+#define ARM_NR_fchownat          325U
 #define ARM_NR_fstatat64         327U
 #define ARM_NR_unlinkat          328U
 #define ARM_NR_renameat          329U
@@ -180,7 +184,7 @@ extern char **environ;
 #define ARM_NR_readlinkat        332U
 #define ARM_NR_fchmodat          333U
 #define ARM_NR_faccessat         334U
-#define ARM_NR_fchownat          335U
+#define ARM_NR_pselect6          335U
 #define ARM_NR_ppoll             336U
 #define ARM_NR_set_robust_list   338U
 #define ARM_NR_get_robust_list   339U
@@ -202,7 +206,10 @@ extern char **environ;
 #define ARM_NR_clock_gettime64   403U
 #define ARM_NR_clock_getres64    406U
 #define ARM_NR_clock_nanosleep64 407U
+#define ARM_NR_timerfd_gettime64 410U
+#define ARM_NR_timerfd_settime64 411U
 #define ARM_NR_utimensat_time64  412U
+#define ARM_NR_pselect6_time64   413U
 #define ARM_NR_ppoll_time64      414U
 #define ARM_NR_futex_time64      422U
 #define ARM_NR_faccessat2        439U
@@ -242,6 +249,21 @@ typedef struct arm_timespec32 {
     int32_t tv_nsec;
 } arm_timespec32_t;
 
+typedef struct arm_timeval32 {
+    int32_t tv_sec;
+    int32_t tv_usec;
+} arm_timeval32_t;
+
+typedef struct arm_itimerspec32 {
+    arm_timespec32_t it_interval;
+    arm_timespec32_t it_value;
+} arm_itimerspec32_t;
+
+typedef struct arm_itimerspec64 {
+    arm_timespec64_t it_interval;
+    arm_timespec64_t it_value;
+} arm_itimerspec64_t;
+
 typedef struct arm_stat64 {
     uint64_t st_dev;
     uint8_t  __pad0[4];
@@ -264,7 +286,7 @@ typedef struct arm_stat64 {
     uint64_t st_ino;
 } arm_stat64_t;
 
-typedef struct arm_statfs64 {
+typedef struct __attribute__((packed, aligned(4))) arm_statfs64 {
     uint32_t f_type;
     uint32_t f_bsize;
     uint64_t f_blocks;
@@ -278,6 +300,8 @@ typedef struct arm_statfs64 {
     uint32_t f_flags;
     uint32_t f_spare[4];
 } arm_statfs64_t;
+
+_Static_assert(sizeof(arm_statfs64_t) == 84, "arm_statfs64_t must be 84 bytes");
 
 typedef struct arm_rusage32 {
     struct { int32_t tv_sec; int32_t tv_usec; } ru_utime;
@@ -346,33 +370,48 @@ struct flock64_arm {
 };
 
 #define MAX_DIR_COOKIES 4096U
-static uint64_t g_dir_cookies[MAX_DIR_COOKIES];
-static size_t   g_dir_cookie_count = 0U;
+#define DIR_COOKIE_BASE 0x70000000LL
 
-static int64_t map_dir_cookie(uint64_t host_off)
+typedef struct dir_cookie_entry {
+    int      fd;
+    uint64_t off64;
+} dir_cookie_entry_t;
+
+static dir_cookie_entry_t g_dir_cookies[MAX_DIR_COOKIES];
+static size_t             g_dir_cookie_count = 0U;
+
+static int64_t map_dir_cookie(int fd, uint64_t host_off)
 {
-    if (host_off <= 0x7FFFFFFFULL) {
+    if (host_off < (uint64_t)DIR_COOKIE_BASE) {
         return (int64_t)host_off;
     }
-    for (size_t i = 0; i < g_dir_cookie_count; i++) {
-        if (g_dir_cookies[i] == host_off) {
-            return (int64_t)(i + 1);
+    for (size_t i = 0U; i < g_dir_cookie_count; i++) {
+        if (g_dir_cookies[i].fd == fd && g_dir_cookies[i].off64 == host_off) {
+            return DIR_COOKIE_BASE + (int64_t)i;
         }
     }
+    size_t idx;
     if (g_dir_cookie_count < MAX_DIR_COOKIES) {
-        size_t idx = g_dir_cookie_count++;
-        g_dir_cookies[idx] = host_off;
-        return (int64_t)(idx + 1);
+        idx = g_dir_cookie_count++;
+    } else {
+        idx = (size_t)(host_off % MAX_DIR_COOKIES);
     }
-    return (int64_t)(host_off & 0x7FFFFFFFULL);
+    g_dir_cookies[idx].fd    = fd;
+    g_dir_cookies[idx].off64 = host_off;
+    return DIR_COOKIE_BASE + (int64_t)idx;
 }
 
-static uint64_t unmap_dir_cookie(int64_t guest_off)
+static bool unmap_dir_cookie(int fd, int64_t guest_off, off_t *out_host_off)
 {
-    if (guest_off > 0 && (size_t)guest_off <= g_dir_cookie_count) {
-        return g_dir_cookies[guest_off - 1];
+    if (guest_off >= DIR_COOKIE_BASE &&
+        (uint64_t)(guest_off - DIR_COOKIE_BASE) < g_dir_cookie_count) {
+        size_t idx = (size_t)(guest_off - DIR_COOKIE_BASE);
+        if (g_dir_cookies[idx].fd == fd) {
+            *out_host_off = (off_t)g_dir_cookies[idx].off64;
+            return true;
+        }
     }
-    return (uint64_t)guest_off;
+    return false;
 }
 
 static uint32_t host_ret(ssize_t r)
@@ -391,48 +430,57 @@ static int translate_at_fd(uint32_t guest_dfd)
     return (int)(int32_t)guest_dfd;
 }
 
-static const char *resolve_guest_path(const a32_ctx_t *ctx, const char *guest_path,
-                                     char *buf, size_t buf_size)
+static int resolve_guest_path_ex(const a32_ctx_t *ctx, uint32_t guest_addr,
+                                 char *buf, size_t size, bool follow_final)
 {
-    if (!guest_path) {
-        return NULL;
+    if (guest_addr < 0x1000U || !buf || size == 0U) {
+        return -1;
     }
+    const char *guest_path = (const char *)a32_guest_ptr(ctx, guest_addr);
     if (ctx->sysroot && ctx->sysroot[0] != '\0' && guest_path[0] == '/') {
         if ((strncmp(guest_path, "/proc/", 6) == 0 ||
              strncmp(guest_path, "/sys/", 5) == 0 ||
              strncmp(guest_path, "/dev/", 5) == 0) &&
             access(guest_path, F_OK) == 0) {
-            return guest_path;
+            int n0 = snprintf(buf, size, "%s", guest_path);
+            return (n0 >= 0 && (size_t)n0 < size) ? 0 : -1;
         }
-        int n = snprintf(buf, buf_size, "%s%s", ctx->sysroot, guest_path);
-        if (n > 0 && (size_t)n < buf_size) {
-            for (int depth = 0; depth < 8; depth++) {
-                char link_target[PATH_MAX];
-                ssize_t ln = readlink(buf, link_target, sizeof(link_target) - 1U);
-                if (ln <= 0) {
-                    break;
-                }
-                link_target[ln] = '\0';
-                if (link_target[0] != '/') {
-                    break;
-                }
-                int n2 = snprintf(buf, buf_size, "%s%s", ctx->sysroot, link_target);
-                if (n2 <= 0 || (size_t)n2 >= buf_size) {
-                    break;
+        int n = snprintf(buf, size, "%s%s", ctx->sysroot, guest_path);
+        if (n > 0 && (size_t)n < size) {
+            if (follow_final) {
+                for (int depth = 0; depth < 8; depth++) {
+                    char link_target[PATH_MAX];
+                    ssize_t ln = readlink(buf, link_target, sizeof(link_target) - 1U);
+                    if (ln <= 0) {
+                        break;
+                    }
+                    link_target[ln] = '\0';
+                    if (link_target[0] != '/') {
+                        break;
+                    }
+                    int n2 = snprintf(buf, size, "%s%s", ctx->sysroot, link_target);
+                    if (n2 <= 0 || (size_t)n2 >= size) {
+                        break;
+                    }
                 }
             }
-            if (access(buf, F_OK) == 0) {
-                return buf;
+            struct stat st_chk;
+            if (fstatat(AT_FDCWD, buf, &st_chk, follow_final ? 0 : AT_SYMLINK_NOFOLLOW) == 0) {
+                return 0;
             }
-            if (strncmp(guest_path, "/proc", 5) == 0 ||
-                strncmp(guest_path, "/sys", 4) == 0 ||
-                strncmp(guest_path, "/dev", 4) == 0) {
-                return guest_path;
+            if ((strncmp(guest_path, "/proc", 5) == 0 ||
+                 strncmp(guest_path, "/sys", 4) == 0 ||
+                 strncmp(guest_path, "/dev", 4) == 0) &&
+                fstatat(AT_FDCWD, guest_path, &st_chk, 0) == 0) {
+                int n3 = snprintf(buf, size, "%s", guest_path);
+                return (n3 >= 0 && (size_t)n3 < size) ? 0 : -1;
             }
-            return buf;
+            return 0;
         }
+        return -1;
     }
-    return guest_path;
+    int n = snprintf(buf, size, "%s", guest_path);
+    return (n >= 0 && (size_t)n < size) ? 0 : -1;
 }
 
 static int create_anon_file(const char *name, const void *data, size_t len)
@@ -460,9 +508,9 @@ static int create_proc_maps(const a32_ctx_t *ctx)
 
     for (size_t i = 0; i < ctx->region_count && off + 256 < sizeof(buf); i++) {
         const a32_region_t *r = &ctx->regions[i];
-        char prot_r = (r->prot & 0x4) ? 'r' : '-';
-        char prot_w = (r->prot & 0x2) ? 'w' : '-';
-        char prot_x = (r->prot & 0x1) ? 'x' : '-';
+        char prot_r = (r->prot & 1U) ? 'r' : '-';
+        char prot_w = (r->prot & 2U) ? 'w' : '-';
+        char prot_x = (r->prot & 4U) ? 'x' : '-';
         char prot_s = (r->flags & 0x01) ? 's' : 'p';
         int n = snprintf(buf + off, sizeof(buf) - off,
                          "%08x-%08x %c%c%c%c 00000000 00:00 0 %s%s\n",
@@ -609,37 +657,45 @@ void a32_cleanup_robust_list(a32_ctx_t *ctx)
 typedef struct child_thread_args {
     a32_ctx_t   *child_ctx;
     uint32_t     flags;
+    uint32_t     ptid_va;
+    uint32_t     ctid_va;
+    int          child_tid;
     volatile int started;
 } child_thread_args_t;
 
-static void *child_thread_fn(void *arg)
+static void *guest_thread_start(void *arg)
 {
     child_thread_args_t *args = (child_thread_args_t *)arg;
-    a32_ctx_t *child_ctx = args->child_ctx;
-    uint32_t flags = args->flags;
+    a32_ctx_t *ctx    = args->child_ctx;
+    uint32_t flags    = args->flags;
+    uint32_t ptid_va  = args->ptid_va;
+    uint32_t ctid_va  = args->ctid_va;
 
-    a32_signals_set_thread_ctx(child_ctx);
-    child_ctx->host_tid = (int)syscall(SYS_gettid);
-    child_ctx->is_thread_clone = true;
+    a32_signals_set_thread_ctx(ctx);
+    ctx->host_tid        = (int)syscall(SYS_gettid);
+    ctx->is_thread_clone = true;
+    args->child_tid      = ctx->host_tid;
 
-    if (flags & (0x01000000U /* CLONE_CHILD_SETTID */ | 0x00200000U /* CLONE_CHILD_CLEARTID */)) {
-        if (child_ctx->clear_child_tid != 0U) {
-            *(uint32_t *)a32_guest_ptr(child_ctx, child_ctx->clear_child_tid) =
-                (uint32_t)child_ctx->host_tid;
-        }
+    if ((flags & 0x00100000U /* CLONE_PARENT_SETTID */) && ptid_va != 0U) {
+        *(uint32_t *)a32_guest_ptr(ctx, ptid_va) = (uint32_t)ctx->host_tid;
+    }
+    if ((flags & 0x01000000U /* CLONE_CHILD_SETTID */) && ctid_va != 0U) {
+        uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctid_va);
+        *ctid = (uint32_t)ctx->host_tid;
     }
 
-    args->started = 1;
+    __atomic_store_n(&args->started, 1, __ATOMIC_SEQ_CST);
 
-    a32_jit_run(child_ctx);
+    a32_jit_run(ctx);
 
-    a32_cleanup_robust_list(child_ctx);
-    if (child_ctx->clear_child_tid != 0U) {
-        uint32_t *ctid = (uint32_t *)a32_guest_ptr(child_ctx, child_ctx->clear_child_tid);
+    a32_cleanup_robust_list(ctx);
+    if (ctx->clear_child_tid != 0U) {
+        uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctx->clear_child_tid);
         *ctid = 0U;
         syscall(SYS_futex, ctid, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
     }
-    free(child_ctx);
+    a32_signals_set_thread_ctx(NULL);
+    free(ctx);
     return NULL;
 }
 
@@ -688,6 +744,8 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 *ctid = 0U;
                 syscall(SYS_futex, ctid, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
             }
+            a32_signals_set_thread_ctx(NULL);
+            free(ctx);
             pthread_exit(NULL);
         }
         print_stats_if_enabled(ctx);
@@ -737,6 +795,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_open: {
+        if (a0 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         if (strcmp(guest_path, "/proc/self/maps") == 0) {
             ctx->regs[0] = (uint32_t)create_proc_maps(ctx);
@@ -751,12 +813,20 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(openat(AT_FDCWD, path, (int)a1, (mode_t)a2));
+        bool follow = ((a1 & 0100000U /* O_NOFOLLOW */) == 0U);
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(openat(AT_FDCWD, resolved, (int)a1, (mode_t)a2));
         break;
     }
 
     case ARM_NR_openat: {
+        if (a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         if (strcmp(guest_path, "/proc/self/maps") == 0) {
             ctx->regs[0] = (uint32_t)create_proc_maps(ctx);
@@ -771,34 +841,53 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(openat(translate_at_fd(a0), path, (int)a2, (mode_t)a3));
+        bool follow = ((a2 & 0100000U /* O_NOFOLLOW */) == 0U);
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(openat(translate_at_fd(a0), resolved, (int)a2, (mode_t)a3));
         break;
     }
 
     case ARM_NR_close:
+        for (size_t i = 0U; i < g_dir_cookie_count; i++) {
+            if (g_dir_cookies[i].fd == (int)a0) {
+                g_dir_cookies[i].fd = -1;
+            }
+        }
         ctx->regs[0] = host_ret(close((int)a0));
         break;
 
     case ARM_NR_lseek: {
         off_t off = (off_t)(int32_t)a1;
-        if (a2 == SEEK_SET && off > 0 && (size_t)off <= g_dir_cookie_count) {
-            off = (off_t)unmap_dir_cookie((int64_t)off);
+        if (a2 == SEEK_SET) {
+            (void)unmap_dir_cookie((int)a0, (int64_t)off, &off);
         }
-        ctx->regs[0] = host_ret((ssize_t)lseek((int)a0, off, (int)a2));
+        off_t res = lseek((int)a0, off, (int)a2);
+        if (res < 0) {
+            ctx->regs[0] = (uint32_t)(-errno);
+        } else if ((uint64_t)res >= (uint64_t)DIR_COOKIE_BASE) {
+            ctx->regs[0] = (uint32_t)map_dir_cookie((int)a0, (uint64_t)res);
+        } else {
+            ctx->regs[0] = (uint32_t)res;
+        }
         break;
     }
 
     case ARM_NR__llseek: {
         off_t off = (off_t)(((uint64_t)a1 << 32) | (uint64_t)a2);
-        if (a4 == SEEK_SET && off > 0 && (size_t)off <= g_dir_cookie_count) {
-            off = (off_t)unmap_dir_cookie((int64_t)off);
+        if (a4 == SEEK_SET) {
+            (void)unmap_dir_cookie((int)a0, (int64_t)off, &off);
         }
         off_t res = lseek((int)a0, off, (int)a4);
         if (res < 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             uint64_t ures = (uint64_t)res;
+            if (ures >= (uint64_t)DIR_COOKIE_BASE) {
+                ures = (uint64_t)map_dir_cookie((int)a0, ures);
+            }
             memcpy(a32_guest_ptr(ctx, a3), &ures, sizeof(ures));
             ctx->regs[0] = 0U;
         }
@@ -819,6 +908,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
 
     case ARM_NR_munmap:
         ctx->regs[0] = (uint32_t)a32_vm_munmap(ctx, a0, a1);
+        break;
+
+    case ARM_NR_mremap:
+        ctx->regs[0] = a32_vm_mremap(ctx, a0, a1, a2, a3, a4);
         break;
 
     case ARM_NR_ioctl: {
@@ -896,6 +989,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_fstat64: {
+        if (a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         struct stat st;
         if (fstat((int)a0, &st) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
@@ -908,12 +1005,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
 
     case ARM_NR_stat64:
     case ARM_NR_lstat64: {
+        if (a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         struct stat st;
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
+        bool follow = (nr != ARM_NR_lstat64);
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         int flags = (nr == ARM_NR_lstat64) ? AT_SYMLINK_NOFOLLOW : 0;
-        if (fstatat(AT_FDCWD, path, &st, flags) != 0) {
+        if (fstatat(AT_FDCWD, resolved, &st, flags) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             fill_arm_stat64((arm_stat64_t *)a32_guest_ptr(ctx, a1), &st);
@@ -923,11 +1027,18 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_fstatat64: {
+        if (a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         struct stat st;
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        if (fstatat(translate_at_fd(a0), path, &st, (int)a3) != 0) {
+        bool follow = ((a3 & 0x100U /* AT_SYMLINK_NOFOLLOW */) == 0U);
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        if (fstatat(translate_at_fd(a0), resolved, &st, (int)a3) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             fill_arm_stat64((arm_stat64_t *)a32_guest_ptr(ctx, a2), &st);
@@ -937,19 +1048,24 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_access: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(faccessat(AT_FDCWD, path, (int)a1, 0));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(faccessat(AT_FDCWD, resolved, (int)a1, 0));
         break;
     }
 
     case ARM_NR_faccessat:
     case ARM_NR_faccessat2: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(faccessat(translate_at_fd(a0), path, (int)a2, (int)a3));
+        bool follow = (nr == ARM_NR_faccessat) || ((a3 & 0x100U /* AT_SYMLINK_NOFOLLOW */) == 0U);
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(faccessat(translate_at_fd(a0), resolved, (int)a2, 0));
         break;
     }
 
@@ -1047,10 +1163,22 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_chown32: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(fchownat(AT_FDCWD, path, (uid_t)a1, (gid_t)a2, 0));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(fchownat(AT_FDCWD, resolved, (uid_t)a1, (gid_t)a2, 0));
+        break;
+    }
+
+    case ARM_NR_lchown32: {
+        char resolved[PATH_MAX];
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(fchownat(AT_FDCWD, resolved, (uid_t)a1, (gid_t)a2, AT_SYMLINK_NOFOLLOW));
         break;
     }
 
@@ -1143,11 +1271,21 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_statfs64: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
+        if (a1 != sizeof(arm_statfs64_t) && a1 != 88U) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        if (a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         struct statfs sfs;
-        if (statfs(path, &sfs) != 0) {
+        if (statfs(resolved, &sfs) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             fill_arm_statfs64((arm_statfs64_t *)a32_guest_ptr(ctx, a2), &sfs);
@@ -1157,6 +1295,14 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_fstatfs64: {
+        if (a1 != sizeof(arm_statfs64_t) && a1 != 88U) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        if (a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         struct statfs sfs;
         if (fstatfs((int)a0, &sfs) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
@@ -1260,7 +1406,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 if (d->d_reclen == 0) {
                     break;
                 }
-                d->d_off = map_dir_cookie((uint64_t)d->d_off);
+                d->d_off = map_dir_cookie((int)a0, (uint64_t)d->d_off);
                 pos += d->d_reclen;
             }
         }
@@ -1305,7 +1451,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             }
             uint32_t *d32_words = (uint32_t *)(out + out_pos);
             d32_words[0] = (uint32_t)d64->d_ino;
-            d32_words[1] = (uint32_t)(map_dir_cookie((uint64_t)d64->d_off) & 0x7FFFFFFFU);
+            d32_words[1] = (uint32_t)(map_dir_cookie((int)a0, (uint64_t)d64->d_off) & 0x7FFFFFFFU);
             *(uint16_t *)(out + out_pos + 8) = (uint16_t)reclen32;
             memcpy(out + out_pos + 10, d64->d_name, namelen + 1);
             out[out_pos + reclen32 - 1] = d64->d_type;
@@ -1335,15 +1481,28 @@ int a32_handle_syscall(a32_ctx_t *ctx)
 
     case ARM_NR_clone: {
         uint32_t flags = a0;
-        if ((flags & 0x00000100U /* CLONE_VM */) != 0U && (flags & 0x00004000U /* CLONE_VFORK */) == 0U) {
+        bool is_thread = ((flags & 0x00000100U /* CLONE_VM */) != 0U &&
+                          (flags & 0x00004000U /* CLONE_VFORK */) == 0U);
+        if (is_thread) {
             a32_ctx_t *child_ctx = (a32_ctx_t *)calloc(1, sizeof(a32_ctx_t));
             if (!child_ctx) {
                 ctx->regs[0] = (uint32_t)(-ENOMEM);
                 break;
             }
             memcpy(child_ctx, ctx, sizeof(a32_ctx_t));
-            child_ctx->regs[0]  = 0U;
-            child_ctx->regs[13] = a1 ? a1 : ctx->regs[13];
+            child_ctx->regs[0]          = 0U;
+            child_ctx->regs[13]         = a1 ? a1 : ctx->regs[13];
+            child_ctx->clear_child_tid  = 0U;
+            child_ctx->robust_list_head = 0U;
+            child_ctx->robust_list_len  = 0U;
+            child_ctx->pending_signals  = 0ULL;
+            child_ctx->altstack_sp      = 0U;
+            child_ctx->altstack_size    = 0U;
+            child_ctx->altstack_flags   = 2U; /* SS_DISABLE */
+            child_ctx->ras_top          = 0U;
+            memset(child_ctx->ras_key, 0, sizeof(child_ctx->ras_key));
+            memset(child_ctx->ibtc, 0, sizeof(child_ctx->ibtc));
+
             if (flags & 0x00080000U /* CLONE_SETTLS */) {
                 child_ctx->tls_tp = a3;
             }
@@ -1354,6 +1513,9 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             child_thread_args_t targs;
             targs.child_ctx = child_ctx;
             targs.flags     = flags;
+            targs.ptid_va   = a2;
+            targs.ctid_va   = a4;
+            targs.child_tid = 0;
             targs.started   = 0;
 
             pthread_t pt;
@@ -1361,7 +1523,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-            int prc = pthread_create(&pt, &attr, child_thread_fn, &targs);
+            int prc = pthread_create(&pt, &attr, guest_thread_start, &targs);
             pthread_attr_destroy(&attr);
             if (prc != 0) {
                 free(child_ctx);
@@ -1369,17 +1531,11 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 break;
             }
 
-            while (!targs.started) {
+            while (!__atomic_load_n(&targs.started, __ATOMIC_SEQ_CST)) {
                 sched_yield();
             }
 
-            if (flags & 0x00100000U /* CLONE_PARENT_SETTID */) {
-                if (a2 != 0U) {
-                    *(uint32_t *)a32_guest_ptr(ctx, a2) = (uint32_t)child_ctx->host_tid;
-                }
-            }
-
-            ctx->regs[0] = (uint32_t)child_ctx->host_tid;
+            ctx->regs[0] = (uint32_t)targs.child_tid;
             break;
         }
 
@@ -1402,9 +1558,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_execve: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        const char *path = resolved;
 
         char *new_argv[512];
         int argc_count = 0;
@@ -1581,11 +1740,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_truncate64: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         off_t len = (off_t)(((uint64_t)a3 << 32) | (uint64_t)a2);
-        ctx->regs[0] = host_ret(truncate(path, len));
+        ctx->regs[0] = host_ret(truncate(resolved, len));
         break;
     }
 
@@ -1602,10 +1763,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_statx: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(syscall(SYS_statx, translate_at_fd(a0), path,
+        bool follow = ((a2 & 0x100U /* AT_SYMLINK_NOFOLLOW */) == 0U);
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(syscall(SYS_statx, translate_at_fd(a0), resolved,
                                         (int)a2, (unsigned int)a3,
                                         a32_guest_ptr(ctx, a4)));
         break;
@@ -1796,7 +1960,116 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
     }
 
-    /* Polling, epoll, eventfd, timerfd */
+    /* Select, polling, epoll, eventfd, timerfd */
+    case ARM_NR__newselect:
+    case ARM_NR_pselect6:
+    case ARM_NR_pselect6_time64: {
+        int nfds = (int)a0;
+        if (nfds < 0) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        struct timespec host_ts;
+        struct timespec *ts_ptr = NULL;
+        if (a4 != 0U) {
+            if (a4 < 0x1000U) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            if (nr == ARM_NR__newselect) {
+                const arm_timeval32_t *tv32 = (const arm_timeval32_t *)a32_guest_ptr(ctx, a4);
+                if (tv32->tv_sec < 0 || tv32->tv_usec < 0 || tv32->tv_usec >= 1000000) {
+                    ctx->regs[0] = (uint32_t)(-EINVAL);
+                    break;
+                }
+                host_ts.tv_sec  = (time_t)tv32->tv_sec;
+                host_ts.tv_nsec = (long)tv32->tv_usec * 1000L;
+            } else if (nr == ARM_NR_pselect6) {
+                const arm_timespec32_t *ts32 = (const arm_timespec32_t *)a32_guest_ptr(ctx, a4);
+                host_ts.tv_sec  = (time_t)ts32->tv_sec;
+                host_ts.tv_nsec = (long)ts32->tv_nsec;
+            } else {
+                const arm_timespec64_t *ts64 = (const arm_timespec64_t *)a32_guest_ptr(ctx, a4);
+                host_ts.tv_sec  = (time_t)ts64->tv_sec;
+                host_ts.tv_nsec = (long)ts64->tv_nsec;
+            }
+            ts_ptr = &host_ts;
+        }
+
+        struct {
+            const void *ss;
+            size_t      ss_len;
+        } host_sig_pack;
+        void *sig_arg = NULL;
+        if (nr != ARM_NR__newselect && a5 != 0U) {
+            if (a5 < 0x1000U) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            const uint32_t *g_pack = (const uint32_t *)a32_guest_ptr(ctx, a5);
+            host_sig_pack.ss     = (g_pack[0] != 0U) ? a32_guest_ptr(ctx, g_pack[0]) : NULL;
+            host_sig_pack.ss_len = (size_t)g_pack[1];
+            sig_arg = &host_sig_pack;
+        }
+
+        uint64_t rset[16], wset[16], eset[16];
+        void *r_ptr = NULL;
+        void *w_ptr = NULL;
+        void *e_ptr = NULL;
+        size_t fd_bytes32 = (((size_t)nfds + 31U) / 32U) * 4U;
+        if (nfds <= 1024) {
+            if (a1 != 0U) {
+                memset(rset, 0, sizeof(rset));
+                memcpy(rset, a32_guest_ptr(ctx, a1), fd_bytes32);
+                r_ptr = rset;
+            }
+            if (a2 != 0U) {
+                memset(wset, 0, sizeof(wset));
+                memcpy(wset, a32_guest_ptr(ctx, a2), fd_bytes32);
+                w_ptr = wset;
+            }
+            if (a3 != 0U) {
+                memset(eset, 0, sizeof(eset));
+                memcpy(eset, a32_guest_ptr(ctx, a3), fd_bytes32);
+                e_ptr = eset;
+            }
+        } else {
+            r_ptr = (a1 != 0U) ? a32_guest_ptr(ctx, a1) : NULL;
+            w_ptr = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
+            e_ptr = (a3 != 0U) ? a32_guest_ptr(ctx, a3) : NULL;
+        }
+
+        long r = syscall(SYS_pselect6, nfds, r_ptr, w_ptr, e_ptr, ts_ptr, sig_arg);
+        if (r >= 0 && nfds <= 1024) {
+            if (a1 != 0U) {
+                memcpy(a32_guest_ptr(ctx, a1), rset, fd_bytes32);
+            }
+            if (a2 != 0U) {
+                memcpy(a32_guest_ptr(ctx, a2), wset, fd_bytes32);
+            }
+            if (a3 != 0U) {
+                memcpy(a32_guest_ptr(ctx, a3), eset, fd_bytes32);
+            }
+        }
+        if (a4 != 0U && (r >= 0 || errno == EINTR)) {
+            if (nr == ARM_NR__newselect) {
+                arm_timeval32_t *tv32 = (arm_timeval32_t *)a32_guest_ptr(ctx, a4);
+                tv32->tv_sec  = (int32_t)host_ts.tv_sec;
+                tv32->tv_usec = (int32_t)(host_ts.tv_nsec / 1000L);
+            } else if (nr == ARM_NR_pselect6) {
+                arm_timespec32_t *ts32 = (arm_timespec32_t *)a32_guest_ptr(ctx, a4);
+                ts32->tv_sec  = (int32_t)host_ts.tv_sec;
+                ts32->tv_nsec = (int32_t)host_ts.tv_nsec;
+            } else {
+                arm_timespec64_t *ts64 = (arm_timespec64_t *)a32_guest_ptr(ctx, a4);
+                ts64->tv_sec  = (int64_t)host_ts.tv_sec;
+                ts64->tv_nsec = (int64_t)host_ts.tv_nsec;
+            }
+        }
+        ctx->regs[0] = host_ret(r);
+        break;
+    }
+
     case ARM_NR_poll:
         ctx->regs[0] = host_ret(poll((struct pollfd *)a32_guest_ptr(ctx, a0),
                                     (nfds_t)a1, (int)a2));
@@ -1868,15 +2141,97 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         ctx->regs[0] = host_ret(timerfd_create((int)a0, (int)a1));
         break;
 
-    case ARM_NR_timerfd_settime:
-        ctx->regs[0] = host_ret(timerfd_settime((int)a0, (int)a1,
-                                               (const struct itimerspec *)a32_guest_ptr(ctx, a2),
-                                               a3 ? (struct itimerspec *)a32_guest_ptr(ctx, a3) : NULL));
+    case ARM_NR_timerfd_settime: {
+        if (a2 < 0x1000U || (a3 != 0U && a3 < 0x1000U)) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        arm_itimerspec32_t g_in;
+        memcpy(&g_in, a32_guest_ptr(ctx, a2), sizeof(g_in));
+        struct itimerspec h_in, h_out;
+        memset(&h_out, 0, sizeof(h_out));
+        h_in.it_interval.tv_sec  = (time_t)g_in.it_interval.tv_sec;
+        h_in.it_interval.tv_nsec = (long)g_in.it_interval.tv_nsec;
+        h_in.it_value.tv_sec     = (time_t)g_in.it_value.tv_sec;
+        h_in.it_value.tv_nsec    = (long)g_in.it_value.tv_nsec;
+        int r = timerfd_settime((int)a0, (int)a1, &h_in, (a3 != 0U) ? &h_out : NULL);
+        if (r == 0 && a3 != 0U) {
+            arm_itimerspec32_t g_out;
+            g_out.it_interval.tv_sec  = (int32_t)h_out.it_interval.tv_sec;
+            g_out.it_interval.tv_nsec = (int32_t)h_out.it_interval.tv_nsec;
+            g_out.it_value.tv_sec     = (int32_t)h_out.it_value.tv_sec;
+            g_out.it_value.tv_nsec    = (int32_t)h_out.it_value.tv_nsec;
+            memcpy(a32_guest_ptr(ctx, a3), &g_out, sizeof(g_out));
+        }
+        ctx->regs[0] = host_ret(r);
         break;
+    }
 
-    case ARM_NR_timerfd_gettime:
-        ctx->regs[0] = host_ret(timerfd_gettime((int)a0, (struct itimerspec *)a32_guest_ptr(ctx, a1)));
+    case ARM_NR_timerfd_settime64: {
+        if (a2 < 0x1000U || (a3 != 0U && a3 < 0x1000U)) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        arm_itimerspec64_t g_in;
+        memcpy(&g_in, a32_guest_ptr(ctx, a2), sizeof(g_in));
+        struct itimerspec h_in, h_out;
+        memset(&h_out, 0, sizeof(h_out));
+        h_in.it_interval.tv_sec  = (time_t)g_in.it_interval.tv_sec;
+        h_in.it_interval.tv_nsec = (long)g_in.it_interval.tv_nsec;
+        h_in.it_value.tv_sec     = (time_t)g_in.it_value.tv_sec;
+        h_in.it_value.tv_nsec    = (long)g_in.it_value.tv_nsec;
+        int r = timerfd_settime((int)a0, (int)a1, &h_in, (a3 != 0U) ? &h_out : NULL);
+        if (r == 0 && a3 != 0U) {
+            arm_itimerspec64_t g_out;
+            g_out.it_interval.tv_sec  = (int64_t)h_out.it_interval.tv_sec;
+            g_out.it_interval.tv_nsec = (int64_t)h_out.it_interval.tv_nsec;
+            g_out.it_value.tv_sec     = (int64_t)h_out.it_value.tv_sec;
+            g_out.it_value.tv_nsec    = (int64_t)h_out.it_value.tv_nsec;
+            memcpy(a32_guest_ptr(ctx, a3), &g_out, sizeof(g_out));
+        }
+        ctx->regs[0] = host_ret(r);
         break;
+    }
+
+    case ARM_NR_timerfd_gettime: {
+        if (a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        struct itimerspec h_out;
+        memset(&h_out, 0, sizeof(h_out));
+        int r = timerfd_gettime((int)a0, &h_out);
+        if (r == 0) {
+            arm_itimerspec32_t g_out;
+            g_out.it_interval.tv_sec  = (int32_t)h_out.it_interval.tv_sec;
+            g_out.it_interval.tv_nsec = (int32_t)h_out.it_interval.tv_nsec;
+            g_out.it_value.tv_sec     = (int32_t)h_out.it_value.tv_sec;
+            g_out.it_value.tv_nsec    = (int32_t)h_out.it_value.tv_nsec;
+            memcpy(a32_guest_ptr(ctx, a1), &g_out, sizeof(g_out));
+        }
+        ctx->regs[0] = host_ret(r);
+        break;
+    }
+
+    case ARM_NR_timerfd_gettime64: {
+        if (a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        struct itimerspec h_out;
+        memset(&h_out, 0, sizeof(h_out));
+        int r = timerfd_gettime((int)a0, &h_out);
+        if (r == 0) {
+            arm_itimerspec64_t g_out;
+            g_out.it_interval.tv_sec  = (int64_t)h_out.it_interval.tv_sec;
+            g_out.it_interval.tv_nsec = (int64_t)h_out.it_interval.tv_nsec;
+            g_out.it_value.tv_sec     = (int64_t)h_out.it_value.tv_sec;
+            g_out.it_value.tv_nsec    = (int64_t)h_out.it_value.tv_nsec;
+            memcpy(a32_guest_ptr(ctx, a1), &g_out, sizeof(g_out));
+        }
+        ctx->regs[0] = host_ret(r);
+        break;
+    }
 
     /* Filesystem & descriptor management */
     case ARM_NR_dup:
@@ -1916,10 +2271,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_chdir: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(chdir(path));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(chdir(resolved));
         break;
     }
 
@@ -1928,117 +2285,143 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_mkdir: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(mkdir(path, (mode_t)a1));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(mkdir(resolved, (mode_t)a1));
         break;
     }
 
     case ARM_NR_mkdirat: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(mkdirat(translate_at_fd(a0), path, (mode_t)a2));
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(mkdirat(translate_at_fd(a0), resolved, (mode_t)a2));
         break;
     }
 
     case ARM_NR_rmdir: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(rmdir(path));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(rmdir(resolved));
         break;
     }
 
     case ARM_NR_unlink: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(unlink(path));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(unlink(resolved));
         break;
     }
 
     case ARM_NR_unlinkat: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(unlinkat(translate_at_fd(a0), path, (int)a2));
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(unlinkat(translate_at_fd(a0), resolved, (int)a2));
         break;
     }
 
     case ARM_NR_rename: {
-        const char *g_old = (const char *)a32_guest_ptr(ctx, a0);
-        const char *g_new = (const char *)a32_guest_ptr(ctx, a1);
         char r_old[PATH_MAX], r_new[PATH_MAX];
-        const char *p_old = resolve_guest_path(ctx, g_old, r_old, sizeof(r_old));
-        const char *p_new = resolve_guest_path(ctx, g_new, r_new, sizeof(r_new));
-        ctx->regs[0] = host_ret(rename(p_old, p_new));
+        if (resolve_guest_path_ex(ctx, a0, r_old, sizeof(r_old), false) < 0 ||
+            resolve_guest_path_ex(ctx, a1, r_new, sizeof(r_new), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(rename(r_old, r_new));
         break;
     }
 
     case ARM_NR_renameat: {
-        const char *g_old = (const char *)a32_guest_ptr(ctx, a1);
-        const char *g_new = (const char *)a32_guest_ptr(ctx, a3);
         char r_old[PATH_MAX], r_new[PATH_MAX];
-        const char *p_old = resolve_guest_path(ctx, g_old, r_old, sizeof(r_old));
-        const char *p_new = resolve_guest_path(ctx, g_new, r_new, sizeof(r_new));
-        ctx->regs[0] = host_ret(renameat(translate_at_fd(a0), p_old,
-                                        translate_at_fd(a2), p_new));
+        if (resolve_guest_path_ex(ctx, a1, r_old, sizeof(r_old), false) < 0 ||
+            resolve_guest_path_ex(ctx, a3, r_new, sizeof(r_new), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(renameat(translate_at_fd(a0), r_old,
+                                        translate_at_fd(a2), r_new));
         break;
     }
 
     case ARM_NR_renameat2: {
-        const char *g_old = (const char *)a32_guest_ptr(ctx, a1);
-        const char *g_new = (const char *)a32_guest_ptr(ctx, a3);
         char r_old[PATH_MAX], r_new[PATH_MAX];
-        const char *p_old = resolve_guest_path(ctx, g_old, r_old, sizeof(r_old));
-        const char *p_new = resolve_guest_path(ctx, g_new, r_new, sizeof(r_new));
-        ctx->regs[0] = host_ret(syscall(SYS_renameat2, translate_at_fd(a0), p_old,
-                                        translate_at_fd(a2), p_new, (unsigned int)a4));
+        if (resolve_guest_path_ex(ctx, a1, r_old, sizeof(r_old), false) < 0 ||
+            resolve_guest_path_ex(ctx, a3, r_new, sizeof(r_new), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(syscall(SYS_renameat2, translate_at_fd(a0), r_old,
+                                        translate_at_fd(a2), r_new, (unsigned int)a4));
         break;
     }
 
     case ARM_NR_link: {
-        const char *g_old = (const char *)a32_guest_ptr(ctx, a0);
-        const char *g_new = (const char *)a32_guest_ptr(ctx, a1);
         char r_old[PATH_MAX], r_new[PATH_MAX];
-        const char *p_old = resolve_guest_path(ctx, g_old, r_old, sizeof(r_old));
-        const char *p_new = resolve_guest_path(ctx, g_new, r_new, sizeof(r_new));
-        ctx->regs[0] = host_ret(link(p_old, p_new));
+        if (resolve_guest_path_ex(ctx, a0, r_old, sizeof(r_old), false) < 0 ||
+            resolve_guest_path_ex(ctx, a1, r_new, sizeof(r_new), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(link(r_old, r_new));
         break;
     }
 
     case ARM_NR_linkat: {
-        const char *g_old = (const char *)a32_guest_ptr(ctx, a1);
-        const char *g_new = (const char *)a32_guest_ptr(ctx, a3);
         char r_old[PATH_MAX], r_new[PATH_MAX];
-        const char *p_old = resolve_guest_path(ctx, g_old, r_old, sizeof(r_old));
-        const char *p_new = resolve_guest_path(ctx, g_new, r_new, sizeof(r_new));
-        ctx->regs[0] = host_ret(linkat(translate_at_fd(a0), p_old,
-                                      translate_at_fd(a2), p_new, (int)a4));
+        bool follow_old = ((a4 & 0x400U /* AT_SYMLINK_FOLLOW */) != 0U);
+        if (resolve_guest_path_ex(ctx, a1, r_old, sizeof(r_old), follow_old) < 0 ||
+            resolve_guest_path_ex(ctx, a3, r_new, sizeof(r_new), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(linkat(translate_at_fd(a0), r_old,
+                                      translate_at_fd(a2), r_new, (int)a4));
         break;
     }
 
     case ARM_NR_symlink: {
-        const char *target = (const char *)a32_guest_ptr(ctx, a0);
-        const char *linkpath = (const char *)a32_guest_ptr(ctx, a1);
         char r_link[PATH_MAX];
-        const char *p_link = resolve_guest_path(ctx, linkpath, r_link, sizeof(r_link));
-        ctx->regs[0] = host_ret(symlink(target, p_link));
+        if (a0 < 0x1000U ||
+            resolve_guest_path_ex(ctx, a1, r_link, sizeof(r_link), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        const char *target = (const char *)a32_guest_ptr(ctx, a0);
+        ctx->regs[0] = host_ret(symlink(target, r_link));
         break;
     }
 
     case ARM_NR_symlinkat: {
-        const char *target = (const char *)a32_guest_ptr(ctx, a0);
-        const char *linkpath = (const char *)a32_guest_ptr(ctx, a2);
         char r_link[PATH_MAX];
-        const char *p_link = resolve_guest_path(ctx, linkpath, r_link, sizeof(r_link));
-        ctx->regs[0] = host_ret(symlinkat(target, translate_at_fd(a1), p_link));
+        if (a0 < 0x1000U ||
+            resolve_guest_path_ex(ctx, a2, r_link, sizeof(r_link), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        const char *target = (const char *)a32_guest_ptr(ctx, a0);
+        ctx->regs[0] = host_ret(symlinkat(target, translate_at_fd(a1), r_link));
         break;
     }
 
     case ARM_NR_readlink: {
+        if (a0 < 0x1000U || a1 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         if (strcmp(guest_path, "/proc/self/exe") == 0) {
             const char *ep = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : ctx->guest_argv[0];
@@ -2049,12 +2432,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(readlink(path, (char *)a32_guest_ptr(ctx, a1), (size_t)a2));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(readlink(resolved, (char *)a32_guest_ptr(ctx, a1), (size_t)a2));
         break;
     }
 
     case ARM_NR_readlinkat: {
+        if (a1 < 0x1000U || a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         if (strcmp(guest_path, "/proc/self/exe") == 0) {
             const char *ep = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : ctx->guest_argv[0];
@@ -2065,17 +2455,22 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(readlinkat(translate_at_fd(a0), path,
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(readlinkat(translate_at_fd(a0), resolved,
                                           (char *)a32_guest_ptr(ctx, a2), (size_t)a3));
         break;
     }
 
     case ARM_NR_chmod: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(chmod(path, (mode_t)a1));
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(chmod(resolved, (mode_t)a1));
         break;
     }
 
@@ -2084,20 +2479,25 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_fchmodat: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(fchmodat(translate_at_fd(a0), path, (mode_t)a2, 0));
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(fchmodat(translate_at_fd(a0), resolved, (mode_t)a2, 0));
         break;
     }
 
     case ARM_NR_chown:
     case ARM_NR_lchown: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        int r = (nr == ARM_NR_lchown) ? lchown(path, (uid_t)a1, (gid_t)a2)
-                                      : chown(path, (uid_t)a1, (gid_t)a2);
+        bool follow = (nr != ARM_NR_lchown);
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        int r = (nr == ARM_NR_lchown) ? lchown(resolved, (uid_t)a1, (gid_t)a2)
+                                      : chown(resolved, (uid_t)a1, (gid_t)a2);
         ctx->regs[0] = host_ret(r);
         break;
     }
@@ -2107,10 +2507,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_fchownat: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
-        ctx->regs[0] = host_ret(fchownat(translate_at_fd(a0), path, (uid_t)a2, (gid_t)a3, (int)a4));
+        bool follow = ((a4 & 0x100U /* AT_SYMLINK_NOFOLLOW */) == 0U);
+        if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(fchownat(translate_at_fd(a0), resolved, (uid_t)a2, (gid_t)a3, (int)a4));
         break;
     }
 
@@ -2127,12 +2530,23 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_utimensat: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
+        const char *path = NULL;
+        if (a1 != 0U) {
+            bool follow = ((a3 & 0x100U /* AT_SYMLINK_NOFOLLOW */) == 0U);
+            if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            path = resolved;
+        }
         struct timespec host_ts[2];
         struct timespec *ts_ptr = NULL;
         if (a2 != 0U) {
+            if (a2 < 0x1000U) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
             const arm_timespec32_t *gts = (const arm_timespec32_t *)a32_guest_ptr(ctx, a2);
             host_ts[0].tv_sec  = (time_t)gts[0].tv_sec;
             host_ts[0].tv_nsec = (long)gts[0].tv_nsec;
@@ -2140,17 +2554,28 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             host_ts[1].tv_nsec = (long)gts[1].tv_nsec;
             ts_ptr = host_ts;
         }
-        ctx->regs[0] = host_ret(utimensat(translate_at_fd(a0), path, ts_ptr, (int)a3));
+        ctx->regs[0] = host_ret(syscall(SYS_utimensat, translate_at_fd(a0), path, ts_ptr, (int)a3));
         break;
     }
 
     case ARM_NR_utimensat_time64: {
-        const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
         char resolved[PATH_MAX];
-        const char *path = resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved));
+        const char *path = NULL;
+        if (a1 != 0U) {
+            bool follow = ((a3 & 0x100U /* AT_SYMLINK_NOFOLLOW */) == 0U);
+            if (resolve_guest_path_ex(ctx, a1, resolved, sizeof(resolved), follow) < 0) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
+            path = resolved;
+        }
         struct timespec host_ts[2];
         struct timespec *ts_ptr = NULL;
         if (a2 != 0U) {
+            if (a2 < 0x1000U) {
+                ctx->regs[0] = (uint32_t)(-EFAULT);
+                break;
+            }
             const arm_timespec64_t *gts = (const arm_timespec64_t *)a32_guest_ptr(ctx, a2);
             host_ts[0].tv_sec  = (time_t)gts[0].tv_sec;
             host_ts[0].tv_nsec = (long)gts[0].tv_nsec;
@@ -2158,7 +2583,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             host_ts[1].tv_nsec = (long)gts[1].tv_nsec;
             ts_ptr = host_ts;
         }
-        ctx->regs[0] = host_ret(utimensat(translate_at_fd(a0), path, ts_ptr, (int)a3));
+        ctx->regs[0] = host_ret(syscall(SYS_utimensat, translate_at_fd(a0), path, ts_ptr, (int)a3));
         break;
     }
 

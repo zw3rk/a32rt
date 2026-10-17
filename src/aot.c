@@ -18,8 +18,11 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    1U
+#define A32_AOT_VERSION    2U
 #define A32_MAX_AOT_SCAN   256U
+#define A32_AOT_MAX_BLOCKS 16384U
+#define A32_AOT_MAX_WORDS  2048U
+#define A32_AOT_MAX_PC_MAP 256U
 
 typedef struct a32_aot_header {
     uint32_t magic;
@@ -30,13 +33,11 @@ typedef struct a32_aot_header {
 
 typedef struct a32_aot_block_header {
     uint32_t guest_pc;
+    uint32_t guest_end_pc;
     uint32_t is_thumb;
     uint32_t word_count;
+    uint32_t pc_map_count;
 } a32_aot_block_header_t;
-
-typedef void (*a32_block_iter_fn)(uint32_t guest_pc, bool is_thumb,
-                                  const uint32_t *words, size_t word_count, void *arg);
-void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg);
 
 static uint64_t fnv1a_64_step(uint64_t hash, const void *data, size_t len)
 {
@@ -59,6 +60,15 @@ static uint64_t compute_elf_hash(const char *elf_path)
             uint64_t mt = (uint64_t)st.st_mtime;
             h = fnv1a_64_step(h, &sz, sizeof(sz));
             h = fnv1a_64_step(h, &mt, sizeof(mt));
+        }
+        FILE *f = fopen(elf_path, "rb");
+        if (f != NULL) {
+            uint8_t buf[4096];
+            size_t n = fread(buf, 1U, sizeof(buf), f);
+            if (n > 0U) {
+                h = fnv1a_64_step(h, buf, n);
+            }
+            fclose(f);
         }
     }
     return h;
@@ -89,28 +99,39 @@ typedef struct aot_save_state {
     bool     error;
 } aot_save_state_t;
 
-static void count_block_cb(uint32_t guest_pc, bool is_thumb,
-                           const uint32_t *words, size_t word_count, void *arg)
+static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thumb,
+                           const uint32_t *words, size_t word_count,
+                           const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
+                           void *arg)
 {
     (void)guest_pc;
+    (void)guest_end_pc;
     (void)is_thumb;
     (void)words;
     (void)word_count;
+    (void)pc_map;
+    (void)pc_map_count;
     aot_save_state_t *st = (aot_save_state_t *)arg;
     st->count++;
 }
 
-static void write_block_cb(uint32_t guest_pc, bool is_thumb,
-                           const uint32_t *words, size_t word_count, void *arg)
+static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thumb,
+                           const uint32_t *words, size_t word_count,
+                           const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
+                           void *arg)
 {
     aot_save_state_t *st = (aot_save_state_t *)arg;
     if (st->error) {
         return;
     }
+    size_t map_cnt = (pc_map != NULL && pc_map_count <= A32_AOT_MAX_PC_MAP) ? pc_map_count : 0U;
+
     a32_aot_block_header_t bh;
-    bh.guest_pc   = guest_pc;
-    bh.is_thumb   = is_thumb ? 1U : 0U;
-    bh.word_count = (uint32_t)word_count;
+    bh.guest_pc     = guest_pc;
+    bh.guest_end_pc = guest_end_pc;
+    bh.is_thumb     = is_thumb ? 1U : 0U;
+    bh.word_count   = (uint32_t)word_count;
+    bh.pc_map_count = (uint32_t)map_cnt;
 
     if (fwrite(&bh, sizeof(bh), 1U, st->f) != 1U) {
         st->error = true;
@@ -119,6 +140,12 @@ static void write_block_cb(uint32_t guest_pc, bool is_thumb,
     if (fwrite(words, sizeof(uint32_t), word_count, st->f) != word_count) {
         st->error = true;
         return;
+    }
+    if (map_cnt > 0U) {
+        if (fwrite(pc_map, sizeof(a32_pc_map_stage_t), map_cnt, st->f) != map_cnt) {
+            st->error = true;
+            return;
+        }
     }
 }
 
@@ -188,25 +215,36 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         fclose(f);
         return -1;
     }
-    if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION) {
+    if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION ||
+        hdr.num_blocks > A32_AOT_MAX_BLOCKS) {
         fclose(f);
         return -1;
     }
 
-    static uint32_t words_buf[2048];
+    static uint32_t           words_buf[A32_AOT_MAX_WORDS];
+    static a32_pc_map_stage_t pc_map_buf[A32_AOT_MAX_PC_MAP];
     for (uint32_t i = 0U; i < hdr.num_blocks; i++) {
         a32_aot_block_header_t bh;
         if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
             break;
         }
-        if (bh.word_count > 2048U) {
+        if (bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
+            bh.pc_map_count > A32_AOT_MAX_PC_MAP) {
             break;
         }
         if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
             break;
         }
-        (void)a32_jit_install_aot_block(ctx, bh.guest_pc, bh.is_thumb != 0U,
-                                        words_buf, (size_t)bh.word_count);
+        if (bh.pc_map_count > 0U) {
+            if (fread(pc_map_buf, sizeof(a32_pc_map_stage_t), bh.pc_map_count, f) != bh.pc_map_count) {
+                break;
+            }
+        }
+        (void)a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
+                                        bh.is_thumb != 0U,
+                                        words_buf, (size_t)bh.word_count,
+                                        bh.pc_map_count > 0U ? pc_map_buf : NULL,
+                                        (size_t)bh.pc_map_count);
     }
 
     fclose(f);
@@ -252,6 +290,12 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                  pc += 2U) {
                 const uint16_t *hw_ptr = (const uint16_t *)a32_guest_ptr(ctx, pc);
                 uint16_t hw = *hw_ptr;
+
+                if ((hw >> 11U) >= 0x1DU) {
+                    /* 32-bit Thumb-2 instruction: advance past second halfword */
+                    pc += 2U;
+                    continue;
+                }
 
                 /* Function prologues: PUSH {..., lr} or SUB sp, #imm */
                 if ((hw & 0xFF00U) == 0xB500U || (hw & 0xFF80U) == 0xB080U) {

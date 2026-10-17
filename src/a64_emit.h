@@ -65,17 +65,21 @@ typedef struct a64_buf {
     size_t    cap;
     bool      overflow;
     uint16_t  s_cached_mask;
-    bool      in_cond_branch;
+    unsigned  cond_branch_depth;
+    uint32_t  guest_end_pc;
+    bool      is_call;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
 {
-    b->words          = storage;
-    b->count          = 0U;
-    b->cap            = cap;
-    b->overflow       = false;
-    b->s_cached_mask  = 0U;
-    b->in_cond_branch = false;
+    b->words             = storage;
+    b->count             = 0U;
+    b->cap               = cap;
+    b->overflow          = false;
+    b->s_cached_mask     = 0U;
+    b->cond_branch_depth = 0U;
+    b->guest_end_pc      = 0U;
+    b->is_call           = false;
 }
 
 static inline void a64_emit(a64_buf_t *b, uint32_t insn)
@@ -240,6 +244,8 @@ void a64_emit_isb(a64_buf_t *b);
 /* Branches & block exits */
 size_t a64_emit_b_cond_placeholder(a64_buf_t *b, unsigned cond);
 void   a64_patch_b_cond(a64_buf_t *b, size_t patch_idx, size_t target_idx);
+size_t a64_emit_cbz_w_placeholder(a64_buf_t *b, bool is_cbnz, unsigned rt);
+void   a64_patch_cbz_w(a64_buf_t *b, size_t patch_idx, size_t target_idx);
 void   a64_emit_b(a64_buf_t *b, int32_t offset_words);
 void   a64_emit_b_cond(a64_buf_t *b, unsigned cond, int32_t offset_words);
 void   a64_emit_ret(a64_buf_t *b);

@@ -49,7 +49,7 @@ struct pollfd {
     int16_t revents;
 };
 
-struct statfs64 {
+struct __attribute__((packed, aligned(4))) statfs64 {
     uint32_t f_type;
     uint32_t f_bsize;
     uint64_t f_blocks;
@@ -62,6 +62,40 @@ struct statfs64 {
     uint32_t f_frsize;
     uint32_t f_flags;
     uint32_t f_spare[4];
+};
+
+_Static_assert(sizeof(struct statfs64) == 84U, "ARM EABI statfs64 must be 84 bytes");
+
+struct statfs64_canary {
+    struct statfs64 stfs;
+    uint32_t        canary;
+};
+
+_Static_assert(offsetof(struct statfs64_canary, canary) == 84U,
+               "statfs64 canary must be at byte offset 84");
+
+struct timespec32 {
+    int32_t tv_sec;
+    int32_t tv_nsec;
+};
+
+struct timeval32 {
+    int32_t tv_sec;
+    int32_t tv_usec;
+};
+
+struct itimerspec32 {
+    struct timespec32 it_interval;
+    struct timespec32 it_value;
+};
+
+_Static_assert(sizeof(struct timespec32) == 8U, "timespec32 must be 8 bytes");
+_Static_assert(sizeof(struct timeval32) == 8U, "timeval32 must be 8 bytes");
+_Static_assert(sizeof(struct itimerspec32) == 16U, "itimerspec32 must be 16 bytes");
+
+struct itimerspec32_canary {
+    struct itimerspec32 its;
+    uint32_t            canary[4];
 };
 
 struct statx_timestamp {
@@ -164,6 +198,23 @@ static inline int32_t sys5(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
     __asm__ volatile("svc #0"
                      : "+r"(r0)
                      : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4)
+                     : "memory", "cc");
+    return (int32_t)r0;
+}
+
+static inline int32_t sys6(uint32_t nr, uint32_t a0, uint32_t a1, uint32_t a2,
+                           uint32_t a3, uint32_t a4, uint32_t a5)
+{
+    register uint32_t r7 __asm__("r7") = nr;
+    register uint32_t r0 __asm__("r0") = a0;
+    register uint32_t r1 __asm__("r1") = a1;
+    register uint32_t r2 __asm__("r2") = a2;
+    register uint32_t r3 __asm__("r3") = a3;
+    register uint32_t r4 __asm__("r4") = a4;
+    register uint32_t r5 __asm__("r5") = a5;
+    __asm__ volatile("svc #0"
+                     : "+r"(r0)
+                     : "r"(r7), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
                      : "memory", "cc");
     return (int32_t)r0;
 }
@@ -397,16 +448,40 @@ static int test3_4_epoll_eventfd_poll(void)
 }
 
 /* --------------------------------------------------------------------------
- * Test 6: statx (397) and statfs64 (266) on "/"
+ * Test 6: statx (397) and 84-byte statfs64 (266) / fstatfs64 (267) with canary
  * -------------------------------------------------------------------------- */
 static int test6_statx_statfs(void)
 {
-    struct statfs64 stfs;
-    my_memset(&stfs, 0, sizeof(stfs));
+    struct statfs64_canary sfs_buf;
+    my_memset(&sfs_buf.stfs, 0, sizeof(sfs_buf.stfs));
+    sfs_buf.canary = 0xDEADBEEFU;
+
     int sfs_r = sys3(266U /* statfs64 */, (uint32_t)(uintptr_t)"/",
-                     (uint32_t)sizeof(stfs), (uint32_t)(uintptr_t)&stfs);
-    if (sfs_r != 0 || stfs.f_type == 0U) {
+                     84U /* sizeof(struct statfs64) */,
+                     (uint32_t)(uintptr_t)&sfs_buf.stfs);
+    if (sfs_r != 0 || sfs_buf.stfs.f_type == 0U || sfs_buf.stfs.f_bsize == 0U) {
         return 40;
+    }
+    if (sfs_buf.canary != 0xDEADBEEFU) {
+        return 42;
+    }
+
+    int root_fd = sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */,
+                       (uint32_t)(uintptr_t)"/", 0U /* O_RDONLY */, 0U);
+    if (root_fd < 0) {
+        return 43;
+    }
+    my_memset(&sfs_buf.stfs, 0, sizeof(sfs_buf.stfs));
+    sfs_buf.canary = 0xDEADBEEFU;
+    int fsfs_r = sys3(267U /* fstatfs64 */, (uint32_t)root_fd,
+                      84U /* sizeof(struct statfs64) */,
+                      (uint32_t)(uintptr_t)&sfs_buf.stfs);
+    sys1(6U /* close */, (uint32_t)root_fd);
+    if (fsfs_r != 0 || sfs_buf.stfs.f_type == 0U || sfs_buf.stfs.f_bsize == 0U) {
+        return 44;
+    }
+    if (sfs_buf.canary != 0xDEADBEEFU) {
+        return 45;
     }
 
     struct statx stx;
@@ -417,6 +492,234 @@ static int test6_statx_statfs(void)
     if (sx_r != 0) {
         return 41;
     }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 7: timerfd_create (350), timerfd_settime (353), timerfd_gettime (354)
+ *         with 16-byte itimerspec32
+ * -------------------------------------------------------------------------- */
+static int test7_timerfd(void)
+{
+    int tfd = sys2(350U /* timerfd_create */, 1U /* CLOCK_MONOTONIC */, 0U);
+    if (tfd < 0) {
+        return 50;
+    }
+
+    struct itimerspec32 arm_its;
+    arm_its.it_interval.tv_sec  = 0;
+    arm_its.it_interval.tv_nsec = 0;
+    arm_its.it_value.tv_sec     = 0;
+    arm_its.it_value.tv_nsec    = 50000000;
+
+    struct itimerspec32_canary old_its;
+    my_memset(&old_its.its, 0x5A, sizeof(old_its.its));
+    old_its.canary[0] = 0xDEADBEEFU;
+    old_its.canary[1] = 0xDEADBEEFU;
+    old_its.canary[2] = 0xDEADBEEFU;
+    old_its.canary[3] = 0xDEADBEEFU;
+
+    if (sys4(353U /* timerfd_settime */, (uint32_t)tfd, 0U,
+             (uint32_t)(uintptr_t)&arm_its,
+             (uint32_t)(uintptr_t)&old_its.its) != 0) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        return 51;
+    }
+    if (old_its.canary[0] != 0xDEADBEEFU || old_its.its.it_value.tv_sec != 0) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        return 52;
+    }
+
+    struct itimerspec32_canary cur_its;
+    my_memset(&cur_its.its, 0x5A, sizeof(cur_its.its));
+    cur_its.canary[0] = 0xDEADBEEFU;
+    cur_its.canary[1] = 0xDEADBEEFU;
+    cur_its.canary[2] = 0xDEADBEEFU;
+    cur_its.canary[3] = 0xDEADBEEFU;
+
+    if (sys2(354U /* timerfd_gettime */, (uint32_t)tfd,
+             (uint32_t)(uintptr_t)&cur_its.its) != 0) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        return 53;
+    }
+    if (cur_its.canary[0] != 0xDEADBEEFU ||
+        cur_its.its.it_interval.tv_sec != 0 ||
+        cur_its.its.it_interval.tv_nsec != 0 ||
+        cur_its.its.it_value.tv_sec != 0 ||
+        cur_its.its.it_value.tv_nsec < 0 ||
+        cur_its.its.it_value.tv_nsec > 50000000) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        return 54;
+    }
+
+    sys1(6U /* close */, (uint32_t)tfd);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 8: utimensat(fd, NULL, times, 0) (futimens) in offset mode
+ * -------------------------------------------------------------------------- */
+static int test8_utimensat_futimens(void)
+{
+    static const char tmp_path[] = "/tmp/a32rt_m5_utimens_test";
+    int fd = sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */,
+                  (uint32_t)(uintptr_t)tmp_path,
+                  0x242U /* O_CREAT | O_TRUNC | O_RDWR */, 0600U);
+    if (fd < 0) {
+        return 60;
+    }
+
+    /* futimens(fd, NULL): pathname = NULL (0), times = NULL (0) */
+    int r1 = sys4(348U /* utimensat */, (uint32_t)fd, 0U /* NULL */, 0U /* NULL */, 0U);
+    if (r1 != 0) {
+        sys1(6U /* close */, (uint32_t)fd);
+        sys3(328U /* unlinkat */, 0xFFFFFF9CU, (uint32_t)(uintptr_t)tmp_path, 0U);
+        return 61;
+    }
+
+    /* futimens(fd, times): pathname = NULL (0), explicit timespec32[2] */
+    struct timespec32 ts[2];
+    ts[0].tv_sec  = 1700000000;
+    ts[0].tv_nsec = 123456789;
+    ts[1].tv_sec  = 1700000000;
+    ts[1].tv_nsec = 987654321;
+    int r2 = sys4(348U /* utimensat */, (uint32_t)fd, 0U /* NULL */,
+                  (uint32_t)(uintptr_t)ts, 0U);
+    sys1(6U /* close */, (uint32_t)fd);
+    sys3(328U /* unlinkat */, 0xFFFFFF9CU /* AT_FDCWD */,
+         (uint32_t)(uintptr_t)tmp_path, 0U);
+    if (r2 != 0) {
+        return 62;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 9: pselect6 (335) and _newselect (142) with pipe fd
+ * -------------------------------------------------------------------------- */
+static int test9_pselect6_newselect(void)
+{
+    int pfd[2];
+    pfd[0] = -1;
+    pfd[1] = -1;
+    if (sys2(359U /* pipe2 */, (uint32_t)(uintptr_t)pfd, 0U) != 0) {
+        return 70;
+    }
+
+    char byte_in = 'Q';
+    if (sys3(4U /* write */, (uint32_t)pfd[1], (uint32_t)(uintptr_t)&byte_in, 1U) != 1) {
+        sys1(6U /* close */, (uint32_t)pfd[0]);
+        sys1(6U /* close */, (uint32_t)pfd[1]);
+        return 71;
+    }
+
+    uint32_t fd_idx = (uint32_t)pfd[0] / 32U;
+    uint32_t fd_bit = 1U << ((uint32_t)pfd[0] % 32U);
+
+    /* 1. SYS_pselect6 (335) */
+    uint32_t rfds[32];
+    my_memset(rfds, 0, sizeof(rfds));
+    rfds[fd_idx] |= fd_bit;
+
+    struct timespec32 ts;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = 50000000;
+
+    int ps_r = sys6(335U /* pselect6 */, (uint32_t)(pfd[0] + 1),
+                    (uint32_t)(uintptr_t)rfds, 0U, 0U,
+                    (uint32_t)(uintptr_t)&ts, 0U);
+    if (ps_r != 1 || (rfds[fd_idx] & fd_bit) == 0U) {
+        sys1(6U /* close */, (uint32_t)pfd[0]);
+        sys1(6U /* close */, (uint32_t)pfd[1]);
+        return 72;
+    }
+
+    /* 2. SYS__newselect (142) on the still-ready pipe fd */
+    my_memset(rfds, 0, sizeof(rfds));
+    rfds[fd_idx] |= fd_bit;
+
+    struct timeval32 tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 50000;
+
+    int ns_r = sys5(142U /* _newselect */, (uint32_t)(pfd[0] + 1),
+                    (uint32_t)(uintptr_t)rfds, 0U, 0U,
+                    (uint32_t)(uintptr_t)&tv);
+    if (ns_r != 1 || (rfds[fd_idx] & fd_bit) == 0U) {
+        sys1(6U /* close */, (uint32_t)pfd[0]);
+        sys1(6U /* close */, (uint32_t)pfd[1]);
+        return 73;
+    }
+
+    char byte_out = 0;
+    if (sys3(3U /* read */, (uint32_t)pfd[0], (uint32_t)(uintptr_t)&byte_out, 1U) != 1 ||
+        byte_out != 'Q') {
+        sys1(6U /* close */, (uint32_t)pfd[0]);
+        sys1(6U /* close */, (uint32_t)pfd[1]);
+        return 74;
+    }
+
+    sys1(6U /* close */, (uint32_t)pfd[0]);
+    sys1(6U /* close */, (uint32_t)pfd[1]);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 10: Negative (-EFAULT / -EINVAL) syscall tests
+ * -------------------------------------------------------------------------- */
+static int test10_negative_syscalls(void)
+{
+    /* openat (322) with NULL (0) and low-guard pointer (0x100) -> -EFAULT (-14) */
+    if (sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */, 0U, 0U, 0U) != -14) {
+        return 80;
+    }
+    if (sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */, 0x100U, 0U, 0U) != -14) {
+        return 81;
+    }
+
+    /* stat64 (195) with NULL (0) and low-guard pointer (0x100) -> -EFAULT (-14) */
+    _Alignas(8) uint8_t st64_buf[104];
+    my_memset(st64_buf, 0, sizeof(st64_buf));
+    if (sys2(195U /* stat64 */, 0U, (uint32_t)(uintptr_t)st64_buf) != -14) {
+        return 82;
+    }
+    if (sys2(195U /* stat64 */, 0x100U, (uint32_t)(uintptr_t)st64_buf) != -14) {
+        return 83;
+    }
+    if (sys2(195U /* stat64 */, (uint32_t)(uintptr_t)"/", 0U) != -14) {
+        return 84;
+    }
+    if (sys2(195U /* stat64 */, (uint32_t)(uintptr_t)"/", 0x100U) != -14) {
+        return 85;
+    }
+
+    /* readlinkat (332) with NULL (0) and low-guard pointer (0x100) -> -EFAULT (-14) */
+    char rl_buf[64];
+    my_memset(rl_buf, 0, sizeof(rl_buf));
+    if (sys4(332U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD */, 0U,
+             (uint32_t)(uintptr_t)rl_buf, sizeof(rl_buf)) != -14) {
+        return 86;
+    }
+    if (sys4(332U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD */, 0x100U,
+             (uint32_t)(uintptr_t)rl_buf, sizeof(rl_buf)) != -14) {
+        return 87;
+    }
+    if (sys4(332U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD */,
+             (uint32_t)(uintptr_t)"/proc/self/exe", 0U, sizeof(rl_buf)) != -14) {
+        return 88;
+    }
+    if (sys4(332U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD */,
+             (uint32_t)(uintptr_t)"/proc/self/exe", 0x100U, sizeof(rl_buf)) != -14) {
+        return 89;
+    }
+
+    /* Negative -EINVAL (-22): statfs64 with wrong size (0) */
+    struct statfs64 sfs;
+    if (sys3(266U /* statfs64 */, (uint32_t)(uintptr_t)"/", 0U,
+             (uint32_t)(uintptr_t)&sfs) != -22) {
+        return 90;
+    }
+
     return 0;
 }
 
@@ -435,6 +738,22 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test6_statx_statfs();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test7_timerfd();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test8_utimensat_futimens();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test9_pselect6_newselect();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test10_negative_syscalls();
     if (rc != 0) {
         return rc;
     }

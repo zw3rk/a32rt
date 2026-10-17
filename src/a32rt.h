@@ -36,6 +36,7 @@
 /* Maximum number of tracked guest VMA regions */
 #define A32_MAX_REGIONS 512U
 #define A32_RAS_SIZE    16U
+#define A32_IBTC_SIZE   1024U
 
 typedef struct a32_region {
     uint32_t start;
@@ -44,6 +45,19 @@ typedef struct a32_region {
     uint32_t flags;
     char     name[64];
 } a32_region_t;
+
+typedef struct a32_ibtc_entry {
+    uint32_t    key;
+    uint32_t    epoch;
+    const void *host_code;
+    void       *entry;
+} a32_ibtc_entry_t;
+
+typedef struct a32_pc_map_stage {
+    uint32_t host_word_idx;
+    uint32_t guest_pc;
+    uint32_t itstate;
+} a32_pc_map_stage_t;
 
 /*
  * Architectural + runtime state for a 32-bit ARM guest thread.
@@ -119,13 +133,14 @@ typedef struct a32_ctx {
     uint64_t    wx_transitions;
     uint64_t    flags_elided;
 
-    /* M2 Return Address Stack (RAS) for O(1) return target prediction */
-    uint32_t    ras_key[A32_RAS_SIZE];
-    uint32_t    ras_epoch[A32_RAS_SIZE];
-    const void *ras_code[A32_RAS_SIZE];
-    void       *ras_entry[A32_RAS_SIZE];
-    uint32_t    ras_top;
-    uint64_t    ras_hits;
+    /* M2 Return Address Stack (RAS) & per-thread IBTC for O(1) target prediction */
+    uint32_t         ras_key[A32_RAS_SIZE];
+    uint32_t         ras_epoch[A32_RAS_SIZE];
+    const void      *ras_code[A32_RAS_SIZE];
+    void            *ras_entry[A32_RAS_SIZE];
+    uint32_t         ras_top;
+    uint64_t         ras_hits;
+    a32_ibtc_entry_t ibtc[A32_IBTC_SIZE];
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -158,6 +173,8 @@ uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot
                       uint32_t flags, int fd, uint32_t pgoffset);
 int      a32_vm_mprotect(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot);
 int      a32_vm_munmap(a32_ctx_t *ctx, uint32_t addr, uint32_t len);
+uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
+                       uint32_t new_len, uint32_t flags, uint32_t new_addr);
 
 /* ELF32 loader & initial stack (`src/elf32.c`, `src/stack32.c`) */
 typedef struct a32_elf_info {
@@ -180,6 +197,11 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
                     uint32_t *out_sp);
 
 /* JIT & execution engine (`src/jit.c`, `src/trampoline.S`) */
+typedef void (*a32_block_iter_fn)(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thumb,
+                                  const uint32_t *words, size_t word_count,
+                                  const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
+                                  void *arg);
+
 int         a32_jit_init(a32_ctx_t *ctx);
 int         a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end);
 int         a32_jit_run(a32_ctx_t *ctx);
@@ -187,8 +209,10 @@ uint32_t    a32_jit_run_block(a32_ctx_t *ctx, const void *code_ptr);
 void        a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t itstate);
 bool        a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t *out_itstate);
 const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes);
-int         a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, bool is_thumb,
-                                      const uint32_t *words, size_t word_count);
+int         a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
+                                      bool is_thumb, const uint32_t *words, size_t word_count,
+                                      const a32_pc_map_stage_t *pc_map, size_t pc_map_count);
+void        a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg);
 int         a32_jit_flush_batch(a32_ctx_t *ctx);
 
 /* AOT pre-translator & disk cache (`src/aot.c`, M2) */

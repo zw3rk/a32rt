@@ -209,6 +209,368 @@ static int run_vfp_neon_tests(void)
         return 12;
     }
 
+    /* 12. 64-bit D-register (!is_q) integer SIMD:
+     *     vadd.i64, vsub.i64, vshl.i64, vshr.u64, vshr.s64, vshl.u64, vshl.s64 */
+    uint64_t d64_a = 0x0123456789ABCDEFULL;
+    uint64_t d64_b = 0x1000000080000002ULL;
+    uint64_t d64_out = 0ULL;
+    __asm__ volatile(
+        "vldr d1, [%1]\n"
+        "vldr d2, [%2]\n"
+        "vadd.i64 d0, d1, d2\n"
+        "vstr d0, [%0]\n"
+        :
+        : "r"(&d64_out), "r"(&d64_a), "r"(&d64_b)
+        : "d0", "d1", "d2", "memory"
+    );
+    if (d64_out != (d64_a + d64_b)) {
+        return 13;
+    }
+
+    __asm__ volatile(
+        "vldr d1, [%1]\n"
+        "vldr d2, [%2]\n"
+        "vsub.i64 d0, d1, d2\n"
+        "vstr d0, [%0]\n"
+        :
+        : "r"(&d64_out), "r"(&d64_a), "r"(&d64_b)
+        : "d0", "d1", "d2", "memory"
+    );
+    if (d64_out != (d64_a - d64_b)) {
+        return 14;
+    }
+
+    uint64_t sh_in = 0xF102030405060780ULL;
+    uint64_t shl_imm_out = 0ULL;
+    uint64_t shr_u_out = 0ULL;
+    uint64_t shr_s_out = 0ULL;
+    __asm__ volatile(
+        "vldr d1, [%3]\n"
+        "vshl.i64 d0, d1, #7\n"
+        "vstr d0, [%0]\n"
+        "vshr.u64 d0, d1, #4\n"
+        "vstr d0, [%1]\n"
+        "vshr.s64 d0, d1, #4\n"
+        "vstr d0, [%2]\n"
+        :
+        : "r"(&shl_imm_out), "r"(&shr_u_out), "r"(&shr_s_out), "r"(&sh_in)
+        : "d0", "d1", "memory"
+    );
+    if (shl_imm_out != (sh_in << 7) ||
+        shr_u_out != (sh_in >> 4) ||
+        shr_s_out != (uint64_t)((int64_t)sh_in >> 4)) {
+        return 15;
+    }
+
+    uint64_t sh_cnt_pos = 8ULL;
+    uint64_t sh_cnt_neg = (uint64_t)(int64_t)-4;
+    uint64_t vshl_u64_pos = 0ULL;
+    uint64_t vshl_u64_neg = 0ULL;
+    uint64_t vshl_s64_pos = 0ULL;
+    uint64_t vshl_s64_neg = 0ULL;
+    __asm__ volatile(
+        "vldr d1, [%4]\n"
+        "vldr d2, [%5]\n"
+        "vshl.u64 d0, d1, d2\n"
+        "vstr d0, [%0]\n"
+        "vshl.s64 d0, d1, d2\n"
+        "vstr d0, [%2]\n"
+        "vldr d2, [%6]\n"
+        "vshl.u64 d0, d1, d2\n"
+        "vstr d0, [%1]\n"
+        "vshl.s64 d0, d1, d2\n"
+        "vstr d0, [%3]\n"
+        :
+        : "r"(&vshl_u64_pos), "r"(&vshl_u64_neg),
+          "r"(&vshl_s64_pos), "r"(&vshl_s64_neg),
+          "r"(&sh_in), "r"(&sh_cnt_pos), "r"(&sh_cnt_neg)
+        : "d0", "d1", "d2", "memory"
+    );
+    if (vshl_u64_pos != (sh_in << 8) ||
+        vshl_u64_neg != (sh_in >> 4) ||
+        vshl_s64_pos != (sh_in << 8) ||
+        vshl_s64_neg != (uint64_t)((int64_t)sh_in >> 4)) {
+        return 16;
+    }
+
+    /* 13. VSHL (register) operand order: Vm shifted by Vn (positive & negative counts) */
+    uint32_t vshl_d_val[2] = { 0x00000010U, 0x80000000U };
+    int32_t  vshl_d_cnt[2] = { 3, -4 };
+    uint32_t vshl_d_out[2] = { 0U, 0U };
+    __asm__ volatile(
+        "vld1.32 {d1}, [%1]\n"
+        "vld1.32 {d2}, [%2]\n"
+        "vshl.u32 d0, d1, d2\n"
+        "vst1.32 {d0}, [%0]\n"
+        :
+        : "r"(vshl_d_out), "r"(vshl_d_val), "r"(vshl_d_cnt)
+        : "d0", "d1", "d2", "memory"
+    );
+    if (vshl_d_out[0] != 0x00000080U || vshl_d_out[1] != 0x08000000U) {
+        return 17;
+    }
+
+    int32_t vshl_q_val[4] = { 5, -64, 0x100, -1024 };
+    int32_t vshl_q_cnt[4] = { 4, -2, 3, -5 };
+    int32_t vshl_q_out[4] = { 0, 0, 0, 0 };
+    __asm__ volatile(
+        "vld1.32 {d2, d3}, [%1]\n"
+        "vld1.32 {d4, d5}, [%2]\n"
+        "vshl.s32 q0, q1, q2\n"
+        "vst1.32 {d0, d1}, [%0]\n"
+        :
+        : "r"(vshl_q_out), "r"(vshl_q_val), "r"(vshl_q_cnt)
+        : "d0", "d1", "d2", "d3", "d4", "d5", "memory"
+    );
+    if (vshl_q_out[0] != 80 || vshl_q_out[1] != -16 ||
+        vshl_q_out[2] != 2048 || vshl_q_out[3] != -32) {
+        return 18;
+    }
+
+    /* 14. VMAX and VMIN on both low (d0-d4, N=0) and high (d16-d20, N=1) registers */
+    int32_t s32_in1[2] = { -10, 20 };
+    int32_t s32_in2[2] = { -5, 15 };
+    int32_t s32_max_lo[2] = { 0, 0 };
+    int32_t s32_min_lo[2] = { 0, 0 };
+    int32_t s32_max_hi[2] = { 0, 0 };
+    int32_t s32_min_hi[2] = { 0, 0 };
+    __asm__ volatile(
+        "vld1.32 {d1}, [%4]\n"
+        "vld1.32 {d2}, [%5]\n"
+        "vmax.s32 d0, d1, d2\n"
+        "vmin.s32 d3, d1, d2\n"
+        "vst1.32 {d0}, [%0]\n"
+        "vst1.32 {d3}, [%1]\n"
+        "vld1.32 {d16}, [%4]\n"
+        "vld1.32 {d17}, [%5]\n"
+        "vmax.s32 d18, d16, d17\n"
+        "vmin.s32 d19, d16, d17\n"
+        "vst1.32 {d18}, [%2]\n"
+        "vst1.32 {d19}, [%3]\n"
+        :
+        : "r"(s32_max_lo), "r"(s32_min_lo), "r"(s32_max_hi), "r"(s32_min_hi),
+          "r"(s32_in1), "r"(s32_in2)
+        : "d0", "d1", "d2", "d3", "d16", "d17", "d18", "d19", "memory"
+    );
+    if (s32_max_lo[0] != -5 || s32_max_lo[1] != 20 ||
+        s32_min_lo[0] != -10 || s32_min_lo[1] != 15 ||
+        s32_max_hi[0] != -5 || s32_max_hi[1] != 20 ||
+        s32_min_hi[0] != -10 || s32_min_hi[1] != 15) {
+        return 19;
+    }
+
+    uint16_t u16_in1[4] = { 0x8000U, 0x0010U, 0xFFFFU, 0x1234U };
+    uint16_t u16_in2[4] = { 0x7FFFU, 0x0020U, 0x0001U, 0x5678U };
+    uint16_t u16_max_lo[4] = { 0U, 0U, 0U, 0U };
+    uint16_t u16_min_lo[4] = { 0U, 0U, 0U, 0U };
+    uint16_t u16_max_hi[4] = { 0U, 0U, 0U, 0U };
+    uint16_t u16_min_hi[4] = { 0U, 0U, 0U, 0U };
+    __asm__ volatile(
+        "vld1.16 {d1}, [%4]\n"
+        "vld1.16 {d2}, [%5]\n"
+        "vmax.u16 d0, d1, d2\n"
+        "vmin.u16 d4, d1, d2\n"
+        "vst1.16 {d0}, [%0]\n"
+        "vst1.16 {d4}, [%1]\n"
+        "vld1.16 {d16}, [%4]\n"
+        "vld1.16 {d17}, [%5]\n"
+        "vmax.u16 d18, d16, d17\n"
+        "vmin.u16 d20, d16, d17\n"
+        "vst1.16 {d18}, [%2]\n"
+        "vst1.16 {d20}, [%3]\n"
+        :
+        : "r"(u16_max_lo), "r"(u16_min_lo), "r"(u16_max_hi), "r"(u16_min_hi),
+          "r"(u16_in1), "r"(u16_in2)
+        : "d0", "d1", "d2", "d4", "d16", "d17", "d18", "d20", "memory"
+    );
+    if (u16_max_lo[0] != 0x8000U || u16_max_lo[1] != 0x0020U ||
+        u16_max_lo[2] != 0xFFFFU || u16_max_lo[3] != 0x5678U ||
+        u16_min_lo[0] != 0x7FFFU || u16_min_lo[1] != 0x0010U ||
+        u16_min_lo[2] != 0x0001U || u16_min_lo[3] != 0x1234U ||
+        u16_max_hi[0] != 0x8000U || u16_max_hi[1] != 0x0020U ||
+        u16_max_hi[2] != 0xFFFFU || u16_max_hi[3] != 0x5678U ||
+        u16_min_hi[0] != 0x7FFFU || u16_min_hi[1] != 0x0010U ||
+        u16_min_hi[2] != 0x0001U || u16_min_hi[3] != 0x1234U) {
+        return 20;
+    }
+
+    /* 15. VMOV Rt, Rt2, Sm, Sm1 vs VMOV Rt, Rt2, Dm and VMOV Sm, Sm1, Rt, Rt2 */
+    uint32_t s2_in = 0x3F800000U; /* 1.0f */
+    uint32_t s3_in = 0x40000000U; /* 2.0f */
+    uint32_t r0_from_s = 0U, r1_from_s = 0U;
+    uint32_t r0_from_d = 0U, r1_from_d = 0U;
+    uint32_t s4_out = 0U, s5_out = 0U;
+    __asm__ volatile(
+        "vmov s2, %4\n"
+        "vmov s3, %5\n"
+        "vmov r0, r1, s2, s3\n"
+        "mov %0, r0\n"
+        "mov %1, r1\n"
+        "vmov s4, s5, r0, r1\n"
+        "vmov r0, r1, d2\n"
+        "mov %2, r0\n"
+        "mov %3, r1\n"
+        : "=&r"(r0_from_s), "=&r"(r1_from_s), "=&r"(r0_from_d), "=&r"(r1_from_d)
+        : "r"(s2_in), "r"(s3_in)
+        : "r0", "r1", "d1", "d2"
+    );
+    __asm__ volatile(
+        "vmov %0, s4\n"
+        "vmov %1, s5\n"
+        : "=r"(s4_out), "=r"(s5_out)
+        :
+        : "d2"
+    );
+    if (r0_from_s != s2_in || r1_from_s != s3_in ||
+        r0_from_d != s2_in || r1_from_d != s3_in ||
+        s4_out != s2_in || s5_out != s3_in) {
+        return 21;
+    }
+
+    /* Also test odd single-precision pair (s1, s2 where M=1) vs high D register (d17 where M=1) */
+    uint32_t odd_s1_in = 0x40400000U; /* 3.0f */
+    uint32_t odd_s2_in = 0x40800000U; /* 4.0f */
+    uint32_t odd_r0_out = 0U, odd_r1_out = 0U;
+    uint32_t odd_s1_chk = 0U, odd_s2_chk = 0U;
+    __asm__ volatile(
+        "mov r0, %4\n"
+        "mov r1, %5\n"
+        "vmov s1, s2, r0, r1\n"
+        "vmov %2, s1\n"
+        "vmov %3, s2\n"
+        "mov r0, #0\n"
+        "mov r1, #0\n"
+        "vmov r0, r1, s1, s2\n"
+        "mov %0, r0\n"
+        "mov %1, r1\n"
+        : "=&r"(odd_r0_out), "=&r"(odd_r1_out), "=&r"(odd_s1_chk), "=&r"(odd_s2_chk)
+        : "r"(odd_s1_in), "r"(odd_s2_in)
+        : "r0", "r1", "d0", "d1", "d16"
+    );
+    if (odd_r0_out != odd_s1_in || odd_r1_out != odd_s2_in ||
+        odd_s1_chk != odd_s1_in || odd_s2_chk != odd_s2_in) {
+        return 22;
+    }
+
+    /* 16. VCMP preserving integer CPSR.NZCV before VMRS, and VCVTR rounding vs VCVT */
+    uint32_t cmp_f0_bits = 0x40A00000U; /* 5.0f */
+    uint32_t cmp_f1_bits = 0x41200000U; /* 10.0f */
+    uint32_t eq_a = 77U;
+    uint32_t eq_b = 77U;
+    int int_z_preserved = 0;
+    int fp_lt_transferred = 0;
+    __asm__ volatile(
+        "vmov s0, %4\n"
+        "vmov s1, %5\n"
+        "cmp %2, %3\n"
+        "vcmp.f32 s0, s1\n"
+        "beq 1f\n"
+        "mov %0, #0\n"
+        "b 2f\n"
+        "1:\n"
+        "mov %0, #1\n"
+        "2:\n"
+        "vmrs APSR_nzcv, fpscr\n"
+        "blt 3f\n"
+        "mov %1, #0\n"
+        "b 4f\n"
+        "3:\n"
+        "mov %1, #1\n"
+        "4:\n"
+        : "=&r"(int_z_preserved), "=&r"(fp_lt_transferred)
+        : "r"(eq_a), "r"(eq_b), "r"(cmp_f0_bits), "r"(cmp_f1_bits)
+        : "d0", "cc"
+    );
+    if (int_z_preserved != 1 || fp_lt_transferred != 1) {
+        return 23;
+    }
+
+    float r_pos_f = 2.6f;
+    float r_neg_f = -2.6f;
+    int32_t vcvtr_pos_s32 = 0, vcvtr_neg_s32 = 0;
+    int32_t vcvt_pos_s32 = 0, vcvt_neg_s32 = 0;
+    __asm__ volatile(
+        "vcvtr.s32.f32 %0, %4\n"
+        "vcvtr.s32.f32 %1, %5\n"
+        "vcvt.s32.f32  %2, %4\n"
+        "vcvt.s32.f32  %3, %5\n"
+        : "=&t"(vcvtr_pos_s32), "=&t"(vcvtr_neg_s32),
+          "=&t"(vcvt_pos_s32), "=t"(vcvt_neg_s32)
+        : "t"(r_pos_f), "t"(r_neg_f)
+    );
+    if (vcvtr_pos_s32 != 3 || vcvtr_neg_s32 != -3 ||
+        vcvt_pos_s32 != 2 || vcvt_neg_s32 != -2) {
+        return 24;
+    }
+
+    double r_pos_d = 2.6;
+    double r_neg_d = -2.6;
+    int32_t vcvtr_d_pos = 0, vcvtr_d_neg = 0;
+    int32_t vcvt_d_pos = 0, vcvt_d_neg = 0;
+    __asm__ volatile(
+        "vcvtr.s32.f64 %0, %4\n"
+        "vcvtr.s32.f64 %1, %5\n"
+        "vcvt.s32.f64  %2, %4\n"
+        "vcvt.s32.f64  %3, %5\n"
+        : "=&t"(vcvtr_d_pos), "=&t"(vcvtr_d_neg),
+          "=&t"(vcvt_d_pos), "=t"(vcvt_d_neg)
+        : "w"(r_pos_d), "w"(r_neg_d)
+    );
+    if (vcvtr_d_pos != 3 || vcvtr_d_neg != -3 ||
+        vcvt_d_pos != 2 || vcvt_d_neg != -2) {
+        return 25;
+    }
+
+    /* 17. NEON modified immediate VMOV.F32 (cmode == 15) and VMVN/VMOV shifting ones (cmode == 13) */
+    uint64_t ones64 = 0xFFFFFFFFFFFFFFFFULL;
+    uint64_t f32_imm_d0 = 0ULL;
+    __asm__ volatile(
+        "vldr d0, [%1]\n"
+        "vmov.f32 d0, #1.0e+0\n"
+        "vstr d0, [%0]\n"
+        :
+        : "r"(&f32_imm_d0), "r"(&ones64)
+        : "d0", "memory"
+    );
+    if (f32_imm_d0 != 0x3F8000003F800000ULL) {
+        return 26;
+    }
+
+    uint64_t ones128[2] = { 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL };
+    uint64_t f32_imm_q0[2] = { 0ULL, 0ULL };
+    __asm__ volatile(
+        "vld1.64 {d0, d1}, [%1]\n"
+        "vmov.f32 q0, #1.0e+0\n"
+        "vst1.64 {d0, d1}, [%0]\n"
+        :
+        : "r"(f32_imm_q0), "r"(ones128)
+        : "d0", "d1", "memory"
+    );
+    if (f32_imm_q0[0] != 0x3F8000003F800000ULL ||
+        f32_imm_q0[1] != 0x3F8000003F800000ULL) {
+        return 27;
+    }
+
+    uint64_t cmode13_vmov_d0 = 0ULL;
+    uint64_t cmode13_vmvn_d0 = 0ULL;
+    uint64_t zeroes64 = 0ULL;
+    __asm__ volatile(
+        "vldr d0, [%2]\n"
+        "vmov.i32 d0, #0xabffff\n"
+        "vstr d0, [%0]\n"
+        "vldr d0, [%3]\n"
+        "vmvn.i32 d0, #0xabffff\n"
+        "vstr d0, [%1]\n"
+        :
+        : "r"(&cmode13_vmov_d0), "r"(&cmode13_vmvn_d0),
+          "r"(&ones64), "r"(&zeroes64)
+        : "d0", "memory"
+    );
+    if (cmode13_vmov_d0 != 0x00ABFFFF00ABFFFFULL ||
+        cmode13_vmvn_d0 != 0xFF540000FF540000ULL) {
+        return 28;
+    }
+
     static const char pass_msg[] = "M4 VFPv4-D32 & NEON: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;
