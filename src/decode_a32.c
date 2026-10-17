@@ -421,6 +421,12 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         bool l_bit = ((insn >> 20) & 1U) != 0U;
         unsigned rn = (insn >> 16) & 0xFU;
         uint32_t reg_mask = insn & 0xFFFFU;
+        if (reg_mask == 0U || rn == 15U) {
+            if (cond != A64_COND_AL) {
+                b->count = cond_skip;
+            }
+            return false;
+        }
 
         unsigned count = 0U;
         for (unsigned i = 0U; i < 16U; i++) {
@@ -898,10 +904,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_orr_reg_w(b, rd, rd, A64_TMP1, A64_SHIFT_LSL, 0U);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06100F90U || (insn & 0x0FF00FF0U) == 0x06100FF0U ||
-                   (insn & 0x0FF00FF0U) == 0x06100F10U || (insn & 0x0FF00FF0U) == 0x06100F70U) {
-            /* SADD8 / SSUB8 / SADD16 / SSUB16 Rd, Rn, Rm */
-            bool is_16  = ((insn >> 7) & 1U) == 0U;
-            bool is_sub = ((insn >> 5) & 3U) != 0U;
+                   (insn & 0x0FF00F90U) == 0x06100F10U) {
+            /* SADD8 / SSUB8 / SADD16 / SASX / SSAX / SSUB16 Rd, Rn, Rm */
+            bool is_16   = ((insn >> 7) & 1U) == 0U;
+            unsigned op2 = (insn >> 5) & 3U;
+            bool is_sub  = (op2 != 0U);
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
@@ -912,9 +919,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 for (unsigned i = 0U; i < 2U; i++) {
+                    unsigned rm_i = (op2 == 1U || op2 == 2U) ? (1U - i) : i;
+                    bool is_sub_lane = (op2 == 3U) || (op2 == 1U && i == 0U) || (op2 == 2U && i == 1U);
                     a64_emit_sbfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
-                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
-                    if (is_sub) {
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, rm_i * 16U, rm_i * 16U + 15U);
+                    if (is_sub_lane) {
                         a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                     } else {
                         a64_emit_add_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
@@ -944,10 +953,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06500F90U || (insn & 0x0FF00FF0U) == 0x06500FF0U ||
-                   (insn & 0x0FF00FF0U) == 0x06500F10U || (insn & 0x0FF00FF0U) == 0x06500F70U) {
-            /* UADD8 / USUB8 / UADD16 / USUB16 Rd, Rn, Rm */
-            bool is_16  = ((insn >> 7) & 1U) == 0U;
-            bool is_sub = ((insn >> 5) & 3U) != 0U;
+                   (insn & 0x0FF00F90U) == 0x06500F10U) {
+            /* UADD8 / USUB8 / UADD16 / UASX / USAX / USUB16 Rd, Rn, Rm */
+            bool is_16   = ((insn >> 7) & 1U) == 0U;
+            unsigned op2 = (insn >> 5) & 3U;
+            bool is_sub  = (op2 != 0U);
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
@@ -958,9 +968,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 for (unsigned i = 0U; i < 2U; i++) {
+                    unsigned rm_i = (op2 == 1U || op2 == 2U) ? (1U - i) : i;
+                    bool is_sub_lane = (op2 == 3U) || (op2 == 1U && i == 0U) || (op2 == 2U && i == 1U);
                     a64_emit_ubfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
-                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
-                    if (is_sub) {
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, rm_i * 16U, rm_i * 16U + 15U);
+                    if (is_sub_lane) {
                         a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                     } else {
                         a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
@@ -992,19 +1004,22 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06300F90U || (insn & 0x0FF00FF0U) == 0x06300FF0U ||
-                   (insn & 0x0FF00FF0U) == 0x06300F10U || (insn & 0x0FF00FF0U) == 0x06300F70U) {
-            /* SHADD8 / SHSUB8 / SHADD16 / SHSUB16 Rd, Rn, Rm */
-            bool is_16  = ((insn >> 7) & 1U) == 0U;
-            bool is_sub = ((insn >> 5) & 3U) != 0U;
+                   (insn & 0x0FF00F90U) == 0x06300F10U) {
+            /* SHADD8 / SHSUB8 / SHADD16 / SHASX / SHSAX / SHSUB16 Rd, Rn, Rm */
+            bool is_16   = ((insn >> 7) & 1U) == 0U;
+            unsigned op2 = (insn >> 5) & 3U;
+            bool is_sub  = (op2 != 0U);
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 for (unsigned i = 0U; i < 2U; i++) {
+                    unsigned rm_i = (op2 == 1U || op2 == 2U) ? (1U - i) : i;
+                    bool is_sub_lane = (op2 == 3U) || (op2 == 1U && i == 0U) || (op2 == 2U && i == 1U);
                     a64_emit_sbfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
-                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
-                    if (is_sub) {
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, rm_i * 16U, rm_i * 16U + 15U);
+                    if (is_sub_lane) {
                         a64_emit_sub_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                     } else {
                         a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
@@ -1030,19 +1045,22 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06700F90U || (insn & 0x0FF00FF0U) == 0x06700FF0U ||
-                   (insn & 0x0FF00FF0U) == 0x06700F10U || (insn & 0x0FF00FF0U) == 0x06700F70U) {
-            /* UHADD8 / UHSUB8 / UHADD16 / UHSUB16 Rd, Rn, Rm */
-            bool is_16  = ((insn >> 7) & 1U) == 0U;
-            bool is_sub = ((insn >> 5) & 3U) != 0U;
+                   (insn & 0x0FF00F90U) == 0x06700F10U) {
+            /* UHADD8 / UHSUB8 / UHADD16 / UHASX / UHSAX / UHSUB16 Rd, Rn, Rm */
+            bool is_16   = ((insn >> 7) & 1U) == 0U;
+            unsigned op2 = (insn >> 5) & 3U;
+            bool is_sub  = (op2 != 0U);
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
             a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
             if (is_16) {
                 for (unsigned i = 0U; i < 2U; i++) {
+                    unsigned rm_i = (op2 == 1U || op2 == 2U) ? (1U - i) : i;
+                    bool is_sub_lane = (op2 == 3U) || (op2 == 1U && i == 0U) || (op2 == 2U && i == 1U);
                     a64_emit_ubfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
-                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
-                    if (is_sub) {
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, rm_i * 16U, rm_i * 16U + 15U);
+                    if (is_sub_lane) {
                         a64_emit_sub_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                     } else {
                         a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
@@ -1066,10 +1084,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06200F90U || (insn & 0x0FF00FF0U) == 0x06200FF0U ||
-                   (insn & 0x0FF00FF0U) == 0x06200F10U || (insn & 0x0FF00FF0U) == 0x06200F70U) {
-            /* QADD8 / QSUB8 / QADD16 / QSUB16 Rd, Rn, Rm */
-            bool is_16  = ((insn >> 7) & 1U) == 0U;
-            bool is_sub = ((insn >> 5) & 3U) != 0U;
+                   (insn & 0x0FF00F90U) == 0x06200F10U) {
+            /* QADD8 / QSUB8 / QADD16 / QASX / QSAX / QSUB16 Rd, Rn, Rm */
+            bool is_16   = ((insn >> 7) & 1U) == 0U;
+            unsigned op2 = (insn >> 5) & 3U;
+            bool is_sub  = (op2 != 0U);
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
@@ -1080,9 +1099,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             if (is_16) {
                 a64_emit_mov_imm32(b, A64_ADDR, (uint32_t)-32768);
                 for (unsigned i = 0U; i < 2U; i++) {
+                    unsigned rm_i = (op2 == 1U || op2 == 2U) ? (1U - i) : i;
+                    bool is_sub_lane = (op2 == 3U) || (op2 == 1U && i == 0U) || (op2 == 2U && i == 1U);
                     a64_emit_sbfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
-                    a64_emit_sbfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
-                    if (is_sub) {
+                    a64_emit_sbfm_w(b, A64_TMP1, rm, rm_i * 16U, rm_i * 16U + 15U);
+                    if (is_sub_lane) {
                         a64_emit_sub_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                     } else {
                         a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
@@ -1118,10 +1139,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_mov_w(b, rd, A64_TMP2);
             handled = true;
         } else if ((insn & 0x0FF00FF0U) == 0x06600F90U || (insn & 0x0FF00FF0U) == 0x06600FF0U ||
-                   (insn & 0x0FF00FF0U) == 0x06600F10U || (insn & 0x0FF00FF0U) == 0x06600F70U) {
-            /* UQADD8 / UQSUB8 / UQADD16 / UQSUB16 Rd, Rn, Rm */
-            bool is_16  = ((insn >> 7) & 1U) == 0U;
-            bool is_sub = ((insn >> 5) & 3U) != 0U;
+                   (insn & 0x0FF00F90U) == 0x06600F10U) {
+            /* UQADD8 / UQSUB8 / UQADD16 / UQASX / UQSAX / UQSUB16 Rd, Rn, Rm */
+            bool is_16   = ((insn >> 7) & 1U) == 0U;
+            unsigned op2 = (insn >> 5) & 3U;
+            bool is_sub  = (op2 != 0U);
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
@@ -1132,9 +1154,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             if (is_16) {
                 a64_emit_mov_imm32(b, A64_ADDR, 65535U);
                 for (unsigned i = 0U; i < 2U; i++) {
+                    unsigned rm_i = (op2 == 1U || op2 == 2U) ? (1U - i) : i;
+                    bool is_sub_lane = (op2 == 3U) || (op2 == 1U && i == 0U) || (op2 == 2U && i == 1U);
                     a64_emit_ubfm_w(b, A64_TMP0, rn, i * 16U, i * 16U + 15U);
-                    a64_emit_ubfm_w(b, A64_TMP1, rm, i * 16U, i * 16U + 15U);
-                    if (is_sub) {
+                    a64_emit_ubfm_w(b, A64_TMP1, rm, rm_i * 16U, rm_i * 16U + 15U);
+                    if (is_sub_lane) {
                         a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                         a64_emit_csel_w(b, A64_TMP0, A64_TMP0, A64_ZR, A64_COND_CS);
                     } else {
@@ -1333,7 +1357,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             a64_emit_orr_reg_w(b, rd, rd, A64_TMP0, A64_SHIFT_LSL, 0U);
             handled = true;
         } else if (op1 == 0U && (insn & 0x0FF0FFF0U) == 0x0120F000U &&
-                   ((insn >> 16) & 0xCU) != 0U) {
+                   ((insn >> 16) & 0xFU) != 0U) {
             /* MSR APSR/CPSR_<fields>, Rm */
             unsigned mask = (insn >> 16) & 0xFU;
             unsigned rm = insn & 0xFU;
@@ -1355,7 +1379,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             }
             handled = true;
         } else if (op1 == 1U && (insn & 0x0FF0F000U) == 0x0320F000U &&
-                   ((insn >> 16) & 0xCU) != 0U) {
+                   ((insn >> 16) & 0xFU) != 0U) {
             /* MSR APSR/CPSR_<fields>, #imm */
             unsigned mask = (insn >> 16) & 0xFU;
             uint32_t imm32 = ror32(insn & 0xFFU, ((insn >> 8) & 0xFU) * 2U);

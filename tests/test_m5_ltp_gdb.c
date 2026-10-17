@@ -1616,6 +1616,179 @@ static int test19_r6_madvise_robust_sockopt(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 20: Round 7 regressions —
+ *   20a: truncate (92) and ftruncate (93) positive 32-bit file truncation &
+ *        extension and negative (-EINVAL on negative length, -EFAULT on
+ *        invalid path, -EBADF on invalid fd)
+ *   20b: sched_getaffinity (242) positive return > 0 & non-zero CPU mask and
+ *        negative (-EFAULT on invalid mask pointer, -ESRCH on bad pid)
+ *   20c: gettimeofday (78) with non-NULL tz pointer (+ valid tv & tz and
+ *        NULL tv with non-NULL tz, - EFAULT on invalid tv or tz pointer)
+ * -------------------------------------------------------------------------- */
+struct timezone32_m5 {
+    int32_t tz_minuteswest;
+    int32_t tz_dsttime;
+};
+
+static int test20_r7_truncate_affinity_gettimeofday(void)
+{
+    /*
+     * 20a: truncate (92) and ftruncate (93):
+     *   - Create a 64-byte file, ftruncate (93) to 24 bytes, verify size via
+     *     lseek(SEEK_END) == 24, then extend via ftruncate (93) to 48 bytes.
+     *   - Negative ftruncate (93) with negative length (-1) -> -EINVAL (-22),
+     *     and invalid fd (9999) -> -EBADF (-9).
+     *   - Positive truncate (92) by path to 12 bytes and then 0 bytes,
+     *     verifying lseek(SEEK_END) == 12 and 0.
+     *   - Negative truncate (92) with negative length (-1) -> -EINVAL (-22),
+     *     and invalid path pointer (0, 0x100) -> -EFAULT (-14).
+     */
+    static const char trunc_path[] = "/tmp/a32rt_m5_r7_trunc32_test";
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+
+    int32_t tfd = sys3(5U /* open */, (uint32_t)(uintptr_t)trunc_path,
+                       0x242U /* O_CREAT | O_TRUNC | O_RDWR */, 0644U);
+    if (tfd < 0) {
+        return 174;
+    }
+
+    static char init_data[64];
+    for (int i = 0; i < 64; i++) {
+        init_data[i] = (char)('A' + (i & 15));
+    }
+    if (sys3(4U /* write */, (uint32_t)tfd, (uint32_t)(uintptr_t)init_data, 64U) != 64) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 175;
+    }
+
+    /* Negative: ftruncate (93) with negative length (-1) -> -EINVAL (-22), bad fd -> -EBADF (-9) */
+    if (sys2(93U /* ftruncate */, (uint32_t)tfd, 0xFFFFFFFFU /* -1 */) != -22 /* -EINVAL */ ||
+        sys2(93U /* ftruncate */, (uint32_t)tfd, 0x80000000U /* INT32_MIN */) != -22 /* -EINVAL */ ||
+        sys2(93U /* ftruncate */, 9999U, 16U) != -9 /* -EBADF */) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 176;
+    }
+
+    /* Positive: ftruncate (93) shrink to 24 bytes and extend to 48 bytes */
+    if (sys2(93U /* ftruncate */, (uint32_t)tfd, 24U) != 0 ||
+        sys3(19U /* lseek */, (uint32_t)tfd, 0U, 2U /* SEEK_END */) != 24) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 177;
+    }
+    if (sys2(93U /* ftruncate */, (uint32_t)tfd, 48U) != 0 ||
+        sys3(19U /* lseek */, (uint32_t)tfd, 0U, 2U /* SEEK_END */) != 48) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 178;
+    }
+
+    /* Negative: truncate (92) with negative length (-1) -> -EINVAL (-22), bad path -> -EFAULT (-14) */
+    if (sys2(92U /* truncate */, (uint32_t)(uintptr_t)trunc_path, 0xFFFFFFFFU /* -1 */) != -22 /* -EINVAL */ ||
+        sys2(92U /* truncate */, (uint32_t)(uintptr_t)trunc_path, 0x80000000U /* INT32_MIN */) != -22 /* -EINVAL */ ||
+        sys2(92U /* truncate */, 0U, 10U) != -14 /* -EFAULT */ ||
+        sys2(92U /* truncate */, 0x100U, 10U) != -14 /* -EFAULT */) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 179;
+    }
+
+    /* Positive: truncate (92) by path to 12 bytes and then 0 bytes */
+    if (sys2(92U /* truncate */, (uint32_t)(uintptr_t)trunc_path, 12U) != 0 ||
+        sys3(19U /* lseek */, (uint32_t)tfd, 0U, 2U /* SEEK_END */) != 12) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 180;
+    }
+    if (sys2(92U /* truncate */, (uint32_t)(uintptr_t)trunc_path, 0U) != 0 ||
+        sys3(19U /* lseek */, (uint32_t)tfd, 0U, 2U /* SEEK_END */) != 0) {
+        sys1(6U /* close */, (uint32_t)tfd);
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+        return 181;
+    }
+
+    sys1(6U /* close */, (uint32_t)tfd);
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)trunc_path);
+
+    /*
+     * 20b: sched_getaffinity (242):
+     *   - Negative: invalid mask pointer (0, 0x100) -> -EFAULT (-14);
+     *     non-existent pid (999999) -> -ESRCH (-3)
+     *   - Positive: pid == 0 and pid == gettid() return > 0 with non-zero mask
+     */
+    static uint64_t cpu_mask[16];
+    my_memset(cpu_mask, 0, sizeof(cpu_mask));
+
+    if (sys3(242U /* sched_getaffinity */, 0U, (uint32_t)sizeof(cpu_mask), 0U) != -14 /* -EFAULT */ ||
+        sys3(242U /* sched_getaffinity */, 0U, (uint32_t)sizeof(cpu_mask), 0x100U) != -14 /* -EFAULT */) {
+        return 182;
+    }
+    if (sys3(242U /* sched_getaffinity */, 999999U,
+             (uint32_t)sizeof(cpu_mask), (uint32_t)(uintptr_t)cpu_mask) != -3 /* -ESRCH */) {
+        return 183;
+    }
+
+    int32_t aff_rc = sys3(242U /* sched_getaffinity */, 0U,
+                          (uint32_t)sizeof(cpu_mask), (uint32_t)(uintptr_t)cpu_mask);
+    if (aff_rc <= 0 || cpu_mask[0] == 0ULL) {
+        return 184;
+    }
+
+    /*
+     * 20c: gettimeofday (78) with non-NULL tz pointer:
+     *   - Negative: invalid tv pointer (0x100) or invalid tz pointer (0x100) -> -EFAULT (-14)
+     *   - Positive: both tv and tz non-NULL -> returns 0, populates tv and tz
+     *     without overflowing 8-byte struct timezone into canary words;
+     *     also NULL tv with non-NULL tz -> returns 0
+     */
+    static struct timeval32 gt_tv;
+    static struct {
+        struct timezone32_m5 tz;
+        uint32_t             canary[2];
+    } gt_tz_buf;
+
+    gt_tv.tv_sec  = -1;
+    gt_tv.tv_usec = -1;
+    gt_tz_buf.tz.tz_minuteswest = 0x12345678;
+    gt_tz_buf.tz.tz_dsttime     = 0x12345678;
+    gt_tz_buf.canary[0]         = 0xDEADBEEFU;
+    gt_tz_buf.canary[1]         = 0xCAFEBABEU;
+
+    if (sys2(78U /* gettimeofday */, 0x100U, (uint32_t)(uintptr_t)&gt_tz_buf.tz) != -14 /* -EFAULT */ ||
+        sys2(78U /* gettimeofday */, (uint32_t)(uintptr_t)&gt_tv, 0x100U) != -14 /* -EFAULT */) {
+        return 185;
+    }
+
+    if (sys2(78U /* gettimeofday */,
+             (uint32_t)(uintptr_t)&gt_tv,
+             (uint32_t)(uintptr_t)&gt_tz_buf.tz) != 0) {
+        return 186;
+    }
+    if (gt_tv.tv_sec <= 0 ||
+        gt_tv.tv_usec < 0 ||
+        gt_tv.tv_usec >= 1000000 ||
+        gt_tz_buf.tz.tz_minuteswest == 0x12345678 ||
+        gt_tz_buf.canary[0] != 0xDEADBEEFU ||
+        gt_tz_buf.canary[1] != 0xCAFEBABEU) {
+        return 187;
+    }
+
+    /* Also verify gettimeofday(NULL, &tz) succeeds */
+    gt_tz_buf.tz.tz_minuteswest = 0x12345678;
+    gt_tz_buf.tz.tz_dsttime     = 0x12345678;
+    if (sys2(78U /* gettimeofday */, 0U, (uint32_t)(uintptr_t)&gt_tz_buf.tz) != 0 ||
+        gt_tz_buf.tz.tz_minuteswest == 0x12345678 ||
+        gt_tz_buf.canary[0] != 0xDEADBEEFU ||
+        gt_tz_buf.canary[1] != 0xCAFEBABEU) {
+        return 188;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -1683,6 +1856,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test19_r6_madvise_robust_sockopt();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test20_r7_truncate_affinity_gettimeofday();
     if (rc != 0) {
         return rc;
     }

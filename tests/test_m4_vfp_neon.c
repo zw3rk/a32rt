@@ -1769,6 +1769,192 @@ static int run_vfp_neon_tests(void)
         }
     }
 
+    /*
+     * 29. Round 7 regressions for scalar VMLS.F32 / VMLS.F64 and
+     *     VNMLS.F32 / VNMLS.F64:
+     *     - 29a: VNMLS.F32 / VNMLS.F64 signed-zero (+0.0 when d=+1.0, n=+1.0, m=+1.0
+     *            -> (-1.0) + (+1.0) = +0.0 with sign bit 0; and -0.0 when
+     *            d=+0.0, n=-1.0, m=+0.0 -> (-0.0) + (-0.0) = -0.0 with sign bit 1)
+     *            and VMLS.F32 / VMLS.F64 signed-zero (+0.0 when d=+1.0, n=+1.0, m=+1.0
+     *            -> (+1.0) + (-1.0) = +0.0 with sign bit 0).
+     *     - 29b: VMLS.F32 / VMLS.F64 and VNMLS.F32 / VNMLS.F64 with finite values
+     *            and destination-source register aliasing (Sd == Sn, Sd == Sm,
+     *            Dd == Dn, Dd == Dm).
+     *     - 29c: QNaN propagation in VMLS.F32 / VMLS.F64 and VNMLS.F32 / VNMLS.F64
+     *            (when accumulator d is QNaN or multiplier operand n/m is QNaN).
+     */
+    {
+        /* 29a: Signed-zero checks for VMLS and VNMLS (F32 & F64) */
+        float f_one = 1.0f;
+        float f_neg_one = -1.0f;
+        float f_pos_zero = 0.0f;
+        uint32_t vmls_f32_pzero = 0xFFFFFFFFU;
+        uint32_t vnmls_f32_pzero = 0xFFFFFFFFU;
+        uint32_t vnmls_f32_nzero = 0U;
+        __asm__ volatile(
+            "vldr s1, %3\n"
+            "vldr s3, %3\n"
+            "vldr s5, %3\n"
+            "vmls.f32 s1, s3, s5\n"
+            "vmov %0, s1\n"
+            "vldr s1, %3\n"
+            "vnmls.f32 s1, s3, s5\n"
+            "vmov %1, s1\n"
+            "vldr s1, %5\n"
+            "vldr s3, %4\n"
+            "vldr s5, %5\n"
+            "vnmls.f32 s1, s3, s5\n"
+            "vmov %2, s1\n"
+            : "=&r"(vmls_f32_pzero), "=&r"(vnmls_f32_pzero), "=r"(vnmls_f32_nzero)
+            : "m"(f_one), "m"(f_neg_one), "m"(f_pos_zero)
+            : "s1", "s3", "s5"
+        );
+        if (vmls_f32_pzero != 0x00000000U ||
+            vnmls_f32_pzero != 0x00000000U ||
+            vnmls_f32_nzero != 0x80000000U) {
+            return 83;
+        }
+
+        double d_one = 1.0;
+        double d_neg_one = -1.0;
+        double d_pos_zero = 0.0;
+        uint64_t vmls_f64_pzero = 0xFFFFFFFFFFFFFFFFULL;
+        uint64_t vnmls_f64_pzero = 0xFFFFFFFFFFFFFFFFULL;
+        uint64_t vnmls_f64_nzero = 0ULL;
+        __asm__ volatile(
+            "vldr d16, %3\n"
+            "vldr d17, %3\n"
+            "vldr d18, %3\n"
+            "vmls.f64 d16, d17, d18\n"
+            "vstr d16, %0\n"
+            "vldr d16, %3\n"
+            "vnmls.f64 d16, d17, d18\n"
+            "vstr d16, %1\n"
+            "vldr d16, %5\n"
+            "vldr d17, %4\n"
+            "vldr d18, %5\n"
+            "vnmls.f64 d16, d17, d18\n"
+            "vstr d16, %2\n"
+            : "=m"(vmls_f64_pzero), "=m"(vnmls_f64_pzero), "=m"(vnmls_f64_nzero)
+            : "m"(d_one), "m"(d_neg_one), "m"(d_pos_zero)
+            : "d16", "d17", "d18", "memory"
+        );
+        if (vmls_f64_pzero != 0x0000000000000000ULL ||
+            vnmls_f64_pzero != 0x0000000000000000ULL ||
+            vnmls_f64_nzero != 0x8000000000000000ULL) {
+            return 84;
+        }
+
+        /* 29b: Finite values and Sd == Sn / Sd == Sm / Dd == Dn / Dd == Dm aliasing */
+        float f_20_5 = 20.5f, f_3_5 = 3.5f, f_4_0 = 4.0f;
+        float vmls_f32_fin = 0.0f, vmls_f32_alias_n = 0.0f, vnmls_f32_alias_m = 0.0f;
+        __asm__ volatile(
+            "vldr s1, %3\n"
+            "vldr s2, %4\n"
+            "vldr s3, %5\n"
+            "vmls.f32 s1, s2, s3\n"
+            "vstr s1, %0\n"
+            "vldr s2, %4\n"
+            "vmls.f32 s2, s2, s3\n"
+            "vstr s2, %1\n"
+            "vldr s2, %4\n"
+            "vldr s3, %5\n"
+            "vnmls.f32 s3, s2, s3\n"
+            "vstr s3, %2\n"
+            : "=m"(vmls_f32_fin), "=m"(vmls_f32_alias_n), "=m"(vnmls_f32_alias_m)
+            : "m"(f_20_5), "m"(f_3_5), "m"(f_4_0)
+            : "s1", "s2", "s3", "memory"
+        );
+        /*
+         * vmls_f32_fin:     20.5 - (3.5 * 4.0)  = 6.5
+         * vmls_f32_alias_n: 3.5  - (3.5 * 4.0)  = -10.5
+         * vnmls_f32_alias_m: -4.0 + (3.5 * 4.0) = 10.0
+         */
+        if (vmls_f32_fin != 6.5f ||
+            vmls_f32_alias_n != -10.5f ||
+            vnmls_f32_alias_m != 10.0f) {
+            return 85;
+        }
+
+        double d_20_5 = 20.5, d_3_5 = 3.5, d_4_0 = 4.0;
+        double vmls_f64_fin = 0.0, vmls_f64_alias_n = 0.0, vnmls_f64_alias_m = 0.0;
+        __asm__ volatile(
+            "vldr d1, %3\n"
+            "vldr d2, %4\n"
+            "vldr d3, %5\n"
+            "vmls.f64 d1, d2, d3\n"
+            "vstr d1, %0\n"
+            "vldr d2, %4\n"
+            "vmls.f64 d2, d2, d3\n"
+            "vstr d2, %1\n"
+            "vldr d2, %4\n"
+            "vldr d3, %5\n"
+            "vnmls.f64 d3, d2, d3\n"
+            "vstr d3, %2\n"
+            : "=m"(vmls_f64_fin), "=m"(vmls_f64_alias_n), "=m"(vnmls_f64_alias_m)
+            : "m"(d_20_5), "m"(d_3_5), "m"(d_4_0)
+            : "d1", "d2", "d3", "memory"
+        );
+        if (vmls_f64_fin != 6.5 ||
+            vmls_f64_alias_n != -10.5 ||
+            vnmls_f64_alias_m != 10.0) {
+            return 86;
+        }
+
+        /* 29c: QNaN propagation in VMLS.F32 / VMLS.F64 and VNMLS.F32 / VNMLS.F64 */
+        uint32_t qnan32_in = 0x7FC01234U;
+        uint32_t vmls32_nan_d = 0U, vmls32_nan_n = 0U, vnmls32_nan_d = 0U;
+        __asm__ volatile(
+            "vmov s0, %3\n"
+            "vldr s1, %4\n"
+            "vldr s2, %5\n"
+            "vmls.f32 s0, s1, s2\n"
+            "vmov %0, s0\n"
+            "vldr s0, %4\n"
+            "vmov s1, %3\n"
+            "vmls.f32 s0, s1, s2\n"
+            "vmov %1, s0\n"
+            "vmov s0, %3\n"
+            "vldr s1, %4\n"
+            "vnmls.f32 s0, s1, s2\n"
+            "vmov %2, s0\n"
+            : "=&r"(vmls32_nan_d), "=&r"(vmls32_nan_n), "=r"(vnmls32_nan_d)
+            : "r"(qnan32_in), "m"(f_3_5), "m"(f_4_0)
+            : "s0", "s1", "s2"
+        );
+        if ((vmls32_nan_d & 0x7FC00000U) != 0x7FC00000U ||
+            (vmls32_nan_n & 0x7FC00000U) != 0x7FC00000U ||
+            (vnmls32_nan_d & 0x7FC00000U) != 0x7FC00000U) {
+            return 87;
+        }
+
+        uint64_t qnan64_in = 0x7FF8000012345678ULL;
+        uint64_t vmls64_nan_d = 0ULL, vmls64_nan_n = 0ULL, vnmls64_nan_d = 0ULL;
+        __asm__ volatile(
+            "vldr d0, %3\n"
+            "vldr d1, %4\n"
+            "vldr d2, %5\n"
+            "vmls.f64 d0, d1, d2\n"
+            "vstr d0, %0\n"
+            "vldr d0, %4\n"
+            "vldr d1, %3\n"
+            "vmls.f64 d0, d1, d2\n"
+            "vstr d0, %1\n"
+            "vldr d0, %3\n"
+            "vldr d1, %4\n"
+            "vnmls.f64 d0, d1, d2\n"
+            "vstr d0, %2\n"
+            : "=m"(vmls64_nan_d), "=m"(vmls64_nan_n), "=m"(vnmls64_nan_d)
+            : "m"(qnan64_in), "m"(d_3_5), "m"(d_4_0)
+            : "d0", "d1", "d2", "memory"
+        );
+        if ((vmls64_nan_d & 0x7FF8000000000000ULL) != 0x7FF8000000000000ULL ||
+            (vmls64_nan_n & 0x7FF8000000000000ULL) != 0x7FF8000000000000ULL ||
+            (vnmls64_nan_d & 0x7FF8000000000000ULL) != 0x7FF8000000000000ULL) {
+            return 88;
+        }
+    }
+
     static const char pass_msg[] = "M4 VFPv4-D32 & NEON: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

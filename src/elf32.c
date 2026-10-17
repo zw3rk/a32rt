@@ -163,6 +163,10 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
     out->entry     = (uint32_t)entry64;
     out->phent     = ehdr.e_phentsize;
     out->phnum     = ehdr.e_phnum;
+    if ((out->entry & 3U) == 2U) {
+        fprintf(stderr, "a32rt: %s: misaligned A32 entry point 0x%x\n", label, out->entry);
+        return -1;
+    }
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         const elf32_phdr_t *ph = &phdrs[i];
@@ -182,6 +186,7 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
 
     uint32_t highest_mapped_end  = 0U;
     uint32_t highest_mapped_prot = 0U;
+    uint32_t prev_seg_end        = 0U;
     bool     entry_in_load       = false;
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
@@ -206,11 +211,22 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
 
         uint32_t seg_vaddr  = (uint32_t)seg_vaddr64;
-        if ((out->entry & ~1U) >= seg_vaddr && (out->entry & ~1U) < seg_vaddr + ph->p_memsz) {
+        uint64_t seg_end64  = seg_vaddr64 + memsz;
+        if (seg_vaddr < prev_seg_end) {
+            fprintf(stderr, "a32rt: %s: overlapping or out-of-order PT_LOAD segment at 0x%x\n",
+                    label, seg_vaddr);
+            return -1;
+        }
+        prev_seg_end = (uint32_t)seg_end64;
+
+        uint32_t entry_pc      = (out->entry & 1U) ? (out->entry & ~1U) : (out->entry & ~3U);
+        uint32_t entry_min_len = (out->entry & 1U) ? 2U : 4U;
+        if ((ph->p_flags & PF_X) != 0U &&
+            entry_pc >= seg_vaddr &&
+            (uint64_t)entry_pc + entry_min_len <= seg_vaddr64 + memsz) {
             entry_in_load = true;
         }
         uint32_t page_start = page_down(seg_vaddr);
-        uint64_t seg_end64  = seg_vaddr64 + memsz;
         uint64_t map_end64  = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
         if (page_start < 0x10000U || map_end64 > (uint64_t)A32_KUSER_BASE_32) {
             fprintf(stderr, "a32rt: %s: segment [0x%x, 0x%llx) out of guest bounds\n",

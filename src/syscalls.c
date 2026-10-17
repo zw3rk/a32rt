@@ -84,6 +84,8 @@ extern char **environ;
 #define ARM_NR_symlink           83U
 #define ARM_NR_readlink          85U
 #define ARM_NR_munmap            91U
+#define ARM_NR_truncate          92U
+#define ARM_NR_ftruncate         93U
 #define ARM_NR_fchmod            94U
 #define ARM_NR_fchown            95U
 #define ARM_NR_wait4             114U
@@ -110,6 +112,9 @@ extern char **environ;
 #define ARM_NR_rt_sigreturn      173U
 #define ARM_NR_rt_sigaction      174U
 #define ARM_NR_rt_sigprocmask    175U
+#define ARM_NR_rt_sigpending     176U
+#define ARM_NR_rt_sigqueueinfo   178U
+#define ARM_NR_rt_sigsuspend     179U
 #define ARM_NR_pread64           180U
 #define ARM_NR_pwrite64          181U
 #define ARM_NR_chown             182U
@@ -147,6 +152,8 @@ extern char **environ;
 #define ARM_NR_tkill             238U
 #define ARM_NR_sendfile64        239U
 #define ARM_NR_futex             240U
+#define ARM_NR_sched_setaffinity 241U
+#define ARM_NR_sched_getaffinity 242U
 #define ARM_NR_exit_group        248U
 #define ARM_NR_epoll_create      250U
 #define ARM_NR_epoll_ctl         251U
@@ -201,6 +208,7 @@ extern char **environ;
 #define ARM_NR_epoll_create1     357U
 #define ARM_NR_dup3              358U
 #define ARM_NR_pipe2             359U
+#define ARM_NR_rt_tgsigqueueinfo 363U
 #define ARM_NR_accept4           366U
 #define ARM_NR_prlimit64         369U
 #define ARM_NR_renameat2         382U
@@ -1118,6 +1126,11 @@ int a32_handle_syscall(a32_ctx_t *ctx)
 
     case ARM_NR_exit_group:
         a32_cleanup_robust_list(ctx);
+        if (ctx->clear_child_tid >= 0x1000U) {
+            uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctx->clear_child_tid);
+            *ctid = 0U;
+            syscall(SYS_futex, ctid, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+        }
         print_stats_if_enabled(ctx);
         syscall(SYS_exit_group, (int)a0);
         return 1;
@@ -1719,6 +1732,93 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         ctx->regs[0] = (uint32_t)a32_sys_rt_sigprocmask(ctx, (int)a0, a1, a2, a3);
         break;
 
+    case ARM_NR_rt_sigpending: {
+        if (a1 != 8U) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        if (a0 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        uint64_t pend = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
+        memcpy(a32_guest_ptr(ctx, a0), &pend, sizeof(pend));
+        ctx->regs[0] = 0U;
+        break;
+    }
+
+    case ARM_NR_rt_sigsuspend: {
+        if (a1 != 8U) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        if (a0 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        uint64_t saved_sig_mask = ctx->sig_mask;
+        uint64_t temp_mask      = 0ULL;
+        memcpy(&temp_mask, a32_guest_ptr(ctx, a0), sizeof(temp_mask));
+        temp_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        ctx->sig_mask = temp_mask;
+        ctx->regs[0]  = (uint32_t)(-EINTR);
+        if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & ~temp_mask) != 0ULL) {
+            check_pwait_signals(ctx, temp_mask);
+            if (ctx->exit_reason == A32_EXIT_BRANCH) {
+                restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
+                break;
+            }
+            ctx->sig_mask = temp_mask;
+        }
+        while ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & ~temp_mask) == 0ULL) {
+            struct timespec poll_ts = { 0, 1000000L };
+            long pr = syscall(SYS_ppoll, NULL, 0, &poll_ts, &temp_mask, 8);
+            if (pr < 0 && errno == EINTR) {
+                break;
+            }
+        }
+        ctx->regs[0] = (uint32_t)(-EINTR);
+        check_pwait_signals(ctx, temp_mask);
+        restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);
+        break;
+    }
+
+    case ARM_NR_rt_sigqueueinfo: {
+        if (a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        const uint32_t *gsi = (const uint32_t *)a32_guest_ptr(ctx, a2);
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo           = (int)gsi[0];
+        si.si_errno           = (int)gsi[1];
+        si.si_code            = (int)gsi[2];
+        si.si_pid             = (pid_t)gsi[3];
+        si.si_uid             = (uid_t)gsi[4];
+        si.si_value.sival_int = (int)gsi[5];
+        ctx->regs[0] = host_ret(syscall(SYS_rt_sigqueueinfo, (pid_t)a0, (int)a1, &si));
+        break;
+    }
+
+    case ARM_NR_rt_tgsigqueueinfo: {
+        if (a3 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        const uint32_t *gsi = (const uint32_t *)a32_guest_ptr(ctx, a3);
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo           = (int)gsi[0];
+        si.si_errno           = (int)gsi[1];
+        si.si_code            = (int)gsi[2];
+        si.si_pid             = (pid_t)gsi[3];
+        si.si_uid             = (uid_t)gsi[4];
+        si.si_value.sival_int = (int)gsi[5];
+        ctx->regs[0] = host_ret(syscall(SYS_rt_tgsigqueueinfo, (pid_t)a0, (pid_t)a1, (int)a2, &si));
+        break;
+    }
+
     case ARM_NR_sigaltstack:
         ctx->regs[0] = (uint32_t)a32_sys_sigaltstack(ctx, a0, a1);
         break;
@@ -1967,13 +2067,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         struct timeval tv;
-        if (gettimeofday(&tv, NULL) != 0) {
+        struct timezone tz;
+        memset(&tz, 0, sizeof(tz));
+        if (gettimeofday(&tv, (a1 != 0U) ? &tz : NULL) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             if (a0 != 0U) {
                 uint32_t *p = (uint32_t *)a32_guest_ptr(ctx, a0);
                 p[0] = (uint32_t)tv.tv_sec;
                 p[1] = (uint32_t)tv.tv_usec;
+            }
+            if (a1 != 0U) {
+                int32_t tz32[2] = { (int32_t)tz.tz_minuteswest, (int32_t)tz.tz_dsttime };
+                memcpy(a32_guest_ptr(ctx, a1), tz32, sizeof(tz32));
             }
             ctx->regs[0] = 0U;
         }
@@ -2568,6 +2674,28 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
     }
 
+    case ARM_NR_truncate: {
+        char resolved[PATH_MAX];
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        if ((int32_t)a1 < 0) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        ctx->regs[0] = host_ret(truncate(resolved, (off_t)(int32_t)a1));
+        break;
+    }
+
+    case ARM_NR_ftruncate:
+        if ((int32_t)a1 < 0) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        ctx->regs[0] = host_ret(ftruncate((int)a0, (off_t)(int32_t)a1));
+        break;
+
     case ARM_NR_truncate64: {
         char resolved[PATH_MAX];
         if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), true) < 0) {
@@ -2582,6 +2710,43 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     case ARM_NR_ftruncate64: {
         off_t len = (off_t)(((uint64_t)a3 << 32) | (uint64_t)a2);
         ctx->regs[0] = host_ret(ftruncate((int)a0, len));
+        break;
+    }
+
+    case ARM_NR_sched_setaffinity:
+        if (a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        ctx->regs[0] = host_ret(syscall(SYS_sched_setaffinity, (pid_t)a0,
+                                        (unsigned int)a1, a32_guest_ptr(ctx, a2)));
+        break;
+
+    case ARM_NR_sched_getaffinity: {
+        if (a2 < 0x1000U) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        if ((a1 & 3U) != 0U || a1 == 0U) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        if ((a1 & 7U) == 4U && a1 <= 1020U) {
+            uint64_t kbuf[128];
+            memset(kbuf, 0, sizeof(kbuf));
+            long r = syscall(SYS_sched_getaffinity, (pid_t)a0,
+                             (unsigned int)(a1 + 4U), kbuf);
+            if (r < 0) {
+                ctx->regs[0] = (uint32_t)(-errno);
+            } else {
+                uint32_t out_len = ((uint32_t)r > a1) ? a1 : (uint32_t)r;
+                memcpy(a32_guest_ptr(ctx, a2), kbuf, out_len);
+                ctx->regs[0] = out_len;
+            }
+            break;
+        }
+        ctx->regs[0] = host_ret(syscall(SYS_sched_getaffinity, (pid_t)a0,
+                                        (unsigned int)a1, a32_guest_ptr(ctx, a2)));
         break;
     }
 
@@ -2809,6 +2974,11 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)(-EMSGSIZE);
             break;
         }
+        if ((gm->msg_name != 0U && gm->msg_name < 0x1000U) ||
+            (gm->msg_controllen != 0U && gm->msg_control < 0x1000U)) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
         struct msghdr hm;
         memset(&hm, 0, sizeof(hm));
         hm.msg_name    = (gm->msg_name != 0U) ? a32_guest_ptr(ctx, gm->msg_name) : NULL;
@@ -2818,10 +2988,6 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         _Alignas(8) uint8_t cbuf64[1024];
         memset(cbuf64, 0, sizeof(cbuf64));
         if (gm->msg_control != 0U && gm->msg_controllen > 0U) {
-            if (gm->msg_control < 0x1000U) {
-                ctx->regs[0] = (uint32_t)(-EFAULT);
-                break;
-            }
             if (nr == ARM_NR_sendmsg) {
                 const uint8_t *gctl = (const uint8_t *)a32_guest_ptr(ctx, gm->msg_control);
                 uint32_t off32 = 0U;
@@ -3021,7 +3187,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 has_temp_mask = true;
                 ctx->sig_mask = temp_mask;
             }
-            host_sig_pack.ss     = (g_pack[0] != 0U) ? a32_guest_ptr(ctx, g_pack[0]) : NULL;
+            host_sig_pack.ss     = has_temp_mask ? (const sigset_t *)&temp_mask : NULL;
             host_sig_pack.ss_len = (size_t)g_pack[1];
             sig_arg = &host_sig_pack;
         }
@@ -3150,7 +3316,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->sig_mask = temp_mask;
             ctx->regs[0]  = orig_r0;
         }
-        sigset_t *sig_ptr = a3 ? (sigset_t *)a32_guest_ptr(ctx, a3) : NULL;
+        const sigset_t *sig_ptr = has_temp_mask ? (const sigset_t *)&temp_mask : NULL;
         ctx->regs[0] = host_ret(ppoll((a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL,
                                      (nfds_t)a1, ts_ptr, sig_ptr));
         if (has_temp_mask) {
@@ -3200,7 +3366,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->sig_mask = temp_mask;
             ctx->regs[0]  = orig_r0;
         }
-        sigset_t *sig_ptr = a3 ? (sigset_t *)a32_guest_ptr(ctx, a3) : NULL;
+        const sigset_t *sig_ptr = has_temp_mask ? (const sigset_t *)&temp_mask : NULL;
         ctx->regs[0] = host_ret(ppoll((a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL,
                                      (nfds_t)a1, ts_ptr, sig_ptr));
         if (has_temp_mask) {
@@ -3264,7 +3430,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         }
         ctx->regs[0] = host_ret(epoll_pwait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
                                            (int)a2, (int)a3,
-                                           a4 ? (const sigset_t *)a32_guest_ptr(ctx, a4) : NULL));
+                                           has_temp_mask ? (const sigset_t *)&temp_mask : NULL));
         if (has_temp_mask) {
             check_pwait_signals(ctx, temp_mask);
             restore_pwait_sigmask(ctx, saved_sig_mask, temp_mask);

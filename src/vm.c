@@ -437,7 +437,7 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
             char *endp = NULL;
             errno = 0;
             unsigned long long val = strtoull(env_win, &endp, 0);
-            if (env_win[0] == '-' || errno == ERANGE || !endp ||
+            if (strchr(env_win, '-') != NULL || errno == ERANGE || !endp ||
                 endp == env_win || *endp != '\0' || (uint64_t)val == UINT64_MAX) {
                 fprintf(stderr, "a32rt: invalid A32RT_WINDOW '%s'\n", env_win);
                 return -1;

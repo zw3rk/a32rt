@@ -310,7 +310,7 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
     fclose(f);
     if (i < hdr.num_blocks) {
         (void)a32_jit_flush_batch(ctx);
-        (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFF0000U);
+        (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
         unlink(cache_path);
         return -1;
     }
@@ -486,9 +486,10 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                 uint32_t insn = *insn_ptr;
 
                 /* Function prologues: STMDB sp!, {..., lr} or SUB sp, sp, #imm */
-                if ((insn & 0x0FFF4000U) == 0x092D4000U ||
-                    (insn & 0x0FFF0000U) == 0x024D0000U ||
-                    insn == 0xE52DE004U) {
+                if ((insn >> 28U) != 0xFU &&
+                    ((insn & 0x0FFF4000U) == 0x092D4000U ||
+                     (insn & 0x0FFF0000U) == 0x024D0000U ||
+                     insn == 0xE52DE004U)) {
                     add_target(pc, false, disc_pcs, disc_thumb, &disc_count);
                 }
                 /* Branch / call: B / BL */

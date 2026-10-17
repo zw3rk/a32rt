@@ -97,7 +97,7 @@ int main(int argc, char **argv, char **envp)
             i++;
             break;
         } else if (strcmp(argv[i], "--window") == 0) {
-            if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || strchr(argv[i + 1], '-') != NULL) {
                 usage(argv[0]);
                 return 1;
             }

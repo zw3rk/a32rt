@@ -120,6 +120,9 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
         unsigned rt2 = (insn >> 16) & 0xFU;
         unsigned rt  = (insn >> 12) & 0xFU;
         uint32_t off;
+        if (rt == 15U || rt2 == 15U || (l_bit && rt == rt2)) {
+            return false;
+        }
         if (!is_double) {
             unsigned sm = ((insn & 0xFU) << 1) | ((insn >> 5) & 1U);
             if (sm == 31U) {
@@ -181,6 +184,9 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
         /* VMOV Sn, Rt / VMOV Rt, Sn */
         if (opc1 == 0U && !is_double) {
+            if (rt == 15U) {
+                return false;
+            }
             unsigned sn = (((insn >> 16) & 0xFU) << 1) | ((insn >> 7) & 1U);
             uint32_t off = A32_CTX_VFP_OFFSET + (sn * 4U);
             if (l_bit) {
@@ -722,13 +728,12 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     a64_emit_fmul_s(b, 0U, 1U, 2U);
                     a64_emit_fadd_s(b, 0U, 3U, 0U);
                 }
-            } else { /* VMLS: d - n*m */
+            } else { /* VMLS: d + (-(n * m)) = FPAdd(d, FPNeg(FPMul(n, m))) */
+                a64_emit(b, (is_double ? 0x1E608800U : 0x1E208800U) | (2U << 16) | (1U << 5) | 0U); /* fnmul s0/d0, s1/d1, s2/d2 */
                 if (is_double) {
-                    a64_emit_fmul_d(b, 0U, 1U, 2U);
-                    a64_emit_fsub_d(b, 0U, 3U, 0U);
+                    a64_emit_fadd_d(b, 0U, 3U, 0U);
                 } else {
-                    a64_emit_fmul_s(b, 0U, 1U, 2U);
-                    a64_emit_fsub_s(b, 0U, 3U, 0U);
+                    a64_emit_fadd_s(b, 0U, 3U, 0U);
                 }
             }
             handled = true;
@@ -745,13 +750,15 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     a64_emit_fneg_s(b, 3U, 3U);
                     a64_emit_fadd_s(b, 0U, 3U, 0U);
                 }
-            } else { /* VNMLS: -d + n*m */
+            } else { /* VNMLS: (-d) + (n * m) = FPAdd(FPNeg(d), FPMul(n, m)) */
                 if (is_double) {
                     a64_emit_fmul_d(b, 0U, 1U, 2U);
-                    a64_emit_fsub_d(b, 0U, 0U, 3U);
+                    a64_emit_fneg_d(b, 3U, 3U);
+                    a64_emit_fadd_d(b, 0U, 3U, 0U);
                 } else {
                     a64_emit_fmul_s(b, 0U, 1U, 2U);
-                    a64_emit_fsub_s(b, 0U, 0U, 3U);
+                    a64_emit_fneg_s(b, 3U, 3U);
+                    a64_emit_fadd_s(b, 0U, 3U, 0U);
                 }
             }
             handled = true;

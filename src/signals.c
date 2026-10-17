@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -115,6 +116,7 @@ _Static_assert(offsetof(a32_rt_sigframe_t, uc) == 128,
 static _Thread_local a32_ctx_t *g_tls_ctx = NULL;
 static guest_sigaction_t        g_guest_sigactions[65];
 static _Thread_local siginfo_t  g_pending_siginfo[65];
+static uint64_t                 g_host_handler_installed_mask = 0ULL;
 
 void a32_signals_set_thread_ctx(a32_ctx_t *ctx)
 {
@@ -169,7 +171,11 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     } else {
         frame->info.si_code = 128; /* SI_KERNEL */
     }
-    if (host_info != NULL && (host_info->si_code <= 0 || sig == SIGCHLD)) {
+    if (host_info != NULL && host_info->si_code < 0) {
+        frame->info._pad[0] = (uint32_t)host_info->si_pid;
+        frame->info._pad[1] = (uint32_t)host_info->si_uid;
+        frame->info._pad[2] = (uint32_t)host_info->si_value.sival_int;
+    } else if (host_info != NULL && (host_info->si_code == 0 || sig == SIGCHLD)) {
         frame->info._pad[0] = (uint32_t)host_info->si_pid;
         frame->info._pad[1] = (uint32_t)host_info->si_uid;
         frame->info._pad[2] = (uint32_t)host_info->si_status;
@@ -186,13 +192,13 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
                                             ? A32_SS_DISABLE
                                             : ((on_altstack ? A32_SS_ONSTACK : 0U) |
                                                (ctx->altstack_flags & 0x80000000U)));
-    frame->saved_pad  = 1U;
-    frame->uc._pad[0] = ctx->altstack_sp;
-    frame->uc._pad[1] = ctx->altstack_size;
-    frame->uc._pad[2] = ctx->altstack_flags;
     if ((switched_to_altstack || on_altstack) &&
         (act->flags & A32_SA_ONSTACK) != 0U &&
         (ctx->altstack_flags & 0x80000000U) != 0U) {
+        frame->saved_pad    = 1U;
+        frame->uc._pad[0]   = ctx->altstack_sp;
+        frame->uc._pad[1]   = ctx->altstack_size;
+        frame->uc._pad[2]   = ctx->altstack_flags;
         ctx->altstack_sp    = 0U;
         ctx->altstack_size  = 0U;
         ctx->altstack_flags = A32_SS_DISABLE;
@@ -339,6 +345,40 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     }
 }
 
+struct a64_kernel_sigaction {
+    void (*k_sa_handler)(int, siginfo_t *, void *);
+    unsigned long k_sa_flags;
+    void (*k_sa_restorer)(void);
+    uint64_t k_sa_mask;
+};
+
+static int install_host_sigaction(int signum, unsigned long flags)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = host_sig_handler;
+    sa.sa_flags     = (int)flags;
+    sigfillset(&sa.sa_mask);
+    if (sigaction(signum, &sa, NULL) == 0) {
+        g_host_handler_installed_mask |= (1ULL << (signum - 1));
+        return 0;
+    }
+    if (signum == 34) {
+        struct a64_kernel_sigaction ksa;
+        memset(&ksa, 0, sizeof(ksa));
+        if (syscall(SYS_rt_sigaction, SIGUSR1, NULL, &ksa, (size_t)8) == 0) {
+            ksa.k_sa_handler = host_sig_handler;
+            ksa.k_sa_flags   = flags | (ksa.k_sa_flags & 0x04000000UL);
+            ksa.k_sa_mask    = ~0ULL;
+            if (syscall(SYS_rt_sigaction, signum, &ksa, NULL, (size_t)8) == 0) {
+                g_host_handler_installed_mask |= (1ULL << (signum - 1));
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
 int a32_signals_init(a32_ctx_t *ctx)
 {
     (void)ctx;
@@ -348,15 +388,10 @@ int a32_signals_init(a32_ctx_t *ctx)
         SIGUSR1, SIGUSR2, SIGPIPE, SIGALRM, SIGWINCH
     };
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = host_sig_handler;
-    sa.sa_flags     = SA_SIGINFO | SA_NODEFER | SA_RESTART;
-    sigfillset(&sa.sa_mask);
-
+    g_host_handler_installed_mask = 0ULL;
     for (size_t i = 0; i < sizeof(monitored_signals) / sizeof(monitored_signals[0]); i++) {
         int s = monitored_signals[i];
-        if (sigaction(s, &sa, NULL) != 0) {
+        if (install_host_sigaction(s, (unsigned long)(SA_SIGINFO | SA_NODEFER | SA_RESTART)) != 0) {
             fprintf(stderr, "a32rt: failed to install host signal handler for signal %d: %s\n",
                     s, strerror(errno));
             return -1;
@@ -455,15 +490,19 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
             __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (signum - 1)), __ATOMIC_SEQ_CST);
         }
 
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_sigaction = host_sig_handler;
-        sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
+        unsigned long sa_flags = (unsigned long)(SA_SIGINFO | SA_NODEFER);
         if (new_words[0] <= 1U || (new_words[1] & A32_SA_RESTART) != 0U) {
-            sa.sa_flags |= SA_RESTART;
+            sa_flags |= (unsigned long)SA_RESTART;
         }
-        sigfillset(&sa.sa_mask);
-        sigaction(signum, &sa, NULL);
+        if (signum == SIGCHLD) {
+            if ((new_words[1] & A32_SA_NOCLDSTOP) != 0U) {
+                sa_flags |= (unsigned long)SA_NOCLDSTOP;
+            }
+            if ((new_words[1] & A32_SA_NOCLDWAIT) != 0U) {
+                sa_flags |= (unsigned long)SA_NOCLDWAIT;
+            }
+        }
+        (void)install_host_sigaction(signum, sa_flags);
     }
 
     if (oldact_va != 0U) {
@@ -502,6 +541,24 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
             break;
         default:
             return -EINVAL;
+        }
+
+        if (how == 0 || how == 2) {
+            uint64_t need_install = ctx->sig_mask & ~g_host_handler_installed_mask;
+            if (need_install != 0ULL) {
+                for (int s = 1; s <= 64; s++) {
+                    uint64_t bit = 1ULL << (s - 1);
+                    if ((need_install & bit) == 0ULL) {
+                        continue;
+                    }
+                    if (s == SIGKILL || s == SIGSTOP || s == SIGTSTP ||
+                        s == SIGTTIN || s == SIGTTOU || s == SIGCONT ||
+                        s == 32 || s == 33) {
+                        continue;
+                    }
+                    (void)install_host_sigaction(s, (unsigned long)(SA_SIGINFO | SA_NODEFER | SA_RESTART));
+                }
+            }
         }
     }
 

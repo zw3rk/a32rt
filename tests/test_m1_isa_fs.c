@@ -2899,6 +2899,399 @@ static int run_test(void)
         }
     }
 
+    /*
+     * 31. Round 7 positive & regression tests for all 12 parallel 16-bit
+     *     exchange instructions:
+     *     - 31a: SASX, SSAX, UASX, USAX + SEL (verifying cross-lane
+     *            Rn[31:16] +/- Rm[15:0] and Rn[15:0] -/+ Rm[31:16] results,
+     *            CPSR.GE[3:0] updates including signed 16-bit overflow, and
+     *            CPSR.NZCV preservation).
+     *     - 31b: SHASX, SHSAX, UHASX, UHSAX (verifying signed and unsigned
+     *            halving cross-lane results including unsigned a < b lanes and
+     *            preservation of CPSR.GE, CPSR.Q, and CPSR.NZCV).
+     *     - 31c: QASX, QSAX, UQASX, UQSAX (verifying signed and unsigned
+     *            saturating cross-lane results and preservation of CPSR.GE,
+     *            CPSR.Q, and CPSR.NZCV).
+     */
+    {
+        uint32_t res = 0U, flags = 0U, sel_out = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+        uint32_t sel_a = 0x11223344U;
+        uint32_t sel_b = 0xAABBCCDDU;
+        const uint32_t psr_mask = 0xF80F0000U; /* NZCV (31:28), Q (27), GE (19:16) */
+        uint32_t psr_a = 0x60050000U;          /* N=0,Z=1,C=1,V=0, Q=0, GE=0b0101 */
+        uint32_t psr_b = 0x980A0000U;          /* N=1,Z=0,C=0,V=1, Q=1, GE=0b1010 */
+        uint32_t zero_psr = 0U;
+
+        /*
+         * 31a-1: SASX + SEL:
+         *   case 1: Rn = 0x70001000 (+28672, +4096), Rm = 0x20002000 (+8192, +8192)
+         *     hi = Rn[31:16] + Rm[15:0] = +28672 + +8192 = +36864 (0x9000) >= 0 -> GE[3:2] = 11
+         *     lo = Rn[15:0] - Rm[31:16] = +4096  - +8192 = -4096  (0xF000) <  0 -> GE[1:0] = 00
+         *   case 2: Rn = 0xF0002000 (-4096, +8192), Rm = 0xF0000800 (-4096, +2048)
+         *     hi = -4096 + +2048  = -2048  (0xF800) <  0 -> GE[3:2] = 00
+         *     lo = +8192 - -4096  = +12288 (0x3000) >= 0 -> GE[1:0] = 11
+         */
+        uint32_t sasx_rn1 = 0x70001000U, sasx_rm1 = 0x20002000U;
+        uint32_t sasx_rn2 = 0xF0002000U, sasx_rm2 = 0xF0000800U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "sasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(sasx_rn1), [rm] "r"(sasx_rm1),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x9000F000U || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x600C0000U) {
+            return 202;
+        }
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "sasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(sasx_rn2), [rm] "r"(sasx_rm2),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0xF8003000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x80030000U) {
+            return 203;
+        }
+
+        /*
+         * 31a-2: SSAX + SEL:
+         *   case 1: Rn = 0x90007000 (-28672, +28672), Rm = 0x20002000 (+8192, +8192)
+         *     hi = Rn[31:16] - Rm[15:0] = -28672 - +8192 = -36864 (0x7000) <  0 -> GE[3:2] = 00
+         *     lo = Rn[15:0] + Rm[31:16] = +28672 + +8192 = +36864 (0x9000) >= 0 -> GE[1:0] = 11
+         *   case 2: Rn = 0x3000F000 (+12288, -4096), Rm = 0x08001000 (+2048, +4096)
+         *     hi = +12288 - +4096 = +8192 (0x2000) >= 0 -> GE[3:2] = 11
+         *     lo = -4096  + +2048 = -2048 (0xF800) <  0 -> GE[1:0] = 00
+         */
+        uint32_t ssax_rn1 = 0x90007000U, ssax_rm1 = 0x20002000U;
+        uint32_t ssax_rn2 = 0x3000F000U, ssax_rm2 = 0x08001000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "ssax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(ssax_rn1), [rm] "r"(ssax_rm1),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x70009000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x60030000U) {
+            return 204;
+        }
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "ssax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(ssax_rn2), [rm] "r"(ssax_rm2),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x2000F800U || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x800C0000U) {
+            return 205;
+        }
+
+        /*
+         * 31a-3: UASX + SEL:
+         *   case 1: Rn = 0xF0001000, Rm = 0x30002000
+         *     hi = 0xF000 + 0x2000 = 0x11000 >= 0x10000 -> 0x1000, GE[3:2] = 11
+         *     lo = 0x1000 - 0x3000 = -0x2000 <  0       -> 0xE000, GE[1:0] = 00
+         *   case 2: Rn = 0x10005000, Rm = 0x20003000
+         *     hi = 0x1000 + 0x3000 = 0x04000 <  0x10000 -> 0x4000, GE[3:2] = 00
+         *     lo = 0x5000 - 0x2000 = +0x3000 >= 0       -> 0x3000, GE[1:0] = 11
+         */
+        uint32_t uasx_rn1 = 0xF0001000U, uasx_rm1 = 0x30002000U;
+        uint32_t uasx_rn2 = 0x10005000U, uasx_rm2 = 0x20003000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "uasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(uasx_rn1), [rm] "r"(uasx_rm1),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x1000E000U || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x600C0000U) {
+            return 206;
+        }
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "uasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(uasx_rn2), [rm] "r"(uasx_rm2),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x40003000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x80030000U) {
+            return 207;
+        }
+
+        /*
+         * 31a-4: USAX + SEL:
+         *   case 1: Rn = 0x1000F000, Rm = 0x20003000
+         *     hi = 0x1000 - 0x3000 = -0x2000 <  0       -> 0xE000, GE[3:2] = 00
+         *     lo = 0xF000 + 0x2000 = 0x11000 >= 0x10000 -> 0x1000, GE[1:0] = 11
+         *   case 2: Rn = 0x50001000, Rm = 0x30002000
+         *     hi = 0x5000 - 0x2000 = +0x3000 >= 0       -> 0x3000, GE[3:2] = 11
+         *     lo = 0x1000 + 0x3000 = 0x04000 <  0x10000 -> 0x4000, GE[1:0] = 00
+         */
+        uint32_t usax_rn1 = 0x1000F000U, usax_rm1 = 0x20003000U;
+        uint32_t usax_rn2 = 0x50001000U, usax_rm2 = 0x30002000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "usax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(usax_rn1), [rm] "r"(usax_rm1),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0xE0001000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x60030000U) {
+            return 208;
+        }
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "usax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(usax_rn2), [rm] "r"(usax_rm2),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x30004000U || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x800C0000U) {
+            return 209;
+        }
+
+        /*
+         * 31b: Halving parallel 16-bit exchange (SHASX, SHSAX, UHASX, UHSAX):
+         *      Verify cross-lane halving results and preservation of NZCV, Q, GE.
+         */
+        /* 31b-1: SHASX */
+        uint32_t shasx_rn = 0x4E20B1E0U; /* hi = +20000, lo = -20000 */
+        uint32_t shasx_rm = 0x4E214E20U; /* hi = +20001, lo = +20000 -> (+20000, -20001) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "shasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(shasx_rn), [rm] "r"(shasx_rm)
+            : "cc"
+        );
+        if (res != 0x4E20B1DFU || (flags & psr_mask) != psr_a) {
+            return 210;
+        }
+
+        /* 31b-2: SHSAX */
+        uint32_t shsax_rn = 0x4E20B1E0U; /* hi = +20000, lo = -20000 */
+        uint32_t shsax_rm = 0xB1DFB1E0U; /* hi = -20001, lo = -20000 -> (+20000, -20001) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "shsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(shsax_rn), [rm] "r"(shsax_rm)
+            : "cc"
+        );
+        if (res != 0x4E20B1DFU || (flags & psr_mask) != psr_b) {
+            return 211;
+        }
+
+        /* 31b-3: UHASX (both lo < Rm[31:16] negative diff and lo >= Rm[31:16]) */
+        uint32_t uhasx_rn1 = 0xC3500064U; /* hi = 50000, lo = 100 */
+        uint32_t uhasx_rm1 = 0x012CC350U; /* hi = 300,   lo = 50000 -> hi=50000 (0xC350), lo=(100-300)>>1=-100 (0xFF9C) */
+        uint32_t uhasx_rn2 = 0xFFFFC350U; /* hi = 65535, lo = 50000 */
+        uint32_t uhasx_rm2 = 0x27100001U; /* hi = 10000, lo = 1     -> hi=32768 (0x8000), lo=20000 (0x4E20) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "uhasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(uhasx_rn1), [rm] "r"(uhasx_rm1)
+            : "cc"
+        );
+        if (res != 0xC350FF9CU || (flags & psr_mask) != psr_a) {
+            return 212;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "uhasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(uhasx_rn2), [rm] "r"(uhasx_rm2)
+            : "cc"
+        );
+        if (res != 0x80004E20U || (flags & psr_mask) != psr_b) {
+            return 213;
+        }
+
+        /* 31b-4: UHSAX (both hi < Rm[15:0] negative diff and hi >= Rm[15:0]) */
+        uint32_t uhsax_rn1 = 0x0064C350U; /* hi = 100,   lo = 50000 */
+        uint32_t uhsax_rm1 = 0xC350012CU; /* hi = 50000, lo = 300   -> hi=-100 (0xFF9C), lo=50000 (0xC350) */
+        uint32_t uhsax_rn2 = 0xC350FFFFU; /* hi = 50000, lo = 65535 */
+        uint32_t uhsax_rm2 = 0x00012710U; /* hi = 1,     lo = 10000 -> hi=20000 (0x4E20), lo=32768 (0x8000) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "uhsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(uhsax_rn1), [rm] "r"(uhsax_rm1)
+            : "cc"
+        );
+        if (res != 0xFF9CC350U || (flags & psr_mask) != psr_a) {
+            return 214;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "uhsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(uhsax_rn2), [rm] "r"(uhsax_rm2)
+            : "cc"
+        );
+        if (res != 0x4E208000U || (flags & psr_mask) != psr_b) {
+            return 215;
+        }
+
+        /*
+         * 31c: Saturating parallel 16-bit exchange (QASX, QSAX, UQASX, UQSAX):
+         *      Verify saturating and non-saturating cross-lane results and
+         *      preservation of NZCV, Q, GE.
+         */
+        /* 31c-1: QASX */
+        uint32_t qasx_rn1 = 0x75308AD0U; /* hi = +30000, lo = -30000 */
+        uint32_t qasx_rm1 = 0x27102710U; /* hi = +10000, lo = +10000 -> +32767 (0x7FFF), -32768 (0x8000) */
+        uint32_t qasx_rn2 = 0x03E807D0U; /* hi = +1000,  lo = +2000 */
+        uint32_t qasx_rm2 = 0x01F407D0U; /* hi = +500,   lo = +2000  -> +3000 (0x0BB8), +1500 (0x05DC) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "qasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(qasx_rn1), [rm] "r"(qasx_rm1)
+            : "cc"
+        );
+        if (res != 0x7FFF8000U || (flags & psr_mask) != psr_a) {
+            return 216;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "qasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(qasx_rn2), [rm] "r"(qasx_rm2)
+            : "cc"
+        );
+        if (res != 0x0BB805DCU || (flags & psr_mask) != psr_b) {
+            return 217;
+        }
+
+        /* 31c-2: QSAX */
+        uint32_t qsax_rn1 = 0x75308AD0U; /* hi = +30000, lo = -30000 */
+        uint32_t qsax_rm1 = 0xD8F0D8F0U; /* hi = -10000, lo = -10000 -> +32767 (0x7FFF), -32768 (0x8000) */
+        uint32_t qsax_rn2 = 0x07D0FC18U; /* hi = +2000,  lo = -1000 */
+        uint32_t qsax_rm2 = 0x019001F4U; /* hi = +400,   lo = +500   -> +1500 (0x05DC), -600 (0xFDA8) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "qsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(qsax_rn1), [rm] "r"(qsax_rm1)
+            : "cc"
+        );
+        if (res != 0x7FFF8000U || (flags & psr_mask) != psr_a) {
+            return 218;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "qsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(qsax_rn2), [rm] "r"(qsax_rm2)
+            : "cc"
+        );
+        if (res != 0x05DCFDA8U || (flags & psr_mask) != psr_b) {
+            return 219;
+        }
+
+        /* 31c-3: UQASX */
+        uint32_t uqasx_rn1 = 0xC3502710U; /* hi = 50000, lo = 10000 */
+        uint32_t uqasx_rm1 = 0x75307530U; /* hi = 30000, lo = 30000 -> 65535 (0xFFFF), 0 (0x0000) */
+        uint32_t uqasx_rn2 = 0x2710C350U; /* hi = 10000, lo = 50000 */
+        uint32_t uqasx_rm2 = 0x3A984E20U; /* hi = 15000, lo = 20000 -> 30000 (0x7530), 35000 (0x88B8) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "uqasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(uqasx_rn1), [rm] "r"(uqasx_rm1)
+            : "cc"
+        );
+        if (res != 0xFFFF0000U || (flags & psr_mask) != psr_a) {
+            return 220;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "uqasx %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(uqasx_rn2), [rm] "r"(uqasx_rm2)
+            : "cc"
+        );
+        if (res != 0x753088B8U || (flags & psr_mask) != psr_b) {
+            return 221;
+        }
+
+        /* 31c-4: UQSAX */
+        uint32_t uqsax_rn1 = 0x2710C350U; /* hi = 10000, lo = 50000 */
+        uint32_t uqsax_rm1 = 0x75307530U; /* hi = 30000, lo = 30000 -> 0 (0x0000), 65535 (0xFFFF) */
+        uint32_t uqsax_rn2 = 0xC3502710U; /* hi = 50000, lo = 10000 */
+        uint32_t uqsax_rm2 = 0x4E203A98U; /* hi = 20000, lo = 15000 -> 35000 (0x88B8), 30000 (0x7530) */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pa]\n\t"
+            "uqsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pa] "r"(psr_a), [rn] "r"(uqsax_rn1), [rm] "r"(uqsax_rm1)
+            : "cc"
+        );
+        if (res != 0x0000FFFFU || (flags & psr_mask) != psr_a) {
+            return 222;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[pb]\n\t"
+            "uqsax %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "msr apsr_nzcvqg, %[z]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [pb] "r"(psr_b), [rn] "r"(uqsax_rn2), [rm] "r"(uqsax_rm2), [z] "r"(zero_psr)
+            : "cc"
+        );
+        if (res != 0x88B87530U || (flags & psr_mask) != psr_b) {
+            return 223;
+        }
+    }
+
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

@@ -1720,6 +1720,268 @@ static int test17_r6_signal_aliasing_ign_autodisarm(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 18: Round 7 regressions —
+ *   18a: rt_sigpending (176) and rt_sigsuspend (179) negative (-EINVAL / -EFAULT)
+ *        and positive flow, plus blocking real-time signal 34 (SIGRTMIN) via
+ *        rt_sigprocmask(SIG_BLOCK, ...) BEFORE calling rt_sigaction(34, ...)
+ *   18b: SS_AUTODISARM when a non-SA_ONSTACK signal handler runs on the normal
+ *        stack and calls sigaltstack(SS_DISABLE): verify rt_sigreturn does NOT
+ *        overwrite that change back to the old SS_AUTODISARM altstack
+ * -------------------------------------------------------------------------- */
+static volatile uint32_t g_r7_rt34_hits = 0U;
+static volatile int32_t  g_r7_rt34_last_sig = 0;
+static volatile uint32_t g_r7_non_onstack_result = 0U;
+
+static void r7_sigrt34_handler(int sig, void *info, void *ucontext)
+{
+    (void)info;
+    (void)ucontext;
+    g_r7_rt34_hits++;
+    g_r7_rt34_last_sig = sig;
+}
+
+static void r7_non_onstack_disarm_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    (void)ucontext;
+
+    uint32_t cur_sp = 0U;
+    __asm__ volatile("mov %0, sp" : "=r"(cur_sp));
+
+    /* Because SA_ONSTACK is NOT set, handler must execute on the normal stack */
+    if (cur_sp >= g_altstack_base && cur_sp < g_altstack_base + g_altstack_size) {
+        g_r7_non_onstack_result = 1U;
+        return;
+    }
+
+    /* Before calling sigaltstack(SS_DISABLE), altstack is still SS_AUTODISARM */
+    struct stack32_m3 oss = { 0U, 0, 0U };
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        oss.ss_sp != g_altstack_base ||
+        (uint32_t)oss.ss_flags != 0x80000000U) {
+        g_r7_non_onstack_result = 2U;
+        return;
+    }
+
+    /* Explicitly disable the alternate stack from inside the non-SA_ONSTACK handler */
+    struct stack32_m3 dis_ss;
+    dis_ss.ss_sp = 0U;
+    dis_ss.ss_flags = 2 /* SS_DISABLE */;
+    dis_ss.ss_size = 0U;
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&dis_ss, 0U) != 0) {
+        g_r7_non_onstack_result = 3U;
+        return;
+    }
+
+    g_r7_non_onstack_result = 100U;
+}
+
+static int test18_r7_rt_sigpending_sigsuspend_autodisarm(void)
+{
+    const uint32_t sigrt34 = 34U; /* SIGRTMIN */
+    const uint64_t rt34_bit = 1ULL << (sigrt34 - 1U); /* 1ULL << 33 */
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+    uint64_t pend_mask = 0ULL;
+    uint64_t saved_mask = 0ULL;
+
+    /*
+     * 18a-1: Negative checks for rt_sigpending (176) and rt_sigsuspend (179):
+     *   - sigsetsize != 8 (0, 4, 16) -> -EINVAL (-22)
+     *   - set / mask < 0x1000U (0, 0x100U) -> -EFAULT (-14)
+     */
+    if (sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 0U) != -22 ||
+        sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 4U) != -22 ||
+        sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 16U) != -22) {
+        return 157;
+    }
+    if (sys2(176U /* rt_sigpending */, 0U, 8U) != -14 ||
+        sys2(176U /* rt_sigpending */, 0x100U, 8U) != -14) {
+        return 158;
+    }
+    if (sys2(179U /* rt_sigsuspend */, (uint32_t)(uintptr_t)&pend_mask, 0U) != -22 ||
+        sys2(179U /* rt_sigsuspend */, (uint32_t)(uintptr_t)&pend_mask, 4U) != -22 ||
+        sys2(179U /* rt_sigsuspend */, (uint32_t)(uintptr_t)&pend_mask, 16U) != -22) {
+        return 159;
+    }
+    if (sys2(179U /* rt_sigsuspend */, 0U, 8U) != -14 ||
+        sys2(179U /* rt_sigsuspend */, 0x100U, 8U) != -14) {
+        return 160;
+    }
+
+    /*
+     * 18a-2: Block signal 34 (SIGRTMIN) FIRST via rt_sigprocmask(SIG_BLOCK, ...)
+     *        BEFORE calling rt_sigaction(34, ...), send signal 34 via tkill,
+     *        verify rt_sigpending reports bit 33 (1ULL << 33), then install the
+     *        handler for signal 34 and call rt_sigsuspend with an empty mask to
+     *        deliver signal 34 and verify -EINTR (-4).
+     */
+    g_r7_rt34_hits = 0U;
+    g_r7_rt34_last_sig = 0;
+
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */,
+             (uint32_t)(uintptr_t)&rt34_bit,
+             (uint32_t)(uintptr_t)&saved_mask, 8U) != 0) {
+        return 161;
+    }
+
+    /* Send signal 34 to self while blocked and BEFORE rt_sigaction(34, ...) */
+    if (sys2(238U /* tkill */, tid, sigrt34) != 0) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        return 162;
+    }
+
+    /* Verify rt_sigpending reports bit 33 (1ULL << 33) set */
+    pend_mask = 0ULL;
+    if (sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & rt34_bit) == 0ULL) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        return 163;
+    }
+
+    /* Now install a handler for signal 34 via rt_sigaction while still blocked */
+    struct sigaction32 act34;
+    struct sigaction32 old_act34;
+    act34.sa_handler  = (uint32_t)(uintptr_t)r7_sigrt34_handler;
+    act34.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act34.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act34.sa_mask[0]  = 0U;
+    act34.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, sigrt34,
+             (uint32_t)(uintptr_t)&act34,
+             (uint32_t)(uintptr_t)&old_act34, 8U) != 0 ||
+        g_r7_rt34_hits != 0U) {
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        return 164;
+    }
+
+    /* Call rt_sigsuspend with an empty mask to deliver pending signal 34 */
+    uint64_t empty_mask = 0ULL;
+    int32_t susp_rc = sys2(179U /* rt_sigsuspend */,
+                           (uint32_t)(uintptr_t)&empty_mask, 8U);
+    if (susp_rc != -4 /* -EINTR */ ||
+        g_r7_rt34_hits != 1U ||
+        g_r7_rt34_last_sig != 34) {
+        sys4(174U /* rt_sigaction */, sigrt34, (uint32_t)(uintptr_t)&old_act34, 0U, 8U);
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        return 165;
+    }
+
+    /* After rt_sigsuspend returns, signal 34 must no longer be pending and must still be blocked */
+    pend_mask = 0xFFFFFFFFFFFFFFFFULL;
+    uint64_t post_mask = 0ULL;
+    if (sys2(176U /* rt_sigpending */, (uint32_t)(uintptr_t)&pend_mask, 8U) != 0 ||
+        (pend_mask & rt34_bit) != 0ULL ||
+        sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U,
+             (uint32_t)(uintptr_t)&post_mask, 8U) != 0 ||
+        (post_mask & rt34_bit) == 0ULL) {
+        sys4(174U /* rt_sigaction */, sigrt34, (uint32_t)(uintptr_t)&old_act34, 0U, 8U);
+        sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+             (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+        return 166;
+    }
+
+    sys4(174U /* rt_sigaction */, sigrt34, (uint32_t)(uintptr_t)&old_act34, 0U, 8U);
+    sys4(175U /* rt_sigprocmask */, 2U /* SIG_SETMASK */,
+         (uint32_t)(uintptr_t)&saved_mask, 0U, 8U);
+
+    /*
+     * 18b: Regression test for SS_AUTODISARM when a non-SA_ONSTACK signal
+     *      handler runs on the normal stack and calls sigaltstack(SS_DISABLE):
+     *      verify rt_sigreturn does NOT overwrite that change back to the old
+     *      SS_AUTODISARM altstack!
+     */
+    uint32_t alt_mem = (uint32_t)sys6(192U /* mmap2 */, 0U, 16384U,
+                                      3U /* PROT_READ|PROT_WRITE */,
+                                      0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                      0xFFFFFFFFU, 0U);
+    if (alt_mem > 0xFFFFF000U) {
+        return 167;
+    }
+
+    g_altstack_base = alt_mem;
+    g_altstack_size = 16384U;
+    g_r7_non_onstack_result = 0U;
+
+    struct stack32_m3 ss;
+    ss.ss_sp = alt_mem;
+    ss.ss_flags = (int32_t)0x80000000U; /* SS_AUTODISARM */
+    ss.ss_size = 16384U;
+    struct stack32_m3 oss = { 0U, 0, 0U };
+    if (sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss,
+             (uint32_t)(uintptr_t)&oss) != 0) {
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 168;
+    }
+
+    struct sigaction32 act_no_onstack;
+    struct sigaction32 old_usr1;
+    act_no_onstack.sa_handler  = (uint32_t)(uintptr_t)r7_non_onstack_disarm_handler;
+    act_no_onstack.sa_flags    = 0x04000004U; /* SA_RESTORER | SA_SIGINFO (NO SA_ONSTACK) */
+    act_no_onstack.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act_no_onstack.sa_mask[0]  = 0U;
+    act_no_onstack.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+             (uint32_t)(uintptr_t)&act_no_onstack,
+             (uint32_t)(uintptr_t)&old_usr1, 8U) != 0) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 169;
+    }
+
+    if (sys2(238U /* tkill */, tid, 10U /* SIGUSR1 */) != 0) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_usr1, 0U, 8U);
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 170;
+    }
+
+    sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_usr1, 0U, 8U);
+
+    if (g_r7_non_onstack_result != 100U) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 171;
+    }
+
+    /*
+     * Verify that after rt_sigreturn from the non-SA_ONSTACK handler, the
+     * handler's sigaltstack(SS_DISABLE) change remains in effect (oss.ss_flags == 2)
+     * and was NOT overwritten back to the old SS_AUTODISARM altstack!
+     */
+    oss.ss_sp = 0U;
+    oss.ss_flags = 0;
+    oss.ss_size = 0U;
+    if (sys2(186U /* sigaltstack */, 0U, (uint32_t)(uintptr_t)&oss) != 0 ||
+        oss.ss_flags != 2 /* SS_DISABLE */) {
+        ss.ss_sp = 0U;
+        ss.ss_flags = 2 /* SS_DISABLE */;
+        ss.ss_size = 0U;
+        sys2(186U /* sigaltstack */, (uint32_t)(uintptr_t)&ss, 0U);
+        sys2(91U /* munmap */, alt_mem, 16384U);
+        return 172;
+    }
+
+    sys2(91U /* munmap */, alt_mem, 16384U);
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -1787,6 +2049,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test17_r6_signal_aliasing_ign_autodisarm();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test18_r7_rt_sigpending_sigsuspend_autodisarm();
     if (rc != 0) {
         return rc;
     }
