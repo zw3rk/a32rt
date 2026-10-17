@@ -140,6 +140,11 @@ static void reset_cache_locked(a32_ctx_t *ctx)
     memset(g_ht, 0, sizeof(g_ht));
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras_key, 0, sizeof(ctx->ras_key));
+        memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
+        memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
+        memset(ctx->ras_entry, 0, sizeof(ctx->ras_entry));
+        ctx->ras_top = 0U;
     }
     g_side_table_count = 0U;
     atomic_fetch_add_explicit(&g_cache_epoch, 1U, memory_order_acq_rel);
@@ -326,6 +331,11 @@ int a32_jit_init(a32_ctx_t *ctx)
 {
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras_key, 0, sizeof(ctx->ras_key));
+        memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
+        memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
+        memset(ctx->ras_entry, 0, sizeof(ctx->ras_entry));
+        ctx->ras_top = 0U;
     }
     if (g_code_cache != NULL) {
         return 0;
@@ -350,6 +360,11 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
 {
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
+        memset(ctx->ras_key, 0, sizeof(ctx->ras_key));
+        memset(ctx->ras_epoch, 0, sizeof(ctx->ras_epoch));
+        memset(ctx->ras_code, 0, sizeof(ctx->ras_code));
+        memset(ctx->ras_entry, 0, sizeof(ctx->ras_entry));
+        ctx->ras_top = 0U;
     }
     jit_lock_acquire();
     uint32_t old_epoch = atomic_fetch_add_explicit(&g_cache_epoch, 1U, memory_order_acq_rel);
@@ -357,7 +372,8 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
     for (size_t i = 0U; i < A32_HT_SIZE; i++) {
         uint32_t k = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
         const void *hc = atomic_load_explicit(&g_ht[i].host_code, memory_order_relaxed);
-        if (k != 0U && hc != NULL) {
+        if (k != 0U && hc != NULL &&
+            atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) == old_epoch) {
             uint32_t b_start = g_ht[i].guest_pc;
             uint32_t b_end   = (g_ht[i].guest_end_pc > b_start) ? g_ht[i].guest_end_pc : (b_start + 4U);
             if (b_start < end && b_end > start) {
@@ -374,6 +390,28 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
                 atomic_store_explicit(&g_ht[i].chain_entry[1], NULL, memory_order_relaxed);
             } else {
                 atomic_store_explicit(&g_ht[i].epoch, new_epoch, memory_order_release);
+            }
+        }
+    }
+    for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+        if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != new_epoch) {
+            continue;
+        }
+        for (size_t c = 0U; c < 2U; c++) {
+            uint32_t ce_epoch     = atomic_load_explicit(&g_ht[i].chain_epoch[c], memory_order_relaxed);
+            uint32_t ce_key       = atomic_load_explicit(&g_ht[i].chain_key[c], memory_order_relaxed);
+            const void *ce_code   = atomic_load_explicit(&g_ht[i].chain_code[c], memory_order_relaxed);
+            a32_cache_entry_t *ce = atomic_load_explicit(&g_ht[i].chain_entry[c], memory_order_relaxed);
+            if (ce != NULL && ce_code != NULL && ce_epoch == old_epoch &&
+                atomic_load_explicit(&ce->epoch, memory_order_relaxed) == new_epoch &&
+                atomic_load_explicit(&ce->host_code, memory_order_relaxed) == ce_code &&
+                atomic_load_explicit(&ce->key, memory_order_relaxed) == ce_key) {
+                atomic_store_explicit(&g_ht[i].chain_epoch[c], new_epoch, memory_order_release);
+            } else {
+                atomic_store_explicit(&g_ht[i].chain_epoch[c], 0U, memory_order_release);
+                atomic_store_explicit(&g_ht[i].chain_key[c], 0U, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].chain_code[c], NULL, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].chain_entry[c], NULL, memory_order_relaxed);
             }
         }
     }
@@ -496,7 +534,10 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
                 atomic_load_explicit(&g_ht[idx].host_code, memory_order_relaxed) != NULL &&
                 atomic_load_explicit(&g_ht[idx].epoch, memory_order_relaxed) == cur_epoch) {
                 if (flush_now && g_batch_max > g_batch_min) {
-                    flush_batch_locked(ctx);
+                    if (flush_batch_locked(ctx) != 0) {
+                        jit_lock_release();
+                        return NULL;
+                    }
                 }
                 jit_lock_release();
                 return &g_ht[idx];
@@ -536,6 +577,13 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     commit_side_table_locked(dst, code_bytes, aligned_pc, is_thumb ? ctx->itstate : 0U,
                              &side_start, &side_count);
 
+    if (flush_now) {
+        if (flush_batch_locked(ctx) != 0) {
+            jit_lock_release();
+            return NULL;
+        }
+    }
+
     uint32_t end_pc = (buf.guest_end_pc > aligned_pc) ? buf.guest_end_pc : (aligned_pc + 4U);
     cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     a32_cache_entry_t *res_entry = NULL;
@@ -566,9 +614,6 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         }
     }
 
-    if (flush_now) {
-        flush_batch_locked(ctx);
-    }
     ctx->blocks_compiled++;
 
     jit_lock_release();
@@ -598,11 +643,13 @@ const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, ui
 void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
 {
     jit_lock_acquire();
+    uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     a32_pc_map_stage_t pc_map[MAX_STAGE_PC_MAP];
     for (size_t i = 0U; i < A32_HT_SIZE; i++) {
-        uint32_t key = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
+        uint32_t key          = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
         const void *host_code = atomic_load_explicit(&g_ht[i].host_code, memory_order_relaxed);
-        if (key != 0U && host_code != NULL && g_ht[i].code_bytes > 0U) {
+        uint32_t ep           = atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed);
+        if (key != 0U && host_code != NULL && ep == cur_epoch && g_ht[i].code_bytes > 0U) {
             uint32_t guest_pc     = g_ht[i].guest_pc;
             uint32_t guest_end_pc = (g_ht[i].guest_end_pc > guest_pc) ?
                                     g_ht[i].guest_end_pc : (guest_pc + 4U);
@@ -614,9 +661,10 @@ void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
             uintptr_t end         = base + g_ht[i].code_bytes;
             size_t map_count      = 0U;
 
-            if (g_ht[i].side_start + g_ht[i].side_count <= A32_SIDE_TABLE_SIZE) {
+            if (g_side_table_count >= g_ht[i].side_start + g_ht[i].side_count &&
+                g_side_table_count - g_ht[i].side_start <= A32_SIDE_TABLE_SIZE) {
                 for (size_t s = 0U; s < g_ht[i].side_count && map_count < MAX_STAGE_PC_MAP; s++) {
-                    size_t st_idx = g_ht[i].side_start + s;
+                    size_t st_idx = (g_ht[i].side_start + s) % A32_SIDE_TABLE_SIZE;
                     if (g_side_table[st_idx].host_pc_start >= base &&
                         g_side_table[st_idx].host_pc_start < end) {
                         pc_map[map_count].host_word_idx =
@@ -647,7 +695,8 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, a32_cache_entry_t *
         atomic_load_explicit(&prev_entry->epoch, memory_order_relaxed) == epoch &&
         atomic_load_explicit(&prev_entry->host_code, memory_order_relaxed) != NULL &&
         atomic_load_explicit(&cur_entry->epoch, memory_order_relaxed) == epoch &&
-        atomic_load_explicit(&cur_entry->host_code, memory_order_relaxed) != NULL) {
+        atomic_load_explicit(&cur_entry->key, memory_order_relaxed) == key &&
+        atomic_load_explicit(&cur_entry->host_code, memory_order_relaxed) == code) {
         uint32_t e0    = atomic_load_explicit(&prev_entry->chain_epoch[0], memory_order_relaxed);
         const void *c0 = atomic_load_explicit(&prev_entry->chain_code[0], memory_order_relaxed);
         uint32_t k0    = atomic_load_explicit(&prev_entry->chain_key[0], memory_order_relaxed);
@@ -720,7 +769,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                 a32_cache_entry_t *e0 = atomic_load_explicit(&prev_entry->chain_entry[0], memory_order_relaxed);
                 if (c0 != NULL && e0 != NULL &&
                     atomic_load_explicit(&e0->epoch, memory_order_acquire) == epoch &&
-                    atomic_load_explicit(&e0->host_code, memory_order_acquire) != NULL) {
+                    atomic_load_explicit(&e0->key, memory_order_relaxed) == key &&
+                    atomic_load_explicit(&e0->host_code, memory_order_acquire) == c0) {
                     code      = c0;
                     cur_entry = e0;
                     ctx->chain_hits++;
@@ -731,7 +781,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                 a32_cache_entry_t *e1 = atomic_load_explicit(&prev_entry->chain_entry[1], memory_order_relaxed);
                 if (c1 != NULL && e1 != NULL &&
                     atomic_load_explicit(&e1->epoch, memory_order_acquire) == epoch &&
-                    atomic_load_explicit(&e1->host_code, memory_order_acquire) != NULL) {
+                    atomic_load_explicit(&e1->key, memory_order_relaxed) == key &&
+                    atomic_load_explicit(&e1->host_code, memory_order_acquire) == c1) {
                     code      = c1;
                     cur_entry = e1;
                     ctx->chain_hits++;
@@ -749,7 +800,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                 a32_cache_entry_t *r_entry = (a32_cache_entry_t *)ctx->ras_entry[r_idx];
                 if (r_entry != NULL &&
                     atomic_load_explicit(&r_entry->epoch, memory_order_acquire) == epoch &&
-                    atomic_load_explicit(&r_entry->host_code, memory_order_acquire) != NULL) {
+                    atomic_load_explicit(&r_entry->key, memory_order_relaxed) == key &&
+                    atomic_load_explicit(&r_entry->host_code, memory_order_acquire) == ctx->ras_code[r_idx]) {
                     code      = ctx->ras_code[r_idx];
                     cur_entry = r_entry;
                     ctx->ras_hits++;
@@ -766,7 +818,8 @@ int a32_jit_run(a32_ctx_t *ctx)
                 a32_cache_entry_t *i_entry = (a32_cache_entry_t *)ctx->ibtc[ibtc_idx].entry;
                 if (i_entry != NULL &&
                     atomic_load_explicit(&i_entry->epoch, memory_order_acquire) == epoch &&
-                    atomic_load_explicit(&i_entry->host_code, memory_order_acquire) != NULL) {
+                    atomic_load_explicit(&i_entry->key, memory_order_relaxed) == key &&
+                    atomic_load_explicit(&i_entry->host_code, memory_order_acquire) == ctx->ibtc[ibtc_idx].host_code) {
                     code      = ctx->ibtc[ibtc_idx].host_code;
                     cur_entry = i_entry;
                     ctx->ibtc_hits++;
@@ -805,7 +858,7 @@ int a32_jit_run(a32_ctx_t *ctx)
 
         if (reason == A32_EXIT_BRANCH || reason == A32_EXIT_INTERWORK) {
             if (cur_entry != NULL && cur_entry->is_call) {
-                uint32_t ret_key = (ctx->regs[14] & ~1U) | (ctx->regs[14] & 1U);
+                uint32_t ret_key = (ctx->regs[14] & ~1U) | (is_thumb ? 1U : 0U);
                 uint32_t r_ibtc  = ((ret_key >> 1U) ^ (ret_key & 1U)) & (A32_IBTC_SIZE - 1U);
                 uint32_t top     = ctx->ras_top;
                 if (ret_key != 0U &&
@@ -859,7 +912,7 @@ int a32_jit_run(a32_ctx_t *ctx)
             prev_entry = NULL;
             if (ctx->gdb_enabled) {
                 a32_gdb_handle_stop(ctx, 5 /* SIGTRAP */);
-            } else {
+            } else if (!a32_signals_deliver_sync(ctx, 5 /* SIGTRAP */, ctx->regs[15])) {
                 raise(5 /* SIGTRAP */);
             }
             break;
@@ -869,6 +922,18 @@ int a32_jit_run(a32_ctx_t *ctx)
             return 139;
 
         case A32_EXIT_UNDEF:
+            prev_entry = NULL;
+            if (ctx->gdb_enabled) {
+                a32_gdb_handle_stop(ctx, 4 /* SIGILL */);
+                break;
+            }
+            if (a32_signals_deliver_sync(ctx, 4 /* SIGILL */, ctx->regs[15])) {
+                break;
+            }
+            fprintf(stderr, "a32rt: aborting on exit_reason=%u at guest pc=0x%08x\n",
+                    reason, ctx->regs[15]);
+            return 127;
+
         default:
             fprintf(stderr, "a32rt: aborting on exit_reason=%u at guest pc=0x%08x\n",
                     reason, ctx->regs[15]);

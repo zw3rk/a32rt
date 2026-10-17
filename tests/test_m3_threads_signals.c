@@ -692,6 +692,224 @@ static int test9_negative_signal_syscalls(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 10: Process-forking clone (without CLONE_VM) with SETTID / SETTLS
+ * -------------------------------------------------------------------------- */
+static int test10_clone_process_fork(void)
+{
+    uint32_t saved_tls = 0U;
+    __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(saved_tls));
+
+    uint32_t parent_sentinel_tls = 0x11112220U;
+    uint32_t child_sentinel_tls  = 0x22224440U;
+    if (sys1(0x0F0005U /* ARM_NR_set_tls */, parent_sentinel_tls) != 0) {
+        return 96;
+    }
+
+    volatile uint32_t parent_tid = 0U;
+    volatile uint32_t child_tid  = 0U;
+    /*
+     * SIGCHLD (17) | CLONE_PARENT_SETTID (0x00100000) |
+     * CLONE_CHILD_SETTID (0x01000000) | CLONE_SETTLS (0x00080000)
+     */
+    uint32_t clone_flags = 17U | 0x00100000U | 0x01000000U | 0x00080000U;
+    int32_t cpid = sys6(120U /* clone */, clone_flags, 0U /* child_stack = NULL */,
+                        (uint32_t)(uintptr_t)&parent_tid,
+                        child_sentinel_tls,
+                        (uint32_t)(uintptr_t)&child_tid, 0U);
+    if (cpid < 0) {
+        (void)sys1(0x0F0005U /* ARM_NR_set_tls */, saved_tls);
+        return 97;
+    }
+
+    if (cpid == 0) {
+        /* Child process */
+        uint32_t child_tls_hw = 0U;
+        __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(child_tls_hw));
+        typedef uint32_t (*kuser_get_tls_fn)(void);
+        kuser_get_tls_fn get_tls = (kuser_get_tls_fn)(uintptr_t)0xFFFF0FE0U;
+        uint32_t child_tls_kuser = get_tls();
+        uint32_t my_tid = (uint32_t)sys1(224U /* gettid */, 0U);
+
+        if (child_tls_hw != child_sentinel_tls ||
+            child_tls_kuser != child_sentinel_tls ||
+            child_tid == 0U || child_tid != my_tid) {
+            sys1(248U /* exit_group */, 99U);
+        }
+        sys1(248U /* exit_group */, 55U);
+        __builtin_unreachable();
+    }
+
+    /* Parent process: verify parent_tid was written and parent's TLS is intact */
+    uint32_t after_parent_tls = 0U;
+    __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(after_parent_tls));
+    (void)sys1(0x0F0005U /* ARM_NR_set_tls */, saved_tls);
+
+    if (parent_tid != (uint32_t)cpid) {
+        return 98;
+    }
+    if (after_parent_tls != parent_sentinel_tls) {
+        return 99;
+    }
+
+    uint32_t wstatus = 0U;
+    int32_t wrc = sys4(114U /* wait4 */, (uint32_t)cpid,
+                       (uint32_t)(uintptr_t)&wstatus, 0U, 0U);
+    if (wrc != cpid) {
+        return 100;
+    }
+    if (((wstatus >> 8) & 0xFFU) != 55U || (wstatus & 0x7FU) != 0U) {
+        return 101;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 11: Synchronous SIGILL si_addr and ucontext fault_address == arm_pc
+ * -------------------------------------------------------------------------- */
+static volatile uint32_t g_sigill_handled = 0U;
+static volatile uint32_t g_sigill_addr_ok = 0U;
+static volatile uint32_t g_sigill_expected_pc = 0U;
+
+static void sigill_handler(int sig, void *info, void *uctx_ptr)
+{
+    uint8_t *uc = (uint8_t *)uctx_ptr;
+    uint32_t arm_pc     = *(uint32_t *)(uc + 92);
+    uint32_t fault_addr = *(uint32_t *)(uc + 100);
+
+    /* Advance past the 4-byte undefined instruction */
+    *(uint32_t *)(uc + 92) = arm_pc + 4U;
+
+    const struct siginfo32 *si = (const struct siginfo32 *)info;
+    if (sig == 4 && si != NULL && si->si_signo == 4 &&
+        (uint32_t)(uintptr_t)si->si_addr == g_sigill_expected_pc &&
+        arm_pc == g_sigill_expected_pc &&
+        fault_addr == g_sigill_expected_pc) {
+        g_sigill_addr_ok = 1U;
+    }
+    g_sigill_handled = 1U;
+}
+
+static int test11_sigill_fault_addr(void)
+{
+    g_sigill_handled = 0U;
+    g_sigill_addr_ok = 0U;
+    g_sigill_expected_pc = 0U;
+
+    struct sigaction32 act;
+    act.sa_handler  = (uint32_t)(uintptr_t)sigill_handler;
+    act.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0]  = 0U;
+    act.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 4U /* SIGILL */,
+             (uint32_t)(uintptr_t)&act, 0U, 8U) != 0) {
+        return 102;
+    }
+
+    volatile uint32_t post_udf_reached = 0U;
+    __asm__ volatile(
+        "adr r0, 1f\n"
+        "str r0, [%1]\n"
+        "1:\n"
+        ".word 0xE7F000F0\n" /* A32 UDF #0 */
+        "mov %0, #1\n"
+        : "=&r"(post_udf_reached)
+        : "r"(&g_sigill_expected_pc)
+        : "r0", "memory"
+    );
+
+    if (g_sigill_handled != 1U || post_udf_reached != 1U) {
+        return 103;
+    }
+    if (g_sigill_addr_ok != 1U) {
+        return 104;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 12: Block chaining across partial cacheflush & targeted invalidation
+ * -------------------------------------------------------------------------- */
+static int test12_chaining_partial_cacheflush(void)
+{
+    uint32_t pages = (uint32_t)sys6(192U /* mmap2 */, 0U, 12288U,
+                                    3U /* PROT_READ|PROT_WRITE */,
+                                    0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                    0xFFFFFFFFU, 0U);
+    if (pages > 0xFFFFF000U) {
+        return 105;
+    }
+    uint32_t page_a = pages;
+    uint32_t page_b = pages + 4096U;
+    uint32_t page_c = pages + 8192U;
+
+    uint32_t *code_a = (uint32_t *)(uintptr_t)page_a;
+    uint32_t *code_b = (uint32_t *)(uintptr_t)page_b;
+    uint32_t *code_c = (uint32_t *)(uintptr_t)page_c;
+
+    /* Page A: add r0, r0, #5; b page_b */
+    int32_t disp = ((int32_t)page_b - (int32_t)(page_a + 12U)) >> 2;
+    code_a[0] = 0xE2800005U; /* add r0, r0, #5 */
+    code_a[1] = 0xEA000000U | ((uint32_t)disp & 0x00FFFFFFU); /* b page_b */
+
+    /* Page B: add r0, r0, #10; bx lr */
+    code_b[0] = 0xE280000AU; /* add r0, r0, #10 */
+    code_b[1] = 0xE12FFF1EU; /* bx lr */
+
+    /* Page C: mov r0, #77; bx lr */
+    code_c[0] = 0xE3A0004DU; /* mov r0, #77 */
+    code_c[1] = 0xE12FFF1EU; /* bx lr */
+
+    if (sys3(125U /* mprotect */, pages, 12288U, 5U /* PROT_READ|PROT_EXEC */) != 0) {
+        sys2(91U /* munmap */, pages, 12288U);
+        return 106;
+    }
+    sys3(0x0F0002U /* cacheflush */, pages, pages + 12288U, 0U);
+
+    typedef uint32_t (*chain_fn_t)(uint32_t);
+    chain_fn_t fn_a = (chain_fn_t)(uintptr_t)page_a;
+
+    /* First call translates A & B and patches A->B chain; second runs chained */
+    if (fn_a(100U) != 115U || fn_a(100U) != 115U) {
+        sys2(91U /* munmap */, pages, 12288U);
+        return 107;
+    }
+
+    /* Partial cacheflush of unrelated page C must preserve A->B chain */
+    sys3(0x0F0002U /* cacheflush */, page_c, page_c + 16U, 0U);
+    if (fn_a(100U) != 115U || fn_a(100U) != 115U) {
+        sys2(91U /* munmap */, pages, 12288U);
+        return 108;
+    }
+
+    /*
+     * Now patch ONLY page B (add r0, r0, #37) and cacheflush ONLY page B.
+     * Invalidation of page B must unchain page A's outgoing chain slot so
+     * calling fn_a(100) re-translates page B and returns 100 + 5 + 37 = 142.
+     */
+    if (sys3(125U /* mprotect */, page_b, 4096U, 3U /* PROT_READ|PROT_WRITE */) != 0) {
+        sys2(91U /* munmap */, pages, 12288U);
+        return 109;
+    }
+    code_b[0] = 0xE2800025U; /* add r0, r0, #37 */
+    if (sys3(125U /* mprotect */, page_b, 4096U, 5U /* PROT_READ|PROT_EXEC */) != 0) {
+        sys2(91U /* munmap */, pages, 12288U);
+        return 110;
+    }
+    sys3(0x0F0002U /* cacheflush */, page_b, page_b + 16U, 0U);
+
+    if (fn_a(100U) != 142U || fn_a(100U) != 142U) {
+        sys2(91U /* munmap */, pages, 12288U);
+        return 111;
+    }
+
+    sys2(91U /* munmap */, pages, 12288U);
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -727,6 +945,18 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test9_negative_signal_syscalls();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test10_clone_process_fork();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test11_sigill_fault_addr();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test12_chaining_partial_cacheflush();
     if (rc != 0) {
         return rc;
     }

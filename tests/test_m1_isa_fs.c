@@ -164,6 +164,144 @@ static uint32_t __attribute__((noinline)) arm_asr_reg(uint32_t val, uint32_t sh)
     return out;
 }
 
+static uint32_t __attribute__((noinline))
+arm_lsls_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t out = 0U;
+    uint32_t fl  = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "lsls %[out], %[val], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [out] "=&r"(out), [fl] "=&r"(fl)
+        : [val] "r"(val), [sh] "r"(sh), [cin] "r"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return out;
+}
+
+static uint32_t __attribute__((noinline))
+arm_lsrs_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t out = 0U;
+    uint32_t fl  = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "lsrs %[out], %[val], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [out] "=&r"(out), [fl] "=&r"(fl)
+        : [val] "r"(val), [sh] "r"(sh), [cin] "r"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return out;
+}
+
+static uint32_t __attribute__((noinline))
+arm_asrs_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t out = 0U;
+    uint32_t fl  = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "asrs %[out], %[val], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [out] "=&r"(out), [fl] "=&r"(fl)
+        : [val] "r"(val), [sh] "r"(sh), [cin] "r"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return out;
+}
+
+static uint32_t __attribute__((noinline))
+arm_rors_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t out = 0U;
+    uint32_t fl  = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "rors %[out], %[val], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [out] "=&r"(out), [fl] "=&r"(fl)
+        : [val] "r"(val), [sh] "r"(sh), [cin] "r"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return out;
+}
+
+#if defined(__thumb__)
+static uint32_t __attribute__((noinline))
+t16_lsls_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t io = val;
+    uint32_t fl = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "lsls %[io], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [io] "+l"(io), [fl] "=&l"(fl)
+        : [sh] "l"(sh), [cin] "l"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return io;
+}
+
+static uint32_t __attribute__((noinline))
+t16_lsrs_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t io = val;
+    uint32_t fl = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "lsrs %[io], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [io] "+l"(io), [fl] "=&l"(fl)
+        : [sh] "l"(sh), [cin] "l"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return io;
+}
+
+static uint32_t __attribute__((noinline))
+t16_asrs_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t io = val;
+    uint32_t fl = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "asrs %[io], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [io] "+l"(io), [fl] "=&l"(fl)
+        : [sh] "l"(sh), [cin] "l"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return io;
+}
+
+static uint32_t __attribute__((noinline))
+t16_rors_reg_c(uint32_t val, uint32_t sh, uint32_t c_in, uint32_t *out_c)
+{
+    uint32_t io = val;
+    uint32_t fl = 0U;
+    __asm__ volatile(
+        "subs %[fl], %[cin], #1\n\t"
+        "rors %[io], %[sh]\n\t"
+        "mrs  %[fl], apsr\n\t"
+        : [io] "+l"(io), [fl] "=&l"(fl)
+        : [sh] "l"(sh), [cin] "l"(c_in)
+        : "cc"
+    );
+    *out_c = (fl >> 29) & 1U;
+    return io;
+}
+#endif
+
 static int run_test(void)
 {
     /* 1. Hardware division udiv / sdiv */
@@ -1479,6 +1617,289 @@ static int run_test(void)
         }
     }
 #endif
+
+    /*
+     * 22. Barrel-shifter carry-out (C flag) on register-specified shifts
+     *     (LSLS, LSRS, ASRS, RORS by register) for amount == 0 (preserving C),
+     *     amount == 1..31, amount == 32, and amount > 32.
+     */
+    {
+        uint32_t c_out = 0U;
+
+        /* 22a: LSLS by register */
+        if (arm_lsls_reg_c(0x12345678U, 0U, 1U, &c_out) != 0x12345678U || c_out != 1U ||
+            arm_lsls_reg_c(0x12345678U, 0U, 0U, &c_out) != 0x12345678U || c_out != 0U ||
+            arm_lsls_reg_c(0x12345678U, 256U, 1U, &c_out) != 0x12345678U || c_out != 1U ||
+            arm_lsls_reg_c(0x12345678U, 256U, 0U, &c_out) != 0x12345678U || c_out != 0U ||
+            arm_lsls_reg_c(0x40000001U, 1U, 1U, &c_out) != 0x80000002U || c_out != 0U ||
+            arm_lsls_reg_c(0x40000001U, 2U, 0U, &c_out) != 0x00000004U || c_out != 1U ||
+            arm_lsls_reg_c(0x00000003U, 31U, 0U, &c_out) != 0x80000000U || c_out != 1U ||
+            arm_lsls_reg_c(0x00000001U, 31U, 1U, &c_out) != 0x80000000U || c_out != 0U ||
+            arm_lsls_reg_c(0x12345671U, 32U, 0U, &c_out) != 0U || c_out != 1U ||
+            arm_lsls_reg_c(0x12345670U, 32U, 1U, &c_out) != 0U || c_out != 0U ||
+            arm_lsls_reg_c(0xFFFFFFFFU, 33U, 1U, &c_out) != 0U || c_out != 0U ||
+            arm_lsls_reg_c(0xFFFFFFFFU, 64U, 1U, &c_out) != 0U || c_out != 0U) {
+            return 126;
+        }
+
+        /* 22b: LSRS by register */
+        if (arm_lsrs_reg_c(0x87654321U, 0U, 1U, &c_out) != 0x87654321U || c_out != 1U ||
+            arm_lsrs_reg_c(0x87654321U, 0U, 0U, &c_out) != 0x87654321U || c_out != 0U ||
+            arm_lsrs_reg_c(0x87654321U, 256U, 1U, &c_out) != 0x87654321U || c_out != 1U ||
+            arm_lsrs_reg_c(0x87654321U, 256U, 0U, &c_out) != 0x87654321U || c_out != 0U ||
+            arm_lsrs_reg_c(0x80000002U, 1U, 1U, &c_out) != 0x40000001U || c_out != 0U ||
+            arm_lsrs_reg_c(0x80000002U, 2U, 0U, &c_out) != 0x20000000U || c_out != 1U ||
+            arm_lsrs_reg_c(0x40000000U, 31U, 0U, &c_out) != 0U || c_out != 1U ||
+            arm_lsrs_reg_c(0x80000000U, 31U, 1U, &c_out) != 1U || c_out != 0U ||
+            arm_lsrs_reg_c(0x80000000U, 32U, 0U, &c_out) != 0U || c_out != 1U ||
+            arm_lsrs_reg_c(0x7FFFFFFFU, 32U, 1U, &c_out) != 0U || c_out != 0U ||
+            arm_lsrs_reg_c(0xFFFFFFFFU, 33U, 1U, &c_out) != 0U || c_out != 0U ||
+            arm_lsrs_reg_c(0xFFFFFFFFU, 64U, 1U, &c_out) != 0U || c_out != 0U) {
+            return 127;
+        }
+
+        /* 22c: ASRS by register */
+        if (arm_asrs_reg_c(0x80000002U, 0U, 1U, &c_out) != 0x80000002U || c_out != 1U ||
+            arm_asrs_reg_c(0x80000002U, 0U, 0U, &c_out) != 0x80000002U || c_out != 0U ||
+            arm_asrs_reg_c(0x80000002U, 256U, 1U, &c_out) != 0x80000002U || c_out != 1U ||
+            arm_asrs_reg_c(0x80000002U, 256U, 0U, &c_out) != 0x80000002U || c_out != 0U ||
+            arm_asrs_reg_c(0x80000002U, 1U, 1U, &c_out) != 0xC0000001U || c_out != 0U ||
+            arm_asrs_reg_c(0x80000002U, 2U, 0U, &c_out) != 0xE0000000U || c_out != 1U ||
+            arm_asrs_reg_c(0x40000000U, 31U, 0U, &c_out) != 0U || c_out != 1U ||
+            arm_asrs_reg_c(0x80000000U, 32U, 0U, &c_out) != 0xFFFFFFFFU || c_out != 1U ||
+            arm_asrs_reg_c(0x80000000U, 33U, 0U, &c_out) != 0xFFFFFFFFU || c_out != 1U ||
+            arm_asrs_reg_c(0x80000000U, 64U, 0U, &c_out) != 0xFFFFFFFFU || c_out != 1U ||
+            arm_asrs_reg_c(0x7FFFFFFFU, 32U, 1U, &c_out) != 0U || c_out != 0U ||
+            arm_asrs_reg_c(0x7FFFFFFFU, 33U, 1U, &c_out) != 0U || c_out != 0U) {
+            return 128;
+        }
+
+        /* 22d: RORS by register */
+        if (arm_rors_reg_c(0x80000001U, 0U, 1U, &c_out) != 0x80000001U || c_out != 1U ||
+            arm_rors_reg_c(0x80000001U, 0U, 0U, &c_out) != 0x80000001U || c_out != 0U ||
+            arm_rors_reg_c(0x80000001U, 256U, 1U, &c_out) != 0x80000001U || c_out != 1U ||
+            arm_rors_reg_c(0x80000001U, 256U, 0U, &c_out) != 0x80000001U || c_out != 0U ||
+            arm_rors_reg_c(0x00000001U, 1U, 0U, &c_out) != 0x80000000U || c_out != 1U ||
+            arm_rors_reg_c(0x00000002U, 1U, 1U, &c_out) != 0x00000001U || c_out != 0U ||
+            arm_rors_reg_c(0x12345678U, 8U, 1U, &c_out) != 0x78123456U || c_out != 0U ||
+            arm_rors_reg_c(0x12345680U, 8U, 0U, &c_out) != 0x80123456U || c_out != 1U ||
+            arm_rors_reg_c(0x80000001U, 32U, 0U, &c_out) != 0x80000001U || c_out != 1U ||
+            arm_rors_reg_c(0x7FFFFFFFU, 32U, 1U, &c_out) != 0x7FFFFFFFU || c_out != 0U ||
+            arm_rors_reg_c(0x00000001U, 33U, 0U, &c_out) != 0x80000000U || c_out != 1U ||
+            arm_rors_reg_c(0x00000002U, 33U, 1U, &c_out) != 0x00000001U || c_out != 0U ||
+            arm_rors_reg_c(0x80000001U, 64U, 0U, &c_out) != 0x80000001U || c_out != 1U ||
+            arm_rors_reg_c(0x7FFFFFFFU, 64U, 1U, &c_out) != 0x7FFFFFFFU || c_out != 0U) {
+            return 129;
+        }
+
+#if defined(__thumb__)
+        /* 22e: T16 2-operand LSLS / LSRS / ASRS / RORS by register */
+        if (t16_lsls_reg_c(0x12345671U, 0U, 1U, &c_out) != 0x12345671U || c_out != 1U ||
+            t16_lsls_reg_c(0x12345671U, 0U, 0U, &c_out) != 0x12345671U || c_out != 0U ||
+            t16_lsls_reg_c(0x40000001U, 2U, 0U, &c_out) != 0x00000004U || c_out != 1U ||
+            t16_lsls_reg_c(0x12345671U, 32U, 0U, &c_out) != 0U || c_out != 1U ||
+            t16_lsls_reg_c(0xFFFFFFFFU, 33U, 1U, &c_out) != 0U || c_out != 0U ||
+            t16_lsrs_reg_c(0x80000002U, 0U, 1U, &c_out) != 0x80000002U || c_out != 1U ||
+            t16_lsrs_reg_c(0x80000002U, 2U, 0U, &c_out) != 0x20000000U || c_out != 1U ||
+            t16_lsrs_reg_c(0x80000000U, 32U, 0U, &c_out) != 0U || c_out != 1U ||
+            t16_lsrs_reg_c(0xFFFFFFFFU, 33U, 1U, &c_out) != 0U || c_out != 0U ||
+            t16_asrs_reg_c(0x80000002U, 0U, 0U, &c_out) != 0x80000002U || c_out != 0U ||
+            t16_asrs_reg_c(0x80000002U, 2U, 0U, &c_out) != 0xE0000000U || c_out != 1U ||
+            t16_asrs_reg_c(0x80000000U, 32U, 0U, &c_out) != 0xFFFFFFFFU || c_out != 1U ||
+            t16_asrs_reg_c(0x80000000U, 33U, 0U, &c_out) != 0xFFFFFFFFU || c_out != 1U ||
+            t16_rors_reg_c(0x80000001U, 0U, 0U, &c_out) != 0x80000001U || c_out != 0U ||
+            t16_rors_reg_c(0x00000001U, 1U, 0U, &c_out) != 0x80000000U || c_out != 1U ||
+            t16_rors_reg_c(0x80000001U, 32U, 0U, &c_out) != 0x80000001U || c_out != 1U ||
+            t16_rors_reg_c(0x00000001U, 33U, 0U, &c_out) != 0x80000000U || c_out != 1U) {
+            return 130;
+        }
+#endif
+    }
+
+    /*
+     * 23. Regression tests for MSR APSR_nzcvq, Rm, MSR APSR_g, Rm (GE[3:0] bits [19:16]
+     *     read back via SEL and MRS), and MSR APSR_nzcvqg, Rm.
+     */
+    {
+        uint32_t sel_a = 0x11223344U;
+        uint32_t sel_b = 0xAABBCCDDU;
+        uint32_t sel_out = 0U;
+        uint32_t flags = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+
+        /* 23a: MSR APSR_g, Rm with GE = 0b0101 (0x00050000) preserving Z=1, C=1 (0x60000000) */
+        uint32_t ge_0101 = 0x00050000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "msr apsr_g, %[ge]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[out], %[sa], %[sb]\n\t"
+            : [out] "=&r"(sel_out), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [ge] "r"(ge_0101), [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (sel_out != 0xAA22CC44U || (flags & 0xF00F0000U) != 0x60050000U) {
+            return 131;
+        }
+
+        /* 23b: MSR APSR_g, Rm with GE = 0b1010 (0x000A0000) preserving N=1 (0x80000000) */
+        uint32_t ge_1010 = 0x000A0000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "msr apsr_g, %[ge]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[out], %[sa], %[sb]\n\t"
+            : [out] "=&r"(sel_out), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [ge] "r"(ge_1010), [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (sel_out != 0x11BB33DDU || (flags & 0xF00F0000U) != 0x800A0000U) {
+            return 132;
+        }
+
+        /* 23c: MSR APSR_nzcvq, Rm updates NZCV without clobbering GE[3:0] */
+        uint32_t nzcv_a = 0xA0000000U; /* N=1, Z=0, C=1, V=0 */
+        uint32_t nzcv_5 = 0x50000000U; /* N=0, Z=1, C=0, V=1 */
+        __asm__ volatile(
+            "msr apsr_g, %[ge]\n\t"
+            "msr apsr_nzcvq, %[nzcv]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[out], %[sa], %[sb]\n\t"
+            : [out] "=&r"(sel_out), [fl] "=&r"(flags)
+            : [ge] "r"(ge_0101), [nzcv] "r"(nzcv_a), [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (sel_out != 0xAA22CC44U || (flags & 0xF00F0000U) != 0xA0050000U) {
+            return 133;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[nzcv]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [fl] "=&r"(flags)
+            : [nzcv] "r"(nzcv_5)
+            : "cc"
+        );
+        if ((flags & 0xF00F0000U) != 0x50050000U) {
+            return 134;
+        }
+
+        /* 23d: MSR APSR_nzcvqg, Rm updates both NZCV and GE[3:0] */
+        uint32_t both_9c = 0x900C0000U; /* N=1, Z=0, C=0, V=1, GE=0b1100 */
+        __asm__ volatile(
+            "msr apsr_nzcvqg, %[both]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[out], %[sa], %[sb]\n\t"
+            : [out] "=&r"(sel_out), [fl] "=&r"(flags)
+            : [both] "r"(both_9c), [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (sel_out != 0x1122CCDDU || (flags & 0xF00F0000U) != 0x900C0000U) {
+            return 135;
+        }
+    }
+
+    /*
+     * 24. Regression tests for SSAT16, USAT16, and UADD8 / USUB8 + SEL:
+     *     Verify dual 16-bit signed/unsigned saturation, parallel bytewise
+     *     addition/subtraction GE[3:0] flags via SEL, and NZCV preservation.
+     */
+    {
+        uint32_t res = 0U, flags = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+
+        /* 24a: SSAT16 #8 (signed range [-128, +127] = [0xFF80, 0x007F]) */
+        uint32_t s16_in1 = 0x012CFED4U; /* hi = +300 -> +127 (0x007F), lo = -300 -> -128 (0xFF80) */
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "ssat16 %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [in] "r"(s16_in1)
+            : "cc"
+        );
+        if (res != 0x007FFF80U || (flags & 0xF0000000U) != 0x60000000U) {
+            return 136;
+        }
+
+        uint32_t s16_in2 = 0xFFD600C8U; /* hi = -42 (in-range), lo = +200 -> +127 (0x007F) */
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "ssat16 %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [in] "r"(s16_in2)
+            : "cc"
+        );
+        if (res != 0xFFD6007FU || (flags & 0xF0000000U) != 0x80000000U) {
+            return 137;
+        }
+
+        /* 24b: USAT16 #8 (unsigned range [0, 255] = [0x0000, 0x00FF]) */
+        uint32_t u16_in1 = 0xFFCE01F4U; /* hi = -50 -> 0, lo = +500 -> 255 (0x00FF) */
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "usat16 %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [in] "r"(u16_in1)
+            : "cc"
+        );
+        if (res != 0x000000FFU || (flags & 0xF0000000U) != 0x60000000U) {
+            return 138;
+        }
+
+        uint32_t u16_in2 = 0x03E8002AU; /* hi = +1000 -> 255 (0x00FF), lo = +42 (in-range) */
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "usat16 %[res], #8, %[in]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [c1] "r"(c1), [c2] "r"(c2), [in] "r"(u16_in2)
+            : "cc"
+        );
+        if (res != 0x00FF002AU || (flags & 0xF0000000U) != 0x80000000U) {
+            return 139;
+        }
+
+        /* 24c: UADD8 + SEL (both A32 and T32) */
+        uint32_t ua_rn = 0xF0208010U;
+        uint32_t ua_rm = 0x203080F0U;
+        uint32_t sel_a = 0x11223344U;
+        uint32_t sel_b = 0xAABBCCDDU;
+        uint32_t sel_out = 0U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "uadd8 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(ua_rn), [rm] "r"(ua_rm),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x10500000U || sel_out != 0x11BB3344U ||
+            (flags & 0xF00F0000U) != 0x600B0000U) {
+            return 140;
+        }
+
+        /* 24d: USUB8 + SEL (both A32 and T32) */
+        uint32_t us_rn = 0x10508020U;
+        uint32_t us_rm = 0x20509010U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "usub8 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(us_rn), [rm] "r"(us_rm),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0xF000F010U || sel_out != 0xAA22CC44U ||
+            (flags & 0xF00F0000U) != 0x80050000U) {
+            return 141;
+        }
+    }
 
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));

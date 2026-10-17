@@ -170,6 +170,24 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
     }
 }
 
+static void vm_coalesce_regions_locked(void)
+{
+    size_t i = 0U;
+    while (i + 1U < g_vm_region_count) {
+        a32_region_t *cur  = &g_vm_regions[i];
+        a32_region_t *next = &g_vm_regions[i + 1U];
+        if (cur->end == next->start &&
+            cur->prot == next->prot &&
+            (cur->flags & 0x23U) == (next->flags & 0x23U) &&
+            strcmp(cur->name, next->name) == 0) {
+            cur->end = next->end;
+            vm_remove_region_at(i + 1U);
+        } else {
+            i++;
+        }
+    }
+}
+
 static int vm_record_region_locked(uint32_t start, uint32_t end,
                                    uint32_t prot, uint32_t flags, const char *name)
 {
@@ -182,8 +200,11 @@ static int vm_record_region_locked(uint32_t start, uint32_t end,
     } else {
         name_copy[0] = '\0';
     }
+    uint32_t clean_flags = flags & ~(0x10U | 0x100000U);
     vm_unmap_regions_locked(start, end);
-    return vm_insert_region_raw(start, end, prot, flags, name_copy);
+    int rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
+    vm_coalesce_regions_locked();
+    return rc;
 }
 
 static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot)
@@ -245,6 +266,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
             }
         }
     }
+    vm_coalesce_regions_locked();
 }
 
 static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
@@ -253,6 +275,43 @@ static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
         if (g_vm_regions[i].end > start && g_vm_regions[i].start < end) {
             return true;
         }
+    }
+    return false;
+}
+
+static bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
+                                         uint32_t *out_prot, uint32_t *out_flags,
+                                         char *out_name, size_t name_sz)
+{
+    if (start >= end) {
+        return false;
+    }
+    uint32_t cur = start;
+    bool first = true;
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const a32_region_t *r = &g_vm_regions[i];
+        if (r->end <= cur) {
+            continue;
+        }
+        if (r->start > cur) {
+            return false;
+        }
+        if (first) {
+            if (out_prot) {
+                *out_prot = r->prot;
+            }
+            if (out_flags) {
+                *out_flags = r->flags;
+            }
+            if (out_name && name_sz > 0U) {
+                snprintf(out_name, name_sz, "%s", r->name);
+            }
+            first = false;
+        }
+        if (r->end >= end) {
+            return true;
+        }
+        cur = r->end;
     }
     return false;
 }
@@ -305,6 +364,10 @@ static int try_reserve_window(uint64_t base)
 
     void *res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (res == MAP_FAILED && (errno == EINVAL || errno == EOPNOTSUPP)) {
+        res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if (res == MAP_FAILED) {
         return -1;
     }
@@ -336,11 +399,6 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
         }
     }
 
-    if (!has_explicit && ctx->has_host_info && ctx->host_info.window_hint != 0ULL) {
-        base = ctx->host_info.window_hint;
-        has_explicit = true;
-    }
-
     if (has_explicit) {
         if (try_reserve_window(base) != 0) {
             fprintf(stderr, "a32rt: failed to reserve guest window at 0x%llx\n",
@@ -348,6 +406,9 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
             return -1;
         }
         ctx->guest_base = base;
+    } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
+               try_reserve_window(ctx->host_info.window_hint) == 0) {
+        ctx->guest_base = ctx->host_info.window_hint;
     } else {
         /* Try G = 0 first; if occupied, scan 4 GiB-aligned windows [4G, 64G). */
         if (try_reserve_window(0ULL) == 0) {
@@ -422,6 +483,12 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
     uint32_t new_page = (uint32_t)new_page64;
 
     if (new_page > old_page) {
+        if (vm_range_overlaps_locked(old_page, new_page)) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_to_ctx(ctx);
+            vm_lock_release();
+            return curr;
+        }
         uint32_t len = new_page - old_page;
         void *host_addr = a32_guest_ptr(ctx, old_page);
         void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
@@ -432,24 +499,24 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
             vm_lock_release();
             return curr;
         }
-        (void)vm_record_region_locked(g_vm_brk_base, new_page,
+        (void)vm_record_region_locked(old_page, new_page,
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
         void *host_addr = a32_guest_ptr(ctx, new_page);
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
-        mmap(host_addr, len, PROT_NONE,
-             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        vm_unmap_regions_locked(g_vm_brk_base, old_page);
-        if (new_page > g_vm_brk_base) {
-            (void)vm_record_region_locked(g_vm_brk_base, new_page,
-                                          (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
-        }
+        (void)mmap(host_addr, len, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        vm_unmap_regions_locked(new_page, old_page);
     }
 
     g_vm_brk_curr = new_brk;
     vm_sync_to_ctx(ctx);
     vm_lock_release();
+
+    if (new_page < old_page) {
+        a32_jit_invalidate_range(ctx, new_page, old_page);
+    }
     return new_brk;
 }
 
@@ -498,19 +565,26 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         }
         target_va = addr;
     } else {
-        if (vm_find_free_gap_locked(aligned_len, &target_va) != 0) {
+        uint32_t hint_va = page_align_down(addr);
+        if (addr != 0U &&
+            hint_va >= A32_MMAP_BASE_32 &&
+            (uint64_t)hint_va + aligned_len <= (uint64_t)A32_KUSER_BASE_32 &&
+            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + aligned_len))) {
+            target_va = hint_va;
+        } else if (vm_find_free_gap_locked(aligned_len, &target_va) != 0) {
             return (uint32_t)(-ENOMEM);
         }
     }
 
     int host_prot = 0;
-    if (prot & 0x1U) {
+    if (prot & (0x1U | 0x4U)) {
         host_prot |= PROT_READ;
     }
     if (prot & 0x2U) {
         host_prot |= PROT_WRITE;
     }
-    if (prot & 0x4U) {
+    if ((prot & 0x4U) != 0U &&
+        !((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL && (prot & 0x2U) != 0U)) {
         host_prot |= PROT_EXEC;
     }
 
@@ -560,13 +634,14 @@ static int vm_mprotect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint3
     }
 
     int host_prot = 0;
-    if (prot & 0x1U) {
+    if (prot & (0x1U | 0x4U)) {
         host_prot |= PROT_READ;
     }
     if (prot & 0x2U) {
         host_prot |= PROT_WRITE;
     }
-    if (prot & 0x4U) {
+    if ((prot & 0x4U) != 0U &&
+        !((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL && (prot & 0x2U) != 0U)) {
         host_prot |= PROT_EXEC;
     }
 
@@ -667,28 +742,39 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         return (uint32_t)(-ENOMEM);
     }
 
-    if ((flags & 2U /* MREMAP_FIXED */) == 0U) {
-        if (new_aligned == old_aligned) {
-            return old_addr;
-        }
-        if (new_aligned < old_aligned) {
-            int rc = a32_vm_munmap(ctx, old_addr + (uint32_t)new_aligned,
-                                   (uint32_t)(old_aligned - new_aligned));
-            if (rc != 0) {
-                return (uint32_t)rc;
-            }
-            return old_addr;
-        }
-    }
-
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
 
     uint32_t prot = 0x3U; /* Default PROT_READ | PROT_WRITE */
-    for (size_t i = 0U; i < g_vm_region_count; i++) {
-        if (g_vm_regions[i].start <= old_addr && g_vm_regions[i].end > old_addr) {
-            prot = g_vm_regions[i].prot;
-            break;
+    uint32_t orig_flags = 0x22U;
+    char     orig_name[64];
+    orig_name[0] = '\0';
+    if (!vm_check_mapped_range_locked(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned),
+                                      &prot, &orig_flags, orig_name, sizeof(orig_name))) {
+        vm_sync_to_ctx(ctx);
+        vm_lock_release();
+        return (uint32_t)(-EFAULT);
+    }
+    uint32_t keep_flags = orig_flags & 0x23U;
+    const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
+
+    if ((flags & 2U /* MREMAP_FIXED */) == 0U) {
+        if (new_aligned == old_aligned) {
+            vm_sync_to_ctx(ctx);
+            vm_lock_release();
+            return old_addr;
+        }
+        if (new_aligned < old_aligned) {
+            uint32_t unmap_addr = old_addr + (uint32_t)new_aligned;
+            uint32_t unmap_len  = (uint32_t)(old_aligned - new_aligned);
+            int rc = vm_munmap_locked(ctx, unmap_addr, unmap_len);
+            vm_sync_to_ctx(ctx);
+            vm_lock_release();
+            if (rc != 0) {
+                return (uint32_t)rc;
+            }
+            a32_jit_invalidate_range(ctx, unmap_addr, unmap_addr + unmap_len);
+            return old_addr;
         }
     }
 
@@ -723,6 +809,8 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         if (prot != 0x3U) {
             (void)vm_mprotect_locked(ctx, mapped, (uint32_t)new_aligned, prot);
         }
+        (void)vm_record_region_locked(mapped, (uint32_t)((uint64_t)mapped + new_aligned),
+                                      prot, keep_flags, region_name);
         (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
         vm_sync_to_ctx(ctx);
         vm_lock_release();
@@ -741,6 +829,8 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                        prot, 0x32U /* MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS */,
                                        -1, 0U);
         if (ext <= 0xFFFFF000U) {
+            (void)vm_record_region_locked(old_end, (uint32_t)new_end,
+                                          prot, keep_flags, region_name);
             uint32_t ext_end = (uint32_t)new_end;
             if (ext_end > g_vm_mmap_cursor && ext_end <= A32_MMAP_TOP_32) {
                 g_vm_mmap_cursor = ext_end;
@@ -774,6 +864,8 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     if (prot != 0x3U) {
         (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
     }
+    (void)vm_record_region_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
+                                  prot, keep_flags, region_name);
     (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
     vm_sync_to_ctx(ctx);
     vm_lock_release();

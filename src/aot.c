@@ -9,6 +9,7 @@
 #include "a32rt.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,19 +50,35 @@ static uint64_t fnv1a_64_step(uint64_t hash, const void *data, size_t len)
     return hash;
 }
 
-static uint64_t compute_elf_hash(const char *elf_path)
+static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
 {
     uint64_t h = 0xcbf29ce484222325ULL;
+    if (ctx != NULL) {
+        h = fnv1a_64_step(h, &ctx->elf_base, sizeof(ctx->elf_base));
+        h = fnv1a_64_step(h, &ctx->interp_base, sizeof(ctx->interp_base));
+    }
     if (elf_path != NULL) {
         h = fnv1a_64_step(h, elf_path, strlen(elf_path));
+        char resolved_path[PATH_MAX];
+        const char *host_path = elf_path;
+        if (ctx != NULL &&
+            a32_resolve_guest_path(ctx, elf_path, resolved_path, sizeof(resolved_path)) == 0) {
+            host_path = resolved_path;
+        }
         struct stat st;
-        if (stat(elf_path, &st) == 0) {
+        if (stat(host_path, &st) != 0 && host_path != elf_path) {
+            host_path = elf_path;
+        }
+        if (stat(host_path, &st) == 0) {
             uint64_t sz = (uint64_t)st.st_size;
             uint64_t mt = (uint64_t)st.st_mtime;
             h = fnv1a_64_step(h, &sz, sizeof(sz));
             h = fnv1a_64_step(h, &mt, sizeof(mt));
         }
-        FILE *f = fopen(elf_path, "rb");
+        FILE *f = fopen(host_path, "rb");
+        if (f == NULL && host_path != elf_path) {
+            f = fopen(elf_path, "rb");
+        }
         if (f != NULL) {
             uint8_t buf[4096];
             size_t n = fread(buf, 1U, sizeof(buf), f);
@@ -77,7 +94,7 @@ static uint64_t compute_elf_hash(const char *elf_path)
 static void resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
                                char *out_path, size_t out_len)
 {
-    uint64_t h = compute_elf_hash(elf_path);
+    uint64_t h = compute_elf_hash(ctx, elf_path);
     const char *dir = ctx->cache_dir;
     if (dir == NULL || dir[0] == '\0') {
         dir = getenv("A32RT_CACHE");
@@ -192,7 +209,10 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
 
-    fclose(f);
+    if (fclose(f) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
     if (rename(tmp_path, cache_path) != 0) {
         unlink(tmp_path);
         return -1;
@@ -231,7 +251,9 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
             break;
         }
-        if (bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
+        if ((bh.is_thumb & ~3U) != 0U ||
+            bh.guest_end_pc <= (bh.guest_pc & ~1U) ||
+            bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
             bh.pc_map_count > A32_AOT_MAX_PC_MAP) {
             break;
         }
@@ -252,7 +274,9 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
     }
 
     fclose(f);
-    (void)a32_jit_flush_batch(ctx);
+    if (a32_jit_flush_batch(ctx) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -283,14 +307,21 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
 
     (void)a32_jit_compile_block(ctx, entry_pc, entry_thumb, NULL);
 
+    if (ctx->elf_entry != 0U && ctx->elf_entry != elf_info->entry) {
+        bool     main_thumb = (ctx->elf_entry & 1U) != 0U;
+        uint32_t main_pc    = ctx->elf_entry & (main_thumb ? ~1U : ~3U);
+        (void)a32_jit_compile_block(ctx, main_pc, main_thumb, NULL);
+    }
+
     uint32_t disc_pcs[A32_MAX_AOT_SCAN];
     bool     disc_thumb[A32_MAX_AOT_SCAN];
     size_t   disc_count = 0U;
 
     if (elf_info->text_start > 0U && elf_info->text_end > elf_info->text_start) {
         if (entry_thumb) {
-            for (uint32_t pc = elf_info->text_start;
-                 pc + 2U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
+            uint32_t scan_start = (elf_info->text_start + 1U) & ~1U;
+            for (uint32_t pc = scan_start;
+                 pc >= scan_start && pc + 2U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
                  pc += 2U) {
                 const uint16_t *hw_ptr = (const uint16_t *)a32_guest_ptr(ctx, pc);
                 uint16_t hw = *hw_ptr;
@@ -383,8 +414,9 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                 }
             }
         } else {
-            for (uint32_t pc = elf_info->text_start;
-                 pc + 4U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
+            uint32_t scan_start = (elf_info->text_start + 3U) & ~3U;
+            for (uint32_t pc = scan_start;
+                 pc >= scan_start && pc + 4U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
                  pc += 4U) {
                 const uint32_t *insn_ptr = (const uint32_t *)a32_guest_ptr(ctx, pc);
                 uint32_t insn = *insn_ptr;
@@ -432,6 +464,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
         (void)a32_jit_compile_block(ctx, disc_pcs[i], disc_thumb[i], NULL);
     }
 
-    (void)a32_jit_flush_batch(ctx);
+    if (a32_jit_flush_batch(ctx) != 0) {
+        return -1;
+    }
     return a32_aot_save_cache(ctx, elf_path);
 }

@@ -256,7 +256,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         uint32_t pstate = (uint32_t)uc->uc_mcontext.pstate;
         ctx->cpsr = (ctx->cpsr & ~A32_CPSR_NZCV_MASK) | (pstate & A32_CPSR_NZCV_MASK);
 
-        if (info && info->si_addr) {
+        if ((sig == SIGSEGV || sig == SIGBUS) && info != NULL) {
             ctx->fault_addr = (uint32_t)((uintptr_t)info->si_addr - ctx->guest_base);
         } else {
             ctx->fault_addr = guest_pc;
@@ -269,7 +269,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         if (act->handler == 0U /* SIG_DFL */) {
             fprintf(stderr, "a32rt: unhandled guest signal %d at guest pc=0x%08x, fault_addr=0x%08x\n",
                     sig, guest_pc, ctx->fault_addr);
-            exit(128 + sig);
+            _exit(128 + sig);
         }
 
         deliver_guest_signal(ctx, sig, act, info);
@@ -300,7 +300,7 @@ int a32_signals_init(a32_ctx_t *ctx)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = host_sig_handler;
-    sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
+    sa.sa_flags     = SA_SIGINFO | SA_NODEFER | SA_RESTART;
     sigfillset(&sa.sa_mask);
 
     for (size_t i = 0; i < sizeof(monitored_signals) / sizeof(monitored_signals[0]); i++) {
@@ -339,12 +339,29 @@ void a32_signals_check_pending(a32_ctx_t *ctx)
                 if (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH) {
                     continue;
                 }
-                exit(128 + sig);
+                _exit(128 + sig);
             }
             deliver_guest_signal(ctx, sig, act, NULL);
             break;
         }
     }
+}
+
+bool a32_signals_deliver_sync(a32_ctx_t *ctx, int sig, uint32_t fault_addr)
+{
+    if (!ctx || sig < 1 || sig > 64) {
+        return false;
+    }
+    ctx->fault_addr = fault_addr;
+    guest_sigaction_t *act = &g_guest_sigactions[sig];
+    if (act->handler == 0U /* SIG_DFL */) {
+        return false;
+    }
+    if (act->handler == 1U /* SIG_IGN */) {
+        return true;
+    }
+    deliver_guest_signal(ctx, sig, act, NULL);
+    return true;
 }
 
 int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
@@ -382,6 +399,9 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = host_sig_handler;
         sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
+        if (new_words[0] <= 1U || (new_words[1] & A32_SA_RESTART) != 0U) {
+            sa.sa_flags |= SA_RESTART;
+        }
         sigfillset(&sa.sa_mask);
         sigaction(signum, &sa, NULL);
     }
@@ -434,7 +454,7 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     }
 
     uint32_t sp = ctx->regs[13];
-    if (sp < 0x1000U) {
+    if (sp < 0x1000U || (uint64_t)sp + sizeof(a32_rt_sigframe_t) > 0xFFFF0000ULL) {
         return -EFAULT;
     }
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, sp);

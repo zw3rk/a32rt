@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -252,7 +253,7 @@ static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         } else {
             for (size_t i = 0U; i < ctx->region_count; i++) {
                 const a32_region_t *r = &ctx->regions[i];
-                if (r->prot != 0U && cur >= (uint64_t)r->start && cur < (uint64_t)r->end) {
+                if ((r->prot & 0x1U) != 0U && cur >= (uint64_t)r->start && cur < (uint64_t)r->end) {
                     if ((uint64_t)r->end > next) {
                         next = (uint64_t)r->end;
                     }
@@ -318,6 +319,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             if (strlen(p) >= 8U) {
                 ctx->cpsr = decode_u32_le(p);
             }
+            ctx->itstate = 0U;
             if (ctx->regs[15] & 1U) {
                 ctx->cpsr |= A32_CPSR_T;
                 ctx->regs[15] &= ~1U;
@@ -359,9 +361,11 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                 *eq = '\0';
                 unsigned reg = (unsigned)strtoul(cmd + 1, NULL, 16);
                 const char *val_str = eq + 1;
-                if (reg < 16U) {
+                size_t val_len = strlen(val_str);
+                if (reg < 16U && val_len >= 8U) {
                     ctx->regs[reg] = decode_u32_le(val_str);
                     if (reg == 15U) {
+                        ctx->itstate = 0U;
                         if (ctx->regs[15] & 1U) {
                             ctx->cpsr |= A32_CPSR_T;
                             ctx->regs[15] &= ~1U;
@@ -370,13 +374,13 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                         }
                     }
                     send_packet(g_client_sock, "OK");
-                } else if (reg == 25U) {
+                } else if (reg == 25U && val_len >= 8U) {
                     ctx->cpsr = decode_u32_le(val_str);
                     send_packet(g_client_sock, "OK");
-                } else if (reg >= 26U && reg < 58U) {
+                } else if (reg >= 26U && reg < 58U && val_len >= 16U) {
                     ctx->vfp_d[reg - 26U] = decode_u64_le(val_str);
                     send_packet(g_client_sock, "OK");
-                } else if (reg == 58U) {
+                } else if (reg == 58U && val_len >= 8U) {
                     ctx->fpscr = decode_u32_le(val_str);
                     send_packet(g_client_sock, "OK");
                 } else {
@@ -428,16 +432,41 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     send_packet(g_client_sock, "E14");
                     continue;
                 }
-                const char *hex_data = colon + 1;
-                uint8_t *dst = (uint8_t *)a32_guest_ptr(ctx, addr);
-                for (size_t i = 0U; i < len; i++) {
-                    if (hex_data[i * 2U] == '\0' || hex_data[i * 2U + 1U] == '\0') {
-                        break;
+                if (len > 0U) {
+                    uint32_t page_start = addr & ~0xFFFU;
+                    uint32_t page_end   = (uint32_t)(((uint64_t)addr + (uint64_t)len + 0xFFFULL) & ~0xFFFULL);
+                    if (mprotect(a32_guest_ptr(ctx, page_start),
+                                 (size_t)(page_end - page_start),
+                                 PROT_READ | PROT_WRITE) != 0) {
+                        send_packet(g_client_sock, "E14");
+                        continue;
                     }
-                    dst[i] = (uint8_t)((hex_val(hex_data[i * 2U]) << 4U) |
-                                       hex_val(hex_data[i * 2U + 1U]));
+                    const char *hex_data = colon + 1;
+                    uint8_t *dst = (uint8_t *)a32_guest_ptr(ctx, addr);
+                    for (size_t i = 0U; i < len; i++) {
+                        if (hex_data[i * 2U] == '\0' || hex_data[i * 2U + 1U] == '\0') {
+                            break;
+                        }
+                        dst[i] = (uint8_t)((hex_val(hex_data[i * 2U]) << 4U) |
+                                           hex_val(hex_data[i * 2U + 1U]));
+                    }
+                    a32_jit_invalidate_range((a32_ctx_t *)ctx, addr, addr + (uint32_t)len);
+                    for (uint32_t pg = page_start; pg < page_end; pg += 0x1000U) {
+                        int restore_prot = PROT_READ | PROT_WRITE;
+                        for (size_t i = 0U; i < ctx->region_count; i++) {
+                            const a32_region_t *r = &ctx->regions[i];
+                            if (pg >= r->start && pg < r->end) {
+                                restore_prot = (int)(r->prot & 0x7U);
+                                if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
+                                    (restore_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
+                                    restore_prot = PROT_READ | PROT_EXEC;
+                                }
+                                break;
+                            }
+                        }
+                        (void)mprotect(a32_guest_ptr(ctx, pg), 0x1000U, restore_prot);
+                    }
                 }
-                a32_jit_invalidate_range(ctx, addr, addr + (uint32_t)len);
                 send_packet(g_client_sock, "OK");
             } else {
                 send_packet(g_client_sock, "E01");

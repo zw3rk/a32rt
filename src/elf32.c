@@ -156,8 +156,11 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         const elf32_phdr_t *ph = &phdrs[i];
         if (ph->p_type == PT_PHDR) {
             out->phdr_vaddr = ph->p_vaddr + load_bias;
-        } else if (ph->p_type == PT_INTERP && ph->p_filesz > 0U &&
-                   ph->p_filesz < sizeof(out->interp_path)) {
+        } else if (ph->p_type == PT_INTERP) {
+            if (ph->p_filesz == 0U || ph->p_filesz >= sizeof(out->interp_path)) {
+                fprintf(stderr, "a32rt: %s: invalid PT_INTERP filesz %u\n", label, ph->p_filesz);
+                return -1;
+            }
             if (pread_full(fd, out->interp_path, ph->p_filesz, (off_t)ph->p_offset) != 0) {
                 return -1;
             }
@@ -252,10 +255,13 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             }
 
             uint32_t restore_prot = merged_prot;
+            if ((restore_prot & (uint32_t)PROT_EXEC) != 0U) {
+                restore_prot |= (uint32_t)PROT_READ;
+            }
             if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
                 (restore_prot & (uint32_t)(PROT_WRITE | PROT_EXEC)) ==
                     (uint32_t)(PROT_WRITE | PROT_EXEC)) {
-                restore_prot = (uint32_t)(PROT_READ | PROT_EXEC);
+                restore_prot = (uint32_t)(PROT_READ | PROT_WRITE);
             }
 
             if (a32_vm_mprotect(ctx, page_start, shared_len, restore_prot) != 0) {
@@ -263,26 +269,29 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
                         label, page_start, shared_end, strerror(errno));
                 return -1;
             }
-            a32_vm_record_region(ctx, page_start, shared_end, restore_prot, 0x12U, label);
+            a32_vm_record_region(ctx, page_start, shared_end, merged_prot, 0x12U, label);
 
             if (map_end > map_start) {
                 uint32_t new_len  = map_end - map_start;
                 uint32_t new_prot = (uint32_t)host_prot;
+                if ((new_prot & (uint32_t)PROT_EXEC) != 0U) {
+                    new_prot |= (uint32_t)PROT_READ;
+                }
                 if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
                     (new_prot & (uint32_t)(PROT_WRITE | PROT_EXEC)) ==
                         (uint32_t)(PROT_WRITE | PROT_EXEC)) {
-                    new_prot = (uint32_t)(PROT_READ | PROT_EXEC);
+                    new_prot = (uint32_t)(PROT_READ | PROT_WRITE);
                 }
                 if (mprotect(a32_guest_ptr(ctx, map_start), new_len, (int)new_prot) != 0) {
                     fprintf(stderr, "a32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
                             label, map_start, map_end, strerror(errno));
                     return -1;
                 }
-                a32_vm_record_region(ctx, map_start, map_end, new_prot, 0x12U, label);
+                a32_vm_record_region(ctx, map_start, map_end, (uint32_t)host_prot, 0x12U, label);
                 highest_mapped_end  = map_end;
-                highest_mapped_prot = new_prot;
+                highest_mapped_prot = (uint32_t)host_prot;
             } else {
-                highest_mapped_prot = restore_prot;
+                highest_mapped_prot = merged_prot;
             }
         } else {
             uint32_t map_len = map_end - map_start;
@@ -319,10 +328,13 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             }
 
             uint32_t apply_prot = (uint32_t)host_prot;
+            if ((apply_prot & (uint32_t)PROT_EXEC) != 0U) {
+                apply_prot |= (uint32_t)PROT_READ;
+            }
             if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
                 (apply_prot & (uint32_t)(PROT_WRITE | PROT_EXEC)) ==
                     (uint32_t)(PROT_WRITE | PROT_EXEC)) {
-                apply_prot = (uint32_t)(PROT_READ | PROT_EXEC);
+                apply_prot = (uint32_t)(PROT_READ | PROT_WRITE);
             }
 
             if (mprotect(host_map, map_len, (int)apply_prot) != 0) {
@@ -331,9 +343,9 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
                 return -1;
             }
 
-            a32_vm_record_region(ctx, map_start, map_end, apply_prot, 0x12U, label);
+            a32_vm_record_region(ctx, map_start, map_end, (uint32_t)host_prot, 0x12U, label);
             highest_mapped_end  = map_end;
-            highest_mapped_prot = apply_prot;
+            highest_mapped_prot = (uint32_t)host_prot;
         }
 
         if (ph->p_flags & PF_X) {
@@ -370,12 +382,9 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
         if (!path) {
             return -1;
         }
-        if (ctx->sysroot != NULL && ctx->sysroot[0] != '\0' && path[0] == '/') {
-            char sysroot_path[PATH_MAX];
-            int n = snprintf(sysroot_path, sizeof(sysroot_path), "%s%s", ctx->sysroot, path);
-            if (n > 0 && (size_t)n < sizeof(sysroot_path)) {
-                fd = open(sysroot_path, O_RDONLY | O_CLOEXEC);
-            }
+        char resolved_exec[PATH_MAX];
+        if (a32_resolve_guest_path(ctx, path, resolved_exec, sizeof(resolved_exec)) == 0) {
+            fd = open(resolved_exec, O_RDONLY | O_CLOEXEC);
         }
         if (fd < 0) {
             fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -400,45 +409,13 @@ int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *
     /* Load PT_INTERP if present */
     if (out_info->interp_path[0] != '\0') {
         char resolved_interp[PATH_MAX];
-        if (ctx->sysroot && ctx->sysroot[0] != '\0' && out_info->interp_path[0] == '/') {
-            snprintf(resolved_interp, sizeof(resolved_interp), "%s%s",
-                     ctx->sysroot, out_info->interp_path);
-            for (int depth = 0; depth < 8; depth++) {
-                char link_target[PATH_MAX];
-                ssize_t ln = readlink(resolved_interp, link_target, sizeof(link_target) - 1U);
-                if (ln <= 0) {
-                    break;
-                }
-                link_target[ln] = '\0';
-                if (link_target[0] == '/') {
-                    char cand[PATH_MAX];
-                    int n = snprintf(cand, sizeof(cand), "%s%s", ctx->sysroot, link_target);
-                    if (n > 0 && (size_t)n < sizeof(cand)) {
-                        snprintf(resolved_interp, sizeof(resolved_interp), "%s", cand);
-                    } else {
-                        break;
-                    }
-                } else {
-                    char *slash = strrchr(resolved_interp, '/');
-                    if (!slash) {
-                        break;
-                    }
-                    size_t dir_len = (size_t)(slash - resolved_interp);
-                    char cand[PATH_MAX];
-                    int n = snprintf(cand, sizeof(cand), "%.*s/%s",
-                                     (int)dir_len, resolved_interp, link_target);
-                    if (n > 0 && (size_t)n < sizeof(cand)) {
-                        snprintf(resolved_interp, sizeof(resolved_interp), "%s", cand);
-                    } else {
-                        break;
-                    }
-                }
-            }
+        int ifd = -1;
+        if (a32_resolve_guest_path(ctx, out_info->interp_path,
+                                   resolved_interp, sizeof(resolved_interp)) == 0) {
+            ifd = open(resolved_interp, O_RDONLY | O_CLOEXEC);
         } else {
             snprintf(resolved_interp, sizeof(resolved_interp), "%s", out_info->interp_path);
         }
-
-        int ifd = open(resolved_interp, O_RDONLY | O_CLOEXEC);
         if (ifd < 0 && strcmp(resolved_interp, out_info->interp_path) != 0) {
             ifd = open(out_info->interp_path, O_RDONLY | O_CLOEXEC);
         }

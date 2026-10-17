@@ -740,6 +740,23 @@ static int test10_negative_syscalls(void)
         return 96;
     }
 
+    /* Negative -EFAULT (-14): mremap (163) on unmapped guest address */
+    if (sys4(163U /* mremap */, 0x25000000U, 4096U, 8192U,
+             1U /* MREMAP_MAYMOVE */) != -14) {
+        return 97;
+    }
+
+    /* Negative -EINVAL (-22): readlink (85) and readlinkat (332) with bufsiz == 0 */
+    if (sys3(85U /* readlink */, (uint32_t)(uintptr_t)"/proc/self/exe",
+             (uint32_t)(uintptr_t)rl_buf, 0U) != -22) {
+        return 98;
+    }
+    if (sys4(332U /* readlinkat */, 0xFFFFFF9CU /* AT_FDCWD */,
+             (uint32_t)(uintptr_t)"/proc/self/exe",
+             (uint32_t)(uintptr_t)rl_buf, 0U) != -22) {
+        return 99;
+    }
+
     return 0;
 }
 
@@ -918,6 +935,125 @@ static int test13_proc_maps_heap(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 14: Guest RWX (PROT_READ|PROT_WRITE|PROT_EXEC) mmap2 & mprotect under W^X
+ * -------------------------------------------------------------------------- */
+static int test14_rwx_mmap_mprotect(void)
+{
+    /* Part A: mmap2 directly with PROT_READ|PROT_WRITE|PROT_EXEC (7U) */
+    uint32_t rwx_page = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                       7U /* PROT_READ|PROT_WRITE|PROT_EXEC */,
+                                       0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                       0xFFFFFFFFU, 0U);
+    if (rwx_page > 0xFFFFF000U) {
+        return 115;
+    }
+
+    volatile uint32_t *code = (volatile uint32_t *)(uintptr_t)rwx_page;
+    code[0] = 0xE3A0003AU; /* mov r0, #58 */
+    code[1] = 0xE12FFF1EU; /* bx lr */
+    sys3(0x0F0002U /* cacheflush */, rwx_page, rwx_page + 16U, 0U);
+
+    typedef uint32_t (*rwx_fn_t)(void);
+    rwx_fn_t fn = (rwx_fn_t)(uintptr_t)rwx_page;
+    if (fn() != 58U) {
+        sys2(91U /* munmap */, rwx_page, 4096U);
+        return 116;
+    }
+
+    /* Modify in place WITHOUT calling mprotect (proves guest RWX remains writable) */
+    code[0] = 0xE3A0005BU; /* mov r0, #91 */
+    sys3(0x0F0002U /* cacheflush */, rwx_page, rwx_page + 16U, 0U);
+    if (fn() != 91U) {
+        sys2(91U /* munmap */, rwx_page, 4096U);
+        return 117;
+    }
+    sys2(91U /* munmap */, rwx_page, 4096U);
+
+    /* Part B: mmap2 PROT_READ then mprotect to PROT_READ|PROT_WRITE|PROT_EXEC (7U) */
+    uint32_t p2 = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                 1U /* PROT_READ */,
+                                 0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                 0xFFFFFFFFU, 0U);
+    if (p2 > 0xFFFFF000U) {
+        return 118;
+    }
+    if (sys3(125U /* mprotect */, p2, 4096U, 7U /* PROT_READ|PROT_WRITE|PROT_EXEC */) != 0) {
+        sys2(91U /* munmap */, p2, 4096U);
+        return 119;
+    }
+
+    volatile uint32_t *code2 = (volatile uint32_t *)(uintptr_t)p2;
+    code2[0] = 0xE3A0004CU; /* mov r0, #76 */
+    code2[1] = 0xE12FFF1EU; /* bx lr */
+    sys3(0x0F0002U /* cacheflush */, p2, p2 + 16U, 0U);
+
+    rwx_fn_t fn2 = (rwx_fn_t)(uintptr_t)p2;
+    if (fn2() != 76U) {
+        sys2(91U /* munmap */, p2, 4096U);
+        return 120;
+    }
+
+    code2[0] = 0xE3A00063U; /* mov r0, #99 */
+    sys3(0x0F0002U /* cacheflush */, p2, p2 + 16U, 0U);
+    if (fn2() != 99U) {
+        sys2(91U /* munmap */, p2, 4096U);
+        return 121;
+    }
+
+    sys2(91U /* munmap */, p2, 4096U);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 15: ppoll (336) sigsetsize validation (positive == 8, negative != 8)
+ * -------------------------------------------------------------------------- */
+static int test15_ppoll_sigsetsize(void)
+{
+    int32_t efd = sys2(356U /* eventfd2 */, 1U, 0x800U /* EFD_NONBLOCK */);
+    if (efd < 0) {
+        return 122;
+    }
+
+    struct pollfd pfd;
+    pfd.fd      = efd;
+    pfd.events  = 1; /* POLLIN */
+    pfd.revents = 0;
+
+    struct timespec32 ts;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = 0;
+
+    uint64_t sigmask = 0ULL;
+
+    /* Negative: sigsetsize != 8 (0, 4, 16) must return -EINVAL (-22) */
+    if (sys5(336U /* ppoll */, (uint32_t)(uintptr_t)&pfd, 1U,
+             (uint32_t)(uintptr_t)&ts, (uint32_t)(uintptr_t)&sigmask, 0U) != -22) {
+        sys1(6U /* close */, (uint32_t)efd);
+        return 123;
+    }
+    if (sys5(336U /* ppoll */, (uint32_t)(uintptr_t)&pfd, 1U,
+             (uint32_t)(uintptr_t)&ts, (uint32_t)(uintptr_t)&sigmask, 4U) != -22) {
+        sys1(6U /* close */, (uint32_t)efd);
+        return 124;
+    }
+    if (sys5(336U /* ppoll */, (uint32_t)(uintptr_t)&pfd, 1U,
+             (uint32_t)(uintptr_t)&ts, (uint32_t)(uintptr_t)&sigmask, 16U) != -22) {
+        sys1(6U /* close */, (uint32_t)efd);
+        return 125;
+    }
+
+    /* Positive: sigsetsize == 8 must succeed and report POLLIN */
+    int32_t prc = sys5(336U /* ppoll */, (uint32_t)(uintptr_t)&pfd, 1U,
+                       (uint32_t)(uintptr_t)&ts, (uint32_t)(uintptr_t)&sigmask, 8U);
+    sys1(6U /* close */, (uint32_t)efd);
+    if (prc != 1 || (pfd.revents & 1) == 0) {
+        return 126;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -961,6 +1097,14 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test13_proc_maps_heap();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test14_rwx_mmap_mprotect();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test15_ppoll_sigsetsize();
     if (rc != 0) {
         return rc;
     }

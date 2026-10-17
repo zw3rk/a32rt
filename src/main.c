@@ -153,6 +153,7 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
+    const char *raw_sysroot = ctx.sysroot;
     if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {
         static char sysroot_abs[4096];
         if (realpath(ctx.sysroot, sysroot_abs) != NULL) {
@@ -189,6 +190,29 @@ int main(int argc, char **argv, char **envp)
         exec_path  = argv[i];
         guest_argc = argc - i;
         guest_argv = &argv[i];
+    }
+
+    if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {
+        size_t sr_len = strlen(ctx.sysroot);
+        while (sr_len > 1U && ctx.sysroot[sr_len - 1U] == '/') {
+            sr_len--;
+        }
+        if (sr_len > 1U && strncmp(exec_path, ctx.sysroot, sr_len) == 0 &&
+            exec_path[sr_len] == '/') {
+            exec_path += sr_len;
+        } else if (raw_sysroot != NULL && raw_sysroot != ctx.sysroot) {
+            size_t raw_len = strlen(raw_sysroot);
+            while (raw_len > 1U && raw_sysroot[raw_len - 1U] == '/') {
+                raw_len--;
+            }
+            if (raw_len > 1U && strncmp(exec_path, raw_sysroot, raw_len) == 0 &&
+                exec_path[raw_len] == '/') {
+                exec_path += raw_len;
+            }
+        }
+        while (exec_path[0] == '/' && exec_path[1] == '/') {
+            exec_path++;
+        }
     }
 
     ctx.exec_path = exec_path;
