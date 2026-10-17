@@ -197,7 +197,8 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
                     uint32_t *out_sp);
 
 /* JIT & execution engine (`src/jit.c`, `src/trampoline.S`) */
-typedef void (*a32_block_iter_fn)(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thumb,
+typedef void (*a32_block_iter_fn)(uint32_t guest_pc, uint32_t guest_end_pc,
+                                  bool is_thumb, bool is_call,
                                   const uint32_t *words, size_t word_count,
                                   const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
                                   void *arg);
@@ -210,7 +211,8 @@ void        a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uin
 bool        a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t *out_itstate);
 const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes);
 int         a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
-                                      bool is_thumb, const uint32_t *words, size_t word_count,
+                                      bool is_thumb, bool is_call,
+                                      const uint32_t *words, size_t word_count,
                                       const a32_pc_map_stage_t *pc_map, size_t pc_map_count);
 void        a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg);
 int         a32_jit_flush_batch(a32_ctx_t *ctx);

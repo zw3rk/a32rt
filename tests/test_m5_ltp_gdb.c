@@ -720,6 +720,201 @@ static int test10_negative_syscalls(void)
         return 90;
     }
 
+    /* Additional negative -EFAULT (-14) tests with low-guard pointer (0x100) */
+    if (sys1(122U /* uname */, 0x100U) != -14) {
+        return 91;
+    }
+    if (sys2(183U /* getcwd */, 0x100U, 64U) != -14) {
+        return 92;
+    }
+    if (sys2(191U /* ugetrlimit */, 3U /* RLIMIT_STACK */, 0x100U) != -14) {
+        return 93;
+    }
+    if (sys1(116U /* sysinfo */, 0x100U) != -14) {
+        return 94;
+    }
+    if (sys2(263U /* clock_gettime32 */, 0U /* CLOCK_REALTIME */, 0x100U) != -14) {
+        return 95;
+    }
+    if (sys2(359U /* pipe2 */, 0x100U, 0U) != -14) {
+        return 96;
+    }
+
+    return 0;
+}
+
+static const char *my_strstr(const char *haystack, const char *needle)
+{
+    if (!*needle) {
+        return haystack;
+    }
+    for (; *haystack; haystack++) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n && (*h == *n)) {
+            h++;
+            n++;
+        }
+        if (!*n) {
+            return haystack;
+        }
+    }
+    return NULL;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 11: MAP_FIXED_NOREPLACE (0x100000U) regression test
+ * -------------------------------------------------------------------------- */
+static int test11_map_fixed_noreplace(void)
+{
+    uint32_t p = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                3U /* PROT_READ|PROT_WRITE */,
+                                0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                0xFFFFFFFFU, 0U);
+    if (p > 0xFFFFF000U) {
+        return 100;
+    }
+
+    volatile uint32_t *vp = (volatile uint32_t *)(uintptr_t)p;
+    vp[0] = 0x13579BDFU;
+
+    /* Negative: MAP_FIXED_NOREPLACE on already-mapped page p must return -EEXIST (-17) */
+    int32_t dup_rc = sys6(192U /* mmap2 */, p, 4096U,
+                          3U /* PROT_READ|PROT_WRITE */,
+                          0x22U | 0x100000U /* MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE */,
+                          0xFFFFFFFFU, 0U);
+    if (dup_rc != -17 /* -EEXIST */) {
+        sys2(91U /* munmap */, p, 4096U);
+        return 101;
+    }
+
+    /* Verify existing mapping at p was not overwritten */
+    if (vp[0] != 0x13579BDFU) {
+        sys2(91U /* munmap */, p, 4096U);
+        return 102;
+    }
+
+    if (sys2(91U /* munmap */, p, 4096U) != 0) {
+        return 103;
+    }
+
+    /* Positive: MAP_FIXED_NOREPLACE on now-unmapped page p must succeed at p */
+    uint32_t p2 = (uint32_t)sys6(192U /* mmap2 */, p, 4096U,
+                                 3U /* PROT_READ|PROT_WRITE */,
+                                 0x22U | 0x100000U /* MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE */,
+                                 0xFFFFFFFFU, 0U);
+    if (p2 != p) {
+        if (p2 <= 0xFFFFF000U) {
+            sys2(91U /* munmap */, p2, 4096U);
+        }
+        return 104;
+    }
+    sys2(91U /* munmap */, p2, 4096U);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 12: mremap with PROT_READ | PROT_EXEC (W^X compliance under hl)
+ * -------------------------------------------------------------------------- */
+static int test12_mremap_rx_wx(void)
+{
+    /* Map 8 KiB (2 pages) RW so the second page blocks in-place growth of the first page */
+    uint32_t base = (uint32_t)sys6(192U /* mmap2 */, 0U, 8192U,
+                                   3U /* PROT_READ|PROT_WRITE */,
+                                   0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                   0xFFFFFFFFU, 0U);
+    if (base > 0xFFFFF000U) {
+        return 105;
+    }
+    uint32_t blocker = base + 4096U;
+
+    uint32_t *code = (uint32_t *)(uintptr_t)base;
+    /* A32: mov r0, #85 (0xE3A00055); bx lr (0xE12FFF1E) */
+    code[0] = 0xE3A00055U;
+    code[1] = 0xE12FFF1EU;
+
+    if (sys3(125U /* mprotect */, base, 4096U, 5U /* PROT_READ|PROT_EXEC */) != 0) {
+        sys2(91U /* munmap */, base, 8192U);
+        return 106;
+    }
+    sys3(0x0F0002U /* cacheflush */, base, base + 16U, 0U);
+
+    typedef uint32_t (*rx_fn_t)(void);
+    rx_fn_t fn_old = (rx_fn_t)(uintptr_t)base;
+    if (fn_old() != 85U) {
+        sys2(91U /* munmap */, base, 8192U);
+        return 107;
+    }
+
+    /*
+     * Grow RX page from 4 KiB to 8 KiB with MREMAP_MAYMOVE (1).
+     * Because `blocker` occupies base + 4096, mremap must relocate the RX
+     * mapping while respecting W^X (never requesting PROT_WRITE | PROT_EXEC).
+     */
+    uint32_t new_rx = (uint32_t)sys4(163U /* mremap */, base, 4096U, 8192U,
+                                     1U /* MREMAP_MAYMOVE */);
+    if (new_rx > 0xFFFFF000U || (new_rx & 0xFFFU) != 0U) {
+        sys2(91U /* munmap */, base, 8192U);
+        return 108;
+    }
+    sys3(0x0F0002U /* cacheflush */, new_rx, new_rx + 16U, 0U);
+
+    rx_fn_t fn_new = (rx_fn_t)(uintptr_t)new_rx;
+    if (fn_new() != 85U) {
+        sys2(91U /* munmap */, new_rx, 8192U);
+        sys2(91U /* munmap */, blocker, 4096U);
+        return 109;
+    }
+
+    sys2(91U /* munmap */, new_rx, 8192U);
+    sys2(91U /* munmap */, blocker, 4096U);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 13: /proc/self/maps containing [heap] after brk expansion
+ * -------------------------------------------------------------------------- */
+static int test13_proc_maps_heap(void)
+{
+    uint32_t cur_brk = (uint32_t)sys1(45U /* brk */, 0U);
+    if (cur_brk == 0U) {
+        return 110;
+    }
+    uint32_t new_brk = (uint32_t)sys1(45U /* brk */, cur_brk + 4096U);
+    if (new_brk != cur_brk + 4096U) {
+        return 111;
+    }
+
+    int32_t mfd = sys4(322U /* openat */, 0xFFFFFF9CU /* AT_FDCWD */,
+                       (uint32_t)(uintptr_t)"/proc/self/maps", 0U /* O_RDONLY */, 0U);
+    if (mfd < 0) {
+        (void)sys1(45U /* brk */, cur_brk);
+        return 112;
+    }
+
+    char maps_buf[4096];
+    my_memset(maps_buf, 0, sizeof(maps_buf));
+    int32_t mread = 0;
+    while (mread < (int32_t)(sizeof(maps_buf) - 1U)) {
+        int32_t nr = sys3(3U /* read */, (uint32_t)mfd,
+                          (uint32_t)(uintptr_t)(maps_buf + mread),
+                          (uint32_t)(sizeof(maps_buf) - 1U - (uint32_t)mread));
+        if (nr <= 0) {
+            break;
+        }
+        mread += nr;
+    }
+    sys1(6U /* close */, (uint32_t)mfd);
+    (void)sys1(45U /* brk */, cur_brk);
+
+    if (mread <= 0) {
+        return 113;
+    }
+    maps_buf[mread] = '\0';
+    if (!my_strstr(maps_buf, "[heap]")) {
+        return 114;
+    }
+
     return 0;
 }
 
@@ -754,6 +949,18 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test10_negative_syscalls();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test11_map_fixed_noreplace();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test12_mremap_rx_wx();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test13_proc_maps_heap();
     if (rc != 0) {
         return rc;
     }

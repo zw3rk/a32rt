@@ -67,8 +67,10 @@ int main(int argc, char **argv, char **envp)
         env_gdb = getenv("A32RT_GDB_PORT");
     }
     if (env_gdb && env_gdb[0] != '\0') {
-        ctx.gdb_port = (int)strtol(env_gdb, NULL, 10);
-        if (ctx.gdb_port > 0) {
+        char *endp = NULL;
+        long port = strtol(env_gdb, &endp, 10);
+        if (endp && endp != env_gdb && *endp == '\0' && port > 0 && port <= 65535) {
+            ctx.gdb_port = (int)port;
             ctx.gdb_enabled = true;
         }
     }
@@ -94,21 +96,45 @@ int main(int argc, char **argv, char **envp)
             explicit_sep = true;
             i++;
             break;
-        } else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--window") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                usage(argv[0]);
+                return 1;
+            }
             char *endp = NULL;
             requested_window = (uint64_t)strtoull(argv[i + 1], &endp, 0);
+            if (!endp || endp == argv[i + 1] || *endp != '\0') {
+                usage(argv[0]);
+                return 1;
+            }
             i += 2;
-        } else if (strcmp(argv[i], "--sysroot") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--sysroot") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                usage(argv[0]);
+                return 1;
+            }
             ctx.sysroot = argv[i + 1];
             i += 2;
-        } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--cache") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                usage(argv[0]);
+                return 1;
+            }
             ctx.cache_dir = argv[i + 1];
             i += 2;
-        } else if (strcmp(argv[i], "--gdb") == 0 && i + 1 < argc) {
-            ctx.gdb_port = (int)strtol(argv[i + 1], NULL, 10);
-            if (ctx.gdb_port > 0) {
-                ctx.gdb_enabled = true;
+        } else if (strcmp(argv[i], "--gdb") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                usage(argv[0]);
+                return 1;
             }
+            char *endp = NULL;
+            long port = strtol(argv[i + 1], &endp, 10);
+            if (!endp || endp == argv[i + 1] || *endp != '\0' || port <= 0 || port > 65535) {
+                usage(argv[0]);
+                return 1;
+            }
+            ctx.gdb_port = (int)port;
+            ctx.gdb_enabled = true;
             i += 2;
         } else if (strcmp(argv[i], "--aot") == 0) {
             ctx.aot_mode = true;
@@ -124,6 +150,13 @@ int main(int argc, char **argv, char **envp)
             return 0;
         } else {
             break;
+        }
+    }
+
+    if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {
+        static char sysroot_abs[4096];
+        if (realpath(ctx.sysroot, sysroot_abs) != NULL) {
+            ctx.sysroot = sysroot_abs;
         }
     }
 

@@ -40,17 +40,19 @@
 #define AT_EXECFN       31U
 
 /* ARMv7 / ARMv8 AArch32 HWCAP bits */
-#define ARM_HWCAP_HALF   (1U << 1)
-#define ARM_HWCAP_THUMB  (1U << 2)
+#define ARM_HWCAP_HALF      (1U << 1)
+#define ARM_HWCAP_THUMB     (1U << 2)
 #define ARM_HWCAP_FAST_MULT (1U << 4)
-#define ARM_HWCAP_VFP    (1U << 6)
-#define ARM_HWCAP_EDSP   (1U << 7)
-#define ARM_HWCAP_NEON   (1U << 12)
-#define ARM_HWCAP_VFPv3  (1U << 13)
-#define ARM_HWCAP_VFPD32 (1U << 19)
-#define ARM_HWCAP_IDIVA  (1U << 17)
-#define ARM_HWCAP_IDIVT  (1U << 18)
-#define ARM_HWCAP_LPAE   (1U << 20)
+#define ARM_HWCAP_VFP       (1U << 6)
+#define ARM_HWCAP_EDSP      (1U << 7)
+#define ARM_HWCAP_NEON      (1U << 12)
+#define ARM_HWCAP_VFPv3     (1U << 13)
+#define ARM_HWCAP_TLS       (1U << 15)
+#define ARM_HWCAP_VFPv4     (1U << 16)
+#define ARM_HWCAP_IDIVA     (1U << 17)
+#define ARM_HWCAP_IDIVT     (1U << 18)
+#define ARM_HWCAP_VFPD32    (1U << 19)
+#define ARM_HWCAP_LPAE      (1U << 20)
 
 static uint32_t push_bytes(a32_ctx_t *ctx, uint32_t *sp, const void *data, size_t len)
 {
@@ -142,8 +144,9 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     /* Build 32-bit auxv table (pairs of uint32_t) */
     uint32_t hwcap = ARM_HWCAP_HALF | ARM_HWCAP_THUMB | ARM_HWCAP_FAST_MULT |
                      ARM_HWCAP_VFP | ARM_HWCAP_EDSP | ARM_HWCAP_NEON |
-                     ARM_HWCAP_VFPv3 | ARM_HWCAP_VFPD32 |
-                     ARM_HWCAP_IDIVA | ARM_HWCAP_IDIVT | ARM_HWCAP_LPAE;
+                     ARM_HWCAP_VFPv3 | ARM_HWCAP_TLS | ARM_HWCAP_VFPv4 |
+                     ARM_HWCAP_IDIVA | ARM_HWCAP_IDIVT | ARM_HWCAP_VFPD32 |
+                     ARM_HWCAP_LPAE;
     uint32_t auxv[40];
     size_t   aux_idx = 0;
 #define PUSH_AUX(k, v) do { auxv[aux_idx++] = (k); auxv[aux_idx++] = (v); } while (0)

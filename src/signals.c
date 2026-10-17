@@ -93,18 +93,24 @@ typedef struct a32_siginfo {
 } a32_siginfo_t;
 
 typedef struct a32_rt_sigframe {
+    a32_siginfo_t  info;
+    a32_ucontext_t uc;
+    uint32_t       retcode[2];
     uint32_t       magic;
     uint32_t       saved_regs[16];
     uint32_t       saved_cpsr;
-    uint64_t       saved_mask;
-    uint32_t       saved_fault;
-    uint32_t       saved_itstate;
     uint32_t       saved_fpscr;
+    uint32_t       saved_itstate;
+    uint32_t       saved_fault;
     uint32_t       saved_pad;
+    uint64_t       saved_mask;
     uint64_t       saved_vfp_d[32];
-    a32_siginfo_t  info;
-    a32_ucontext_t uc;
 } a32_rt_sigframe_t;
+
+_Static_assert(offsetof(a32_rt_sigframe_t, info) == 0,
+               "rt_sigframe info must be at offset 0");
+_Static_assert(offsetof(a32_rt_sigframe_t, uc) == 128,
+               "rt_sigframe uc must be at offset 128");
 
 static _Thread_local a32_ctx_t *g_tls_ctx = NULL;
 static guest_sigaction_t        g_guest_sigactions[65];
@@ -119,7 +125,7 @@ a32_ctx_t *a32_signals_get_thread_ctx(void)
     return g_tls_ctx;
 }
 
-static void deliver_guest_signal(a32_ctx_t *ctx, int sig, const guest_sigaction_t *act,
+static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act,
                                  const siginfo_t *host_info)
 {
     uint32_t sp = ctx->regs[13];
@@ -135,6 +141,8 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, const guest_sigaction_
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, frame_va);
     memset(frame, 0, sizeof(*frame));
 
+    frame->retcode[0]    = 0xE3A070ADU; /* mov r7, #173 (ARM_NR_rt_sigreturn) */
+    frame->retcode[1]    = 0xEF000000U; /* svc #0 */
     frame->magic         = A32_SIGFRAME_MAGIC;
     memcpy(frame->saved_regs, ctx->regs, sizeof(ctx->regs));
     frame->saved_cpsr    = ctx->cpsr;
@@ -202,6 +210,9 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, const guest_sigaction_
     ctx->itstate  = 0U;
 
     uint32_t handler = act->handler;
+    if (act->flags & A32_SA_RESETHAND) {
+        act->handler = 0U;
+    }
     if (handler & 1U) {
         ctx->cpsr |= A32_CPSR_T;
         ctx->regs[15] = handler & ~1U;
@@ -345,6 +356,9 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
     if (sigsetsize != sizeof(uint64_t)) {
         return -EINVAL;
     }
+    if ((act_va != 0U && act_va < 0x1000U) || (oldact_va != 0U && oldact_va < 0x1000U)) {
+        return -EFAULT;
+    }
 
     if (oldact_va != 0U) {
         guest_sigaction_t cur = g_guest_sigactions[signum];
@@ -380,6 +394,9 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
 {
     if (!ctx || sigsetsize != sizeof(uint64_t)) {
         return -EINVAL;
+    }
+    if ((set_va != 0U && set_va < 0x1000U) || (oldset_va != 0U && oldset_va < 0x1000U)) {
+        return -EFAULT;
     }
 
     if (oldset_va != 0U) {
@@ -417,6 +434,9 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     }
 
     uint32_t sp = ctx->regs[13];
+    if (sp < 0x1000U) {
+        return -EFAULT;
+    }
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, sp);
 
     const a32_sigcontext_t *sc = &frame->uc.uc_mcontext;
@@ -470,6 +490,9 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
 {
     if (!ctx) {
         return -EINVAL;
+    }
+    if ((uss_va != 0U && uss_va < 0x1000U) || (uoss_va != 0U && uoss_va < 0x1000U)) {
+        return -EFAULT;
     }
 
     if (uoss_va != 0U) {

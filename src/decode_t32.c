@@ -108,7 +108,9 @@ static bool t32_insn_uncond_ends_block(uint16_t hw1, uint16_t hw2)
         return true;
     }
     /* LDM.W / POP.W with PC */
-    if ((hw1 & 0xFE40U) == 0xE800U && ((hw1 >> 4) & 1U) != 0U && (hw2 & 0x8000U) != 0U) {
+    if ((hw1 & 0xFE40U) == 0xE800U &&
+        (((hw1 >> 7) & 3U) == 1U || ((hw1 >> 7) & 3U) == 2U) &&
+        ((hw1 >> 4) & 1U) != 0U && (hw2 & 0x8000U) != 0U) {
         return true;
     }
     /* LDR.W pc, ... */
@@ -189,6 +191,16 @@ static bool t32_insn_overwrites_all_flags(const t32_insn_info_t *info)
         }
     }
 
+    /* VMRS APSR_nzcv, FPSCR */
+    if (hw1 == 0xEEF1U && hw2 == 0xFA10U) {
+        return true;
+    }
+
+    /* MSR CPSR_f, Rn */
+    if ((hw1 & 0xFFF0U) == 0xF380U && (hw2 & 0xFF00U) == 0x8800U) {
+        return true;
+    }
+
     return false;
 }
 
@@ -246,11 +258,6 @@ static bool t32_insn_reads_flags(const t32_insn_info_t *info)
 
     /* MRS Rd, CPSR */
     if (hw1 == 0xF3EFU && (hw2 & 0xF0FFU) == 0x8000U) {
-        return true;
-    }
-
-    /* VMRS APSR_nzcv, FPSCR */
-    if (hw1 == 0xEEF1U && hw2 == 0xFA10U) {
         return true;
     }
 
@@ -1082,7 +1089,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         }
         if (handled) {
             if (rd == 15U && !set_flags) {
-                a64_emit_exit_branch_reg(b, dst, true);
+                a64_emit_exit_branch_reg(b, dst, false);
                 if (is_uncond) {
                     *out_ends_block = true;
                 }
@@ -1394,7 +1401,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         }
         if (handled) {
             if (rd == 15U && !set_flags) {
-                a64_emit_exit_branch_reg(b, dst, true);
+                a64_emit_exit_branch_reg(b, dst, false);
                 if (is_uncond) {
                     *out_ends_block = true;
                 }
@@ -1439,22 +1446,67 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             return true;
         }
         if ((hw1 & 0xFF80U) == 0xFA00U && (hw2 & 0xF080U) == 0xF080U) {
-            /* SXTH / UXTH / SXTB / UXTB (+ add variants) */
+            /* SXTH / UXTH / SXTB16 / UXTB16 / SXTB / UXTB (+ add variants) */
             unsigned op = (hw1 >> 4) & 7U;
+            if (op > 5U) {
+                return false;
+            }
             unsigned rot = ((hw2 >> 4) & 3U) * 8U;
             a64_emit_orr_reg_w(b, A64_TMP0, A64_ZR, rm, A64_SHIFT_ROR, rot);
+            if (op == 2U || op == 3U) {
+                if (op == 2U) {
+                    a64_emit_sbfm_w(b, A64_TMP1, A64_TMP0, 0U, 7U);
+                    a64_emit_sbfm_w(b, A64_TMP0, A64_TMP0, 16U, 23U);
+                } else {
+                    a64_emit_ubfm_w(b, A64_TMP1, A64_TMP0, 0U, 7U);
+                    a64_emit_ubfm_w(b, A64_TMP0, A64_TMP0, 16U, 23U);
+                }
+                if (rn != 15U) {
+                    a64_emit_add_reg_w(b, false, A64_TMP1, A64_TMP1, rn, A64_SHIFT_LSL, 0U);
+                    a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, rn, A64_SHIFT_LSR, 16U);
+                }
+                a64_emit_bfm_w(b, A64_TMP1, A64_TMP0, 16U, 15U);
+                a64_emit_mov_w(b, rd, A64_TMP1);
+                return true;
+            }
             if (op == 0U) {
-                a64_emit_sbfm_w(b, rd, A64_TMP0, 0U, 15U);
+                a64_emit_sbfm_w(b, A64_TMP0, A64_TMP0, 0U, 15U);
             } else if (op == 1U) {
-                a64_emit_ubfm_w(b, rd, A64_TMP0, 0U, 15U);
+                a64_emit_ubfm_w(b, A64_TMP0, A64_TMP0, 0U, 15U);
             } else if (op == 4U) {
-                a64_emit_sbfm_w(b, rd, A64_TMP0, 0U, 7U);
+                a64_emit_sbfm_w(b, A64_TMP0, A64_TMP0, 0U, 7U);
             } else {
-                a64_emit_ubfm_w(b, rd, A64_TMP0, 0U, 7U);
+                a64_emit_ubfm_w(b, A64_TMP0, A64_TMP0, 0U, 7U);
             }
             if (rn != 15U) {
-                a64_emit_add_reg_w(b, false, rd, rd, rn, A64_SHIFT_LSL, 0U);
+                a64_emit_add_reg_w(b, false, rd, rn, A64_TMP0, A64_SHIFT_LSL, 0U);
+            } else {
+                a64_emit_mov_w(b, rd, A64_TMP0);
             }
+            return true;
+        }
+        if ((hw1 & 0xFFF0U) == 0xFA80U && (hw2 & 0xF0C0U) == 0xF080U) {
+            /* QADD / QDADD / QSUB / QDSUB Rd, Rm, Rn */
+            unsigned subop = (hw2 >> 4) & 3U;
+            bool is_double = (subop & 1U) != 0U;
+            bool is_sub = (subop & 2U) != 0U;
+            a64_emit_mrs_nzcv(b, A64_TMP3);
+            a64_emit_mov_w(b, A64_TMP0, rn);
+            if (is_double) {
+                a64_emit_add_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP0, A64_SHIFT_LSL, 0U);
+                a64_emit_movz_w(b, A64_TMP2, 0x8000U, 1U);
+                a64_emit_eor_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_ASR, 31U);
+                a64_emit_csel_w(b, A64_TMP0, A64_TMP2, A64_TMP0, A64_COND_VS);
+            }
+            if (is_sub) {
+                a64_emit_sub_reg_w(b, true, A64_TMP0, rm, A64_TMP0, A64_SHIFT_LSL, 0U);
+            } else {
+                a64_emit_add_reg_w(b, true, A64_TMP0, rm, A64_TMP0, A64_SHIFT_LSL, 0U);
+            }
+            a64_emit_movz_w(b, A64_TMP2, 0x8000U, 1U);
+            a64_emit_eor_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_ASR, 31U);
+            a64_emit_csel_w(b, rd, A64_TMP2, A64_TMP0, A64_COND_VS);
+            a64_emit_msr_nzcv(b, A64_TMP3);
             return true;
         }
         if ((hw1 & 0xFFF0U) == 0xFAB0U && (hw2 & 0xF0C0U) == 0xF080U) {
@@ -1501,8 +1553,10 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             unsigned subop = (hw2 >> 4) & 0xFU;
             if (subop == 0U) {
                 a64_emit_madd_w(b, rd, rn, rm, (ra == 15U) ? A64_ZR : ra);
-            } else {
+            } else if (subop == 1U) {
                 a64_emit_msub_w(b, rd, rn, rm, ra);
+            } else {
+                return false;
             }
             return true;
         }
@@ -1514,6 +1568,26 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             a64_emit_sbfm_w(b, A64_TMP0, rn, n_top ? 16U : 0U, n_top ? 31U : 15U);
             a64_emit_sbfm_w(b, A64_TMP1, rm, m_top ? 16U : 0U, m_top ? 31U : 15U);
             a64_emit_madd_w(b, rd, A64_TMP0, A64_TMP1, (ra == 15U) ? A64_ZR : ra);
+            return true;
+        }
+        if (((hw1 & 0xFFF0U) == 0xFB20U || (hw1 & 0xFFF0U) == 0xFB40U) && (hw2 & 0x00E0U) == 0U) {
+            /* SMUAD{X} / SMUSD{X} / SMLAD{X} / SMLSD{X} */
+            bool is_sub = (hw1 & 0xFFF0U) == 0xFB40U;
+            bool m_swap = ((hw2 >> 4) & 1U) != 0U;
+            unsigned ra = (hw2 >> 12) & 0xFU;
+            unsigned m1_lsb = m_swap ? 16U : 0U;
+            unsigned m2_lsb = m_swap ? 0U : 16U;
+            unsigned acc = (ra == 15U) ? A64_ZR : ra;
+            a64_emit_sbfm_w(b, A64_TMP0, rn, 0U, 15U);
+            a64_emit_sbfm_w(b, A64_TMP1, rm, m1_lsb, m1_lsb + 15U);
+            a64_emit_madd_w(b, A64_TMP2, A64_TMP0, A64_TMP1, acc);
+            a64_emit_sbfm_w(b, A64_TMP0, rn, 16U, 31U);
+            a64_emit_sbfm_w(b, A64_TMP1, rm, m2_lsb, m2_lsb + 15U);
+            if (is_sub) {
+                a64_emit_msub_w(b, rd, A64_TMP0, A64_TMP1, A64_TMP2);
+            } else {
+                a64_emit_madd_w(b, rd, A64_TMP0, A64_TMP1, A64_TMP2);
+            }
             return true;
         }
         if ((hw1 & 0xFFF0U) == 0xFB30U && (hw2 & 0x00E0U) == 0U) {
@@ -1530,8 +1604,49 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             }
             return true;
         }
+        if (((hw1 & 0xFFF0U) == 0xFB50U || (hw1 & 0xFFF0U) == 0xFB60U) && (hw2 & 0x00E0U) == 0U) {
+            /* SMMUL{R} / SMMLA{R} / SMMLS{R} */
+            bool is_sub = (hw1 & 0xFFF0U) == 0xFB60U;
+            bool round = ((hw2 >> 4) & 1U) != 0U;
+            unsigned ra = (hw2 >> 12) & 0xFU;
+            if (round) {
+                a64_emit_movz_w(b, A64_TMP1, 0x8000U, 1U);
+            } else {
+                a64_emit_movz_w(b, A64_TMP1, 0U, 0U);
+            }
+            if (is_sub || ra != 15U) {
+                a64_emit_bfi_x(b, A64_TMP1, ra, 32U, 32U);
+            }
+            if (is_sub) {
+                a64_emit_smsubl_x(b, A64_TMP0, rn, rm, A64_TMP1);
+            } else {
+                a64_emit_smaddl_x(b, A64_TMP0, rn, rm, A64_TMP1);
+            }
+            a64_emit_ubfx_x_to_w(b, rd, A64_TMP0, 32U, 32U);
+            return true;
+        }
+        if ((hw1 & 0xFFF0U) == 0xFB70U && (hw2 & 0x00F0U) == 0U) {
+            /* USAD8 / USADA8 */
+            unsigned ra = (hw2 >> 12) & 0xFU;
+            a64_emit_mrs_nzcv(b, A64_TMP3);
+            if (ra != 15U) {
+                a64_emit_mov_w(b, A64_TMP2, ra);
+            } else {
+                a64_emit_movz_w(b, A64_TMP2, 0U, 0U);
+            }
+            for (unsigned i = 0U; i < 4U; i++) {
+                a64_emit_ubfm_w(b, A64_TMP0, rn, i * 8U, i * 8U + 7U);
+                a64_emit_ubfm_w(b, A64_TMP1, rm, i * 8U, i * 8U + 7U);
+                a64_emit_sub_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
+                a64_emit_csneg_w(b, A64_TMP0, A64_TMP0, A64_TMP0, A64_COND_PL);
+                a64_emit_add_reg_w(b, false, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_LSL, 0U);
+            }
+            a64_emit_msr_nzcv(b, A64_TMP3);
+            a64_emit_mov_w(b, rd, A64_TMP2);
+            return true;
+        }
         if ((hw1 & 0xFF80U) == 0xFB80U) {
-            /* SMULL / SDIV / UMULL / UDIV / SMLAL / UMLAL */
+            /* SMULL / SDIV / UMULL / UDIV / SMLAL / SMLAL<x><y> / SMLALD / SMLSLD / UMLAL / UMAAL */
             unsigned op = (hw1 >> 4) & 7U;
             unsigned rd_lo = (hw2 >> 12) & 0xFU;
             unsigned subop = (hw2 >> 4) & 0xFU;
@@ -1542,6 +1657,53 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             if (op == 3U && subop == 0xFU) {
                 a64_emit_udiv_w(b, rd, rn, rm);
                 return true;
+            }
+            if (op == 6U && subop == 6U) {
+                /* UMAAL RdLo, RdHi, Rn, Rm */
+                a64_emit_mov_w(b, A64_TMP1, rd_lo);
+                a64_emit_umaddl_x(b, A64_TMP0, rn, rm, A64_TMP1);
+                a64_emit_add_uxtw_x(b, A64_TMP0, A64_TMP0, rd);
+                a64_emit_mov_w(b, rd_lo, A64_TMP0);
+                a64_emit_ubfx_x_to_w(b, rd, A64_TMP0, 32U, 32U);
+                return true;
+            }
+            if (op == 4U && (subop & 0xCU) == 8U) {
+                /* SMLAL<x><y> RdLo, RdHi, Rn, Rm */
+                unsigned lsb_n = ((subop >> 1) & 1U) ? 16U : 0U;
+                unsigned lsb_m = (subop & 1U) ? 16U : 0U;
+                a64_emit_mov_w(b, A64_TMP2, rd_lo);
+                a64_emit_bfi_x(b, A64_TMP2, rd, 32U, 32U);
+                a64_emit_sbfm_w(b, A64_TMP0, rn, lsb_n, lsb_n + 15U);
+                a64_emit_sbfm_w(b, A64_TMP1, rm, lsb_m, lsb_m + 15U);
+                a64_emit_smaddl_x(b, A64_TMP2, A64_TMP0, A64_TMP1, A64_TMP2);
+                a64_emit_mov_w(b, rd_lo, A64_TMP2);
+                a64_emit_ubfx_x_to_w(b, rd, A64_TMP2, 32U, 32U);
+                return true;
+            }
+            if ((op == 4U || op == 5U) && (subop & 0xEU) == 0xCU) {
+                /* SMLALD{X} / SMLSLD{X} RdLo, RdHi, Rn, Rm */
+                bool is_sub = (op == 5U);
+                bool m_swap = (subop & 1U) != 0U;
+                unsigned m1_lsb = m_swap ? 16U : 0U;
+                unsigned m2_lsb = m_swap ? 0U : 16U;
+                a64_emit_mov_w(b, A64_TMP2, rd_lo);
+                a64_emit_bfi_x(b, A64_TMP2, rd, 32U, 32U);
+                a64_emit_sbfm_w(b, A64_TMP0, rn, 0U, 15U);
+                a64_emit_sbfm_w(b, A64_TMP1, rm, m1_lsb, m1_lsb + 15U);
+                a64_emit_smaddl_x(b, A64_TMP2, A64_TMP0, A64_TMP1, A64_TMP2);
+                a64_emit_sbfm_w(b, A64_TMP0, rn, 16U, 31U);
+                a64_emit_sbfm_w(b, A64_TMP1, rm, m2_lsb, m2_lsb + 15U);
+                if (is_sub) {
+                    a64_emit_smsubl_x(b, A64_TMP2, A64_TMP0, A64_TMP1, A64_TMP2);
+                } else {
+                    a64_emit_smaddl_x(b, A64_TMP2, A64_TMP0, A64_TMP1, A64_TMP2);
+                }
+                a64_emit_mov_w(b, rd_lo, A64_TMP2);
+                a64_emit_ubfx_x_to_w(b, rd, A64_TMP2, 32U, 32U);
+                return true;
+            }
+            if (subop != 0U || (op != 0U && op != 2U && op != 4U && op != 6U)) {
+                return false;
             }
             bool is_signed = (op == 0U || op == 4U);
             bool accumulate = (op >= 4U);
@@ -1564,7 +1726,8 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
 
     /* 6. Load/store multiple, dual, exclusive, table branch: (hw1 & 0xFE00) == 0xE800 */
     if ((hw1 & 0xFE00U) == 0xE800U) {
-        if ((hw1 & 0xFE40U) == 0xE800U) {
+        if ((hw1 & 0xFE40U) == 0xE800U &&
+            (((hw1 >> 7) & 3U) == 1U || ((hw1 >> 7) & 3U) == 2U)) {
             /* LDMIA.W / STMIA.W / LDMDB.W / STMDB.W (PUSH.W / POP.W) */
             bool u_bit = ((hw1 >> 7) & 1U) != 0U;
             bool w_bit = ((hw1 >> 5) & 1U) != 0U;
@@ -1736,6 +1899,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         unsigned rn   = hw1 & 0xFU;
         unsigned rt   = (hw2 >> 12) & 0xFU;
 
+        if (size > 2U) {
+            return false;
+        }
         if (rt == 15U && is_load && size != 2U) {
             /* PLD / PLI hint */
             return true;
@@ -1904,6 +2070,9 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 
     /* Pre-pass: scan guest instructions in the basic block */
     for (unsigned count = 0U; (count < max_insns || (!ctx->single_step && scan_itstate != 0U)) && num_insns < T32_MAX_PRESCAN_INSNS; count++) {
+        if (count > 0U && scan_itstate == 0U && (scan_pc & 0xFFFU) == 0U) {
+            break;
+        }
         if (ctx->gdb_enabled && count > 0U && a32_gdb_has_breakpoint(scan_pc)) {
             break;
         }
@@ -1934,6 +2103,9 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         bool ends_uncond = false;
 
         if (is_32bit) {
+            if (count > 0U && !in_it && ((scan_pc + 2U) & 0xFFFU) == 0U) {
+                break;
+            }
             uint16_t hw2 = guest_hw[1];
             info->hw2 = hw2;
             scan_pc += 4U;

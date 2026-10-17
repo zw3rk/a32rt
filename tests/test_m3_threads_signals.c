@@ -43,6 +43,11 @@ __asm__(
     "my_rt_restorer:\n"
     "    mov r7, #173\n"  /* SYS_rt_sigreturn */
     "    svc #0\n"
+    ".globl resethand_asm_handler\n"
+    ".type resethand_asm_handler, %function\n"
+    "resethand_asm_handler:\n"
+    "    ldr r3, [sp, #0]\n"
+    "    b   resethand_c_handler\n"
     ".globl arm_clone_trampoline\n"
     ".type arm_clone_trampoline, %function\n"
     "arm_clone_trampoline:\n"
@@ -68,6 +73,7 @@ __asm__(
 int arm_clone_trampoline(uint32_t flags, void *child_stack, uint32_t *ptid,
                          void *tls, uint32_t *ctid, void (*fn)(void));
 void my_rt_restorer(void);
+void resethand_asm_handler(int sig, void *info, void *ucontext);
 
 static inline int32_t sys1(uint32_t nr, uint32_t a0)
 {
@@ -522,6 +528,170 @@ static int test6_vm_boundaries(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 7: a32_jit_invalidate_range epoch preservation regression test
+ * -------------------------------------------------------------------------- */
+static uint32_t __attribute__((noinline)) hot_fn_a(uint32_t x)
+{
+    uint32_t acc = x ^ 0x13579BDFU;
+    for (uint32_t i = 0U; i < 8U; i++) {
+        if ((acc & 1U) != 0U) {
+            acc = (acc >> 1) ^ 0xEDB88320U;
+        } else {
+            acc >>= 1;
+        }
+    }
+    return acc + x;
+}
+
+static uint32_t __attribute__((noinline)) hot_fn_b(uint32_t rounds)
+{
+    uint32_t (* volatile fn_ptr)(uint32_t) = hot_fn_a;
+    uint32_t total = 0x12345678U;
+    for (uint32_t r = 0U; r < rounds; r++) {
+        total ^= hot_fn_a(total + r);
+        total += fn_ptr(r ^ 0x55AA55AAU);
+    }
+    return total;
+}
+
+static int test7_invalidate_range_epoch(void)
+{
+    _Alignas(64) uint32_t scratch_c[32];
+    for (uint32_t i = 0U; i < 32U; i++) {
+        scratch_c[i] = i * 3U + 1U;
+    }
+
+    /* Warm up and chain hot functions A and B before any range invalidation */
+    uint32_t baseline_a = hot_fn_a(42U);
+    uint32_t baseline_b = hot_fn_b(16U);
+
+    /*
+     * Trigger a32_jit_invalidate_range repeatedly via cacheflush on scratch_c
+     * and verify hot_fn_a and hot_fn_b continue to execute and re-chain properly.
+     */
+    for (uint32_t iter = 0U; iter < 6U; iter++) {
+        scratch_c[iter & 31U] ^= 0xA5A5A5A5U;
+        sys3(0x0F0002U /* __ARM_NR_cacheflush */,
+             (uint32_t)(uintptr_t)&scratch_c[0],
+             (uint32_t)(uintptr_t)&scratch_c[32],
+             0U);
+
+        for (uint32_t run = 0U; run < 4U; run++) {
+            if (hot_fn_a(42U) != baseline_a) {
+                return 70;
+            }
+            if (hot_fn_b(16U) != baseline_b) {
+                return 71;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 8: SA_RESETHAND (0x80000000U) & siginfo at [sp + 0] regression test
+ * -------------------------------------------------------------------------- */
+static volatile uint32_t g_resethand_calls = 0U;
+static volatile int32_t  g_resethand_sp0_signo = 0;
+static volatile int32_t  g_resethand_info_signo = 0;
+
+void resethand_c_handler(int sig, void *info, void *ucontext, int32_t sp0_signo)
+{
+    (void)ucontext;
+    g_resethand_calls++;
+    g_resethand_sp0_signo = sp0_signo;
+    if (info != NULL) {
+        const struct siginfo32 *si = (const struct siginfo32 *)info;
+        g_resethand_info_signo = si->si_signo;
+    } else {
+        g_resethand_info_signo = -1;
+    }
+    if (sig != 12) {
+        g_resethand_info_signo = -2;
+    }
+}
+
+static int test8_sa_resethand(void)
+{
+    g_resethand_calls = 0U;
+    g_resethand_sp0_signo = 0;
+    g_resethand_info_signo = 0;
+
+    struct sigaction32 act;
+    act.sa_handler  = (uint32_t)(uintptr_t)resethand_asm_handler;
+    act.sa_flags    = 0x80000000U | 0x04000000U | 0x00000004U; /* SA_RESETHAND | SA_RESTORER | SA_SIGINFO */
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0]  = 0U;
+    act.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 12U /* SIGUSR2 */,
+             (uint32_t)(uintptr_t)&act, 0U, 8U) != 0) {
+        return 80;
+    }
+
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+    if (sys2(238U /* tkill */, tid, 12U /* SIGUSR2 */) != 0) {
+        return 81;
+    }
+
+    if (g_resethand_calls != 1U ||
+        g_resethand_sp0_signo != 12 ||
+        g_resethand_info_signo != 12) {
+        return 82;
+    }
+
+    struct sigaction32 oldact;
+    oldact.sa_handler  = 0xDEADBEEFU;
+    oldact.sa_flags    = 0U;
+    oldact.sa_restorer = 0U;
+    oldact.sa_mask[0]  = 0U;
+    oldact.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 12U /* SIGUSR2 */,
+             0U, (uint32_t)(uintptr_t)&oldact, 8U) != 0) {
+        return 83;
+    }
+    if (oldact.sa_handler != 0U /* SIG_DFL */) {
+        return 84;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 9: Negative (-EFAULT) signal syscall tests
+ * -------------------------------------------------------------------------- */
+static int test9_negative_signal_syscalls(void)
+{
+    /* rt_sigaction (174) with invalid act (0x100) and invalid oldact (0x100) -> -EFAULT (-14) */
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */, 0x100U, 0U, 8U) != -14) {
+        return 90;
+    }
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */, 0U, 0x100U, 8U) != -14) {
+        return 91;
+    }
+
+    /* rt_sigprocmask (175) with invalid set (0x100) and invalid oldset (0x100) -> -EFAULT (-14) */
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0x100U, 0U, 8U) != -14) {
+        return 92;
+    }
+    if (sys4(175U /* rt_sigprocmask */, 0U /* SIG_BLOCK */, 0U, 0x100U, 8U) != -14) {
+        return 93;
+    }
+
+    /* sigaltstack (186) with invalid uss (0x100) and invalid uoss (0x100) -> -EFAULT (-14) */
+    if (sys2(186U /* sigaltstack */, 0x100U, 0U) != -14) {
+        return 94;
+    }
+    if (sys2(186U /* sigaltstack */, 0U, 0x100U) != -14) {
+        return 95;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -545,6 +715,18 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test6_vm_boundaries();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test7_invalidate_range_epoch();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test8_sa_resethand();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test9_negative_signal_syscalls();
     if (rc != 0) {
         return rc;
     }

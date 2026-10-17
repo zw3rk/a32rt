@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    2U
+#define A32_AOT_VERSION    3U
 #define A32_MAX_AOT_SCAN   256U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  2048U
@@ -99,7 +99,8 @@ typedef struct aot_save_state {
     bool     error;
 } aot_save_state_t;
 
-static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thumb,
+static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
+                           bool is_thumb, bool is_call,
                            const uint32_t *words, size_t word_count,
                            const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
                            void *arg)
@@ -107,6 +108,7 @@ static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thu
     (void)guest_pc;
     (void)guest_end_pc;
     (void)is_thumb;
+    (void)is_call;
     (void)words;
     (void)word_count;
     (void)pc_map;
@@ -115,7 +117,8 @@ static void count_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thu
     st->count++;
 }
 
-static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thumb,
+static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
+                           bool is_thumb, bool is_call,
                            const uint32_t *words, size_t word_count,
                            const a32_pc_map_stage_t *pc_map, size_t pc_map_count,
                            void *arg)
@@ -129,7 +132,7 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc, bool is_thu
     a32_aot_block_header_t bh;
     bh.guest_pc     = guest_pc;
     bh.guest_end_pc = guest_end_pc;
-    bh.is_thumb     = is_thumb ? 1U : 0U;
+    bh.is_thumb     = (is_thumb ? 1U : 0U) | (is_call ? 2U : 0U);
     bh.word_count   = (uint32_t)word_count;
     bh.pc_map_count = (uint32_t)map_cnt;
 
@@ -241,7 +244,8 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
             }
         }
         (void)a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
-                                        bh.is_thumb != 0U,
+                                        (bh.is_thumb & 1U) != 0U,
+                                        (bh.is_thumb & 2U) != 0U,
                                         words_buf, (size_t)bh.word_count,
                                         bh.pc_map_count > 0U ? pc_map_buf : NULL,
                                         (size_t)bh.pc_map_count);
@@ -292,6 +296,63 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                 uint16_t hw = *hw_ptr;
 
                 if ((hw >> 11U) >= 0x1DU) {
+                    if (pc + 4U > elf_info->text_end) {
+                        break;
+                    }
+                    uint16_t hw1 = hw;
+                    uint16_t hw2 = hw_ptr[1];
+
+                    /* 32-bit prologue: PUSH.W {..., lr} (STMDB sp!, {..., lr}) */
+                    if (hw1 == 0xE92DU && (hw2 & 0x4000U) != 0U) {
+                        add_target(pc, true, disc_pcs, disc_thumb, &disc_count);
+                    } else if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0x8000U) != 0U) {
+                        if ((hw2 & 0xD000U) == 0xD000U || (hw2 & 0xD000U) == 0xC000U ||
+                            (hw2 & 0xD000U) == 0x9000U) {
+                            /* 32-bit BL / BLX / B.W <label> */
+                            bool is_blx    = (hw2 & 0xD000U) == 0xC000U;
+                            bool is_link   = (hw2 & 0x4000U) != 0U;
+                            uint32_t s     = (hw1 >> 10U) & 1U;
+                            uint32_t j1    = (hw2 >> 13U) & 1U;
+                            uint32_t j2    = (hw2 >> 11U) & 1U;
+                            uint32_t i1    = ~(j1 ^ s) & 1U;
+                            uint32_t i2    = ~(j2 ^ s) & 1U;
+                            uint32_t imm10 = hw1 & 0x3FFU;
+                            uint32_t imm11 = hw2 & 0x7FFU;
+                            int32_t offset = (int32_t)((s << 24U) | (i1 << 23U) | (i2 << 22U) |
+                                                       (imm10 << 12U) | (imm11 << 1U));
+                            if (s != 0U) {
+                                offset |= (int32_t)0xFE000000U;
+                            }
+                            uint32_t tgt = is_blx ? ((((pc + 4U) & ~3U) + (uint32_t)offset) & ~3U)
+                                                  : (pc + 4U + (uint32_t)offset);
+                            if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                                add_target(tgt, !is_blx, disc_pcs, disc_thumb, &disc_count);
+                            }
+                            if (is_link && pc + 4U < elf_info->text_end) {
+                                add_target(pc + 4U, true, disc_pcs, disc_thumb, &disc_count);
+                            }
+                        } else if ((hw2 & 0xD000U) == 0x8000U) {
+                            unsigned cond = (hw1 >> 6U) & 0xFU;
+                            if (cond < 14U) {
+                                /* 32-bit B<cond>.W <label> */
+                                uint32_t s     = (hw1 >> 10U) & 1U;
+                                uint32_t j1    = (hw2 >> 13U) & 1U;
+                                uint32_t j2    = (hw2 >> 11U) & 1U;
+                                uint32_t imm6  = hw1 & 0x3FU;
+                                uint32_t imm11 = hw2 & 0x7FFU;
+                                int32_t offset = (int32_t)((s << 20U) | (j2 << 19U) | (j1 << 18U) |
+                                                           (imm6 << 12U) | (imm11 << 1U));
+                                if (s != 0U) {
+                                    offset |= (int32_t)0xFFE00000U;
+                                }
+                                uint32_t tgt = pc + 4U + (uint32_t)offset;
+                                if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
+                                    add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
+                                }
+                            }
+                        }
+                    }
+
                     /* 32-bit Thumb-2 instruction: advance past second halfword */
                     pc += 2U;
                     continue;
@@ -344,6 +405,9 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
                         add_target(tgt, false, disc_pcs, disc_thumb, &disc_count);
                     }
+                    if (((insn >> 24U) & 1U) != 0U && pc + 4U < elf_info->text_end) {
+                        add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
+                    }
                 }
                 /* Branch with Link and Exchange: BLX (imm) */
                 else if ((insn & 0xFE000000U) == 0xFA000000U) {
@@ -355,6 +419,9 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2) + (int32_t)(h << 1U));
                     if (tgt >= elf_info->text_start && tgt < elf_info->text_end) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
+                    }
+                    if (pc + 4U < elf_info->text_end) {
+                        add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
             }

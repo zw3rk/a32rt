@@ -167,14 +167,13 @@ static int flush_batch_locked(a32_ctx_t *ctx)
         ctx->wx_transitions++;
     }
 
-    /*
-     * Align g_code_used up to the next 4 KiB page boundary so subsequent
-     * allocations never re-mprotect(PROT_READ | PROT_WRITE) a page that
-     * already holds live executable code being run by another thread.
-     */
-    g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
-
     if (g_batch_max > g_batch_min) {
+        /*
+         * Align g_code_used up to the next 4 KiB page boundary so subsequent
+         * allocations never re-mprotect(PROT_READ | PROT_WRITE) a page that
+         * already holds live executable code being run by another thread.
+         */
+        g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
         flush_icache_range(ctx, (const void *)g_batch_min, g_batch_max - g_batch_min);
         g_batch_min = UINTPTR_MAX;
         g_batch_max = 0U;
@@ -290,6 +289,11 @@ void a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t i
 
 bool a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t *out_itstate)
 {
+    if (g_code_cache == NULL ||
+        host_pc < (uintptr_t)g_code_cache ||
+        host_pc >= (uintptr_t)g_code_cache + A32_CODE_CACHE_SIZE) {
+        return false;
+    }
     jit_lock_acquire();
     size_t total = g_side_table_count;
     size_t count = (total > A32_SIDE_TABLE_SIZE) ? A32_SIDE_TABLE_SIZE : total;
@@ -348,7 +352,8 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
     }
     jit_lock_acquire();
-    atomic_fetch_add_explicit(&g_cache_epoch, 1U, memory_order_acq_rel);
+    uint32_t old_epoch = atomic_fetch_add_explicit(&g_cache_epoch, 1U, memory_order_acq_rel);
+    uint32_t new_epoch = old_epoch + 1U;
     for (size_t i = 0U; i < A32_HT_SIZE; i++) {
         uint32_t k = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
         const void *hc = atomic_load_explicit(&g_ht[i].host_code, memory_order_relaxed);
@@ -367,6 +372,8 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
                 atomic_store_explicit(&g_ht[i].chain_key[1], 0U, memory_order_relaxed);
                 atomic_store_explicit(&g_ht[i].chain_code[1], NULL, memory_order_relaxed);
                 atomic_store_explicit(&g_ht[i].chain_entry[1], NULL, memory_order_relaxed);
+            } else {
+                atomic_store_explicit(&g_ht[i].epoch, new_epoch, memory_order_release);
             }
         }
     }
@@ -401,7 +408,8 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
 }
 
 int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
-                              bool is_thumb, const uint32_t *words, size_t word_count,
+                              bool is_thumb, bool is_call,
+                              const uint32_t *words, size_t word_count,
                               const a32_pc_map_stage_t *pc_map, size_t pc_map_count)
 {
     if (words == NULL || word_count == 0U) {
@@ -437,9 +445,10 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
     if (pc_map != NULL && pc_map_count > 0U) {
         size_t n = (pc_map_count <= MAX_STAGE_PC_MAP) ? pc_map_count : MAX_STAGE_PC_MAP;
         for (size_t i = 0U; i < n; i++) {
-            g_stage_pc_map[i] = pc_map[i];
+            if (pc_map[i].host_word_idx < word_count) {
+                g_stage_pc_map[g_stage_pc_map_count++] = pc_map[i];
+            }
         }
-        g_stage_pc_map_count = n;
     }
     size_t side_start = 0U;
     size_t side_count = 0U;
@@ -454,7 +463,7 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
         const void *hc = atomic_load_explicit(&g_ht[idx].host_code, memory_order_relaxed);
         if (k == 0U || hc == NULL || k == key) {
             populate_ht_entry_locked(&g_ht[idx], key, dst, aligned_pc, end_pc,
-                                     (uint32_t)code_bytes, false, side_start, side_count,
+                                     (uint32_t)code_bytes, is_call, side_start, side_count,
                                      cur_epoch);
             inserted = true;
             break;
@@ -462,7 +471,7 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
     }
     if (!inserted) {
         populate_ht_entry_locked(&g_ht[slot], key, dst, aligned_pc, end_pc,
-                                 (uint32_t)code_bytes, false, side_start, side_count,
+                                 (uint32_t)code_bytes, is_call, side_start, side_count,
                                  cur_epoch);
     }
 
@@ -471,7 +480,7 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
 }
 
 static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, bool is_thumb,
-                                                  a32_cache_entry_t *oneshot_entry)
+                                                  a32_cache_entry_t *oneshot_entry, bool flush_now)
 {
     uint32_t aligned_pc = pc & ~1U;
     uint32_t key        = aligned_pc | (is_thumb ? 1U : 0U);
@@ -479,11 +488,16 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     bool     uncached   = (ctx->itstate != 0U) || ctx->single_step;
 
     jit_lock_acquire();
+    uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     if (!uncached) {
         for (size_t probe = 0U; probe < 16U; probe++) {
             uint32_t idx = (slot + (uint32_t)probe) & A32_HT_MASK;
             if (atomic_load_explicit(&g_ht[idx].key, memory_order_relaxed) == key &&
-                atomic_load_explicit(&g_ht[idx].host_code, memory_order_relaxed) != NULL) {
+                atomic_load_explicit(&g_ht[idx].host_code, memory_order_relaxed) != NULL &&
+                atomic_load_explicit(&g_ht[idx].epoch, memory_order_relaxed) == cur_epoch) {
+                if (flush_now && g_batch_max > g_batch_min) {
+                    flush_batch_locked(ctx);
+                }
                 jit_lock_release();
                 return &g_ht[idx];
             }
@@ -522,8 +536,8 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     commit_side_table_locked(dst, code_bytes, aligned_pc, is_thumb ? ctx->itstate : 0U,
                              &side_start, &side_count);
 
-    uint32_t end_pc    = (buf.guest_end_pc > aligned_pc) ? buf.guest_end_pc : (aligned_pc + 4U);
-    uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
+    uint32_t end_pc = (buf.guest_end_pc > aligned_pc) ? buf.guest_end_pc : (aligned_pc + 4U);
+    cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     a32_cache_entry_t *res_entry = NULL;
 
     if (uncached && oneshot_entry != NULL) {
@@ -552,17 +566,21 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         }
     }
 
-    flush_batch_locked(ctx);
+    if (flush_now) {
+        flush_batch_locked(ctx);
+    }
     ctx->blocks_compiled++;
 
     jit_lock_release();
     return res_entry;
 }
 
-const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes)
+static const void *compile_block_internal(a32_ctx_t *ctx, uint32_t guest_pc, bool is_thumb,
+                                          uint32_t *out_code_bytes, bool flush_now)
 {
     a32_cache_entry_t oneshot_entry;
-    a32_cache_entry_t *entry = lookup_or_compile_entry(ctx, pc, is_thumb, &oneshot_entry);
+    a32_cache_entry_t *entry = lookup_or_compile_entry(ctx, guest_pc, is_thumb,
+                                                       &oneshot_entry, flush_now);
     if (entry == NULL) {
         return NULL;
     }
@@ -570,6 +588,11 @@ const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, ui
         *out_code_bytes = entry->code_bytes;
     }
     return atomic_load_explicit(&entry->host_code, memory_order_acquire);
+}
+
+const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes)
+{
+    return compile_block_internal(ctx, pc, is_thumb, out_code_bytes, false);
 }
 
 void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
@@ -584,25 +607,29 @@ void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
             uint32_t guest_end_pc = (g_ht[i].guest_end_pc > guest_pc) ?
                                     g_ht[i].guest_end_pc : (guest_pc + 4U);
             bool is_thumb         = (key & 1U) != 0U;
+            bool is_call          = g_ht[i].is_call;
             const uint32_t *words = (const uint32_t *)host_code;
             size_t word_count     = g_ht[i].code_bytes / sizeof(uint32_t);
             uintptr_t base        = (uintptr_t)host_code;
             uintptr_t end         = base + g_ht[i].code_bytes;
             size_t map_count      = 0U;
 
-            for (size_t s = 0U; s < g_ht[i].side_count && map_count < MAX_STAGE_PC_MAP; s++) {
-                size_t st_idx = (g_ht[i].side_start + s) % A32_SIDE_TABLE_SIZE;
-                if (g_side_table[st_idx].host_pc_start >= base &&
-                    g_side_table[st_idx].host_pc_start < end) {
-                    pc_map[map_count].host_word_idx =
-                        (uint32_t)((g_side_table[st_idx].host_pc_start - base) / sizeof(uint32_t));
-                    pc_map[map_count].guest_pc = g_side_table[st_idx].guest_pc;
-                    pc_map[map_count].itstate  = g_side_table[st_idx].itstate;
-                    map_count++;
+            if (g_ht[i].side_start + g_ht[i].side_count <= A32_SIDE_TABLE_SIZE) {
+                for (size_t s = 0U; s < g_ht[i].side_count && map_count < MAX_STAGE_PC_MAP; s++) {
+                    size_t st_idx = g_ht[i].side_start + s;
+                    if (g_side_table[st_idx].host_pc_start >= base &&
+                        g_side_table[st_idx].host_pc_start < end) {
+                        pc_map[map_count].host_word_idx =
+                            (uint32_t)((g_side_table[st_idx].host_pc_start - base) / sizeof(uint32_t));
+                        pc_map[map_count].guest_pc = g_side_table[st_idx].guest_pc;
+                        pc_map[map_count].itstate  = g_side_table[st_idx].itstate;
+                        map_count++;
+                    }
                 }
             }
 
-            fn(guest_pc, guest_end_pc, is_thumb, words, word_count, pc_map, map_count, arg);
+            fn(guest_pc, guest_end_pc, is_thumb, is_call, words, word_count,
+               map_count > 0U ? pc_map : NULL, map_count, arg);
         }
     }
     jit_lock_release();
@@ -650,7 +677,7 @@ int a32_jit_run(a32_ctx_t *ctx)
     a32_cache_entry_t *prev_entry = NULL;
 
     for (;;) {
-        if (ctx->pending_signals != 0) {
+        if ((ctx->pending_signals & ~ctx->sig_mask) != 0ULL) {
             a32_signals_check_pending(ctx);
             prev_entry = NULL;
         }
@@ -750,7 +777,7 @@ int a32_jit_run(a32_ctx_t *ctx)
 
         /* 3. Otherwise lookup or compile */
         if (code == NULL) {
-            cur_entry = lookup_or_compile_entry(ctx, pc, is_thumb, &oneshot_entry);
+            cur_entry = lookup_or_compile_entry(ctx, pc, is_thumb, &oneshot_entry, true);
             if (cur_entry == NULL) {
                 return 1;
             }
@@ -774,11 +801,10 @@ int a32_jit_run(a32_ctx_t *ctx)
 
         prev_entry = uncached ? NULL : cur_entry;
         ctx->blocks_executed++;
-        uint32_t prev_lr = ctx->regs[14];
-        uint32_t reason  = a32_jit_run_block(ctx, code);
+        uint32_t reason = a32_jit_run_block(ctx, code);
 
         if (reason == A32_EXIT_BRANCH || reason == A32_EXIT_INTERWORK) {
-            if ((cur_entry != NULL && cur_entry->is_call) || ctx->regs[14] != prev_lr) {
+            if (cur_entry != NULL && cur_entry->is_call) {
                 uint32_t ret_key = (ctx->regs[14] & ~1U) | (ctx->regs[14] & 1U);
                 uint32_t r_ibtc  = ((ret_key >> 1U) ^ (ret_key & 1U)) & (A32_IBTC_SIZE - 1U);
                 uint32_t top     = ctx->ras_top;

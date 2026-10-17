@@ -432,12 +432,19 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
             vm_lock_release();
             return curr;
         }
+        (void)vm_record_region_locked(g_vm_brk_base, new_page,
+                                      (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
         void *host_addr = a32_guest_ptr(ctx, new_page);
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
         mmap(host_addr, len, PROT_NONE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        vm_unmap_regions_locked(g_vm_brk_base, old_page);
+        if (new_page > g_vm_brk_base) {
+            (void)vm_record_region_locked(g_vm_brk_base, new_page,
+                                          (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
+        }
     }
 
     g_vm_brk_curr = new_brk;
@@ -471,7 +478,18 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     }
 
     uint32_t target_va = 0U;
-    if (flags & 0x10U /* MAP_FIXED */) {
+    if ((flags & 0x100000U /* MAP_FIXED_NOREPLACE */) != 0U) {
+        if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < A32_LOW_GUARD_SIZE) {
+            return (uint32_t)(-EINVAL);
+        }
+        if ((uint64_t)addr + aligned_len > (uint64_t)A32_KUSER_BASE_32) {
+            return (uint32_t)(-ENOMEM);
+        }
+        if (vm_range_overlaps_locked(addr, (uint32_t)((uint64_t)addr + aligned_len))) {
+            return (uint32_t)(-EEXIST);
+        }
+        target_va = addr;
+    } else if ((flags & 0x10U /* MAP_FIXED */) != 0U) {
         if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < A32_LOW_GUARD_SIZE) {
             return (uint32_t)(-EINVAL);
         }
@@ -523,7 +541,7 @@ uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 
-    if (res <= 0xFFFFF000U && (flags & 0x10U /* MAP_FIXED */) != 0U) {
+    if (res <= 0xFFFFF000U && (flags & (0x10U | 0x100000U)) != 0U) {
         uint64_t aligned_len = page_align_up((uint64_t)len);
         a32_jit_invalidate_range(ctx, res, (uint32_t)((uint64_t)res + aligned_len));
     }
@@ -688,8 +706,9 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             return (uint32_t)(-EINVAL);
         }
 
+        uint32_t rw_prot = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
         uint32_t mapped = vm_mmap2_locked(ctx, new_addr, (uint32_t)new_aligned,
-                                          prot | 0x3U, 0x32U /* MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS */,
+                                          rw_prot, 0x32U /* MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS */,
                                           -1, 0U);
         if (mapped > 0xFFFFF000U) {
             vm_sync_to_ctx(ctx);
@@ -701,7 +720,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
         size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
         memcpy(a32_guest_ptr(ctx, mapped), a32_guest_ptr(ctx, old_addr), copy_bytes);
-        if ((prot & 0x3U) != 0x3U) {
+        if (prot != 0x3U) {
             (void)vm_mprotect_locked(ctx, mapped, (uint32_t)new_aligned, prot);
         }
         (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
@@ -722,6 +741,10 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                        prot, 0x32U /* MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS */,
                                        -1, 0U);
         if (ext <= 0xFFFFF000U) {
+            uint32_t ext_end = (uint32_t)new_end;
+            if (ext_end > g_vm_mmap_cursor && ext_end <= A32_MMAP_TOP_32) {
+                g_vm_mmap_cursor = ext_end;
+            }
             vm_sync_to_ctx(ctx);
             vm_lock_release();
             return old_addr;
@@ -734,8 +757,9 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         return (uint32_t)(-ENOMEM);
     }
 
+    uint32_t rw_prot = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
     uint32_t new_va = vm_mmap2_locked(ctx, 0U, (uint32_t)new_aligned,
-                                      prot | 0x3U, 0x22U /* MAP_PRIVATE | MAP_ANONYMOUS */,
+                                      rw_prot, 0x22U /* MAP_PRIVATE | MAP_ANONYMOUS */,
                                       -1, 0U);
     if (new_va > 0xFFFFF000U) {
         vm_sync_to_ctx(ctx);
@@ -747,7 +771,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         (void)mprotect(a32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
     }
     memcpy(a32_guest_ptr(ctx, new_va), a32_guest_ptr(ctx, old_addr), (size_t)old_aligned);
-    if ((prot & 0x3U) != 0x3U) {
+    if (prot != 0x3U) {
         (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
     }
     (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);

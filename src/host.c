@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 void a32_host_probe(a32_ctx_t *ctx)
@@ -29,12 +30,16 @@ void a32_host_probe(a32_ctx_t *ctx)
 
     int fd = open(A32H_DEV_PATH, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
+        fd = open(A32H_DEV_PATH, O_RDONLY | O_CLOEXEC);
+    }
+    if (fd < 0) {
         return;
     }
 
     a32h_info_t info;
     memset(&info, 0, sizeof(info));
-    if (ioctl(fd, (int)A32H_GET_INFO, &info) == 0 && info.abi_major == A32H_ABI_MAJOR) {
+    if (syscall(SYS_ioctl, fd, (unsigned long)A32H_GET_INFO, &info) == 0 &&
+        info.abi_major == A32H_ABI_MAJOR) {
         ctx->host_info = info;
         ctx->has_host_info = true;
     }

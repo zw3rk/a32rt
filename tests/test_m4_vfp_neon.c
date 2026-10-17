@@ -571,6 +571,341 @@ static int run_vfp_neon_tests(void)
         return 28;
     }
 
+    /* 18. Regression tests for VQMOVN.S16, VQMOVN.U16, and VQMOVUN.S16 (saturation vs truncation) */
+    {
+        int16_t q_s16[8]   = { -300, -128, -42, 0, 42, 127, 128, 1000 };
+        int8_t  out_s8[8]  = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        static const int8_t exp_s8[8] = { -128, -128, -42, 0, 42, 127, 127, 127 };
+        __asm__ volatile(
+            "vld1.16 {d2, d3}, [%1]\n"
+            "vqmovn.s16 d0, q1\n"
+            "vst1.8 {d0}, [%0]\n"
+            :
+            : "r"(out_s8), "r"(q_s16)
+            : "d0", "d2", "d3", "memory"
+        );
+        for (int i = 0; i < 8; i++) {
+            if (out_s8[i] != exp_s8[i]) {
+                return 29;
+            }
+        }
+
+        uint16_t q_u16[8]  = { 0U, 1U, 127U, 255U, 256U, 0x0102U, 0x7FFFU, 0xFFFFU };
+        uint8_t  out_u8[8] = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
+        static const uint8_t exp_u8[8] = { 0U, 1U, 127U, 255U, 255U, 255U, 255U, 255U };
+        __asm__ volatile(
+            "vld1.16 {d2, d3}, [%1]\n"
+            "vqmovn.u16 d0, q1\n"
+            "vst1.8 {d0}, [%0]\n"
+            :
+            : "r"(out_u8), "r"(q_u16)
+            : "d0", "d2", "d3", "memory"
+        );
+        for (int i = 0; i < 8; i++) {
+            if (out_u8[i] != exp_u8[i]) {
+                return 30;
+            }
+        }
+
+        int16_t q_su16[8]   = { -500, -1, 0, 42, 127, 200, 255, 256 };
+        uint8_t out_su8[8]  = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
+        static const uint8_t exp_su8[8] = { 0U, 0U, 0U, 42U, 127U, 200U, 255U, 255U };
+        __asm__ volatile(
+            "vld1.16 {d2, d3}, [%1]\n"
+            "vqmovun.s16 d0, q1\n"
+            "vst1.8 {d0}, [%0]\n"
+            :
+            : "r"(out_su8), "r"(q_su16)
+            : "d0", "d2", "d3", "memory"
+        );
+        for (int i = 0; i < 8; i++) {
+            if (out_su8[i] != exp_su8[i]) {
+                return 31;
+            }
+        }
+    }
+
+    /* 19. Regression tests for VSLI.32 vs VSHL.I32, VSRI.32, VSRA.S32, VRSHR.U32, VSHRN.I16 */
+    {
+        uint32_t d0_init[2]  = { 0x11223344U, 0x55667788U };
+        uint32_t d1_in[2]    = { 0xAABBCCDDU, 0xEEFF1234U };
+        uint32_t vsli_out[2] = { 0U, 0U };
+        uint32_t vshl_out[2] = { 0U, 0U };
+        uint32_t vsri_out[2] = { 0U, 0U };
+        __asm__ volatile(
+            "vld1.32 {d0}, [%3]\n"
+            "vld1.32 {d1}, [%4]\n"
+            "vsli.32 d0, d1, #8\n"
+            "vshl.i32 d2, d1, #8\n"
+            "vst1.32 {d0}, [%0]\n"
+            "vst1.32 {d2}, [%1]\n"
+            "vld1.32 {d0}, [%3]\n"
+            "vsri.32 d0, d1, #8\n"
+            "vst1.32 {d0}, [%2]\n"
+            :
+            : "r"(vsli_out), "r"(vshl_out), "r"(vsri_out), "r"(d0_init), "r"(d1_in)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (vsli_out[0] != 0xBBCCDD44U || vsli_out[1] != 0xFF123488U ||
+            vshl_out[0] != 0xBBCCDD00U || vshl_out[1] != 0xFF123400U ||
+            vsri_out[0] != 0x11AABBCCU || vsri_out[1] != 0x55EEFF12U) {
+            return 32;
+        }
+
+        int32_t sra_acc[2] = { 100, -50 };
+        int32_t sra_in[2]  = { 64, -32 };
+        int32_t sra_out[2] = { 0, 0 };
+        __asm__ volatile(
+            "vld1.32 {d0}, [%1]\n"
+            "vld1.32 {d1}, [%2]\n"
+            "vsra.s32 d0, d1, #4\n"
+            "vst1.32 {d0}, [%0]\n"
+            :
+            : "r"(sra_out), "r"(sra_acc), "r"(sra_in)
+            : "d0", "d1", "memory"
+        );
+        if (sra_out[0] != 104 || sra_out[1] != -52) {
+            return 33;
+        }
+
+        uint32_t rshr_in[2]  = { 23U, 24U };
+        uint32_t rshr_out[2] = { 0U, 0U };
+        __asm__ volatile(
+            "vld1.32 {d1}, [%1]\n"
+            "vrshr.u32 d0, d1, #4\n"
+            "vst1.32 {d0}, [%0]\n"
+            :
+            : "r"(rshr_out), "r"(rshr_in)
+            : "d0", "d1", "memory"
+        );
+        if (rshr_out[0] != 1U || rshr_out[1] != 2U) {
+            return 34;
+        }
+
+        uint16_t shrn_in[8] = {
+            0x0120U, 0x0340U, 0x0560U, 0x0780U,
+            0x09A0U, 0x0BC0U, 0x0DE0U, 0x0F10U
+        };
+        uint8_t shrn_out[8] = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
+        static const uint8_t shrn_exp[8] = {
+            0x12U, 0x34U, 0x56U, 0x78U,
+            0x9AU, 0xBCU, 0xDEU, 0xF1U
+        };
+        __asm__ volatile(
+            "vld1.16 {d2, d3}, [%1]\n"
+            "vshrn.i16 d0, q1, #4\n"
+            "vst1.8 {d0}, [%0]\n"
+            :
+            : "r"(shrn_out), "r"(shrn_in)
+            : "d0", "d2", "d3", "memory"
+        );
+        for (int i = 0; i < 8; i++) {
+            if (shrn_out[i] != shrn_exp[i]) {
+                return 35;
+            }
+        }
+    }
+
+    /* 20. Single-lane and all-lane VLD2.8 / VST2.8 */
+    {
+        uint8_t  dup2_in[2] = { 0xAAU, 0x55U };
+        uint64_t dup_d0 = 0ULL, dup_d1 = 0ULL;
+        __asm__ volatile(
+            "vld2.8 {d0[], d1[]}, [%2]\n"
+            "vstr d0, [%0]\n"
+            "vstr d1, [%1]\n"
+            :
+            : "r"(&dup_d0), "r"(&dup_d1), "r"(dup2_in)
+            : "d0", "d1", "memory"
+        );
+        if (dup_d0 != 0xAAAAAAAAAAAAAAAAULL || dup_d1 != 0x5555555555555555ULL) {
+            return 36;
+        }
+
+        uint64_t init_d0 = 0x0706050403020100ULL;
+        uint64_t init_d1 = 0x1716151413121110ULL;
+        uint8_t  lane3_in[2] = { 0xCCU, 0xDDU };
+        uint64_t after_d0 = 0ULL, after_d1 = 0ULL;
+        uint8_t  st_lane3[2] = { 0U, 0U };
+        uint8_t  st_lane5[2] = { 0U, 0U };
+        __asm__ volatile(
+            "vldr d0, [%4]\n"
+            "vldr d1, [%5]\n"
+            "vld2.8 {d0[3], d1[3]}, [%6]\n"
+            "vstr d0, [%0]\n"
+            "vstr d1, [%1]\n"
+            "vst2.8 {d0[3], d1[3]}, [%2]\n"
+            "vst2.8 {d0[5], d1[5]}, [%3]\n"
+            :
+            : "r"(&after_d0), "r"(&after_d1),
+              "r"(st_lane3), "r"(st_lane5),
+              "r"(&init_d0), "r"(&init_d1), "r"(lane3_in)
+            : "d0", "d1", "memory"
+        );
+        if (after_d0 != 0x07060504CC020100ULL ||
+            after_d1 != 0x17161514DD121110ULL ||
+            st_lane3[0] != 0xCCU || st_lane3[1] != 0xDDU ||
+            st_lane5[0] != 0x05U || st_lane5[1] != 0x15U) {
+            return 37;
+        }
+    }
+
+    /*
+     * 21. VQADD, VQSUB, VHADD, VABD, VABA, VPADD, VCLS, VCLZ, VCNT, VABS, VNEG, VSWP,
+     *     and scalar VNMUL.F32 / VNMUL.F64
+     */
+    {
+        /* 21a: VQADD.S16 & VQSUB.S16 */
+        int16_t qa_in1[4] = { 30000, -30000, 100, -100 };
+        int16_t qa_in2[4] = { 10000, -10000, 200, 50 };
+        int16_t qa_out[4] = { 0, 0, 0, 0 };
+        int16_t qs_out[4] = { 0, 0, 0, 0 };
+        __asm__ volatile(
+            "vld1.16 {d1}, [%2]\n"
+            "vld1.16 {d2}, [%3]\n"
+            "vqadd.s16 d0, d1, d2\n"
+            "vqsub.s16 d3, d1, d2\n"
+            "vst1.16 {d0}, [%0]\n"
+            "vst1.16 {d3}, [%1]\n"
+            :
+            : "r"(qa_out), "r"(qs_out), "r"(qa_in1), "r"(qa_in2)
+            : "d0", "d1", "d2", "d3", "memory"
+        );
+        if (qa_out[0] != 32767 || qa_out[1] != -32768 || qa_out[2] != 300 || qa_out[3] != -50 ||
+            qs_out[0] != 20000 || qs_out[1] != -20000 || qs_out[2] != -100 || qs_out[3] != -150) {
+            return 38;
+        }
+
+        /* 21b: VHADD.S32 */
+        int32_t ha_in1[2] = { 0x7FFFFFF0, -100 };
+        int32_t ha_in2[2] = { 0x00000010, -200 };
+        int32_t ha_out[2] = { 0, 0 };
+        __asm__ volatile(
+            "vld1.32 {d1}, [%1]\n"
+            "vld1.32 {d2}, [%2]\n"
+            "vhadd.s32 d0, d1, d2\n"
+            "vst1.32 {d0}, [%0]\n"
+            :
+            : "r"(ha_out), "r"(ha_in1), "r"(ha_in2)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (ha_out[0] != 0x40000000 || ha_out[1] != -150) {
+            return 39;
+        }
+
+        /* 21c: VABD.S16 & VABA.S16 */
+        int16_t abd_in1[4] = { -10, 50, 100, -5 };
+        int16_t abd_in2[4] = { 20, -10, 100, -25 };
+        int16_t aba_acc[4] = { 100, 200, 300, 400 };
+        int16_t abd_out[4] = { 0, 0, 0, 0 };
+        int16_t aba_out[4] = { 0, 0, 0, 0 };
+        __asm__ volatile(
+            "vld1.16 {d1}, [%2]\n"
+            "vld1.16 {d2}, [%3]\n"
+            "vld1.16 {d3}, [%4]\n"
+            "vabd.s16 d0, d1, d2\n"
+            "vaba.s16 d3, d1, d2\n"
+            "vst1.16 {d0}, [%0]\n"
+            "vst1.16 {d3}, [%1]\n"
+            :
+            : "r"(abd_out), "r"(aba_out), "r"(abd_in1), "r"(abd_in2), "r"(aba_acc)
+            : "d0", "d1", "d2", "d3", "memory"
+        );
+        if (abd_out[0] != 30 || abd_out[1] != 60 || abd_out[2] != 0 || abd_out[3] != 20 ||
+            aba_out[0] != 130 || aba_out[1] != 260 || aba_out[2] != 300 || aba_out[3] != 420) {
+            return 40;
+        }
+
+        /* 21d: VPADD.I32 & VPADD.F32 */
+        int32_t vp_i1[2] = { 10, 20 };
+        int32_t vp_i2[2] = { 300, 400 };
+        int32_t vp_io[2] = { 0, 0 };
+        float   vp_f1[2] = { 1.5f, 2.5f };
+        float   vp_f2[2] = { 10.0f, 20.0f };
+        float   vp_fo[2] = { 0.0f, 0.0f };
+        __asm__ volatile(
+            "vld1.32 {d1}, [%2]\n"
+            "vld1.32 {d2}, [%3]\n"
+            "vpadd.i32 d0, d1, d2\n"
+            "vst1.32 {d0}, [%0]\n"
+            "vld1.32 {d1}, [%4]\n"
+            "vld1.32 {d2}, [%5]\n"
+            "vpadd.f32 d0, d1, d2\n"
+            "vst1.32 {d0}, [%1]\n"
+            :
+            : "r"(vp_io), "r"(vp_fo), "r"(vp_i1), "r"(vp_i2), "r"(vp_f1), "r"(vp_f2)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (vp_io[0] != 30 || vp_io[1] != 700 || vp_fo[0] != 4.0f || vp_fo[1] != 30.0f) {
+            return 41;
+        }
+
+        /* 21e: VCLS.S32, VCLZ.I32, VCNT.8 */
+        uint32_t cls_in[2]  = { 0x1FFFFFFFU, 0xC0000000U };
+        uint32_t cls_out[2] = { 0U, 0U };
+        uint32_t clz_in[2]  = { 0x00080000U, 0x00000001U };
+        uint32_t clz_out[2] = { 0U, 0U };
+        uint8_t  cnt_in[8]  = { 0x00U, 0x01U, 0x03U, 0x0FU, 0x55U, 0xAAU, 0x7FU, 0xFFU };
+        uint8_t  cnt_out[8] = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
+        static const uint8_t cnt_exp[8] = { 0U, 1U, 2U, 4U, 4U, 4U, 7U, 8U };
+        __asm__ volatile(
+            "vld1.32 {d1}, [%3]\n"
+            "vcls.s32 d0, d1\n"
+            "vst1.32 {d0}, [%0]\n"
+            "vld1.32 {d1}, [%4]\n"
+            "vclz.i32 d0, d1\n"
+            "vst1.32 {d0}, [%1]\n"
+            "vld1.8 {d1}, [%5]\n"
+            "vcnt.8 d0, d1\n"
+            "vst1.8 {d0}, [%2]\n"
+            :
+            : "r"(cls_out), "r"(clz_out), "r"(cnt_out),
+              "r"(cls_in), "r"(clz_in), "r"(cnt_in)
+            : "d0", "d1", "memory"
+        );
+        if (cls_out[0] != 2U || cls_out[1] != 1U ||
+            clz_out[0] != 12U || clz_out[1] != 31U) {
+            return 42;
+        }
+        for (int i = 0; i < 8; i++) {
+            if (cnt_out[i] != cnt_exp[i]) {
+                return 43;
+            }
+        }
+
+        /* 21f: VABS.S32, VNEG.S32, VSWP */
+        int32_t an_in[2]   = { -42, 99 };
+        int32_t abs_out[2] = { 0, 0 };
+        int32_t neg_out[2] = { 0, 0 };
+        __asm__ volatile(
+            "vld1.32 {d2}, [%2]\n"
+            "vabs.s32 d0, d2\n"
+            "vneg.s32 d1, d2\n"
+            "vswp d0, d1\n"
+            "vst1.32 {d1}, [%0]\n"
+            "vst1.32 {d0}, [%1]\n"
+            :
+            : "r"(abs_out), "r"(neg_out), "r"(an_in)
+            : "d0", "d1", "d2", "memory"
+        );
+        if (abs_out[0] != 42 || abs_out[1] != 99 ||
+            neg_out[0] != 42 || neg_out[1] != -99) {
+            return 44;
+        }
+
+        /* 21g: Scalar VNMUL.F32 and VNMUL.F64 */
+        float nm_f1 = 3.5f, nm_f2 = 2.0f, nm_fo = 0.0f;
+        __asm__ volatile("vnmul.f32 %0, %1, %2" : "=t"(nm_fo) : "t"(nm_f1), "t"(nm_f2));
+        if (nm_fo != -7.0f) {
+            return 45;
+        }
+        double nm_d1 = -6.25, nm_d2 = 4.0, nm_do = 0.0;
+        __asm__ volatile("vnmul.f64 %0, %1, %2" : "=w"(nm_do) : "w"(nm_d1), "w"(nm_d2));
+        if (nm_do != 25.0) {
+            return 46;
+        }
+    }
+
     static const char pass_msg[] = "M4 VFPv4-D32 & NEON: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;
