@@ -1365,14 +1365,18 @@ int a32_jit_run(a32_ctx_t *ctx)
                     }
                 }
                 if (found_e != NULL && found_code != NULL) {
-                    ctx->ras[top].key       = ret_key;
-                    ctx->ras[top].epoch     = epoch;
-                    ctx->ras[top].host_code = found_code;
-                    ctx->ras[top].entry     = found_e;
-                    ctx->ras_key[top]       = ret_key;
-                    ctx->ras_epoch[top]     = epoch;
-                    ctx->ras_code[top]      = found_code;
-                    ctx->ras_entry[top]     = found_e;
+                    ctx->ibtc[r_ibtc].key       = ret_key;
+                    ctx->ibtc[r_ibtc].epoch     = epoch;
+                    ctx->ibtc[r_ibtc].host_code = found_code;
+                    ctx->ibtc[r_ibtc].entry     = found_e;
+                    ctx->ras[top].key           = ret_key;
+                    ctx->ras[top].epoch         = epoch;
+                    ctx->ras[top].host_code     = found_code;
+                    ctx->ras[top].entry         = found_e;
+                    ctx->ras_key[top]           = ret_key;
+                    ctx->ras_epoch[top]         = epoch;
+                    ctx->ras_code[top]          = found_code;
+                    ctx->ras_entry[top]         = found_e;
                     if (cur_entry != NULL && !uncached) {
                         atomic_store_explicit(&cur_entry->ret_epoch, 0U, memory_order_release);
                         atomic_store_explicit(&cur_entry->ret_key, ret_key, memory_order_relaxed);

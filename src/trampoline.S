@@ -90,26 +90,9 @@ a32_jit_run_block:
     and     w24, w15, w25           /* aligned_pc = w15 & align_mask */
     orr     w24, w24, w26           /* next_key = aligned_pc | is_thumb */
 
-    ldar    w21, [x28]              /* cur_epoch = g_cache_epoch */
+    ldr     w21, [x28]              /* cur_epoch = g_cache_epoch */
     cbz     w21, .Lslow_exit
     orr     x24, x24, x21, lsl #32  /* x24 = next_key (lo32) | cur_epoch (hi32) */
-
-.Lcheck_ras_pop:
-    add     x30, x19, #8, lsl #12   /* x30 = x19 + 0x8000 */
-    ldr     w17, [x30, #0x9a8]      /* w17 = ctx->ras_top */
-    sub     w17, w17, #1
-    ubfx    x22, x17, #0, #6        /* x22 = r_idx = (ras_top - 1) & 63 */
-    add     x22, x30, x22, lsl #5   /* x22 = x19 + 0x8000 + r_idx * 32 */
-    ldr     x23, [x22, #0x1a0]      /* ras[r_idx].key | (ras[r_idx].epoch << 32) */
-    eor     x23, x23, x24
-    cbnz    x23, .Ltry_chain0
-    /* RAS match: x23 == 0 */
-    and     w17, w17, #0x3f
-    str     w17, [x30, #0x9a8]      /* ctx->ras_top = r_idx */
-    str     xzr, [x22, #0x1a0]      /* clear popped RAS slot */
-    ldp     x17, x23, [x22, #0x1a8] /* x17 = host_code, x23 = entry */
-    mov     w22, #2                 /* 2 = ras hit */
-    b       .Lverify_entry
 
 .Ltry_chain0:
     ldr     w23, [x27, #24]         /* chain_epoch[0] */
@@ -120,8 +103,21 @@ a32_jit_run_block:
     cbnz    w17, .Ltry_chain1
     ldr     x17, [x27, #32]         /* chain_code[0] */
     ldr     x23, [x27, #48]         /* chain_entry[0] */
-    mov     w22, #0                 /* 0 = chain hit */
-    b       .Lverify_entry
+
+.Lverify_chain:
+    cbz     x17, .Lslow_exit
+    cbz     x23, .Lslow_exit
+    ldp     x21, x30, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x24, x24, x21
+    eor     x30, x30, x17
+    orr     x24, x24, x30
+    cbnz    x24, .Lslow_exit
+    mov     x27, x23                /* cur_entry = next_entry */
+    ldp     x21, x22, [x19, #384]   /* blocks_executed, chain_hits */
+    add     x21, x21, #1
+    add     x22, x22, #1
+    stp     x21, x22, [x19, #384]
+    b       .Lrun_loop
 
 .Ltry_chain1:
     ldr     w23, [x27, #28]         /* chain_epoch[1] */
@@ -132,8 +128,7 @@ a32_jit_run_block:
     cbnz    w17, .Ltry_ibtc
     ldr     x17, [x27, #40]         /* chain_code[1] */
     ldr     x23, [x27, #56]         /* chain_entry[1] */
-    mov     w22, #0                 /* 0 = chain hit */
-    b       .Lverify_entry
+    b       .Lverify_chain
 
 .Ltry_ibtc:
     eor     w17, w26, w24, lsr #1   /* (next_key >> 1) ^ is_thumb */
@@ -141,95 +136,51 @@ a32_jit_run_block:
     add     x22, x19, x17, lsl #5   /* x22 = (uint8_t *)ctx + ibtc_idx * 32 */
     ldr     x17, [x22, #416]        /* ibtc.key (lo32) | ibtc.epoch (hi32) */
     eor     x17, x17, x24
-    cbnz    x17, .Lslow_exit
+    cbnz    x17, .Lcheck_ras_pop
     ldp     x17, x23, [x22, #424]   /* ibtc.host_code, ibtc.entry */
-    mov     w22, #1                 /* 1 = ibtc hit */
-
-.Lverify_entry:
     cbz     x17, .Lslow_exit
     cbz     x23, .Lslow_exit
-    ldar    x21, [x23]              /* next_entry->key (lo32) | next_entry->epoch (hi32) */
+    ldp     x21, x30, [x23]         /* next_entry->key|epoch, next_entry->host_code */
     eor     x24, x24, x21
+    eor     x30, x30, x17
+    orr     x24, x24, x30
     cbnz    x24, .Lslow_exit
-    ldr     x24, [x23, #8]          /* next_entry->host_code */
-    eor     x24, x24, x17
-    cbnz    x24, .Lslow_exit
-    ldar    w24, [x28]              /* re-verify g_cache_epoch */
-    eor     x24, x24, x21, lsr #32
-    cbnz    w24, .Lslow_exit
-
-    /* In-trampoline RAS push when cur_entry->is_call != 0 (only after fast transition verified) */
-    ldrb    w16, [x27, #76]         /* cur_entry->is_call */
-    cbz     w16, .Lfinish_step
-    and     w16, w14, w25           /* lr_aligned = w14 & align_mask */
-    ldr     w24, [x27, #68]         /* cur_entry->guest_end_pc */
-    eor     w24, w24, w16           /* lr_aligned must equal guest_end_pc */
-    cbnz    w24, .Lfinish_step
-    orr     w16, w16, w26           /* ret_key = lr_aligned | is_thumb */
-    eor     w24, w16, w21           /* w21 lo32 is next_key; if ret_key == next_key, not a call */
-    cbz     w24, .Lfinish_step
-    lsr     x21, x21, #32           /* w21 = cur_epoch */
-    ldr     w24, [x27, #84]         /* cur_entry->ret_epoch */
-    eor     w24, w24, w21           /* == cur_epoch? */
-    cbnz    w24, .Lras_lookup_ibtc
-    ldr     w24, [x27, #80]         /* cur_entry->ret_key */
-    eor     w24, w24, w16
-    cbnz    w24, .Lras_lookup_ibtc
-    ldp     x15, x24, [x27, #88]    /* x15 = ret_code, x24 = ret_entry */
-    b       .Lras_do_push
-
-.Lras_lookup_ibtc:
-    eor     w24, w26, w16, lsr #1   /* ibtc_idx = ((ret_key >> 1) ^ is_thumb) & 1023 */
-    and     w24, w24, #0x3ff
-    add     x24, x19, x24, lsl #5   /* x24 = ctx + ibtc_idx * 32 */
-    orr     x15, x16, x21, lsl #32  /* x15 = ret_key | (cur_epoch << 32) */
-    ldr     x30, [x24, #416]        /* ibtc.key | (ibtc.epoch << 32) */
-    eor     x30, x30, x15
-    cbnz    x30, .Lfinish_step      /* Not in IBTC yet -> skip fast push */
-    ldp     x15, x24, [x24, #424]   /* x15 = ibtc.host_code, x24 = ibtc.entry */
-    cbz     x15, .Lfinish_step
-    cbz     x24, .Lfinish_step
-    /* Cache in cur_entry->ret_* for next time */
-    str     wzr, [x27, #84]
-    str     w16, [x27, #80]
-    stp     x15, x24, [x27, #88]
-    add     x30, x27, #84
-    stlr    w21, [x30]
-
-.Lras_do_push:
-    orr     x16, x16, x21, lsl #32  /* x16 = ret_key | (cur_epoch << 32) */
-    add     x30, x19, #8, lsl #12   /* x30 = x19 + 0x8000 */
-    ldr     w21, [x30, #0x9a8]      /* w21 = ras_top */
-    and     w21, w21, #0x3f
-    add     x30, x30, x21, lsl #5   /* x30 = x19 + 0x8000 + ras_top * 32 */
-    str     x16, [x30, #0x1a0]      /* ras.key | (ras.epoch << 32) */
-    stp     x15, x24, [x30, #0x1a8] /* ras.host_code, ras.entry */
-    add     w21, w21, #1
-    and     w21, w21, #0x3f
-    add     x30, x19, #8, lsl #12
-    str     w21, [x30, #0x9a8]      /* ctx->ras_top = (ras_top + 1) & 63 */
-
-.Lfinish_step:
     mov     x27, x23                /* cur_entry = next_entry */
     ldr     x21, [x19, #384]        /* blocks_executed */
+    ldr     x22, [x19, #408]        /* ibtc_hits */
     add     x21, x21, #1
+    add     x22, x22, #1
     str     x21, [x19, #384]
-    cbz     w22, .Linc_chain
-    tbz     w22, #0, .Linc_ras
-    ldr     x21, [x19, #408]        /* ibtc_hits */
-    add     x21, x21, #1
-    str     x21, [x19, #408]
+    str     x22, [x19, #408]
     b       .Lrun_loop
-.Linc_chain:
-    ldr     x21, [x19, #392]        /* chain_hits */
+
+.Lcheck_ras_pop:
+    add     x30, x19, #8, lsl #12   /* x30 = x19 + 0x8000 */
+    ldr     w17, [x30, #0x9a8]      /* w17 = ctx->ras_top */
+    sub     w17, w17, #1
+    ubfx    x22, x17, #0, #6        /* x22 = r_idx = (ras_top - 1) & 63 */
+    add     x22, x30, x22, lsl #5   /* x22 = x19 + 0x8000 + r_idx * 32 */
+    ldr     x23, [x22, #0x1a0]      /* ras[r_idx].key | (ras[r_idx].epoch << 32) */
+    eor     x23, x23, x24
+    cbnz    x23, .Lslow_exit
+    and     w17, w17, #0x3f
+    str     w17, [x30, #0x9a8]      /* ctx->ras_top = r_idx */
+    str     xzr, [x22, #0x1a0]      /* clear popped RAS slot */
+    ldp     x17, x23, [x22, #0x1a8] /* x17 = host_code, x23 = entry */
+    cbz     x17, .Lslow_exit
+    cbz     x23, .Lslow_exit
+    ldp     x21, x22, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x24, x24, x21
+    eor     x22, x22, x17
+    orr     x24, x24, x22
+    cbnz    x24, .Lslow_exit
+    mov     x27, x23                /* cur_entry = next_entry */
+    ldr     x21, [x19, #384]        /* blocks_executed */
+    ldr     x22, [x30, #0x9a0]      /* ras_hits */
     add     x21, x21, #1
-    str     x21, [x19, #392]
-    b       .Lrun_loop
-.Linc_ras:
-    add     x30, x19, #8, lsl #12
-    ldr     x21, [x30, #0x9a0]      /* ras_hits */
-    add     x21, x21, #1
-    str     x21, [x30, #0x9a0]
+    add     x22, x22, #1
+    str     x21, [x19, #384]
+    str     x22, [x30, #0x9a0]
     b       .Lrun_loop
 
 .Lslow_exit:

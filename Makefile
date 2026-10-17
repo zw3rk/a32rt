@@ -273,13 +273,13 @@ bench-hl: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite under
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(BUILD_DIR)/bench-suite-aarch64)
 	@printf "\033[36m=== [hyper-linux] 2. a32rt A32 (Cold JIT, G=4GiB) ===\033[0m\n"
 	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
-	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@printf "\033[36m=== [hyper-linux] 3. a32rt A32 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@printf "\033[36m=== [hyper-linux] 4. a32rt Thumb-2 (Cold JIT, G=4GiB) ===\033[0m\n"
 	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
-	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
 	@printf "\033[36m=== [hyper-linux] 5. a32rt Thumb-2 (Warm .a32cache AOT, G=4GiB) ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
@@ -291,11 +291,14 @@ bench-lima: $(A32RT_BIN) $(BENCH_BINS) ## Run multi-workload benchmark suite ins
 	@printf "\033[36m=== [Lima Linux VM] 1. Native aarch64-linux ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(BUILD_DIR)/bench-suite-aarch64)
 	@printf "\033[36m=== [Lima Linux VM] 2. a32rt A32 (Warm .a32cache AOT, G=0) ===\033[0m\n"
-	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
-	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(BUILD_DIR)/bench-suite-armhf)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@printf "\033[36m=== [Lima Linux VM] 3. a32rt Thumb-2 (Warm .a32cache AOT, G=0) ===\033[0m\n"
-	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
-	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats $(abspath $(BUILD_DIR)/bench-suite-thumb)
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
 	@printf "\033[36m=== [Lima Linux VM] 4. qemu-arm 10.1.0 TCG (A32) ===\033[0m\n"
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- qemu-arm $(abspath $(BUILD_DIR)/bench-suite-armhf)
 	@printf "\033[36m=== [Lima Linux VM] 5. qemu-arm 10.1.0 TCG (Thumb-2) ===\033[0m\n"

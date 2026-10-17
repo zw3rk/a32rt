@@ -162,29 +162,29 @@ All times in microseconds (`us`, lower is better):
 
 | Translator / Target | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | **vs. `qemu-arm`** |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Native `aarch64-linux`** | `aarch64` | 812 | 1,161 | 431 | 2,132 | 1,419 | **5,955** | 8.54× |
+| **Native `aarch64-linux`** | `aarch64` | 803 | 958 | 432 | 2,131 | 1,337 | **5,661** | 8.98× |
 | **Apple `RosettaLinux`** | `x86_64` | 973 | 2,071 | 733 | 3,714 | 775 | **8,266** | 6.15× |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **5,224** | **2,652** | **2,896** | **15,650** | **915** | **27,337** | **1.86× faster** |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **5,463** | **2,630** | **3,122** | **15,667** | **924** | **27,806** | **1.83× faster** |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **4,442** | **3,402** | **2,918** | **12,131** | **967** | **23,860** | **2.13× faster** |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **4,694** | **3,251** | **2,695** | **13,063** | **1,066** | **24,769** | **2.05× faster** |
 | **`qemu-arm` 10.1.0 (TCG)** | `armhf` (Thumb-2) | 6,206 | 3,676 | 14,726 | 24,781 | 1,277 | **50,666** | 1.00× |
 | **`qemu-arm` 10.1.0 (TCG)** | `armhf` (A32) | 6,827 | 5,680 | 15,183 | 21,568 | 1,593 | **50,851** | 1.00× (baseline) |
 | **`qemu-i386` 10.1.0 (TCG)** | `i386` (32-bit x86) | 5,889 | 12,086 | 15,680 | 29,731 | 2,471 | **65,857** | 0.77× |
 | **`qemu-x86_64` 10.1.0 (TCG)** | `x86_64` | 23,292 | 4,727 | 16,834 | 23,924 | 2,373 | **71,150** | 0.71× |
 
 Key takeaways:
-- **`a32rt` vs. `qemu-arm` 10.1.0 (TCG)**: `a32rt` beats `qemu-arm` on **every single workload**: **1.19×–1.25× faster** on `coremark`, **1.39×–2.16× faster** on `chacha20`, **4.86×–5.09× faster** on `vfp_simd` (where `a32rt` lowers VFPv4-D32 / NEON directly to hardware AArch64 FP/ASIMD instructions rather than softfloat helpers), **1.38×–1.58× faster** on `calls_ibtc` (with **`3,571,150` in-trampoline 64-entry `RAS` hits** and zero C dispatcher fallbacks), and **1.40×–1.72× faster** on `syscalls`.
-- **`a32rt` vs. `qemu-x86_64` / `qemu-i386`**: `a32rt` is **2.6× faster** than `qemu-x86_64` and **2.4× faster** than `qemu-i386`.
+- **`a32rt` vs. `qemu-arm` 10.1.0 (TCG)**: `a32rt` beats `qemu-arm` on **every single workload**: **1.40×–1.45× faster** on `coremark`, **1.08×–1.75× faster** on `chacha20`, **5.05×–5.63× faster** on `vfp_simd` (where `a32rt` lowers VFPv4-D32 / NEON directly to hardware AArch64 FP/ASIMD instructions rather than softfloat helpers), **1.65×–2.04× faster** on `calls_ibtc` (`12,131 us` Thumb-2 and `13,063 us` A32 vs. `24,781 us` / `21,568 us` for `qemu-arm`), and **1.32×–1.49× faster** on `syscalls`.
+- **`a32rt` vs. `qemu-x86_64` / `qemu-i386`**: `a32rt` is **2.9×–3.0× faster** than `qemu-x86_64` and **2.7×–2.8× faster** than `qemu-i386`.
 
 ### 2. `hyper-linux` (`hl` on macOS Apple M5, Offset Mode `G = 4 GiB`)
 
-| Translator / Target (`hl`) | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | Runtime `blocks_compiled` / `ras_hits` |
+| Translator / Target (`hl`) | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | Runtime `blocks_compiled` |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Native `aarch64-linux`** | `aarch64` | 798 | 956 | 461 | 2,031 | 10,640 | **14,886** | — |
-| **Apple `RosettaLinux`** | `x86_64` | 882 | 1,687 | 736 | 3,167 | 11,799 | **18,271** | — (AOT) |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **5,142** | **2,313** | **2,514** | **15,033** | **11,387** | **36,389** | **`1` / `3,571,150`** |
-| **`a32rt` (Cold JIT)** | **`armhf` (Thumb-2)** | 6,148 | 2,284 | 2,390 | 14,448 | 11,142 | **36,412** | `122` / `3,571,150` |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **5,928** | **2,283** | **2,510** | **13,870** | **13,489** | **38,080** | **`2` / `3,571,150`** |
-| **`a32rt` (Cold JIT)** | **`armhf` (A32)** | 6,007 | 2,301 | 2,283 | 16,361 | 16,044 | **42,996** | `117` / `3,571,136` |
+| **Native `aarch64-linux`** | `aarch64` | 807 | 1,057 | 555 | 2,156 | 12,808 | **17,383** | — |
+| **Apple `RosettaLinux`** | `x86_64` | 832 | 1,690 | 810 | 4,305 | 10,598 | **18,235** | — (AOT) |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **3,543** | **2,090** | **2,395** | **8,322** | **11,338** | **27,688** | **`2`** |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **3,664** | **1,993** | **2,407** | **9,122** | **11,374** | **28,560** | **`1`** |
+| **`a32rt` (Cold JIT)** | **`armhf` (A32)** | 4,556 | 2,400 | 2,910 | 10,168 | 11,061 | **31,095** | `117` |
+| **`a32rt` (Cold JIT)** | **`armhf` (Thumb-2)** | 3,798 | 2,521 | 2,892 | 10,071 | 13,302 | **32,584** | `122` |
 
 ---
 
@@ -192,7 +192,9 @@ Key takeaways:
 
 All `M0`–`M5` and `M0-hl`–`M5-hl` milestones specified in [`A32RT.md`](A32RT.md) — as well as the 64-entry in-trampoline `RAS`, full ARMv8-A AArch32 user-mode ISA (`VSEL`, `VMAXNM`/`VMINNM`, `VRINT*`, `VCVT{A,N,P,M}`, `CRC32`/`CRC32C`, and `AES`/`PMULL`/`SHA1`/`SHA256` Crypto), multi-region `PT_INTERP`/`.so` `.a32cache` AOT pre-translation, `VFP_MAGIC` (`0x56465001`) signal frame `uc_regspace` support, and block/network `ioctl` translation — are complete and verified. Potential future enhancements include:
 
-- **Cross-Block Superblock Register Allocation for `d0`–`d31`**: Keeping guest VFP/NEON `d0`–`d31` resident in host `v0`–`v31` across entire `a32_jit_run_block` dispatch chains rather than loading/storing `d` registers at basic-block boundaries.
+- **Direct Native Code-to-Code Patching / Superblock Emission**: Emitting direct AArch64 `B <target>` branches between chained basic blocks inside the executable code cache (or forming multi-block trace superblocks) so hot loops and `bl`/`bx lr` pairs stay inside the code cache without returning to `trampoline.S` (`blr x17` / `ret`) on every basic block.
+- **Cross-Block Register Allocation for `d0`–`d31`**: Keeping guest VFP/NEON `d0`–`d31` resident in host `v0`–`v31` across entire `a32_jit_run_block` dispatch chains rather than loading/storing `d` registers to `ctx->vregs` at basic-block boundaries.
+- **Base-Address-Independent (Relocatable) `.so` AOT Blocks**: Recording guest-PC immediate fixups in `.a32cache` so shared libraries mapped via `mmap2(PROT_EXEC)` at an arbitrary ASLR `load_bias` can relocate pre-translated A64 blocks rather than requiring a matching `load_bias`.
 - **Specialized Multimedia/DRM `ioctl` Device Families**: Extending `ARM_NR_ioctl` struct translation for specialized multimedia or GPU device families (`V4L2`, `DRM`, `ALSA`) if needed by desktop/GUI workloads.
 
 ---

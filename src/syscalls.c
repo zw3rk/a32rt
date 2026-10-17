@@ -2405,7 +2405,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         struct timespec ts;
-        if (clock_gettime((clockid_t)a0, &ts) != 0) {
+        if (syscall(SYS_clock_gettime, (long)a0, &ts) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             arm_timespec32_t ts32;
@@ -2423,7 +2423,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         struct timespec ts;
-        if (clock_gettime((clockid_t)a0, &ts) != 0) {
+        if (syscall(SYS_clock_gettime, (long)a0, &ts) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             arm_timespec64_t ts64;
@@ -2484,7 +2484,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         struct timeval tv;
         struct timezone tz;
         memset(&tz, 0, sizeof(tz));
-        if (gettimeofday(&tv, (a1 != 0U) ? &tz : NULL) != 0) {
+        if (syscall(SYS_gettimeofday, &tv, (a1 != 0U) ? &tz : NULL) != 0) {
             ctx->regs[0] = (uint32_t)(-errno);
         } else {
             if (a0 != 0U) {
