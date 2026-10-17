@@ -13,13 +13,17 @@
     .globl a32_jit_run_block
     .type a32_jit_run_block, %function
 a32_jit_run_block:
-    stp     x29, x30, [sp, #-96]!
-    mov     x29, sp
+    stp     x29, x30, [sp, #-160]!
+    mov     x29, #0                 /* x29 = accumulated in-trampoline chain_hits delta */
     stp     x19, x20, [sp, #16]
     stp     x21, x22, [sp, #32]
     stp     x23, x24, [sp, #48]
     stp     x25, x26, [sp, #64]
     stp     x27, x28, [sp, #80]
+    stp     d8,  d9,  [sp, #96]
+    stp     d10, d11, [sp, #112]
+    stp     d12, d13, [sp, #128]
+    stp     d14, d15, [sp, #144]
 
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
@@ -79,72 +83,54 @@ a32_jit_run_block:
     eor     w17, w17, w26           /* bit 0 must match current is_thumb */
     cbnz    w17, .Lslow_exit
 .Lmode_ok:
-    ldr     w17, [x19, #88]         /* ctx->itstate */
-    ldr     w23, [x19, #376]        /* trace | gdb | single_step | sync_sig_delivered */
-    orr     w17, w17, w23
-    cbnz    w17, .Lslow_exit
-    ldp     x17, x23, [x19, #360]   /* sig_mask, pending_signals */
-    bic     x17, x23, x17
-    cbnz    x17, .Lslow_exit
-
-    and     w24, w15, w25           /* aligned_pc = w15 & align_mask */
-    orr     w24, w24, w26           /* next_key = aligned_pc | is_thumb */
-
+    ldp     x17, x23, [x19, #368]   /* pending_signals (64b), trace|gdb|single_step|sync_sig (32b) */
+    ldr     w22, [x19, #88]         /* ctx->itstate */
+    orr     w22, w23, w22           /* w22 = flags | itstate (zero-extended to x22) */
+    orr     x23, x17, x22           /* x23 = pending_signals | flags | itstate */
+    cbnz    x23, .Lcheck_signals_slow
+.Lsignals_ok:
     ldr     w21, [x28]              /* cur_epoch = g_cache_epoch */
+    and     w24, w15, w25           /* aligned_pc = w15 & align_mask */
     cbz     w21, .Lslow_exit
+    orr     w24, w24, w26           /* next_key = aligned_pc | is_thumb */
     orr     x24, x24, x21, lsl #32  /* x24 = next_key (lo32) | cur_epoch (hi32) */
 
 .Ltry_chain0:
-    ldr     w23, [x27, #24]         /* chain_epoch[0] */
-    eor     w23, w23, w21
-    cbnz    w23, .Lslow_exit        /* slot 0 empty/stale -> let C chain it */
-    ldr     w17, [x27, #16]         /* chain_key[0] */
-    eor     w17, w17, w24
-    cbnz    w17, .Ltry_chain1
-    ldr     x17, [x27, #32]         /* chain_code[0] */
-    ldr     x23, [x27, #48]         /* chain_entry[0] */
-
-.Lverify_chain:
+    ldr     x23, [x27, #48]         /* x23 = cur_entry->chain_entry[0] */
+    cbz     x23, .Lslow_exit        /* slot 0 empty -> let C chain it */
+    ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x21, x21, x24
+    cbnz    x21, .Ltry_chain1
     cbz     x17, .Lslow_exit
-    cbz     x23, .Lslow_exit
-    ldp     x21, x30, [x23]         /* next_entry->key|epoch, next_entry->host_code */
-    eor     x24, x24, x21
-    eor     x30, x30, x17
-    orr     x24, x24, x30
-    cbnz    x24, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
-    ldp     x21, x22, [x19, #384]   /* blocks_executed, chain_hits */
-    add     x21, x21, #1
-    add     x22, x22, #1
-    stp     x21, x22, [x19, #384]
+    add     x29, x29, #1            /* chain_hits_delta++ */
     b       .Lrun_loop
 
 .Ltry_chain1:
-    ldr     w23, [x27, #28]         /* chain_epoch[1] */
-    eor     w23, w23, w21
-    cbnz    w23, .Lslow_exit        /* slot 1 empty/stale -> let C chain it */
-    ldr     w17, [x27, #20]         /* chain_key[1] */
-    eor     w17, w17, w24
-    cbnz    w17, .Ltry_ibtc
-    ldr     x17, [x27, #40]         /* chain_code[1] */
-    ldr     x23, [x27, #56]         /* chain_entry[1] */
-    b       .Lverify_chain
+    lsr     x21, x21, #32           /* if slot 0 missed due to stale epoch, re-chain in C */
+    cbnz    x21, .Lslow_exit
+    ldr     x23, [x27, #56]         /* x23 = cur_entry->chain_entry[1] */
+    cbz     x23, .Lslow_exit        /* slot 1 empty -> let C chain it */
+    ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x21, x21, x24
+    cbnz    x21, .Ltry_ibtc
+    cbz     x17, .Lslow_exit
+    mov     x27, x23                /* cur_entry = next_entry */
+    add     x29, x29, #1            /* chain_hits_delta++ */
+    b       .Lrun_loop
 
 .Ltry_ibtc:
+    lsr     x21, x21, #32           /* if slot 1 missed due to stale epoch, re-chain in C */
+    cbnz    x21, .Lslow_exit
     eor     w17, w26, w24, lsr #1   /* (next_key >> 1) ^ is_thumb */
     and     w17, w17, #0x3ff        /* ibtc_idx = ... & 1023 */
     add     x22, x19, x17, lsl #5   /* x22 = (uint8_t *)ctx + ibtc_idx * 32 */
-    ldr     x17, [x22, #416]        /* ibtc.key (lo32) | ibtc.epoch (hi32) */
-    eor     x17, x17, x24
-    cbnz    x17, .Lcheck_ras_pop
-    ldp     x17, x23, [x22, #424]   /* ibtc.host_code, ibtc.entry */
+    ldr     x23, [x22, #432]        /* x23 = ibtc.entry */
+    cbz     x23, .Lcheck_ras_pop
+    ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x21, x21, x24
+    cbnz    x21, .Lcheck_ras_pop
     cbz     x17, .Lslow_exit
-    cbz     x23, .Lslow_exit
-    ldp     x21, x30, [x23]         /* next_entry->key|epoch, next_entry->host_code */
-    eor     x24, x24, x21
-    eor     x30, x30, x17
-    orr     x24, x24, x30
-    cbnz    x24, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
     ldr     x21, [x19, #384]        /* blocks_executed */
     ldr     x22, [x19, #408]        /* ibtc_hits */
@@ -183,7 +169,20 @@ a32_jit_run_block:
     str     x22, [x30, #0x9a0]
     b       .Lrun_loop
 
+.Lcheck_signals_slow:
+    cbnz    w22, .Lslow_exit        /* flags or itstate non-zero -> slow exit */
+    ldr     x23, [x19, #360]        /* ctx->sig_mask */
+    bic     x17, x17, x23           /* unmasked pending_signals */
+    cbnz    x17, .Lslow_exit
+    b       .Lsignals_ok
+
 .Lslow_exit:
+    cbz     x29, 4f
+    ldp     x21, x22, [x19, #384]   /* blocks_executed, chain_hits */
+    add     x21, x21, x29
+    add     x22, x22, x29
+    stp     x21, x22, [x19, #384]
+4:
     str     x27, [x19, #400]        /* ctx->last_exec_entry = cur_entry */
 
     /* Capture hardware NZCV immediately */
@@ -225,11 +224,15 @@ a32_jit_run_block:
     /* Return exit_reason in w0 */
     mov     w0, w16
 
+    ldp     d8,  d9,  [sp, #96]
+    ldp     d10, d11, [sp, #112]
+    ldp     d12, d13, [sp, #128]
+    ldp     d14, d15, [sp, #144]
     ldp     x19, x20, [sp, #16]
     ldp     x21, x22, [sp, #32]
     ldp     x23, x24, [sp, #48]
     ldp     x25, x26, [sp, #64]
     ldp     x27, x28, [sp, #80]
-    ldp     x29, x30, [sp], #96
+    ldp     x29, x30, [sp], #160
     ret
     .size a32_jit_run_block, .-a32_jit_run_block

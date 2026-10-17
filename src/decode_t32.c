@@ -9,7 +9,7 @@
 
 #include <stdio.h>
 
-#define T32_MAX_BLOCK_INSNS 64U
+#define T32_MAX_BLOCK_INSNS 128U
 
 static uint32_t ror32_t(uint32_t val, unsigned rot)
 {
@@ -2523,7 +2523,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 
     /* Pre-pass: scan guest instructions in the basic block */
     for (unsigned count = 0U; (count < max_insns || (!ctx->single_step && scan_itstate != 0U)) && num_insns < T32_MAX_PRESCAN_INSNS; count++) {
-        if (count > 0U && (scan_pc & ~0xFFFU) != start_page) {
+        if (count > 0U && ((scan_pc & ~0xFFFU) != start_page || (scan_itstate == 0U && (scan_pc - pc) >= 496U))) {
             break;
         }
         if (ctx->gdb_enabled && count > 0U && a32_gdb_has_breakpoint(scan_pc)) {

@@ -59,12 +59,20 @@
 #define A64_COND_LE 13U
 #define A64_COND_AL 14U
 
+#define A64_VFP_CACHE_SLOTS 24U /* Host v8..v31 */
+#define A64_VFP_KIND_NONE   0U
+#define A64_VFP_KIND_S      1U
+#define A64_VFP_KIND_D      2U
+
 typedef struct a64_buf {
     uint32_t *words;
     size_t    count;
     size_t    cap;
     bool      overflow;
-    uint16_t  s_cached_mask;
+    uint8_t   vfp_slot_kind[A64_VFP_CACHE_SLOTS];
+    uint8_t   vfp_slot_reg[A64_VFP_CACHE_SLOTS];
+    uint32_t  vfp_slot_dirty;
+    uint8_t   vfp_next_evict;
     unsigned  cond_branch_depth;
     uint32_t  guest_end_pc;
     bool      is_call;
@@ -76,11 +84,18 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     b->count             = 0U;
     b->cap               = cap;
     b->overflow          = false;
-    b->s_cached_mask     = 0U;
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
+        b->vfp_slot_reg[i]  = 0U;
+    }
+    b->vfp_slot_dirty    = 0U;
+    b->vfp_next_evict    = 0U;
     b->cond_branch_depth = 0U;
     b->guest_end_pc      = 0U;
     b->is_call           = false;
 }
+
+void a64_vfp_cache_flush(a64_buf_t *b, bool invalidate);
 
 static inline void a64_emit(a64_buf_t *b, uint32_t insn)
 {

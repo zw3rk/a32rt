@@ -9,7 +9,7 @@
 
 #include <stdio.h>
 
-#define A32_MAX_BLOCK_INSNS 64U
+#define A32_MAX_BLOCK_INSNS 128U
 
 static uint32_t ror32(uint32_t val, unsigned rot)
 {

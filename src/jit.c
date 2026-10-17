@@ -595,6 +595,8 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     atomic_store_explicit(&entry->host_code, NULL, memory_order_release);
     atomic_store_explicit(&entry->chain_epoch[0], 0U, memory_order_release);
     atomic_store_explicit(&entry->chain_epoch[1], 0U, memory_order_release);
+    atomic_store_explicit(&entry->chain_entry[0], NULL, memory_order_release);
+    atomic_store_explicit(&entry->chain_entry[1], NULL, memory_order_release);
     atomic_store_explicit(&entry->ret_epoch, 0U, memory_order_release);
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&entry->guest_pc, guest_pc, memory_order_relaxed);
@@ -605,10 +607,8 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     entry->side_count = side_count;
     atomic_store_explicit(&entry->chain_key[0], 0U, memory_order_relaxed);
     atomic_store_explicit(&entry->chain_code[0], NULL, memory_order_relaxed);
-    atomic_store_explicit(&entry->chain_entry[0], NULL, memory_order_relaxed);
     atomic_store_explicit(&entry->chain_key[1], 0U, memory_order_relaxed);
     atomic_store_explicit(&entry->chain_code[1], NULL, memory_order_relaxed);
-    atomic_store_explicit(&entry->chain_entry[1], NULL, memory_order_relaxed);
     atomic_store_explicit(&entry->ret_key, 0U, memory_order_relaxed);
     atomic_store_explicit(&entry->ret_code, NULL, memory_order_relaxed);
     atomic_store_explicit(&entry->ret_entry, NULL, memory_order_relaxed);
@@ -1017,10 +1017,11 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
         if (k0 == key || (c0_dead && k1 != key)) {
             if (c0_dead || c0 != code || ce0 != cur_entry) {
                 atomic_store_explicit(&prev_entry->chain_epoch[0], 0U, memory_order_release);
+                atomic_store_explicit(&prev_entry->chain_entry[0], NULL, memory_order_release);
                 atomic_thread_fence(memory_order_release);
                 atomic_store_explicit(&prev_entry->chain_key[0], key, memory_order_relaxed);
                 atomic_store_explicit(&prev_entry->chain_code[0], code, memory_order_relaxed);
-                atomic_store_explicit(&prev_entry->chain_entry[0], cur_entry, memory_order_relaxed);
+                atomic_store_explicit(&prev_entry->chain_entry[0], cur_entry, memory_order_release);
                 atomic_store_explicit(&prev_entry->chain_epoch[0], epoch, memory_order_release);
             }
         } else {
@@ -1031,10 +1032,11 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
             if (c1_dead || k1 == key) {
                 if (c1_dead || c1 != code || ce1 != cur_entry) {
                     atomic_store_explicit(&prev_entry->chain_epoch[1], 0U, memory_order_release);
+                    atomic_store_explicit(&prev_entry->chain_entry[1], NULL, memory_order_release);
                     atomic_thread_fence(memory_order_release);
                     atomic_store_explicit(&prev_entry->chain_key[1], key, memory_order_relaxed);
                     atomic_store_explicit(&prev_entry->chain_code[1], code, memory_order_relaxed);
-                    atomic_store_explicit(&prev_entry->chain_entry[1], cur_entry, memory_order_relaxed);
+                    atomic_store_explicit(&prev_entry->chain_entry[1], cur_entry, memory_order_release);
                     atomic_store_explicit(&prev_entry->chain_epoch[1], epoch, memory_order_release);
                 }
             }

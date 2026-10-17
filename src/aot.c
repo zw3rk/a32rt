@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    3U
+#define A32_AOT_VERSION    4U
 #define A32_MAX_AOT_SCAN   4096U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  2048U
