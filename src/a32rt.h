@@ -121,9 +121,10 @@ typedef struct a32_ctx {
     bool        trace_enabled;
     bool        stats_enabled;
     bool        aot_mode;
-    bool        gdb_enabled;
-    bool        single_step;
-    int         gdb_port;
+    bool          gdb_enabled;
+    bool          single_step;
+    volatile bool sync_sig_delivered;
+    int           gdb_port;
     uint64_t    blocks_compiled;
     uint64_t    blocks_executed;
     uint64_t    chain_hits;

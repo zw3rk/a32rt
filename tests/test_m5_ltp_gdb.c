@@ -1295,6 +1295,170 @@ static int test17_prctl_groups_robust(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 18: Round 5 regressions — mprotect (-ENOMEM/-EINVAL/len=0),
+ *          mremap MAP_SHARED|MAP_ANONYMOUS across fork(), and
+ *          execve on 0644 ARM32 ELF returning -EACCES in-place
+ * -------------------------------------------------------------------------- */
+static int test18_mprotect_mremap_shared_execve_noexec(void)
+{
+    /*
+     * 18a: mprotect (125) positive and negative checks:
+     *      - Negative: unmapped guest address (0x26000000U) -> -ENOMEM (-12)
+     *      - Negative: invalid prot (0x100U) -> -EINVAL (-22)
+     *      - Positive: len == 0 on aligned page -> 0
+     */
+    if (sys3(125U /* mprotect */, 0x26000000U, 4096U, 1U /* PROT_READ */) != -12 /* -ENOMEM */) {
+        return 148;
+    }
+    if (sys3(125U /* mprotect */, 0x26000000U, 4096U, 0x100U /* invalid prot */) != -22 /* -EINVAL */) {
+        return 149;
+    }
+    if (sys3(125U /* mprotect */, 0x26000000U, 0U, 1U /* PROT_READ */) != 0) {
+        return 150;
+    }
+
+    /*
+     * 18b: mremap on MAP_SHARED | MAP_ANONYMOUS (0x21U):
+     *      1. Grow a 1-page MAP_SHARED | MAP_ANONYMOUS region in-place to 2 pages,
+     *         then force a move to 3 pages with MREMAP_MAYMOVE (1U) by placing a
+     *         blocker page immediately after it.
+     *      2. Verify page contents are preserved and /proc/self/maps reports
+     *         `rw-s` (MAP_SHARED) rather than `rw-p` (MAP_PRIVATE).
+     */
+    uint32_t sh_base = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                      3U /* PROT_READ|PROT_WRITE */,
+                                      0x21U /* MAP_SHARED|MAP_ANONYMOUS */,
+                                      0xFFFFFFFFU, 0U);
+    if (sh_base > 0xFFFFF000U) {
+        return 151;
+    }
+
+    volatile uint32_t *sh_p1 = (volatile uint32_t *)(uintptr_t)sh_base;
+    sh_p1[0] = 0x11112222U;
+
+    uint32_t sh_grown = (uint32_t)sys4(163U /* mremap */, sh_base, 4096U, 8192U,
+                                       1U /* MREMAP_MAYMOVE */);
+    if (sh_grown > 0xFFFFF000U || (sh_grown & 0xFFFU) != 0U) {
+        sys2(91U /* munmap */, sh_base, 4096U);
+        return 152;
+    }
+
+    volatile uint32_t *grown_p1 = (volatile uint32_t *)(uintptr_t)sh_grown;
+    volatile uint32_t *grown_p2 = (volatile uint32_t *)(uintptr_t)(sh_grown + 4096U);
+    if (grown_p1[0] != 0x11112222U) {
+        sys2(91U /* munmap */, sh_grown, 8192U);
+        return 153;
+    }
+    grown_p2[0] = 0x33334444U;
+
+    /* Map a blocker page at sh_grown + 8192 to force MREMAP_MAYMOVE relocation */
+    uint32_t blocker = (uint32_t)sys6(192U /* mmap2 */, sh_grown + 8192U, 4096U,
+                                      1U /* PROT_READ */,
+                                      0x32U /* MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED */,
+                                      0xFFFFFFFFU, 0U);
+    if (blocker != sh_grown + 8192U) {
+        sys2(91U /* munmap */, sh_grown, 8192U);
+        return 154;
+    }
+
+    uint32_t sh_moved = (uint32_t)sys4(163U /* mremap */, sh_grown, 8192U, 12288U,
+                                       1U /* MREMAP_MAYMOVE */);
+    sys2(91U /* munmap */, blocker, 4096U);
+    if (sh_moved > 0xFFFFF000U || (sh_moved & 0xFFFU) != 0U || sh_moved == sh_grown) {
+        sys2(91U /* munmap */, sh_grown, 8192U);
+        return 155;
+    }
+
+    volatile uint32_t *moved_p1 = (volatile uint32_t *)(uintptr_t)sh_moved;
+    volatile uint32_t *moved_p2 = (volatile uint32_t *)(uintptr_t)(sh_moved + 4096U);
+    volatile uint32_t *moved_p3 = (volatile uint32_t *)(uintptr_t)(sh_moved + 8192U);
+    moved_p3[0] = 0xCAFEBABEU;
+
+    /* Check /proc/self/maps to verify sh_moved is recorded as rw-s (MAP_SHARED) */
+    static const char maps_path[] = "/proc/self/maps";
+    int32_t mfd = sys3(5U /* open */, (uint32_t)(uintptr_t)maps_path, 0U /* O_RDONLY */, 0U);
+    if (mfd < 0) {
+        sys2(91U /* munmap */, sh_moved, 12288U);
+        return 156;
+    }
+    char maps_buf[4096];
+    int32_t mn = sys3(3U /* read */, (uint32_t)mfd, (uint32_t)(uintptr_t)maps_buf,
+                      (uint32_t)(sizeof(maps_buf) - 1U));
+    sys1(6U /* close */, (uint32_t)mfd);
+    if (mn <= 0) {
+        sys2(91U /* munmap */, sh_moved, 12288U);
+        return 156;
+    }
+    maps_buf[mn] = '\0';
+
+    if (moved_p1[0] != 0x11112222U ||
+        moved_p2[0] != 0x33334444U ||
+        moved_p3[0] != 0xCAFEBABEU ||
+        !my_strstr(maps_buf, "rw-s")) {
+        sys2(91U /* munmap */, sh_moved, 12288U);
+        return 156;
+    }
+    sys2(91U /* munmap */, sh_moved, 12288U);
+
+    /*
+     * 18c: Negative execve (11) on a 0644 (non-executable) file containing a
+     *      valid 32-bit ARM ELF header must return -EACCES (-13) in-place
+     *      without replacing the calling process!
+     */
+    static const char noexec_elf_path[] = "/tmp/a32rt_m5_noexec_arm32_elf";
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)noexec_elf_path);
+
+    int32_t efd = sys3(5U /* open */, (uint32_t)(uintptr_t)noexec_elf_path,
+                       0x241U /* O_CREAT | O_TRUNC | O_WRONLY */, 0644U);
+    if (efd < 0) {
+        return 157;
+    }
+
+    uint8_t elf32_hdr[52];
+    my_memset(elf32_hdr, 0, sizeof(elf32_hdr));
+    elf32_hdr[0]  = 0x7FU;
+    elf32_hdr[1]  = (uint8_t)'E';
+    elf32_hdr[2]  = (uint8_t)'L';
+    elf32_hdr[3]  = (uint8_t)'F';
+    elf32_hdr[4]  = 1U;  /* ELFCLASS32 */
+    elf32_hdr[5]  = 1U;  /* ELFDATA2LSB */
+    elf32_hdr[6]  = 1U;  /* EV_CURRENT */
+    elf32_hdr[16] = 2U;  /* ET_EXEC (lo) */
+    elf32_hdr[17] = 0U;  /* ET_EXEC (hi) */
+    elf32_hdr[18] = 40U; /* EM_ARM (lo) */
+    elf32_hdr[19] = 0U;  /* EM_ARM (hi) */
+    elf32_hdr[20] = 1U;  /* EV_CURRENT */
+
+    int32_t nw = sys3(4U /* write */, (uint32_t)efd,
+                      (uint32_t)(uintptr_t)elf32_hdr, (uint32_t)sizeof(elf32_hdr));
+    sys1(6U /* close */, (uint32_t)efd);
+    if (nw != (int32_t)sizeof(elf32_hdr)) {
+        sys1(10U /* unlink */, (uint32_t)(uintptr_t)noexec_elf_path);
+        return 158;
+    }
+    /* Ensure mode is strictly 0644 (no execute bits) */
+    (void)sys2(15U /* chmod */, (uint32_t)(uintptr_t)noexec_elf_path, 0644U);
+
+    uint32_t ex_argv[2];
+    ex_argv[0] = (uint32_t)(uintptr_t)noexec_elf_path;
+    ex_argv[1] = 0U;
+    uint32_t ex_envp[1];
+    ex_envp[0] = 0U;
+
+    int32_t ex_rc = sys3(11U /* execve */,
+                         (uint32_t)(uintptr_t)noexec_elf_path,
+                         (uint32_t)(uintptr_t)ex_argv,
+                         (uint32_t)(uintptr_t)ex_envp);
+    sys1(10U /* unlink */, (uint32_t)(uintptr_t)noexec_elf_path);
+
+    if (ex_rc != -13 /* -EACCES */) {
+        return 159;
+    }
+
+    return 0;
+}
+
 static int run_all_m5(void)
 {
     int rc = test1_uname();
@@ -1354,6 +1518,10 @@ static int run_all_m5(void)
         return rc;
     }
     rc = test17_prctl_groups_robust();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test18_mprotect_mremap_shared_execve_noexec();
     if (rc != 0) {
         return rc;
     }

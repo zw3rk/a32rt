@@ -282,7 +282,7 @@ static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         } else {
             for (size_t i = 0U; i < ctx->region_count; i++) {
                 const a32_region_t *r = &ctx->regions[i];
-                if ((r->prot & 0x1U) != 0U && cur >= (uint64_t)r->start && cur < (uint64_t)r->end) {
+                if ((r->prot & 0x7U) != 0U && cur >= (uint64_t)r->start && cur < (uint64_t)r->end) {
                     if ((uint64_t)r->end > next) {
                         next = (uint64_t)r->end;
                     }
@@ -488,6 +488,9 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                             const a32_region_t *r = &ctx->regions[i];
                             if (pg >= r->start && pg < r->end) {
                                 restore_prot = (int)(r->prot & 0x7U);
+                                if ((restore_prot & PROT_EXEC) != 0) {
+                                    restore_prot |= PROT_READ;
+                                }
                                 if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
                                     (restore_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
                                     restore_prot = PROT_READ | PROT_WRITE;
@@ -502,7 +505,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             } else {
                 send_packet(g_client_sock, "E01");
             }
-        } else if (cmd[0] == 'Z' && cmd[1] == '0') {
+        } else if (cmd[0] == 'Z' && (cmd[1] == '0' || cmd[1] == '1') && cmd[2] == ',') {
             /* Insert breakpoint: Z0,<addr>,<kind> */
             char *comma1 = strchr(cmd + 3, ',');
             uint32_t addr;
@@ -535,7 +538,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             }
             a32_jit_invalidate_range(ctx, addr, addr + len);
             send_packet(g_client_sock, inserted ? "OK" : "E01");
-        } else if (cmd[0] == 'z' && cmd[1] == '0') {
+        } else if (cmd[0] == 'z' && (cmd[1] == '0' || cmd[1] == '1') && cmd[2] == ',') {
             /* Remove breakpoint: z0,<addr>,<kind> */
             char *comma1 = strchr(cmd + 3, ',');
             uint32_t addr;

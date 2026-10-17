@@ -147,7 +147,8 @@ int main(int argc, char **argv, char **envp)
             usage(argv[0]);
             return 0;
         } else {
-            break;
+            usage(argv[0]);
+            return 1;
         }
     }
 

@@ -227,6 +227,9 @@ extern char **environ;
 #ifndef SYS_memfd_create
 #define SYS_memfd_create 279
 #endif
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
 
 typedef struct arm_iovec32 {
     uint32_t iov_base;
@@ -805,6 +808,52 @@ static int create_proc_auxv(const a32_ctx_t *ctx)
     return create_anon_file("proc_auxv", ctx->auxv_data, ctx->auxv_bytes);
 }
 
+static bool match_proc_self(const char *path, const char *leaf)
+{
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    const char *p = path;
+    while (*p == '/') {
+        p++;
+    }
+    if (strncmp(p, "proc/", 5) != 0) {
+        return false;
+    }
+    p += 5;
+    while (*p == '/') {
+        p++;
+    }
+    if (strncmp(p, "self/", 5) != 0) {
+        return false;
+    }
+    p += 5;
+    while (*p == '/') {
+        p++;
+    }
+    return strcmp(p, leaf) == 0;
+}
+
+static const char *get_guest_exe_path(const a32_ctx_t *ctx)
+{
+    const char *ep = (ctx->exec_path && ctx->exec_path[0])
+                     ? ctx->exec_path
+                     : (ctx->guest_argv ? ctx->guest_argv[0] : NULL);
+    if (!ep) {
+        ep = "";
+    }
+    if (ctx->sysroot && ctx->sysroot[0]) {
+        size_t sr_len = strlen(ctx->sysroot);
+        while (sr_len > 1U && ctx->sysroot[sr_len - 1U] == '/') {
+            sr_len--;
+        }
+        if (sr_len > 1U && strncmp(ep, ctx->sysroot, sr_len) == 0 && ep[sr_len] == '/') {
+            ep += sr_len;
+        }
+    }
+    return ep;
+}
+
 static void fill_arm_stat64(arm_stat64_t *dst, const struct stat *src)
 {
     memset(dst, 0, sizeof(*dst));
@@ -869,6 +918,9 @@ static void fill_arm_statfs64(arm_statfs64_t *dst, const struct statfs *src)
 
 static bool is_arm32_elf_file(const char *path)
 {
+    if (access(path, X_OK) != 0) {
+        return false;
+    }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return false;
@@ -879,8 +931,10 @@ static bool is_arm32_elf_file(const char *path)
     if (n < 20) {
         return false;
     }
+    uint16_t e_type = (uint16_t)hdr[16] | (uint16_t)((uint16_t)hdr[17] << 8);
     if (hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F' &&
         hdr[4] == 1 /* ELFCLASS32 */ && hdr[5] == 1 /* ELFDATA2LSB */ &&
+        (e_type == 2U /* ET_EXEC */ || e_type == 3U /* ET_DYN */) &&
         hdr[18] == 40 && hdr[19] == 0 /* EM_ARM */) {
         return true;
     }
@@ -903,8 +957,8 @@ void a32_cleanup_robust_list(a32_ctx_t *ctx)
         if (futex_va >= 0x1000U) {
             uint32_t *futex_ptr = (uint32_t *)a32_guest_ptr(ctx, futex_va);
             uint32_t val = *futex_ptr;
-            if ((val & 0x0FFFFFFFU) == (uint32_t)ctx->host_tid) {
-                *futex_ptr |= 0x40000000U /* FUTEX_OWNER_DIED */;
+            if ((val & 0x3FFFFFFFU) == (uint32_t)ctx->host_tid) {
+                *futex_ptr = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
                 syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
             }
         }
@@ -936,10 +990,10 @@ static void *guest_thread_start(void *arg)
     ctx->is_thread_clone = true;
     args->child_tid      = ctx->host_tid;
 
-    if ((flags & 0x00100000U /* CLONE_PARENT_SETTID */) && ptid_va != 0U) {
+    if ((flags & 0x00100000U /* CLONE_PARENT_SETTID */) && ptid_va >= 0x1000U) {
         *(uint32_t *)a32_guest_ptr(ctx, ptid_va) = (uint32_t)ctx->host_tid;
     }
-    if ((flags & 0x01000000U /* CLONE_CHILD_SETTID */) && ctid_va != 0U) {
+    if ((flags & 0x01000000U /* CLONE_CHILD_SETTID */) && ctid_va >= 0x1000U) {
         uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctid_va);
         *ctid = (uint32_t)ctx->host_tid;
     }
@@ -949,7 +1003,7 @@ static void *guest_thread_start(void *arg)
     a32_jit_run(ctx);
 
     a32_cleanup_robust_list(ctx);
-    if (ctx->clear_child_tid != 0U) {
+    if (ctx->clear_child_tid >= 0x1000U) {
         uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctx->clear_child_tid);
         *ctid = 0U;
         syscall(SYS_futex, ctid, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
@@ -1029,13 +1083,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_exit:
+        a32_cleanup_robust_list(ctx);
+        if (ctx->clear_child_tid >= 0x1000U) {
+            uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctx->clear_child_tid);
+            *ctid = 0U;
+            syscall(SYS_futex, ctid, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+        }
         if (ctx->is_thread_clone) {
-            a32_cleanup_robust_list(ctx);
-            if (ctx->clear_child_tid != 0U) {
-                uint32_t *ctid = (uint32_t *)a32_guest_ptr(ctx, ctx->clear_child_tid);
-                *ctid = 0U;
-                syscall(SYS_futex, ctid, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
-            }
             a32_signals_set_thread_ctx(NULL);
             free(ctx);
             pthread_exit(NULL);
@@ -1116,15 +1170,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
-        if (strcmp(guest_path, "/proc/self/maps") == 0) {
+        if (match_proc_self(guest_path, "maps")) {
             ctx->regs[0] = (uint32_t)create_proc_maps(ctx);
             break;
         }
-        if (strcmp(guest_path, "/proc/self/cmdline") == 0) {
+        if (match_proc_self(guest_path, "cmdline")) {
             ctx->regs[0] = (uint32_t)create_proc_cmdline(ctx);
             break;
         }
-        if (strcmp(guest_path, "/proc/self/auxv") == 0) {
+        if (match_proc_self(guest_path, "auxv")) {
             ctx->regs[0] = (uint32_t)create_proc_auxv(ctx);
             break;
         }
@@ -1133,6 +1187,25 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), follow) < 0) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
+        }
+        if (match_proc_self(resolved, "maps")) {
+            ctx->regs[0] = (uint32_t)create_proc_maps(ctx);
+            break;
+        }
+        if (match_proc_self(resolved, "cmdline")) {
+            ctx->regs[0] = (uint32_t)create_proc_cmdline(ctx);
+            break;
+        }
+        if (match_proc_self(resolved, "auxv")) {
+            ctx->regs[0] = (uint32_t)create_proc_auxv(ctx);
+            break;
+        }
+        if (match_proc_self(guest_path, "exe") || match_proc_self(resolved, "exe")) {
+            const char *ep = get_guest_exe_path(ctx);
+            if (a32_resolve_guest_path(ctx, ep, resolved, sizeof(resolved)) < 0) {
+                ctx->regs[0] = (uint32_t)(-ENOENT);
+                break;
+            }
         }
         ctx->regs[0] = host_ret(openat(AT_FDCWD, resolved, (int)a1, (mode_t)a2));
         break;
@@ -1144,15 +1217,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
-        if (strcmp(guest_path, "/proc/self/maps") == 0) {
+        if (match_proc_self(guest_path, "maps")) {
             ctx->regs[0] = (uint32_t)create_proc_maps(ctx);
             break;
         }
-        if (strcmp(guest_path, "/proc/self/cmdline") == 0) {
+        if (match_proc_self(guest_path, "cmdline")) {
             ctx->regs[0] = (uint32_t)create_proc_cmdline(ctx);
             break;
         }
-        if (strcmp(guest_path, "/proc/self/auxv") == 0) {
+        if (match_proc_self(guest_path, "auxv")) {
             ctx->regs[0] = (uint32_t)create_proc_auxv(ctx);
             break;
         }
@@ -1162,6 +1235,25 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         if (resolve_guest_path_at(ctx, dirfd, a1, resolved, sizeof(resolved), follow) < 0) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
+        }
+        if (match_proc_self(resolved, "maps")) {
+            ctx->regs[0] = (uint32_t)create_proc_maps(ctx);
+            break;
+        }
+        if (match_proc_self(resolved, "cmdline")) {
+            ctx->regs[0] = (uint32_t)create_proc_cmdline(ctx);
+            break;
+        }
+        if (match_proc_self(resolved, "auxv")) {
+            ctx->regs[0] = (uint32_t)create_proc_auxv(ctx);
+            break;
+        }
+        if (match_proc_self(guest_path, "exe") || match_proc_self(resolved, "exe")) {
+            const char *ep = get_guest_exe_path(ctx);
+            if (a32_resolve_guest_path(ctx, ep, resolved, sizeof(resolved)) < 0) {
+                ctx->regs[0] = (uint32_t)(-ENOENT);
+                break;
+            }
         }
         ctx->regs[0] = host_ret(openat(dirfd, resolved, (int)a2, (mode_t)a3));
         break;
@@ -1409,8 +1501,11 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
-        int fa_flags = (nr == ARM_NR_faccessat2) ? (int)(a3 & 0x100U) : 0;
-        ctx->regs[0] = host_ret(faccessat(dirfd, resolved, (int)a2, fa_flags));
+        if (nr == ARM_NR_faccessat2) {
+            ctx->regs[0] = host_ret(syscall(SYS_faccessat2, dirfd, resolved, (int)a2, (int)a3));
+        } else {
+            ctx->regs[0] = host_ret(faccessat(dirfd, resolved, (int)a2, 0));
+        }
         break;
     }
 
@@ -1581,11 +1676,15 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_setgroups32:
+        if ((int32_t)a0 < 0 || a0 > 65536U) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
         if (a0 > 0U && a1 < 0x1000U) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
-        ctx->regs[0] = host_ret(setgroups((size_t)a0, (const gid_t *)a32_guest_ptr(ctx, a1)));
+        ctx->regs[0] = host_ret(setgroups((size_t)a0, a0 > 0U ? (const gid_t *)a32_guest_ptr(ctx, a1) : NULL));
         break;
 
     case ARM_NR_set_tid_address:
@@ -1937,6 +2036,9 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         } else if (pid == 0) {
             ctx->host_tid = (int)syscall(SYS_gettid);
             ctx->is_thread_clone = false;
+            ctx->clear_child_tid = 0U;
+            ctx->robust_list_head = 0U;
+            ctx->robust_list_len = 0U;
             ctx->pending_signals = 0ULL;
             a32_signals_set_thread_ctx(ctx);
             ctx->regs[0] = 0U;
@@ -2014,6 +2116,8 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         } else if (pid == 0) {
             ctx->host_tid = (int)syscall(SYS_gettid);
             ctx->is_thread_clone = false;
+            ctx->robust_list_head = 0U;
+            ctx->robust_list_len = 0U;
             ctx->pending_signals = 0ULL;
             a32_signals_set_thread_ctx(ctx);
             if (a1 != 0U) {
@@ -2389,7 +2493,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
-        if (a0 == 0U) {
+        if (a0 == 0U || (int)a0 == ctx->host_tid || (pid_t)a0 == getpid()) {
             if (a1 != 0U) {
                 uint32_t h = ctx->robust_list_head;
                 memcpy(a32_guest_ptr(ctx, a1), &h, sizeof(h));
@@ -2598,6 +2702,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         arm_msghdr32_t *gm = (arm_msghdr32_t *)a32_guest_ptr(ctx, a1);
+        if (gm->msg_iovlen > 1024U) {
+            ctx->regs[0] = (uint32_t)(-EMSGSIZE);
+            break;
+        }
         struct msghdr hm;
         memset(&hm, 0, sizeof(hm));
         hm.msg_name    = (gm->msg_name != 0U) ? a32_guest_ptr(ctx, gm->msg_name) : NULL;
@@ -2662,12 +2770,26 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 break;
             }
         }
-        const arm_iovec32_t *giov = (const arm_iovec32_t *)a32_guest_ptr(ctx, gm->msg_iov);
+        const arm_iovec32_t *giov = (gm->msg_iovlen > 0U)
+                                    ? (const arm_iovec32_t *)a32_guest_ptr(ctx, gm->msg_iov)
+                                    : NULL;
+        bool bad_iov = false;
         for (uint32_t i = 0U; i < gm->msg_iovlen; i++) {
-            hiov[i].iov_base = a32_guest_ptr(ctx, giov[i].iov_base);
+            if (giov[i].iov_len > 0U && giov[i].iov_base < 0x1000U) {
+                bad_iov = true;
+                break;
+            }
+            hiov[i].iov_base = (giov[i].iov_len > 0U) ? a32_guest_ptr(ctx, giov[i].iov_base) : NULL;
             hiov[i].iov_len  = (size_t)giov[i].iov_len;
         }
-        hm.msg_iov    = hiov;
+        if (bad_iov) {
+            if (hiov != host_iov) {
+                free(hiov);
+            }
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        hm.msg_iov    = (gm->msg_iovlen > 0U) ? hiov : NULL;
         hm.msg_iovlen = (size_t)gm->msg_iovlen;
 
         ssize_t r = (nr == ARM_NR_sendmsg) ? sendmsg((int)a0, &hm, (int)a2)
@@ -3343,26 +3465,17 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a0);
-        if (strcmp(guest_path, "/proc/self/exe") == 0) {
-            const char *ep = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : ctx->guest_argv[0];
-            if (ctx->sysroot && ctx->sysroot[0]) {
-                size_t sr_len = strlen(ctx->sysroot);
-                while (sr_len > 1U && ctx->sysroot[sr_len - 1U] == '/') {
-                    sr_len--;
-                }
-                if (sr_len > 1U && strncmp(ep, ctx->sysroot, sr_len) == 0 && ep[sr_len] == '/') {
-                    ep += sr_len;
-                }
-            }
+        char resolved[PATH_MAX];
+        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
+            ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        if (match_proc_self(guest_path, "exe") || match_proc_self(resolved, "exe")) {
+            const char *ep = get_guest_exe_path(ctx);
             size_t elen = strlen(ep);
             size_t copylen = (elen < (size_t)a2) ? elen : (size_t)a2;
             memcpy(a32_guest_ptr(ctx, a1), ep, copylen);
             ctx->regs[0] = (uint32_t)copylen;
-            break;
-        }
-        char resolved[PATH_MAX];
-        if (resolve_guest_path_ex(ctx, a0, resolved, sizeof(resolved), false) < 0) {
-            ctx->regs[0] = (uint32_t)(-EFAULT);
             break;
         }
         ctx->regs[0] = host_ret(readlink(resolved, (char *)a32_guest_ptr(ctx, a1), (size_t)a2));
@@ -3379,27 +3492,18 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             break;
         }
         const char *guest_path = (const char *)a32_guest_ptr(ctx, a1);
-        if (strcmp(guest_path, "/proc/self/exe") == 0) {
-            const char *ep = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : ctx->guest_argv[0];
-            if (ctx->sysroot && ctx->sysroot[0]) {
-                size_t sr_len = strlen(ctx->sysroot);
-                while (sr_len > 1U && ctx->sysroot[sr_len - 1U] == '/') {
-                    sr_len--;
-                }
-                if (sr_len > 1U && strncmp(ep, ctx->sysroot, sr_len) == 0 && ep[sr_len] == '/') {
-                    ep += sr_len;
-                }
-            }
-            size_t elen = strlen(ep);
-            size_t copylen = (elen < (size_t)a3) ? elen : (size_t)a3;
-            memcpy(a32_guest_ptr(ctx, a2), ep, copylen);
-            ctx->regs[0] = (uint32_t)copylen;
-            break;
-        }
         char resolved[PATH_MAX];
         int dirfd = translate_at_fd(a0);
         if (resolve_guest_path_at(ctx, dirfd, a1, resolved, sizeof(resolved), false) < 0) {
             ctx->regs[0] = (uint32_t)(-EFAULT);
+            break;
+        }
+        if (match_proc_self(guest_path, "exe") || match_proc_self(resolved, "exe")) {
+            const char *ep = get_guest_exe_path(ctx);
+            size_t elen = strlen(ep);
+            size_t copylen = (elen < (size_t)a3) ? elen : (size_t)a3;
+            memcpy(a32_guest_ptr(ctx, a2), ep, copylen);
+            ctx->regs[0] = (uint32_t)copylen;
             break;
         }
         ctx->regs[0] = host_ret(readlinkat(dirfd, resolved,
@@ -3640,6 +3744,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     }
 
     case ARM_NR_madvise:
+        if ((a0 & 0xFFFU) != 0U || a0 < 0x1000U || (uint64_t)a0 + (uint64_t)a1 > 0xFFFF0000ULL) {
+            ctx->regs[0] = (uint32_t)(-EINVAL);
+            break;
+        }
+        if (a2 == 4U /* MADV_DONTNEED */ && a1 > 0U) {
+            a32_jit_invalidate_range(ctx, a0, a0 + a1);
+        }
         ctx->regs[0] = host_ret(madvise(a32_guest_ptr(ctx, a0), (size_t)a1, (int)a2));
         break;
 

@@ -140,6 +140,24 @@ static int vm_insert_region_raw(uint32_t start, uint32_t end,
     return 0;
 }
 
+static void vm_coalesce_regions_locked(void)
+{
+    size_t i = 0U;
+    while (i + 1U < g_vm_region_count) {
+        a32_region_t *cur  = &g_vm_regions[i];
+        a32_region_t *next = &g_vm_regions[i + 1U];
+        if (cur->end == next->start &&
+            cur->prot == next->prot &&
+            (cur->flags & 0x23U) == (next->flags & 0x23U) &&
+            strcmp(cur->name, next->name) == 0) {
+            cur->end = next->end;
+            vm_remove_region_at(i + 1U);
+        } else {
+            i++;
+        }
+    }
+}
+
 static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
 {
     size_t i = 0U;
@@ -154,6 +172,14 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             continue;
         }
         if (r->start < unmap_start && r->end > unmap_end) {
+            if (g_vm_region_count >= A32_MAX_REGIONS + 3U) {
+                size_t before = g_vm_region_count;
+                vm_coalesce_regions_locked();
+                if (g_vm_region_count != before) {
+                    i = 0U;
+                    continue;
+                }
+            }
             uint32_t right_end   = r->end;
             uint32_t right_prot  = r->prot;
             uint32_t right_flags = r->flags;
@@ -169,24 +195,6 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             i++;
         } else {
             r->start = unmap_end;
-            i++;
-        }
-    }
-}
-
-static void vm_coalesce_regions_locked(void)
-{
-    size_t i = 0U;
-    while (i + 1U < g_vm_region_count) {
-        a32_region_t *cur  = &g_vm_regions[i];
-        a32_region_t *next = &g_vm_regions[i + 1U];
-        if (cur->end == next->start &&
-            cur->prot == next->prot &&
-            (cur->flags & 0x23U) == (next->flags & 0x23U) &&
-            strcmp(cur->name, next->name) == 0) {
-            cur->end = next->end;
-            vm_remove_region_at(i + 1U);
-        } else {
             i++;
         }
     }
@@ -283,6 +291,28 @@ static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
     return false;
 }
 
+static bool vm_is_range_mapped_locked(uint32_t start, uint32_t end)
+{
+    if (start >= end) {
+        return false;
+    }
+    uint32_t cur = start;
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const a32_region_t *r = &g_vm_regions[i];
+        if (r->end <= cur) {
+            continue;
+        }
+        if (r->start > cur) {
+            return false;
+        }
+        if (r->end >= end) {
+            return true;
+        }
+        cur = r->end;
+    }
+    return false;
+}
+
 static bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
                                          uint32_t *out_prot, uint32_t *out_flags,
                                          char *out_name, size_t name_sz)
@@ -342,7 +372,6 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
     if (cursor_cand + aligned_len <= (uint64_t)A32_MMAP_TOP_32 &&
         !vm_range_overlaps_locked((uint32_t)cursor_cand, (uint32_t)(cursor_cand + aligned_len))) {
         *out_va = (uint32_t)cursor_cand;
-        g_vm_mmap_cursor = (uint32_t)(cursor_cand + aligned_len);
         return 0;
     }
 
@@ -364,7 +393,6 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
     }
 
     *out_va = (uint32_t)cand;
-    g_vm_mmap_cursor = (uint32_t)(cand + aligned_len);
     return 0;
 }
 
@@ -539,7 +567,7 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
 static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                                 uint32_t flags, int fd, uint32_t pgoffset)
 {
-    if (!ctx || len == 0U) {
+    if (!ctx || len == 0U || (flags & 0x03U) == 0U) {
         return (uint32_t)(-EINVAL);
     }
 
@@ -560,7 +588,8 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         host_flags |= MAP_ANONYMOUS;
     }
 
-    uint32_t target_va = 0U;
+    uint32_t target_va     = 0U;
+    bool     update_cursor = false;
     if ((flags & 0x100000U /* MAP_FIXED_NOREPLACE */) != 0U) {
         if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < A32_LOW_GUARD_SIZE) {
             return (uint32_t)(-EINVAL);
@@ -589,6 +618,8 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
             target_va = hint_va;
         } else if (vm_find_free_gap_locked(aligned_len, &target_va) != 0) {
             return (uint32_t)(-ENOMEM);
+        } else {
+            update_cursor = true;
         }
     }
 
@@ -613,6 +644,9 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         return (uint32_t)(-errno);
     }
 
+    if (update_cursor) {
+        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
+    }
     (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
                                   prot & 0x7U, flags, "[mmap]");
     return target_va;
@@ -621,7 +655,7 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
 uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                       uint32_t flags, int fd, uint32_t pgoffset)
 {
-    if (!ctx || len == 0U) {
+    if (!ctx || len == 0U || (flags & 0x03U) == 0U) {
         return (uint32_t)(-EINVAL);
     }
 
@@ -640,12 +674,21 @@ uint32_t a32_vm_mmap2(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot
 
 static int vm_mprotect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot)
 {
-    if (!ctx || (addr & (A32_PAGE_SIZE - 1U)) != 0U || len == 0U) {
+    if (!ctx || (addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < 0x1000U) {
         return -EINVAL;
     }
+    if ((prot & ~0x7U) != 0U) {
+        return -EINVAL;
+    }
+    if (len == 0U) {
+        return 0;
+    }
     uint64_t aligned_len = page_align_up((uint64_t)len);
+    uint64_t end64       = (uint64_t)addr + aligned_len;
     if (addr < A32_LOW_GUARD_SIZE ||
-        (uint64_t)addr + aligned_len > (uint64_t)A32_KUSER_BASE_32) {
+        aligned_len == 0ULL ||
+        end64 > (uint64_t)A32_KUSER_BASE_32 ||
+        !vm_is_range_mapped_locked(addr, (uint32_t)end64)) {
         return -ENOMEM;
     }
 
@@ -665,14 +708,20 @@ static int vm_mprotect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint3
         return -errno;
     }
 
-    vm_mprotect_regions_locked(addr, (uint32_t)((uint64_t)addr + aligned_len), prot & 0x7U);
+    vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
     return 0;
 }
 
 int a32_vm_mprotect(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot)
 {
-    if (!ctx || (addr & (A32_PAGE_SIZE - 1U)) != 0U || len == 0U) {
+    if (!ctx || (addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < 0x1000U) {
         return -EINVAL;
+    }
+    if ((prot & ~0x7U) != 0U) {
+        return -EINVAL;
+    }
+    if (len == 0U) {
+        return 0;
     }
 
     vm_lock_acquire();
@@ -772,6 +821,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         return (uint32_t)(-EFAULT);
     }
     uint32_t keep_flags = orig_flags & 0x23U;
+    uint32_t map_flags  = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) | 0x20U;
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
 
     if ((flags & 2U /* MREMAP_FIXED */) == 0U) {
@@ -810,7 +860,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
 
         uint32_t rw_prot = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
         uint32_t mapped = vm_mmap2_locked(ctx, new_addr, (uint32_t)new_aligned,
-                                          rw_prot, 0x32U /* MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS */,
+                                          rw_prot, map_flags | 0x10U,
                                           -1, 0U);
         if (mapped > 0xFFFFF000U) {
             vm_sync_to_ctx(ctx);
@@ -842,7 +892,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     if (new_end <= (uint64_t)A32_KUSER_BASE_32 &&
         !vm_range_overlaps_locked(old_end, (uint32_t)new_end)) {
         uint32_t ext = vm_mmap2_locked(ctx, old_end, (uint32_t)(new_aligned - old_aligned),
-                                       prot, 0x32U /* MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS */,
+                                       prot, map_flags | 0x10U,
                                        -1, 0U);
         if (ext <= 0xFFFFF000U) {
             (void)vm_record_region_locked(old_end, (uint32_t)new_end,
@@ -865,7 +915,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
 
     uint32_t rw_prot = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
     uint32_t new_va = vm_mmap2_locked(ctx, 0U, (uint32_t)new_aligned,
-                                      rw_prot, 0x22U /* MAP_PRIVATE | MAP_ANONYMOUS */,
+                                      rw_prot, map_flags,
                                       -1, 0U);
     if (new_va > 0xFFFFF000U) {
         vm_sync_to_ctx(ctx);
@@ -896,6 +946,7 @@ void a32_vm_sync_ctx(a32_ctx_t *ctx)
         return;
     }
     vm_lock_acquire();
+    vm_sync_from_ctx(ctx);
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 }

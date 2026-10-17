@@ -2293,6 +2293,296 @@ static int run_test(void)
 #endif
     }
 
+    /*
+     * 28. Regression tests for SADD8, SSUB8, SADD16, SSUB16 + SEL (Round 5):
+     *     Verify signed parallel byte and halfword addition/subtraction setting
+     *     CPSR.GE[3:0] based on signed >= 0 lane results (including lanes where
+     *     8-bit/16-bit signed overflow wraps the truncated lane bit 7/15),
+     *     while preserving CPSR.NZCV.
+     */
+    {
+        uint32_t res = 0U, flags = 0U, sel_out = 0U;
+        uint32_t c1 = 10U, c2 = 20U;
+        uint32_t sel_a = 0x11223344U;
+        uint32_t sel_b = 0xAABBCCDDU;
+
+        /*
+         * 28a: SADD8 + SEL:
+         *   lane 3: -112 (0x90) + 32 (0x20)  = -80  (0xB0) <  0 -> GE[3] = 0
+         *   lane 2: +32  (0x20) + -32 (0xE0) = 0    (0x00) >= 0 -> GE[2] = 1
+         *   lane 1: +112 (0x70) + 32 (0x20)  = +144 (0x90) >= 0 -> GE[1] = 1
+         *   lane 0: +16  (0x10) + -32 (0xE0) = -16  (0xF0) <  0 -> GE[0] = 0
+         *   -> res = 0xB00090F0U, GE[3:0] = 0b0110 (0x6), sel_out = 0xAA2233DDU
+         */
+        uint32_t sa8_rn = 0x90207010U;
+        uint32_t sa8_rm = 0x20E020E0U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "sadd8 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(sa8_rn), [rm] "r"(sa8_rm),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0xB00090F0U || sel_out != 0xAA2233DDU ||
+            (flags & 0xF00F0000U) != 0x60060000U) {
+            return 168;
+        }
+
+        /*
+         * 28b: SSUB8 + SEL:
+         *   lane 3: +16  (0x10) - -32 (0xE0) = +48  (0x30) >= 0 -> GE[3] = 1
+         *   lane 2: -112 (0x90) - +32 (0x20) = -144 (0x70) <  0 -> GE[2] = 0
+         *   lane 1: +32  (0x20) - +48 (0x30) = -16  (0xF0) <  0 -> GE[1] = 0
+         *   lane 0: +80  (0x50) - +80 (0x50) = 0    (0x00) >= 0 -> GE[0] = 1
+         *   -> res = 0x3070F000U, GE[3:0] = 0b1001 (0x9), sel_out = 0x11BBCC44U
+         */
+        uint32_t ss8_rn = 0x10902050U;
+        uint32_t ss8_rm = 0xE0203050U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "ssub8 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(ss8_rn), [rm] "r"(ss8_rm),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x3070F000U || sel_out != 0x11BBCC44U ||
+            (flags & 0xF00F0000U) != 0x80090000U) {
+            return 169;
+        }
+
+        /*
+         * 28c: SADD16 + SEL:
+         *   hi: +28672 (0x7000) + +8192 (0x2000) = +36864 (0x9000) >= 0 -> GE[3:2] = 0b11
+         *   lo: -4096  (0xF000) + +2048 (0x0800) = -2048  (0xF800) <  0 -> GE[1:0] = 0b00
+         *   -> res = 0x9000F800U, GE[3:0] = 0b1100 (0xC), sel_out = 0x1122CCDDU
+         */
+        uint32_t sa16_rn = 0x7000F000U;
+        uint32_t sa16_rm = 0x20000800U;
+        __asm__ volatile(
+            "cmp %[c1], %[c1]\n\t"
+            "sadd16 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [rn] "r"(sa16_rn), [rm] "r"(sa16_rm),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x9000F800U || sel_out != 0x1122CCDDU ||
+            (flags & 0xF00F0000U) != 0x600C0000U) {
+            return 170;
+        }
+
+        /*
+         * 28d: SSUB16 + SEL:
+         *   hi: -28672 (0x9000) - +8192 (0x2000) = -36864 (0x7000) <  0 -> GE[3:2] = 0b00
+         *   lo: +4096  (0x1000) - -4096 (0xF000) = +8192  (0x2000) >= 0 -> GE[1:0] = 0b11
+         *   -> res = 0x70002000U, GE[3:0] = 0b0011 (0x3), sel_out = 0xAABB3344U
+         */
+        uint32_t ss16_rn = 0x90001000U;
+        uint32_t ss16_rm = 0x2000F000U;
+        __asm__ volatile(
+            "cmp %[c1], %[c2]\n\t"
+            "ssub16 %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "sel %[so], %[sa], %[sb]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags), [so] "=&r"(sel_out)
+            : [c1] "r"(c1), [c2] "r"(c2), [rn] "r"(ss16_rn), [rm] "r"(ss16_rm),
+              [sa] "r"(sel_a), [sb] "r"(sel_b)
+            : "cc"
+        );
+        if (res != 0x70002000U || sel_out != 0xAABB3344U ||
+            (flags & 0xF00F0000U) != 0x80030000U) {
+            return 171;
+        }
+    }
+
+    /*
+     * 29. Regression tests for CPSR.Q (bit 27) sticky overflow flag on signed
+     *     multiply-accumulate instructions (Round 5):
+     *     SMLABB, SMLAWB, SMUAD (0x80008000 * 0x80008000), SMLAD, SMLSD
+     *     (both non-overflowing Q == 0 negative check and overflowing Q == 1
+     *     positive + sticky check).
+     */
+    {
+        const uint32_t q_bit = 1U << 27;
+        uint32_t zero = 0U;
+        uint32_t res = 0U;
+        uint32_t flags = 0U;
+
+        /* 29a: SMLABB (non-overflowing Q == 0 vs overflowing Q == 1 + sticky) */
+        uint32_t smlabb_rn_ok = 100U, smlabb_rm_ok = 200U, smlabb_ra_ok = 300U;
+        uint32_t smlabb_rn_ov = 0x00004000U; /* 16384 */
+        uint32_t smlabb_rm_ov = 0x00004000U; /* 16384 -> product = 0x10000000 */
+        uint32_t smlabb_ra_ov = 0x7FFFFFF0U; /* 0x10000000 + 0x7FFFFFF0 = 0x8FFFFFF0 (signed overflow) */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlabb %[res], %[rn], %[rm], %[ra]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rn] "r"(smlabb_rn_ok),
+              [rm] "r"(smlabb_rm_ok), [ra] "r"(smlabb_ra_ok)
+            : "cc"
+        );
+        if (res != 20300U || (flags & q_bit) != 0U) {
+            return 172;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlabb %[res], %[rno], %[rmo], %[rao]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rno] "r"(smlabb_rn_ov),
+              [rmo] "r"(smlabb_rm_ov), [rao] "r"(smlabb_ra_ov)
+            : "cc"
+        );
+        if (res != 0x8FFFFFF0U || (flags & q_bit) != q_bit) {
+            return 173;
+        }
+        /* Verify Q stays sticky across non-overflowing SMLABB */
+        __asm__ volatile(
+            "smlabb %[res], %[rn], %[rm], %[ra]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [rn] "r"(smlabb_rn_ok), [rm] "r"(smlabb_rm_ok), [ra] "r"(smlabb_ra_ok)
+            : "cc"
+        );
+        if (res != 20300U || (flags & q_bit) != q_bit) {
+            return 174;
+        }
+
+        /* 29b: SMLAWB (non-overflowing Q == 0 vs overflowing Q == 1 + sticky) */
+        uint32_t smlawb_rn_ok = 0x00020000U; /* 2 * 65536 */
+        uint32_t smlawb_rm_ok = 5U;          /* (131072 * 5) >> 16 = 10 */
+        uint32_t smlawb_ra_ok = 100U;
+        uint32_t smlawb_rn_ov = 0x40000000U; /* 2^30 */
+        uint32_t smlawb_rm_ov = 0x00004000U; /* 2^14 -> (2^30 * 2^14) >> 16 = 0x10000000 */
+        uint32_t smlawb_ra_ov = 0x7FFFFFF0U;
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlawb %[res], %[rn], %[rm], %[ra]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rn] "r"(smlawb_rn_ok),
+              [rm] "r"(smlawb_rm_ok), [ra] "r"(smlawb_ra_ok)
+            : "cc"
+        );
+        if (res != 110U || (flags & q_bit) != 0U) {
+            return 175;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlawb %[res], %[rno], %[rmo], %[rao]\n\t"
+            "smlawb %[res], %[rn], %[rm], %[ra]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rno] "r"(smlawb_rn_ov),
+              [rmo] "r"(smlawb_rm_ov), [rao] "r"(smlawb_ra_ov),
+              [rn] "r"(smlawb_rn_ok), [rm] "r"(smlawb_rm_ok), [ra] "r"(smlawb_ra_ok)
+            : "cc"
+        );
+        if (res != 110U || (flags & q_bit) != q_bit) {
+            return 176;
+        }
+
+        /*
+         * 29c: SMUAD (non-overflowing Q == 0 vs 0x80008000 * 0x80008000 where
+         *      (-32768)*(-32768) + (-32768)*(-32768) = +2^31 overflows 32-bit
+         *      signed to 0x80000000U and sets Q = 1!)
+         */
+        uint32_t smuad_rn_ok = 0x00030004U;
+        uint32_t smuad_rm_ok = 0x00050006U;
+        uint32_t smuad_min   = 0x80008000U;
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smuad %[res], %[rn], %[rm]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rn] "r"(smuad_rn_ok), [rm] "r"(smuad_rm_ok)
+            : "cc"
+        );
+        if (res != 39U || (flags & q_bit) != 0U) {
+            return 177;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smuad %[res], %[m], %[m]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [m] "r"(smuad_min)
+            : "cc"
+        );
+        if (res != 0x80000000U || (flags & q_bit) != q_bit) {
+            return 178;
+        }
+
+        /* 29d: SMLAD (non-overflowing Q == 0 vs overflowing Q == 1 + sticky) */
+        uint32_t smlad_ra_ok = 100U;
+        uint32_t smlad_rn_ov = 0x40004000U; /* +16384, +16384 */
+        uint32_t smlad_rm_ov = 0x40004000U; /* p1 + p2 = 0x20000000 */
+        uint32_t smlad_ra_ov = 0x70000000U; /* 0x20000000 + 0x70000000 = 0x90000000 (overflow) */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlad %[res], %[rn], %[rm], %[ra]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rn] "r"(smuad_rn_ok),
+              [rm] "r"(smuad_rm_ok), [ra] "r"(smlad_ra_ok)
+            : "cc"
+        );
+        if (res != 139U || (flags & q_bit) != 0U) {
+            return 179;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlad %[res], %[rno], %[rmo], %[rao]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rno] "r"(smlad_rn_ov),
+              [rmo] "r"(smlad_rm_ov), [rao] "r"(smlad_ra_ov)
+            : "cc"
+        );
+        if (res != 0x90000000U || (flags & q_bit) != q_bit) {
+            return 180;
+        }
+
+        /* 29e: SMLSD (non-overflowing Q == 0 vs overflowing Q == 1 + cleanup) */
+        uint32_t smlsd_rn_ov = 0xC0004000U; /* hi = -16384, lo = +16384 */
+        uint32_t smlsd_rm_ov = 0x40004000U; /* p1 - p2 = 0x10000000 - (-0x10000000) = 0x20000000 */
+        uint32_t smlsd_ra_ov = 0x70000000U; /* (p1 - p2) + ra = 0x90000000 (overflow) */
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlsd %[res], %[rn], %[rm], %[ra]\n\t"
+            "mrs %[fl], apsr\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rn] "r"(smuad_rn_ok),
+              [rm] "r"(smuad_rm_ok), [ra] "r"(smlad_ra_ok)
+            : "cc"
+        );
+        if (res != 109U || (flags & q_bit) != 0U) {
+            return 181;
+        }
+        __asm__ volatile(
+            "msr apsr_nzcvq, %[z]\n\t"
+            "smlsd %[res], %[rno], %[rmo], %[rao]\n\t"
+            "mrs %[fl], apsr\n\t"
+            "msr apsr_nzcvq, %[z]\n\t"
+            : [res] "=&r"(res), [fl] "=&r"(flags)
+            : [z] "r"(zero), [rno] "r"(smlsd_rn_ov),
+              [rmo] "r"(smlsd_rm_ov), [rao] "r"(smlsd_ra_ov)
+            : "cc"
+        );
+        if (res != 0x90000000U || (flags & q_bit) != q_bit) {
+            return 182;
+        }
+    }
+
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

@@ -146,9 +146,16 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         load_bias = default_pie_base;
     }
 
+    uint64_t entry64 = (uint64_t)ehdr.e_entry + (uint64_t)load_bias;
+    if (entry64 < 0x10000ULL || entry64 >= (uint64_t)A32_KUSER_BASE_32) {
+        fprintf(stderr, "a32rt: %s: entry point 0x%llx out of guest bounds\n",
+                label, (unsigned long long)entry64);
+        return -1;
+    }
+
     memset(out, 0, sizeof(*out));
-    out->load_bias = load_bias;
-    out->entry     = ehdr.e_entry + load_bias;
+    out->load_bias = load_bias + page_down(min_vaddr);
+    out->entry     = (uint32_t)entry64;
     out->phent     = ehdr.e_phentsize;
     out->phnum     = ehdr.e_phnum;
 

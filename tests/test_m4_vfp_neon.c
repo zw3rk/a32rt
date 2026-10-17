@@ -1487,6 +1487,90 @@ static int run_vfp_neon_tests(void)
         }
     }
 
+    /*
+     * 27. Double-precision fixed-point VCVT.<S32/S16/U32/U16>.F64 64-bit Dd
+     *     sign/zero-extension and VLD4.32 {d0[], d1[], d2[], d3[]}, [r0:128]
+     *     (Round 5 regression):
+     */
+    {
+        /*
+         * 27a: vcvt.s32.f64 d0, d0, #8 with -2.5  -> -640 (0xFFFFFFFFFFFFFD80ULL)
+         *      vcvt.s16.f64 d1, d1, #4 with -12.5 -> -200 (0xFFFFFFFFFFFFFF38ULL)
+         *      vcvt.u32.f64 d2, d2, #8 with +2.5  -> +640 (0x0000000000000280ULL)
+         *      vcvt.u16.f64 d3, d3, #4 with +12.5 -> +200 (0x00000000000000C8ULL)
+         */
+        double d_neg_2_5  = -2.5;
+        double d_neg_12_5 = -12.5;
+        double d_pos_2_5  = 2.5;
+        double d_pos_12_5 = 12.5;
+        uint64_t raw_s32_d0 = 0ULL;
+        uint64_t raw_s16_d1 = 0ULL;
+        uint64_t raw_u32_d2 = 0xFFFFFFFFFFFFFFFFULL;
+        uint64_t raw_u16_d3 = 0xFFFFFFFFFFFFFFFFULL;
+        double rt_s32 = 0.0;
+        double rt_s16 = 0.0;
+
+        __asm__ volatile(
+            "vldr d0, %6\n"
+            "vldr d1, %7\n"
+            "vldr d2, %8\n"
+            "vldr d3, %9\n"
+            "vcvt.s32.f64 d0, d0, #8\n"
+            "vcvt.s16.f64 d1, d1, #4\n"
+            "vcvt.u32.f64 d2, d2, #8\n"
+            "vcvt.u16.f64 d3, d3, #4\n"
+            "vstr d0, %0\n"
+            "vstr d1, %1\n"
+            "vstr d2, %2\n"
+            "vstr d3, %3\n"
+            "vcvt.f64.s32 d0, d0, #8\n"
+            "vcvt.f64.s16 d1, d1, #4\n"
+            "vstr d0, %4\n"
+            "vstr d1, %5\n"
+            : "=m"(raw_s32_d0), "=m"(raw_s16_d1),
+              "=m"(raw_u32_d2), "=m"(raw_u16_d3),
+              "=m"(rt_s32), "=m"(rt_s16)
+            : "m"(d_neg_2_5), "m"(d_neg_12_5),
+              "m"(d_pos_2_5), "m"(d_pos_12_5)
+            : "d0", "d1", "d2", "d3", "memory"
+        );
+        if (raw_s32_d0 != 0xFFFFFFFFFFFFFD80ULL ||
+            (uint32_t)(raw_s32_d0 >> 32) != 0xFFFFFFFFU ||
+            raw_s16_d1 != 0xFFFFFFFFFFFFFF38ULL ||
+            (uint32_t)(raw_s16_d1 >> 32) != 0xFFFFFFFFU) {
+            return 74;
+        }
+        if (raw_u32_d2 != 0x0000000000000280ULL ||
+            (uint32_t)(raw_u32_d2 >> 32) != 0x00000000U ||
+            raw_u16_d3 != 0x00000000000000C8ULL ||
+            (uint32_t)(raw_u16_d3 >> 32) != 0x00000000U ||
+            rt_s32 != -2.5 || rt_s16 != -12.5) {
+            return 75;
+        }
+
+        /*
+         * 27b: Positive test for vld4.32 {d0[], d1[], d2[], d3[]}, [r0:128]
+         *      (all-lanes 4-element 32-bit structure load with 128-bit alignment hint)
+         */
+        static const _Alignas(16) uint32_t vld4_in[4] = {
+            0x11223344U, 0x55667788U, 0x99AABBCCU, 0xDDEEFF00U
+        };
+        uint64_t vld4_out[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+        __asm__ volatile(
+            "vld4.32 {d0[], d1[], d2[], d3[]}, [%1:128]\n"
+            "vstmia %0, {d0-d3}\n"
+            :
+            : "r"(vld4_out), "r"(vld4_in)
+            : "d0", "d1", "d2", "d3", "memory"
+        );
+        if (vld4_out[0] != 0x1122334411223344ULL ||
+            vld4_out[1] != 0x5566778855667788ULL ||
+            vld4_out[2] != 0x99AABBCC99AABBCCULL ||
+            vld4_out[3] != 0xDDEEFF00DDEEFF00ULL) {
+            return 76;
+        }
+    }
+
     static const char pass_msg[] = "M4 VFPv4-D32 & NEON: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "a32rt.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,7 @@ void a32_host_probe(a32_ctx_t *ctx)
     }
 
     int fd = open(A32H_DEV_PATH, O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
+    if (fd < 0 && (errno == EACCES || errno == EPERM || errno == EROFS)) {
         fd = open(A32H_DEV_PATH, O_RDONLY | O_CLOEXEC);
     }
     if (fd < 0) {

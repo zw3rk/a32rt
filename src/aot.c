@@ -271,17 +271,20 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
                 break;
             }
         }
-        (void)a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
-                                        (bh.is_thumb & 1U) != 0U,
-                                        (bh.is_thumb & 2U) != 0U,
-                                        words_buf, (size_t)bh.word_count,
-                                        bh.pc_map_count > 0U ? pc_map_buf : NULL,
-                                        (size_t)bh.pc_map_count);
+        if (a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
+                                      (bh.is_thumb & 1U) != 0U,
+                                      (bh.is_thumb & 2U) != 0U,
+                                      words_buf, (size_t)bh.word_count,
+                                      bh.pc_map_count > 0U ? pc_map_buf : NULL,
+                                      (size_t)bh.pc_map_count) != 0) {
+            break;
+        }
     }
 
     fclose(f);
     if (i < hdr.num_blocks) {
         (void)a32_jit_flush_batch(ctx);
+        (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFF0000U);
         unlink(cache_path);
         return -1;
     }
@@ -289,6 +292,30 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
     return 0;
+}
+
+static bool aot_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (ctx == NULL || len == 0U || addr + len < addr) {
+        return false;
+    }
+    uint32_t cur = addr;
+    uint32_t end = addr + len;
+    while (cur < end) {
+        bool found = false;
+        for (size_t i = 0U; i < ctx->region_count; i++) {
+            const a32_region_t *r = &ctx->regions[i];
+            if ((r->prot & 0x4U) != 0U && cur >= r->start && cur < r->end) {
+                cur   = (r->end < end) ? r->end : end;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void add_target(uint32_t pc, bool thumb,
@@ -316,12 +343,16 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     bool     entry_thumb = (elf_info->entry & 1U) != 0U;
     uint32_t entry_pc    = elf_info->entry & (entry_thumb ? ~1U : ~3U);
 
-    (void)a32_jit_compile_block(ctx, entry_pc, entry_thumb, NULL);
+    if (aot_range_executable(ctx, entry_pc, entry_thumb ? 2U : 4U)) {
+        (void)a32_jit_compile_block(ctx, entry_pc, entry_thumb, NULL);
+    }
 
     if (ctx->elf_entry != 0U && ctx->elf_entry != elf_info->entry) {
         bool     main_thumb = (ctx->elf_entry & 1U) != 0U;
         uint32_t main_pc    = ctx->elf_entry & (main_thumb ? ~1U : ~3U);
-        (void)a32_jit_compile_block(ctx, main_pc, main_thumb, NULL);
+        if (aot_range_executable(ctx, main_pc, main_thumb ? 2U : 4U)) {
+            (void)a32_jit_compile_block(ctx, main_pc, main_thumb, NULL);
+        }
     }
 
     uint32_t disc_pcs[A32_MAX_AOT_SCAN];
@@ -334,12 +365,18 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
             for (uint32_t pc = scan_start;
                  pc >= scan_start && pc + 2U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
                  pc += 2U) {
+                if (!aot_range_executable(ctx, pc, 2U)) {
+                    continue;
+                }
                 const uint16_t *hw_ptr = (const uint16_t *)a32_guest_ptr(ctx, pc);
                 uint16_t hw = *hw_ptr;
 
                 if ((hw >> 11U) >= 0x1DU) {
                     if (pc + 4U > elf_info->text_end) {
                         break;
+                    }
+                    if (!aot_range_executable(ctx, pc + 2U, 2U)) {
+                        continue;
                     }
                     uint16_t hw1 = hw;
                     uint16_t hw2 = hw_ptr[1];
@@ -368,10 +405,12 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                             uint32_t tgt = is_blx ? ((((pc + 4U) & ~3U) + (uint32_t)offset) & ~3U)
                                                   : (pc + 4U + (uint32_t)offset);
                             if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                                tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
+                                tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
+                                aot_range_executable(ctx, tgt, 4U)) {
                                 add_target(tgt, !is_blx, disc_pcs, disc_thumb, &disc_count);
                             }
-                            if (is_link && pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end) {
+                            if (is_link && pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end &&
+                                aot_range_executable(ctx, pc + 4U, 4U)) {
                                 add_target(pc + 4U, true, disc_pcs, disc_thumb, &disc_count);
                             }
                         } else if ((hw2 & 0xD000U) == 0x8000U) {
@@ -390,7 +429,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                                 }
                                 uint32_t tgt = pc + 4U + (uint32_t)offset;
                                 if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                                    tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
+                                    tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
+                                    aot_range_executable(ctx, tgt, 4U)) {
                                     add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                                 }
                             }
@@ -404,7 +444,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
 
                 /* Function prologues: PUSH {..., lr} or SUB sp, #imm */
                 if (((hw & 0xFF00U) == 0xB500U || (hw & 0xFF80U) == 0xB080U) &&
-                    pc <= 0xFFFFFFFCU && pc + 4U <= elf_info->text_end) {
+                    pc <= 0xFFFFFFFCU && pc + 4U <= elf_info->text_end &&
+                    aot_range_executable(ctx, pc, 4U)) {
                     add_target(pc, true, disc_pcs, disc_thumb, &disc_count);
                 }
                 /* Branch cond: B<c> */
@@ -412,7 +453,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     int8_t imm8 = (int8_t)(hw & 0xFFU);
                     uint32_t tgt = (uint32_t)((int32_t)pc + 4 + ((int32_t)imm8 << 1));
                     if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
+                        aot_range_executable(ctx, tgt, 4U)) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -424,7 +466,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     }
                     uint32_t tgt = (uint32_t)((int32_t)pc + 4 + (imm11 << 1));
                     if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
+                        aot_range_executable(ctx, tgt, 4U)) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -434,6 +477,9 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
             for (uint32_t pc = scan_start;
                  pc >= scan_start && pc + 4U <= elf_info->text_end && disc_count < A32_MAX_AOT_SCAN;
                  pc += 4U) {
+                if (!aot_range_executable(ctx, pc, 4U)) {
+                    continue;
+                }
                 const uint32_t *insn_ptr = (const uint32_t *)a32_guest_ptr(ctx, pc);
                 uint32_t insn = *insn_ptr;
 
@@ -451,11 +497,13 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     }
                     uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2));
                     if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
+                        aot_range_executable(ctx, tgt, 4U)) {
                         add_target(tgt, false, disc_pcs, disc_thumb, &disc_count);
                     }
                     if (((insn >> 24U) & 1U) != 0U &&
-                        pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end) {
+                        pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end &&
+                        aot_range_executable(ctx, pc + 4U, 4U)) {
                         add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -468,10 +516,12 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
                     uint32_t h = (insn >> 24U) & 1U;
                     uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2) + (int32_t)(h << 1U));
                     if (tgt >= elf_info->text_start && tgt < elf_info->text_end &&
-                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end) {
+                        tgt <= 0xFFFFFFFCU && tgt + 4U <= elf_info->text_end &&
+                        aot_range_executable(ctx, tgt, 4U)) {
                         add_target(tgt, true, disc_pcs, disc_thumb, &disc_count);
                     }
-                    if (pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end) {
+                    if (pc <= 0xFFFFFFF7U && pc + 8U <= elf_info->text_end &&
+                        aot_range_executable(ctx, pc + 4U, 4U)) {
                         add_target(pc + 4U, false, disc_pcs, disc_thumb, &disc_count);
                     }
                 }
@@ -480,7 +530,10 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     }
 
     for (size_t i = 0U; i < disc_count; i++) {
-        (void)a32_jit_compile_block(ctx, disc_pcs[i], disc_thumb[i], NULL);
+        uint32_t min_len = disc_thumb[i] ? 2U : 4U;
+        if (aot_range_executable(ctx, disc_pcs[i], min_len)) {
+            (void)a32_jit_compile_block(ctx, disc_pcs[i], disc_thumb[i], NULL);
+        }
     }
 
     if (a32_jit_flush_batch(ctx) != 0) {

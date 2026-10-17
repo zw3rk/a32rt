@@ -1207,6 +1207,197 @@ static int test14_sigaltstack(void)
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Test 15: UDF inside a Thumb IT block (SIGILL si_code, si_addr, arm_pc += 2,
+ *          and preserved ITSTATE across rt_sigreturn)
+ * -------------------------------------------------------------------------- */
+uint32_t thumb_it_udf_helper(uint32_t dummy_r0, uint32_t *out_apsr);
+
+__asm__(
+    ".text\n"
+    ".balign 4\n"
+    ".thumb\n"
+    ".thumb_func\n"
+    ".globl thumb_it_udf_helper\n"
+    ".type thumb_it_udf_helper, %function\n"
+    "thumb_it_udf_helper:\n"
+    "    .short 0x4280\n"             /* +0:  cmp r0, r0 (Z=1, C=1, N=0, V=0) */
+    "    .short 0xbf01\n"             /* +2:  ittt eq */
+    "    .short 0x200a\n"             /* +4:  moveq r0, #10 */
+    "    .short 0xde00\n"             /* +6:  udf #0 (2-byte T16 undefined) */
+    "    .short 0x2014\n"             /* +8:  moveq r0, #20 */
+    "    .short 0x3005\n"             /* +10: addeq r0, r0, #5 */
+    "    .short 0xf3ef, 0x8200\n"     /* +12: mrs r2, apsr */
+    "    .short 0x600a\n"             /* +16: str r2, [r1, #0] */
+    "    .short 0x4770\n"             /* +18: bx lr */
+    ".arm\n"
+);
+
+static volatile uint32_t g_it_udf_handled = 0U;
+static volatile uint32_t g_it_udf_ok = 0U;
+static volatile uint32_t g_it_udf_expected_pc = 0U;
+
+static void it_udf_sigill_handler(int sig, void *info, void *uctx_ptr)
+{
+    uint8_t *uc = (uint8_t *)uctx_ptr;
+    uint32_t arm_r0     = *(uint32_t *)(uc + 32);
+    uint32_t arm_pc     = *(uint32_t *)(uc + 92);
+    uint32_t fault_addr = *(uint32_t *)(uc + 100);
+
+    /* Advance past the 2-byte Thumb UDF instruction */
+    *(uint32_t *)(uc + 92) = arm_pc + 2U;
+
+    const struct siginfo32 *si = (const struct siginfo32 *)info;
+    if (sig == 4 && si != NULL &&
+        si->si_signo == 4 &&
+        si->si_code == 1 /* ILL_ILLOPC */ &&
+        (uint32_t)(uintptr_t)si->si_addr == g_it_udf_expected_pc &&
+        arm_pc == g_it_udf_expected_pc &&
+        fault_addr == g_it_udf_expected_pc &&
+        arm_r0 == 10U) {
+        g_it_udf_ok = 1U;
+    }
+    g_it_udf_handled = 1U;
+}
+
+static int test15_thumb_it_udf_sigill(void)
+{
+    g_it_udf_handled = 0U;
+    g_it_udf_ok = 0U;
+    uint32_t fn_base = ((uint32_t)(uintptr_t)thumb_it_udf_helper) & ~1U;
+    g_it_udf_expected_pc = fn_base + 6U;
+
+    struct sigaction32 act;
+    struct sigaction32 old_act;
+    act.sa_handler  = (uint32_t)(uintptr_t)it_udf_sigill_handler;
+    act.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0]  = 0U;
+    act.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 4U /* SIGILL */,
+             (uint32_t)(uintptr_t)&act, (uint32_t)(uintptr_t)&old_act, 8U) != 0) {
+        return 129;
+    }
+
+    uint32_t apsr_after = 0U;
+    uint32_t r0_after = thumb_it_udf_helper(0U, &apsr_after);
+
+    sys4(174U /* rt_sigaction */, 4U /* SIGILL */,
+         (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+
+    if (g_it_udf_handled != 1U || g_it_udf_ok != 1U) {
+        return 130;
+    }
+    /*
+     * Verify the remaining two instructions in `ittt eq` (`moveq r0, #20` and
+     * `addeq r0, r0, #5`) executed to produce r0 == 25, AND that ITSTATE was
+     * preserved across rt_sigreturn (16-bit moveq/addeq inside an IT block do
+     * not modify NZCV, so Z=1 / C=1 == 0x60000000U remains intact).
+     */
+    if (r0_after != 25U || (apsr_after & 0xF0000000U) != 0x60000000U) {
+        return 131;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Test 16: Asynchronous kill(getpid(), SIGUSR1) / tgkill SA_SIGINFO si_code & si_pid
+ * -------------------------------------------------------------------------- */
+struct siginfo32_kill {
+    int32_t  si_signo;
+    int32_t  si_errno;
+    int32_t  si_code;
+    int32_t  si_pid;
+    uint32_t si_uid;
+    uint32_t _pad[27];
+};
+
+_Static_assert(offsetof(struct siginfo32_kill, si_pid) == 12,
+               "si_pid must be at byte offset 12 in 32-bit siginfo_t");
+
+static volatile uint32_t g_kill_siginfo_calls = 0U;
+static volatile int32_t  g_kill_last_signo = 0;
+static volatile int32_t  g_kill_last_code = 999;
+static volatile int32_t  g_kill_last_pid = -1;
+
+static void kill_siginfo_handler(int sig, void *info, void *ucontext)
+{
+    (void)ucontext;
+    g_kill_siginfo_calls++;
+    g_kill_last_signo = sig;
+    if (info != NULL) {
+        const struct siginfo32_kill *si = (const struct siginfo32_kill *)info;
+        g_kill_last_code = si->si_code;
+        g_kill_last_pid  = si->si_pid;
+    }
+}
+
+static int test16_async_kill_tgkill_siginfo(void)
+{
+    struct sigaction32 act;
+    struct sigaction32 old_act;
+    act.sa_handler  = (uint32_t)(uintptr_t)kill_siginfo_handler;
+    act.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0]  = 0U;
+    act.sa_mask[1]  = 0U;
+
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+             (uint32_t)(uintptr_t)&act, (uint32_t)(uintptr_t)&old_act, 8U) != 0) {
+        return 132;
+    }
+
+    int32_t my_pid = sys1(20U /* getpid */, 0U);
+    int32_t my_tid = sys1(224U /* gettid */, 0U);
+    if (my_pid <= 0 || my_tid <= 0) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+        return 133;
+    }
+
+    /* 16a: kill(getpid(), SIGUSR1) -> si_code <= 0 (SI_USER == 0) and si_pid == getpid() */
+    g_kill_siginfo_calls = 0U;
+    g_kill_last_signo = 0;
+    g_kill_last_code = 999;
+    g_kill_last_pid = -1;
+
+    if (sys2(37U /* kill */, (uint32_t)my_pid, 10U /* SIGUSR1 */) != 0) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+        return 134;
+    }
+    if (g_kill_siginfo_calls != 1U ||
+        g_kill_last_signo != 10 ||
+        g_kill_last_code > 0 ||
+        (g_kill_last_code != 0 /* SI_USER */ && g_kill_last_code != -6 /* SI_TKILL */) ||
+        g_kill_last_pid != my_pid) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+        return 135;
+    }
+
+    /* 16b: tgkill(getpid(), gettid(), SIGUSR1) -> si_code <= 0 (SI_TKILL == -6) and si_pid == getpid() */
+    g_kill_siginfo_calls = 0U;
+    g_kill_last_signo = 0;
+    g_kill_last_code = 999;
+    g_kill_last_pid = -1;
+
+    if (sys3(268U /* tgkill */, (uint32_t)my_pid, (uint32_t)my_tid, 10U /* SIGUSR1 */) != 0) {
+        sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+        return 136;
+    }
+    sys4(174U /* rt_sigaction */, 10U, (uint32_t)(uintptr_t)&old_act, 0U, 8U);
+
+    if (g_kill_siginfo_calls != 1U ||
+        g_kill_last_signo != 10 ||
+        g_kill_last_code > 0 ||
+        (g_kill_last_code != -6 /* SI_TKILL */ && g_kill_last_code != 0 /* SI_USER */) ||
+        g_kill_last_pid != my_pid) {
+        return 137;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -1262,6 +1453,14 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test14_sigaltstack();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test15_thumb_it_udf_sigill();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test16_async_kill_tgkill_siginfo();
     if (rc != 0) {
         return rc;
     }

@@ -193,6 +193,9 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             bool b_bit = ((insn >> 22) & 1U) != 0U;
             bool q_bit = ((insn >> 21) & 1U) != 0U;
             bool e_bit = ((insn >> 5) & 1U) != 0U;
+            if (b_bit && e_bit) {
+                return false;
+            }
             unsigned size = b_bit ? 0U : (e_bit ? 1U : 2U);
             unsigned vd = (((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU);
             if (q_bit) {
@@ -611,7 +614,12 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     }
                     a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, ctx_off);
                     if (is_double) {
-                        a64_emit_str_imm_w(b, A64_ZR, A64_XCTX, ctx_off + 4U);
+                        if (is_unsigned) {
+                            a64_emit_str_imm_w(b, A64_ZR, A64_XCTX, ctx_off + 4U);
+                        } else {
+                            a64_emit_sbfm_w(b, A64_TMP1, A64_TMP0, 31U, 31U);
+                            a64_emit_str_imm_w(b, A64_TMP1, A64_XCTX, ctx_off + 4U);
+                        }
                     }
                 }
                 return true;
@@ -858,6 +866,9 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             if (size == 3U && l_bit) {
                 /* VLD1..4.<8/16/32> {Dd[], ...}, [Rn] */
                 unsigned dup_size = (insn >> 6) & 3U;
+                if (n_structs == 4U && dup_size == 3U && (insn & 0x10U) != 0U) {
+                    dup_size = 2U;
+                }
                 if (dup_size > 2U) {
                     return false;
                 }
