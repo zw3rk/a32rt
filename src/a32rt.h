@@ -75,7 +75,7 @@ typedef struct a32_ctx {
     uint64_t guest_base;        /* 0x48: Host base address G of [G, G+4GiB) window */
     uint32_t exit_reason;       /* 0x50: A32_EXIT_* */
     uint32_t svc_imm;           /* 0x54: SVC immediate */
-    uint32_t itstate;           /* 0x58: Thumb IT block state */
+    uint32_t pad_it;            /* 0x58: Reserved alignment slot */
     uint32_t fault_addr;        /* 0x5c: Faulting guest address */
     uint64_t vfp_d[32];         /* 0x60: VFPv4-D32 / NEON registers (D0..D31 / S0..S31 / Q0..Q15) */
     uint32_t fpscr;             /* 0x160: VFP/NEON Floating-Point Status and Control Register */
@@ -88,7 +88,7 @@ typedef struct a32_ctx {
     bool              gdb_enabled;        /* 0x179 (377) */
     bool              single_step;        /* 0x17a (378) */
     volatile bool     sync_sig_delivered; /* 0x17b (379) */
-    uint32_t          pad1;               /* 0x17c (380) */
+    uint32_t          itstate;            /* 0x17c (380): Thumb IT block state (packed in 128b load at 368) */
     uint64_t          blocks_executed;    /* 0x180 (384) */
     uint64_t          chain_hits;         /* 0x188 (392) */
     void             *last_exec_entry;    /* 0x190 (400) */
@@ -98,12 +98,6 @@ typedef struct a32_ctx {
     uint64_t          ras_hits;           /* 0x89a0 (35232) */
     uint32_t          ras_top;            /* 0x89a8 (35240) */
     uint32_t          pad2;               /* 0x89ac (35244) */
-
-    /* Legacy RAS arrays kept for C compatibility if referenced */
-    uint32_t          ras_key[A32_RAS_SIZE];
-    uint32_t          ras_epoch[A32_RAS_SIZE];
-    const void       *ras_code[A32_RAS_SIZE];
-    void             *ras_entry[A32_RAS_SIZE];
 
     /* Guest memory layout & allocator inside [G, G + 4GiB) */
     uint32_t brk_base;
@@ -163,7 +157,6 @@ _Static_assert(offsetof(a32_ctx_t, tls_tp) == 68, "tls_tp must be at offset 68")
 _Static_assert(offsetof(a32_ctx_t, guest_base) == 72, "guest_base must be at offset 72");
 _Static_assert(offsetof(a32_ctx_t, exit_reason) == 80, "exit_reason must be at offset 80");
 _Static_assert(offsetof(a32_ctx_t, svc_imm) == 84, "svc_imm must be at offset 84");
-_Static_assert(offsetof(a32_ctx_t, itstate) == 88, "itstate must be at offset 88");
 _Static_assert(offsetof(a32_ctx_t, vfp_d) == 96, "vfp_d must be at offset 96 (0x60)");
 _Static_assert(offsetof(a32_ctx_t, fpscr) == 352, "fpscr must be at offset 352 (0x160)");
 _Static_assert(offsetof(a32_ctx_t, sig_mask) == 360, "sig_mask must be at offset 360");
@@ -172,6 +165,7 @@ _Static_assert(offsetof(a32_ctx_t, trace_enabled) == 376, "trace_enabled must be
 _Static_assert(offsetof(a32_ctx_t, gdb_enabled) == 377, "gdb_enabled must be at offset 377");
 _Static_assert(offsetof(a32_ctx_t, single_step) == 378, "single_step must be at offset 378");
 _Static_assert(offsetof(a32_ctx_t, sync_sig_delivered) == 379, "sync_sig_delivered must be at offset 379");
+_Static_assert(offsetof(a32_ctx_t, itstate) == 380, "itstate must be at offset 380");
 _Static_assert(offsetof(a32_ctx_t, blocks_executed) == 384, "blocks_executed must be at offset 384");
 _Static_assert(offsetof(a32_ctx_t, chain_hits) == 392, "chain_hits must be at offset 392");
 _Static_assert(offsetof(a32_ctx_t, last_exec_entry) == 400, "last_exec_entry must be at offset 400");

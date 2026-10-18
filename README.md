@@ -19,13 +19,13 @@ For the full architectural specification, register allocation, and design ration
   - **VFPv4-D32, NEON, ARMv8-A Directed-Rounding FP & Crypto**: Full `s0`–`s31` (32 single-precision), `d0`–`d31` (32 double-precision), and `q0`–`q15` (16 quadword SIMD) register file, including `VLD1`–`VLD4`/`VST1`–`VST4` multi-structure loads/stores, `VTBL`/`VTBX`, polynomial arithmetic (`VMULL.P8` and 64×64→128 carryless `VMULL.P64`), saturating/rounding/widening/narrowing SIMD, `VCMP` + `VMRS APSR_nzcv`, `FPSCR` ↔ `FPCR`/`FPSR` synchronization, ARMv8-A floating-point extensions (`VSEL{EQ,VS,GE,GT}.F32/.F64`, scalar & vector `VMAXNM`/`VMINNM`, `VRINT{A,N,P,M,Z,R,X}.F32/.F64`, `VCVT{A,N,P,M}.{S32,U32}.{F32,F64}`), and hardware Cryptography Extensions (`AESE.8`, `AESD.8`, `AESMC.8`, `AESIMC.8`, `SHA1{C,P,M,H,SU0,SU1}.32`, `SHA256{H,H2,SU0,SU1}.32`) advertised via `AT_HWCAP2 = 0x1f`.
 - **Fast JIT & Persistent `.a32cache` AOT Engine**:
   - **Strict W^X Discipline**: Code is emitted into a staging buffer and transitioned to `PROT_READ | PROT_EXEC` once per basic-block batch. Under `hyper-linux` (`A32H_CAP_ICACHE_TRAP_IALLU`), a single `IC IVAU + ISB` flushes the entire translation cache without per-cacheline VM exits.
-  - **Direct Block Chaining, IBTC & In-Trampoline 64-Entry RAS**: Conditional/unconditional direct branches patch 2-way RW chain slots (`chain_key[0..1]` / `chain_code[0..1]`); polymorphic indirect branches and function returns dispatch in-trampoline through a 64-entry per-thread Return Address Stack (`RAS`, `ctx->ras`) and a 1024-entry lock-free Indirect Branch Target Cache (`IBTC`, `ctx->ibtc`) without exiting to C.
-  - **Intra-Block Optimizations**: 128-instruction basic block window; backward dead-NZCV liveness analysis elides redundant `MRS/MSR NZCV` instructions across consecutive flag-setting operations; 24-slot (`v8`–`v31`) lazy-write-back VFP register cache (`s0`–`s31` and `d0`–`d31`) with clean-first eviction pins floating-point accumulators in host SIMD registers across basic blocks.
-  - **Multi-Region & Shared-Library Disk-Backed AOT Cache**: `a32rt --aot <elf32-or-so>` pre-translates static executables, `PT_INTERP` dynamic linkers (`ld-musl-armhf.so.1` + main executable), and `ET_DYN` shared libraries (`.so`, including `e_entry == 0`) into content-hashed `.a32cache` artifacts (`$A32RT_CACHE` or `/tmp/a32rt-cache-*`) that are loaded automatically at startup and on file-backed `mmap2(..., PROT_EXEC)` mappings.
+  - **Direct In-Cache 8-Slot Chaining (`br x17`), IBTC & In-Trampoline 64-Entry RAS**: Static direct branch/call exits (`a64_emit_exit_branch`) emit a 12-word inline check of `[x19, #368]` (`pending_signals | flags | itstate`), `cur_entry->slot_entry[s]`, and `g_cache_epoch` (`ldar w21, [x28]`), jumping directly to the target block's `host_code` via `br x17` inside the code cache without returning to `trampoline.S` (`99.99%+` in-cache chain rate on hot loops); polymorphic indirect branches and function returns dispatch in-trampoline through a 64-entry per-thread Return Address Stack (`RAS`, `ctx->ras`) and a 1024-entry lock-free Indirect Branch Target Cache (`IBTC`, `ctx->ibtc`) without exiting to C.
+  - **Intra-Block Optimizations**: 128-instruction basic block window; backward dead-NZCV liveness analysis elides redundant `MRS/MSR NZCV` instructions across consecutive flag-setting operations; 24-slot (`v8`–`v31`) lazy-write-back VFP & NEON register cache (`s0`–`s31`, `d0`–`d31`, and 128-bit `q0`–`q15` with full cross-width aliasing) pins scalar and vector accumulators in host SIMD registers across basic blocks.
+  - **Base-Address-Independent (Relocatable) Shared-Library & Multi-Region AOT Cache (`A32_AOT_VERSION 5`)**: `a32rt --aot <elf32-or-so>` pre-translates static executables, `PT_INTERP` dynamic linkers (`ld-musl-armhf.so.1` + main executable), and `ET_DYN` shared libraries (`.so`, including `e_entry == 0` with automatic Thumb-2 vs. A32 prologue detection) into content-hashed `.a32cache` artifacts (`$A32RT_CACHE` or `/tmp/a32rt-cache-*`). Guest-PC-derived immediates use a self-identifying `MOVZ Wd, #hi16, LSL #16` + `MOVK Wd, #lo16, LSL #0` pair (`a64_emit_mov_pc32`), enabling `a32_aot_load_fd` to relocate pre-translated `.so` blocks by `delta = load_bias - hdr.reserved` at runtime when mapped at arbitrary ASLR base addresses via `mmap2(..., PROT_EXEC)`.
 - **Linux ARM EABI (`armhf`) Runtime Compatibility**:
-  - **Dynamic Linking & Sysroot Overlay**: Loads both static (`ET_EXEC`) and PIE/dynamically linked (`ET_DYN` + `PT_INTERP`) ARM32 ELF binaries (verified with Alpine `armv7` `ld-musl-armhf.so.1` and `busybox`), translating sysroot-prefixed paths transparently via `--sysroot` / `A32RT_SYSROOT`.
+  - **Multi-Library Dynamic Linking & Sysroot Overlay**: Loads both static (`ET_EXEC`) and PIE/dynamically linked (`ET_DYN` + `PT_INTERP`) ARM32 ELF binaries (verified with Alpine `armv7` `ld-musl-armhf.so.1`, `busybox`, `apk` with `libapk.so` + `libcrypto.so.3` + `libssl.so.3` + `libz.so.1`, `scanelf`, and `getconf`), translating sysroot-prefixed paths transparently via `--sysroot` / `A32RT_SYSROOT`.
   - **Synthetic `0xffff0000` `[vectors]` kuser Page**: Populates real A32 instruction sequences at `0xffff0f60` (`__kuser_cmpxchg64`), `0xffff0fa0` (`__kuser_memory_barrier`), `0xffff0fc0` (`__kuser_cmpxchg`), `0xffff0fe0` (`__kuser_get_tls`), and helper version `5` at `0xffff0ffc`.
-  - **ARM EABI Syscall & Struct Shim**: Translates 220+ ARM EABI (`r7`, `r0`–`r5`) syscalls and private ARM syscalls (`cacheflush`, `set_tls`, `get_tls`) to `aarch64-linux` (`x8`, `x0`–`x5`), shimming 32-to-64 structures (`stat64`, `statfs64`, `sysinfo`, `rusage`, `iovec`, `msghdr`/`cmsghdr`, `epoll_event`, `flock64`, `timespec`/`timeval`/`itimerspec` time32 & time64 variants, TTY/block/network `ioctl` structs `termios`, `winsize`, `ifreq`, `ifconf`, `BLKGETSIZE*`), `/proc/self/{exe,maps,auxv,cmdline,stat,status}`, `/proc/cpuinfo`, and `execve` re-wrapping.
+  - **ARM EABI Syscall & Struct Shim**: Translates 240+ ARM EABI (`r7`, `r0`–`r5`) syscalls and private ARM syscalls (`cacheflush`, `set_tls`, `get_tls`) to `aarch64-linux` (`x8`, `x0`–`x5`), shimming 32-to-64 structures (`stat64`, `statx`, `statfs64`, `sysinfo`, `rusage`, `iovec`, `msghdr`/`cmsghdr`, `epoll_event`, `flock64`, `timespec`/`timeval`/`itimerspec` time32 & time64 variants, TTY/block/network `ioctl` structs `termios`, `winsize`, `ifreq`, `ifconf`, `BLKGETSIZE*`, `unshare`, `faccessat2`, `fallocate`, `splice`, `sync_file_range2`, `tee`, `timerfd_create`, `signalfd4`, `inotify_init1`, `preadv`/`pwritev`, `setns`, `seccomp`, `memfd_create`, `copy_file_range`, `rseq`, `close_range`), `/proc/self/{exe,maps,auxv,cmdline,stat,status}`, `/proc/cpuinfo`, and `execve` re-wrapping.
   - **Threads, Futexes, Self-Modifying Code & Signals**: Supports `clone` (`CLONE_VM | CLONE_THREAD | CLONE_SETTLS`) with isolated per-thread JIT state, 3-class signal routing (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` side-table PC recovery, guest write-protect SMC invalidation, and asynchronous RT signal delivery), and authentic 32-bit ARM `rt_sigframe` / `sigframe` including the `VFP_MAGIC` (`0x56465001`) coprocessor frame (`d0`–`d31`, `fpscr`, `fpexc`) in `ucontext_t.uc_regspace` across `rt_sigreturn` (`r7 = 173`) / `sigreturn` (`r7 = 119`).
 - **Built-In GDB RSP Stub**: Launch with `--gdb <port>` (or `A32RT_GDB=<port>`) to debug guest `arm32` binaries with `gdb-multiarch` or `lldb` (inspect `r0`–`r15`/`cpsr`, read/write guest memory, single-step basic blocks, and set software breakpoints).
 
@@ -42,7 +42,7 @@ nix develop -c make all
 ```
 
 This produces:
-- `_build/a32rt`: Static-PIE `aarch64-linux` binary translator (`~235 KiB`, zero runtime dependencies).
+- `_build/a32rt`: Static-PIE `aarch64-linux` binary translator (`~240 KiB`, zero runtime dependencies).
 - `_build/a32rt-binfmt-p`: Symlink enabling `binfmt_misc` `P` (preserve `argv[0]`) mode automatically.
 - `_build/hello-*`, `_build/test-m1-*` .. `_build/test-m5-*`, `_build/bench-coremark-*`: Freestanding A32 and Thumb-2 verification binaries.
 
@@ -52,12 +52,14 @@ This produces:
 # Run a static armhf binary directly:
 ./_build/a32rt ./_build/hello-armhf-static
 
-# Run a dynamically linked musl armv7 binary (e.g. busybox) with a sysroot:
+# Run a dynamically linked musl armv7 binary (e.g. busybox or apk) with a sysroot:
 ./_build/a32rt --sysroot ./_build/sysroot-armv7 ./_build/sysroot-armv7/bin/busybox sh -c 'ls / && echo ok'
+./_build/a32rt --sysroot ./_build/sysroot-armv7 ./_build/sysroot-armv7/sbin/apk --version
 
-# Pre-translate an armhf binary (or shared library / PT_INTERP binary) into the persistent AOT cache:
-./_build/a32rt --aot ./_build/bench-coremark-armhf
-./_build/a32rt --stats ./_build/bench-coremark-armhf
+# Pre-translate a shared library (.so) and executable into the relocatable persistent AOT cache:
+./_build/a32rt --aot ./_build/sysroot-armv7/usr/lib/libz.so.1.3.2
+./_build/a32rt --aot --sysroot ./_build/sysroot-armv7 ./_build/sysroot-armv7/sbin/apk
+./_build/a32rt --stats --sysroot ./_build/sysroot-armv7 ./_build/sysroot-armv7/sbin/apk --version
 ```
 
 ### 3. Run under `hyper-linux` (`hl`) on macOS Apple Silicon
@@ -93,8 +95,8 @@ Usage: a32rt [options] [--] <arm32-elf> [guest-args...]
 | `--window <hex>` | `A32RT_WINDOW=<hex>` | Guest 4 GiB window base `G` (e.g. `0x0` or `0x100000000`). Probed via `/dev/a32host` or address-space availability if unset. |
 | `--sysroot <path>` | `A32RT_SYSROOT=<path>` | Guest `armhf` sysroot directory for `PT_INTERP` (`ld-musl-armhf.so.1` / `ld-linux-armhf.so.3`) and absolute file paths. |
 | `--cache <dir>` | `A32RT_CACHE=<dir>` | Directory for persistent `.a32cache` AOT translation artifacts (default: `/tmp/a32rt-cache`). |
-| `--aot` | `A32RT_AOT=1` | Pre-translate `PT_LOAD` executable segments (including `PT_INTERP` and `.so` libraries) into `<cache>` and exit `0`. |
-| `--stats` | `A32RT_STATS=1` | Print JIT/AOT telemetry (blocks, emitted bytes, W^X toggles, IBTC hit rate, RAS hits, cache flushes) to `stderr` on exit. |
+| `--aot` | `A32RT_AOT=1` | Pre-translate `PT_LOAD` executable segments (including `PT_INTERP` and relocatable `.so` libraries) into `<cache>` and exit `0`. |
+| `--stats` | `A32RT_STATS=1` | Print JIT/AOT telemetry (blocks, emitted bytes, W^X toggles, chain/IBTC/RAS hits, cache flushes) to `stderr` on exit. |
 | `--trace` | `A32RT_TRACE=1` | Trace translated basic block entries and guest syscalls to `stderr`. |
 | `--gdb <port>` | `A32RT_GDB=<port>` | Start the GDB Remote Serial Protocol (RSP) server on `127.0.0.1:<port>` and wait for debugger attach before guest entry. |
 | *(argv[0] `*-binfmt-p`)* | `A32RT_BINFMT_P=1` | Enable Linux `binfmt_misc` `P`-flag argument parsing (`<interp> <full-path> <orig-argv0> [args...]`). |
@@ -102,7 +104,7 @@ Usage: a32rt [options] [--] <arm32-elf> [guest-args...]
 
 ---
 
-## Verification & Milestone Suite (`M0`–`M5`)
+## Verification & Milestone Suite (`M0`–`M6`)
 
 `a32rt` is continuously verified against two targets:
 1. **Primary Target (`*-hl`)**: Running inside [`hyper-linux`](../hyper-linux) (`../hyper-linux/_build/hl`) on macOS Apple Silicon in offset mode (`G = 0x1_0000_0000`) with `/dev/a32host` (`A32H_ABI 1.0`).
@@ -111,10 +113,10 @@ Usage: a32rt [options] [--] <arm32-elf> [guest-args...]
 Run the complete test suite on either target via `Makefile`:
 
 ```sh
-# Run all M0..M5 suites under hyper-linux (macOS Apple Silicon):
+# Run all M0..M6 suites under hyper-linux (macOS Apple Silicon):
 make test-all-hl
 
-# Run all M0..M5 suites inside the Lima AArch64 Linux VM:
+# Run all M0..M6 suites inside the Lima AArch64 Linux VM:
 make test-all-lima
 
 # Show all individual Makefile targets:
@@ -129,6 +131,7 @@ make help
 | **M3** | `make test-m3-hl`<br>`make test-m3-lima` | `clone` threads (`CLONE_VM \| CLONE_THREAD \| CLONE_SETTLS`), `LDREX`/`STREX{B,H,D}` + kuser `__kuser_cmpxchg` / `__kuser_cmpxchg64` + `futex`, 3-class signal router (`SIGSEGV` fault recovery with exact guest `PC`, `SIGUSR1` + `SA_SIGINFO` `ucontext_t` + `VFP_MAGIC` `uc_regspace` `d0`–`d31` mutation, `sigaltstack`, real `rt_sigreturn`), and self-modifying code (`SMC`) via both `cacheflush` and write-protected page faults. |
 | **M4** | `make test-m4-hl`<br>`make test-m4-lima` | VFPv4-D32 (`s0`–`s31`, `d0`–`d31`, scalar arithmetic, `VFMA`/`VFMS`, `VSQRT`, `VCVT`, `VCMP` + `VMRS APSR_nzcv`, `FPSCR` rounding modes), NEON ASIMD (`q0`–`q15`, integer/float SIMD, `VLD1`–`VLD4`/`VST1`–`VST4`, `VTBL`/`VTBX`, saturating/widening/narrowing ops, auto-vectorized loops), ARMv8-A Directed-Rounding FP (`VSEL{EQ,VS,GE,GT}`, scalar & vector `VMAXNM`/`VMINNM`, `VRINT{A,N,P,M,Z,R,X}`, `VCVT{A,N,P,M}`), and ARMv8-A `CRC32`/`CRC32C` + Crypto (`AESE`/`AESD`/`AESMC`/`AESIMC`, `VMULL.P64`, `SHA1`, `SHA256`) in both A32 and Thumb-2. |
 | **M5** | `make test-m5-hl`<br>`make test-m5-lima` | LTP-style 32-to-64 syscall & struct conformance (`stat64`/`fstat64`/`fstatat64`, `statfs64`, `sysinfo`, `rusage`, `uname` `"armv7l"`, `fcntl64`, `epoll`, `socketpair` + `sendmsg`/`recvmsg` `SCM_RIGHTS` `cmsghdr` translation, `SIOCGIF*`/`SIOCGIFCONF`/`BLKGETSIZE*` `ioctl` shims, `/proc/self/auxv` `AT_HWCAP2`, `poll`/`ppoll`/`pselect6`, `clock_gettime64`, `prlimit64`, negative `EFAULT` checks) + GDB RSP stub (`?`, `g`/`G`, `m`/`M`, `s`, `c`, `Z0`/`z0`). |
+| **M6** | `make test-m6-hl`<br>`make test-m6-lima` | Direct In-Cache 8-Slot Chaining (`slot_key[0..7]` / `slot_entry[0..7]`, inline `br x17`), Base-Address-Independent Relocatable `.so` AOT Cache (`A32_AOT_VERSION 5`, `a64_emit_mov_pc32`), 128-Bit NEON `q0`–`q15` (`A64_VFP_KIND_Q`) Intra-Block Register Caching & Cross-Width (`Q` ↔ `D` ↔ `S`) Aliasing, and Multi-Library Dynamic Linking (`apk --version` linking `libapk.so.2.14.0`, `libcrypto.so.3`, `libssl.so.3`, `libz.so.1`, `scanelf -V`, `getconf LONG_BIT`, plus relocatable `libz.so.1.3.2` `.a32cache` loading). |
 
 ---
 
@@ -162,39 +165,37 @@ All times in microseconds (`us`, lower is better):
 
 | Translator / Target | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | **vs. `qemu-arm`** |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Native `aarch64-linux`** | `aarch64` | 730 | 917 | 401 | 2,001 | 629 | **4,678** | 10.67× |
-| **Apple `RosettaLinux`** | `x86_64` | 886 | 2,163 | 685 | 3,522 | 661 | **7,917** | 6.31× |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **3,506** | **2,451** | **2,264** | **11,316** | **966** | **20,503** | **2.44× faster** |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **3,846** | **2,765** | **1,799** | **12,559** | **904** | **21,873** | **2.28× faster** |
-| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (Thumb-2) | 5,863 | 3,530 | 15,503 | 23,540 | 1,497 | **49,933** | 1.00× |
-| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (A32) | 6,419 | 5,627 | 18,644 | 20,664 | 1,528 | **52,882** | 0.94× |
-| **`qemu-i386` 10.1.0 (TCG)** | `i386` (32-bit x86) | 5,451 | 11,297 | 14,661 | 27,825 | 2,340 | **61,574** | 0.81× |
-| **`qemu-x86_64` 10.1.0 (TCG)** | `x86_64` | 21,908 | 4,373 | 15,786 | 22,520 | 2,115 | **66,702** | 0.75× |
+| **Native `aarch64-linux`** | `aarch64` | 791 | 947 | 440 | 2,195 | 719 | **5,092** | 14.03× |
+| **Apple `RosettaLinux`** | `x86_64` | 1,023 | 2,044 | 705 | 3,128 | 1,137 | **8,037** | 8.89× |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **2,239** | **2,831** | **2,026** | **5,851** | **939** | **13,886** | **5.15× faster** |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **2,312** | **2,432** | **2,091** | **6,396** | **917** | **14,148** | **5.05× faster** |
+| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (Thumb-2) | 5,730 | 3,642 | 15,914 | 44,779 | 1,379 | **71,444** | 1.00× |
+| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (A32) | 6,679 | 5,538 | 29,577 | 46,090 | 1,748 | **89,632** | 0.80× |
+| **`qemu-i386` 10.1.0 (TCG)** | `i386` (32-bit x86) | 7,092 | 12,622 | 24,687 | 54,489 | 2,715 | **101,605** | 0.70× |
+| **`qemu-x86_64` 10.1.0 (TCG)** | `x86_64` | 22,496 | 4,945 | 29,133 | 44,783 | 1,305 | **102,662** | 0.70× |
 
 Key takeaways:
-- **`a32rt` vs. `qemu-arm` 10.1.0 (TCG)**: `a32rt` beats `qemu-arm` on **every single workload**: **1.52×–1.83× faster** on `coremark`, **1.28×–2.30× faster** on `chacha20`, **8.23×–8.62× faster** on `vfp_simd` (where `a32rt`'s 24-slot `v8`–`v31` lazy-write-back VFP register cache and 128-instruction basic block window keep floating-point accumulators in hardware AArch64 SIMD registers across the entire inner loop), **1.83×–1.87× faster** on `calls_ibtc` (`11,316 us` A32 and `12,559 us` Thumb-2 vs. `20,664 us` / `23,540 us` for `qemu-arm`), and **1.58×–1.66× faster** on `syscalls`.
-- **`a32rt` vs. `qemu-x86_64` / `qemu-i386`**: `a32rt` is **3.0×–3.25× faster** than `qemu-x86_64` and **2.8×–3.0× faster** than `qemu-i386`.
+- **`a32rt` vs. `qemu-arm` 10.1.0 (TCG)**: With `M6` Direct In-Cache 8-Slot Chaining (`br x17`), `a32rt` is **5.05×–6.34× faster overall** than `qemu-arm` and wins on **every single workload**: **2.56×–2.89× faster** on `coremark` (`2,239 us` Thumb-2 / `2,312 us` A32 vs. `5,730 us` / `6,679 us`), **1.29×–2.28× faster** on `chacha20`, **7.85×–14.14× faster** on `vfp_simd` (where `a32rt`'s 24-slot `v8`–`v31` lazy-write-back VFP/NEON register cache and 128-instruction basic block window keep floating-point accumulators in hardware AArch64 SIMD registers across the entire inner loop), **7.21×–7.65× faster** on `calls_ibtc` (`5,851 us` Thumb-2 and `6,396 us` A32 vs. `44,779 us` / `46,090 us`), and **1.47×–1.91× faster** on `syscalls`.
+- **`a32rt` vs. `qemu-x86_64` / `qemu-i386`**: `a32rt` is **7.18×–7.39× faster** than `qemu-x86_64` and `qemu-i386`.
 
 ### 2. `hyper-linux` (`hl` on macOS Apple M5, Offset Mode `G = 4 GiB`)
 
 | Translator / Target (`hl`) | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | Runtime `blocks_compiled` |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Native `aarch64-linux`** | `aarch64` | 730 | 917 | 401 | 2,001 | 9,500 | **13,549** | — |
-| **Apple `RosettaLinux`** | `x86_64` | 797 | 1,687 | 656 | 3,489 | 9,899 | **16,528** | — (AOT) |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **2,694** | **1,798** | **1,337** | **6,599** | **9,714** | **22,142** | **`0`** |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **3,316** | **2,402** | **1,738** | **9,044** | **10,200** | **26,700** | **`0`** |
-| **`a32rt` (Cold JIT)** | **`armhf` (A32)** | 2,704 | 1,810 | 1,881 | 8,900 | 9,850 | **25,145** | `107` |
-| **`a32rt` (Cold JIT)** | **`armhf` (Thumb-2)** | 3,314 | 2,402 | 1,738 | 9,100 | 10,300 | **26,854** | `111` |
+| **Native `aarch64-linux`** | `aarch64` | 789 | 948 | 436 | 2,550 | 14,110 | **18,833** | — |
+| **Apple `RosettaLinux`** | `x86_64` | 1,018 | 2,029 | 732 | 2,889 | 17,507 | **24,175** | — (AOT) |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **2,300** | **2,398** | **1,736** | **5,906** | **16,685** | **29,025** | **`0`** |
+| **`a32rt` (Cold JIT)** | **`armhf` (A32)** | 2,623 | 2,346 | 1,737 | 5,720 | 16,919 | **29,345** | `107` |
+| **`a32rt` (Cold JIT)** | **`armhf` (Thumb-2)** | 2,590 | 2,899 | 1,725 | 5,740 | 19,663 | **32,617** | `111` |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **2,262** | **2,831** | **1,738** | **5,861** | **19,600** | **32,292** | **`0`** |
 
 ---
 
 ## Future Optimization Opportunities
 
-All `M0`–`M5` and `M0-hl`–`M5-hl` milestones specified in [`A32RT.md`](A32RT.md) — as well as the 64-entry in-trampoline `RAS`, streamlined 128-bit in-trampoline chain/IBTC dispatch with register-resident telemetry counters, 24-slot (`v8`–`v31`) lazy-write-back VFP (`s0`–`s31` & `d0`–`d31`) register cache, 128-instruction basic block window, full ARMv8-A AArch32 user-mode ISA (`VSEL`, `VMAXNM`/`VMINNM`, `VRINT*`, `VCVT{A,N,P,M}`, `CRC32`/`CRC32C`, and `AES`/`PMULL`/`SHA1`/`SHA256` Crypto), multi-region `PT_INTERP`/`.so` `.a32cache` AOT pre-translation, `VFP_MAGIC` (`0x56465001`) signal frame `uc_regspace` support, and block/network `ioctl` translation — are complete and verified. Potential future enhancements include:
+All `M0`–`M6` and `M0-hl`–`M6-hl` milestones specified in [`A32RT.md`](A32RT.md) — including Direct In-Cache 8-Slot Chaining (`br x17`), Base-Address-Independent Relocatable `.so` AOT Cache (`A32_AOT_VERSION 5`), 24-slot (`v8`–`v31`) lazy-write-back VFP & 128-bit NEON (`s0`–`s31`, `d0`–`d31`, `q0`–`q15`) register caching, 64-entry in-trampoline `RAS`, 128-instruction basic block window, full ARMv8-A AArch32 user-mode ISA (`VSEL`, `VMAXNM`/`VMINNM`, `VRINT*`, `VCVT{A,N,P,M}`, `CRC32`/`CRC32C`, and `AES`/`PMULL`/`SHA1`/`SHA256` Crypto), multi-library `PT_INTERP`/`.so` dynamic linking (`apk`, `scanelf`, `getconf`), `VFP_MAGIC` (`0x56465001`) signal frame `uc_regspace` support, and block/network `ioctl` translation — are complete and verified. Potential future enhancements include:
 
-- **Direct Native Code-to-Code Patching / Multi-Block Trace Superblocks**: Emitting direct AArch64 `B <target>` branches between chained basic blocks inside the executable code cache (with an inline per-edge signal-check header) so hot loops and `bl`/`bx lr` pairs stay inside the code cache without returning to `trampoline.S` (`blr x17` / `ret`) on every basic block.
-- **Cross-Block Register Allocation for `d0`–`d31` and `q0`–`q15`**: Extending the intra-block 24-slot `v8`–`v31` VFP register cache across basic-block boundaries (or caching 128-bit NEON `q0`–`q15` vector registers across instructions) to eliminate basic-block exit VFP flushes.
-- **Base-Address-Independent (Relocatable) `.so` AOT Blocks**: Recording explicit per-instruction guest-PC relocation metadata in `.a32cache` so shared libraries mapped via `mmap2(PROT_EXEC)` at an arbitrary ASLR `load_bias` can relocate pre-translated A64 blocks rather than requiring a matching `load_bias`.
+- **Multi-Block Trace Superblocks & Cross-Block VFP/NEON Register Allocation**: Extending the intra-block 24-slot `v8`–`v31` VFP/NEON register cache across direct-chained basic-block boundaries (`slot_entry[0..7]`) so hot loops keep floating-point and vector registers live across loop back-edges without basic-block exit VFP flushes.
 - **Specialized Multimedia/DRM `ioctl` Device Families**: Extending `ARM_NR_ioctl` struct translation for specialized multimedia or GPU device families (`V4L2`, `DRM`, `ALSA`) if needed by desktop/GUI workloads.
 
 ---

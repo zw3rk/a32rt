@@ -435,7 +435,25 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
     }
 
     if (out->entry == 0U && out->text_start >= 0x10000U && out->text_end > out->text_start) {
-        out->entry    = out->text_start;
+        size_t thumb_prologues = 0U;
+        size_t a32_prologues   = 0U;
+        uint32_t t_start = (out->text_start + 3U) & ~3U;
+        uint32_t t_end   = out->text_end & ~3U;
+        for (uint32_t p = t_start; p + 4U <= t_end; p += 2U) {
+            const uint16_t *hwp = (const uint16_t *)a32_guest_ptr(ctx, p);
+            uint16_t hw0 = hwp[0];
+            uint16_t hw1 = hwp[1];
+            if ((hw0 & 0xFF00U) == 0xB500U || (hw0 == 0xE92DU && (hw1 & 0x4000U) != 0U)) {
+                thumb_prologues++;
+            }
+            if ((p & 3U) == 0U) {
+                uint32_t w = (uint32_t)hw0 | ((uint32_t)hw1 << 16U);
+                if ((w & 0xFFFF4000U) == 0xE92D4000U) {
+                    a32_prologues++;
+                }
+            }
+        }
+        out->entry    = out->text_start | ((thumb_prologues > a32_prologues) ? 1U : 0U);
         entry_in_load = true;
     }
 

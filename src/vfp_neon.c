@@ -284,7 +284,7 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             uint32_t byte_disp = imm8 * 4U;
             unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
             if (rn == 15U) {
-                a64_emit_mov_imm32(b, A64_TMP0, pc + 8U);
+                a64_emit_mov_pc32(b, A64_TMP0, pc + 8U);
             }
             if (u_bit) {
                 a64_emit_add_imm_w(b, false, A64_ADDR, base_reg, (uint16_t)byte_disp, 0U);
@@ -333,7 +333,7 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
         uint32_t total_bytes = imm8 * 4U;
         unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
         if (rn == 15U) {
-            a64_emit_mov_imm32(b, A64_TMP0, pc + 8U);
+            a64_emit_mov_pc32(b, A64_TMP0, pc + 8U);
         }
         if (!u_bit) {
             a64_emit_sub_imm_w(b, false, A64_ADDR, base_reg, (uint16_t)total_bytes, 0U);
@@ -1212,6 +1212,9 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
         /* VDUP scalar (bits 11..7 == 0b11000) */
         if (((insn >> 7) & 0x1FU) == 0x18U) {
+            if (is_q && (d & 1U) != 0U) {
+                return false;
+            }
             unsigned imm4 = (insn >> 16) & 0xFU;
             if ((imm4 & 7U) == 0U) {
                 return false;

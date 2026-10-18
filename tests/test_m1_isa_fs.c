@@ -3539,6 +3539,50 @@ static int run_test(void)
         }
     }
 
+    /* M6: Extended syscall verification (memfd_create, faccessat2, close_range, unshare) */
+    {
+        /* 1. memfd_create */
+        static const char mfd_name[] = "m6_memfd";
+        int32_t mfd = sys2(385U /* memfd_create */, (uint32_t)(uintptr_t)mfd_name, 1U /* MFD_CLOEXEC */);
+        if (mfd < 0) {
+            return 240;
+        }
+        uint32_t test_val = 0xDEADBEEFU;
+        int32_t wr = sys3(4U /* write */, (uint32_t)mfd, (uint32_t)(uintptr_t)&test_val, 4U);
+        if (wr != 4) {
+            sys1(6U /* close */, (uint32_t)mfd);
+            return 241;
+        }
+        uint64_t seek_res = 0;
+        sys5_llseek((uint32_t)mfd, 0, 0, &seek_res, 0 /* SEEK_SET */);
+        uint32_t read_val = 0;
+        int32_t rd = sys3(3U /* read */, (uint32_t)mfd, (uint32_t)(uintptr_t)&read_val, 4U);
+        sys1(6U /* close */, (uint32_t)mfd);
+        if (rd != 4 || read_val != 0xDEADBEEFU) {
+            return 242;
+        }
+
+        /* 2. faccessat2 */
+        static const char proc_maps[] = "/proc/self/maps";
+        int32_t acc = sys4(439U /* faccessat2 */, (uint32_t)-100 /* AT_FDCWD */,
+                           (uint32_t)(uintptr_t)proc_maps, 4U /* R_OK */, 0U /* flags */);
+        if (acc != 0) {
+            return 243;
+        }
+
+        /* 3. close_range */
+        int32_t cr = sys3(436U /* close_range */, 500U, 505U, 0U);
+        if (cr != 0) {
+            return 244;
+        }
+
+        /* 4. unshare */
+        int32_t un = sys1(337U /* unshare */, 0U);
+        if (un != 0) {
+            return 245;
+        }
+    }
+
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

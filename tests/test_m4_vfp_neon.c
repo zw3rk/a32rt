@@ -2236,7 +2236,8 @@ static int run_vfp_neon_tests(void)
         uint32_t crc_out = 0U, crcc_out = 0U;
         __asm__ volatile(
             "mov r1, #-1\n"
-            "ldr r2, =0x34333231\n"
+            "movw r2, #0x3231\n"
+            "movt r2, #0x3433\n"
             INSN_CRC32W_R0_R1_R2
             "mov r1, r0\n"
             "movw r2, #0x3635\n"
@@ -2249,7 +2250,8 @@ static int run_vfp_neon_tests(void)
             INSN_CRC32H_R0_R1_R2
             "mvn %0, r0\n"
             "mov r1, #-1\n"
-            "ldr r2, =0x34333231\n"
+            "movw r2, #0x3231\n"
+            "movt r2, #0x3433\n"
             INSN_CRC32CW_R0_R1_R2
             "mov r1, r0\n"
             "movw r2, #0x3635\n"
@@ -3057,6 +3059,89 @@ static int run_section32_armv8_vfp_tests(void)
     return 0;
 }
 
+struct m6_neon_aliasing_data {
+    int32_t init_q0[4];
+    int32_t init_q1[4];
+    float init_q4[4];
+    float init_q5[4];
+    int32_t out_q2[4];
+    int32_t out_q3[4];
+    float out_q4[4];
+    uint32_t out_s[4];
+    uint32_t out_d0[2];
+    uint32_t out_d1[2];
+    uint32_t new_s1;
+    int32_t final_q0[4];
+};
+
+static int __attribute__((noinline)) run_m6_neon_aliasing_tests(void)
+{
+    /* 128-Bit NEON q0–q15 Intra-Block Register Caching & Cross-Width (Q <-> D <-> S) Aliasing */
+    struct m6_neon_aliasing_data data;
+    data.init_q0[0] = 10; data.init_q0[1] = 20; data.init_q0[2] = 30; data.init_q0[3] = 40;
+    data.init_q1[0] = 1;  data.init_q1[1] = 2;  data.init_q1[2] = 3;  data.init_q1[3] = 4;
+    data.init_q4[0] = 2.0f; data.init_q4[1] = 3.0f; data.init_q4[2] = 4.0f; data.init_q4[3] = 5.0f;
+    data.init_q5[0] = 1.5f; data.init_q5[1] = 2.5f; data.init_q5[2] = 0.5f; data.init_q5[3] = 10.0f;
+    data.new_s1 = 9999;
+
+    __asm__ volatile(
+        "mov r1, %0\n"
+        "vld1.32 {d0-d1}, [r1]!\n"    /* init_q0 */
+        "vld1.32 {d2-d3}, [r1]!\n"    /* init_q1 */
+        "vld1.32 {d8-d9}, [r1]!\n"    /* init_q4 */
+        "vld1.32 {d10-d11}, [r1]!\n"  /* init_q5 */
+        /* Tight back-to-back sequence of 128-bit vector instructions */
+        "vadd.i32 q0, q0, q1\n"
+        "vsub.i32 q2, q0, q1\n"
+        "veor q3, q2, q0\n"
+        "vmul.f32 q4, q4, q5\n"
+        /* Store out_q2, out_q3, out_q4 */
+        "vst1.32 {d4-d5}, [r1]!\n"    /* out_q2 */
+        "vst1.32 {d6-d7}, [r1]!\n"    /* out_q3 */
+        "vst1.32 {d8-d9}, [r1]!\n"    /* out_q4 */
+        /* Read s0, s1, s2, s3 */
+        "vstr s0, [r1, #0]\n"
+        "vstr s1, [r1, #4]\n"
+        "vstr s2, [r1, #8]\n"
+        "vstr s3, [r1, #12]\n"
+        "add r1, r1, #16\n"
+        /* Read d0, d1 */
+        "vst1.32 {d0-d1}, [r1]!\n"    /* out_d0, out_d1 */
+        /* Modify s1 directly from new_s1 */
+        "vldr s1, [r1, #0]\n"
+        "add r1, r1, #4\n"
+        /* Read q0 again after modifying s1 */
+        "vst1.32 {d0-d1}, [r1]!\n"    /* final_q0 */
+        :
+        : "r"(&data)
+        : "r1", "q0", "q1", "q2", "q3", "q4", "q5", "memory"
+    );
+
+    /* Assert exact bit-for-bit results */
+    if (data.out_q2[0] != 10 || data.out_q2[1] != 20 || data.out_q2[2] != 30 || data.out_q2[3] != 40) {
+        return 301;
+    }
+    if (data.out_q3[0] != 1 || data.out_q3[1] != 2 || data.out_q3[2] != 63 || data.out_q3[3] != 4) {
+        return 302;
+    }
+    if (data.out_q4[0] != 3.0f || data.out_q4[1] != 7.5f || data.out_q4[2] != 2.0f || data.out_q4[3] != 50.0f) {
+        return 303;
+    }
+    if (data.out_s[0] != 11U || data.out_s[1] != 22U || data.out_s[2] != 33U || data.out_s[3] != 44U) {
+        return 304;
+    }
+    if (data.out_d0[0] != 11U || data.out_d0[1] != 22U || data.out_d1[0] != 33U || data.out_d1[1] != 44U) {
+        return 305;
+    }
+    if (data.final_q0[0] != 11 || data.final_q0[1] != 9999 || data.final_q0[2] != 33 || data.final_q0[3] != 44) {
+        return 306;
+    }
+
+    static const char pass_msg[] = "M6 NEON Q-D-S Cross-Width Aliasing: PASS\n";
+    sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
+    return 0;
+}
+
 void __attribute__((noreturn)) _start_c(void)
 {
     int rc = run_vfp_neon_tests();
@@ -3064,6 +3149,10 @@ void __attribute__((noreturn)) _start_c(void)
         sys1(248U /* exit_group */, (uint32_t)rc);
     }
     rc = run_section32_armv8_vfp_tests();
+    if (rc != 0) {
+        sys1(248U /* exit_group */, (uint32_t)rc);
+    }
+    rc = run_m6_neon_aliasing_tests();
     sys1(248U /* exit_group */, (uint32_t)rc);
     __builtin_unreachable();
 }

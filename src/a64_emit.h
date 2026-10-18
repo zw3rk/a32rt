@@ -63,6 +63,9 @@
 #define A64_VFP_KIND_NONE   0U
 #define A64_VFP_KIND_S      1U
 #define A64_VFP_KIND_D      2U
+#define A64_VFP_KIND_Q      3U
+
+#define A64_MAX_EXIT_SLOTS  8U
 
 typedef struct a64_buf {
     uint32_t *words;
@@ -76,6 +79,8 @@ typedef struct a64_buf {
     unsigned  cond_branch_depth;
     uint32_t  guest_end_pc;
     bool      is_call;
+    uint32_t  exit_slot_pcs[A64_MAX_EXIT_SLOTS];
+    unsigned  exit_slot_count;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
@@ -93,6 +98,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     b->cond_branch_depth = 0U;
     b->guest_end_pc      = 0U;
     b->is_call           = false;
+    b->exit_slot_count   = 0U;
 }
 
 void a64_vfp_cache_flush(a64_buf_t *b, bool invalidate);
@@ -110,9 +116,27 @@ static inline void a64_emit(a64_buf_t *b, uint32_t insn)
 void a64_emit_movz_w(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw);
 void a64_emit_movk_w(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw);
 void a64_emit_mov_imm32(a64_buf_t *b, unsigned rd, uint32_t val);
+void a64_emit_mov_pc32(a64_buf_t *b, unsigned rd, uint32_t pc_val);
 void a64_emit_mov_w(a64_buf_t *b, unsigned rd, unsigned rm);
-void a64_emit_mov_x(a64_buf_t *b, unsigned rd, unsigned rm);
 void a64_emit_mvn_reg_w(a64_buf_t *b, unsigned rd, unsigned rm, unsigned shift, unsigned amount);
+
+static inline uint32_t a32_ror32(uint32_t val, unsigned rot)
+{
+    rot &= 31U;
+    if (rot == 0U) {
+        return val;
+    }
+    return (val >> rot) | (val << (32U - rot));
+}
+
+static inline unsigned a32_load_reg(a64_buf_t *b, unsigned reg, uint32_t pc_val, unsigned scratch)
+{
+    if (reg == 15U) {
+        a64_emit_mov_pc32(b, scratch, pc_val);
+        return scratch;
+    }
+    return reg;
+}
 
 /* Arithmetic (32-bit W) */
 void a64_emit_add_imm_w(a64_buf_t *b, bool set_flags, unsigned rd, unsigned rn, uint16_t imm12, unsigned sh);
@@ -137,7 +161,6 @@ void a64_emit_arm_shift_reg_w(a64_buf_t *b, unsigned dst_w, unsigned src_m, unsi
 void a64_emit_ubfm_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned immr, unsigned imms);
 void a64_emit_sbfm_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned immr, unsigned imms);
 void a64_emit_bfm_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned immr, unsigned imms);
-void a64_emit_extr_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned lsb);
 void a64_emit_ubfx_x_to_w(a64_buf_t *b, unsigned rd_w, unsigned rn_x, unsigned lsb, unsigned width);
 void a64_emit_bfi_x(a64_buf_t *b, unsigned rd_x, unsigned rn_x, unsigned lsb, unsigned width);
 void a64_emit_clz_w(a64_buf_t *b, unsigned rd, unsigned rn);
@@ -155,9 +178,8 @@ void a64_emit_crc32_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsig
 
 /* Conditional select & flags */
 void a64_emit_csel_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
-void a64_emit_csinc_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
-void a64_emit_csinv_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
 void a64_emit_csneg_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
+void a64_emit_set_q_cond(a64_buf_t *b, unsigned cond);
 void a64_emit_mrs_nzcv(a64_buf_t *b, unsigned rt);
 void a64_emit_msr_nzcv(a64_buf_t *b, unsigned rt);
 
@@ -187,8 +209,6 @@ void a64_emit_ldrh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte
 void a64_emit_strh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_ldr_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
-void a64_emit_ldr_imm_x(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
-void a64_emit_str_imm_x(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 
 /* VFPv4-D32 / NEON context & guest memory loads/stores (M4) */
 void a64_emit_ldr_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx);
@@ -201,14 +221,10 @@ void a64_emit_guest_ldr_s(a64_buf_t *b, unsigned vt, unsigned addr_w);
 void a64_emit_guest_str_s(a64_buf_t *b, unsigned vt, unsigned addr_w);
 void a64_emit_guest_ldr_d(a64_buf_t *b, unsigned vt, unsigned addr_w);
 void a64_emit_guest_str_d(a64_buf_t *b, unsigned vt, unsigned addr_w);
-void a64_emit_guest_ldr_q(a64_buf_t *b, unsigned vt, unsigned addr_w);
-void a64_emit_guest_str_q(a64_buf_t *b, unsigned vt, unsigned addr_w);
 
 /* Scalar FP instructions (M4) */
 void a64_emit_fmov_w_to_s(a64_buf_t *b, unsigned vd, unsigned rn_w);
 void a64_emit_fmov_s_to_w(a64_buf_t *b, unsigned rd_w, unsigned vn);
-void a64_emit_fmov_x_to_d(a64_buf_t *b, unsigned vd, unsigned rn_x);
-void a64_emit_fmov_d_to_x(a64_buf_t *b, unsigned rd_x, unsigned vn);
 void a64_emit_fmov_s(a64_buf_t *b, unsigned vd, unsigned vn);
 void a64_emit_fmov_d(a64_buf_t *b, unsigned vd, unsigned vn);
 void a64_emit_fadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
@@ -233,8 +249,6 @@ void a64_emit_fnmadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsi
 void a64_emit_fnmadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
 void a64_emit_fnmsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
 void a64_emit_fnmsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fcmp_s(a64_buf_t *b, unsigned vn, unsigned vm, bool zero);
-void a64_emit_fcmp_d(a64_buf_t *b, unsigned vn, unsigned vm, bool zero);
 void a64_emit_fcvt_s_to_d(a64_buf_t *b, unsigned vd, unsigned vn);
 void a64_emit_fcvt_d_to_s(a64_buf_t *b, unsigned vd, unsigned vn);
 void a64_emit_fcvtzs_s_to_w(a64_buf_t *b, unsigned rd_w, unsigned vn);
@@ -282,12 +296,10 @@ size_t a64_emit_b_cond_placeholder(a64_buf_t *b, unsigned cond);
 void   a64_patch_b_cond(a64_buf_t *b, size_t patch_idx, size_t target_idx);
 size_t a64_emit_cbz_w_placeholder(a64_buf_t *b, bool is_cbnz, unsigned rt);
 void   a64_patch_cbz_w(a64_buf_t *b, size_t patch_idx, size_t target_idx);
-void   a64_emit_b(a64_buf_t *b, int32_t offset_words);
-void   a64_emit_b_cond(a64_buf_t *b, unsigned cond, int32_t offset_words);
 void   a64_emit_ret(a64_buf_t *b);
-void   a64_emit_nop(a64_buf_t *b);
 
 /* Standard fragment exit sequences */
+void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc);
 void a64_emit_exit_branch_imm(a64_buf_t *b, uint32_t target_pc, bool interwork);
 void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork);
 void a64_emit_exit_svc(a64_buf_t *b, uint32_t next_pc, uint32_t svc_imm);

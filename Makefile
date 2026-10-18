@@ -11,6 +11,7 @@
         test-m3-hl test-m3-lima \
         test-m4-hl test-m4-lima \
         test-m5-hl test-m5-lima \
+        test-m6-hl test-m6-lima \
         test-all-hl test-all-lima \
         clean
 
@@ -235,9 +236,47 @@ test-m5-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf $(BUILD_DIR)/hello-armhf-s
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["./_build/a32rt", "--gdb", "14321", "./_build/hello-armhf-static"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); time.sleep(0.2); s = socket.create_connection(("127.0.0.1", 14321), timeout=3); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode())(); s.sendall(b"$$?#3f"); r1 = rpkt(); s.sendall(b"$$g#67"); r2 = rpkt(); s.sendall(b"$$s#73"); r3 = rpkt(); s.sendall(b"$$c#63"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5 GDB RSP Stub: PASS")'
 	@printf "\033[32mPASS\033[0m: M5 on Lima\n"
 
-test-all-hl: test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl ## Run complete M0..M5 suite under hyper-linux
+test-m6-hl: $(A32RT_BIN) $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M6 real-world multi-library dynamic linking & relocatable .so AOT cache under hl
+	@printf "\033[32m▸ Verifying M6-hl (apk, scanelf, getconf dynamic linking)\033[0m under $(HL_BIN)\n"
+	@out="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/sbin/apk --version)"; \
+	echo "$$out" | grep -q "apk-tools" || { printf "\033[31mFAIL\033[0m: apk --version failed:\n%s\n" "$$out"; exit 1; }; \
+	printf "M6-hl apk --version: PASS (%s)\n" "$$out"
+	@out="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/usr/bin/scanelf -V)"; \
+	echo "$$out" | grep -q "scanelf" || { printf "\033[31mFAIL\033[0m: scanelf -V failed:\n%s\n" "$$out"; exit 1; }; \
+	printf "M6-hl scanelf -V: PASS (%s)\n" "$$out"
+	@out="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/usr/bin/getconf LONG_BIT)"; \
+	[ "$$out" = "32" ] || { printf "\033[31mFAIL\033[0m: getconf LONG_BIT failed: expected 32, got '%s'\n" "$$out"; exit 1; }; \
+	printf "M6-hl getconf LONG_BIT: PASS (32)\n"
+	@printf "\033[32m▸ Verifying M6-hl (Relocatable Shared-Library .so AOT Cache)\033[0m\n"
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(SYSROOT_ARMV7)/usr/lib/libz.so.1.3.2
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/sbin/apk
+	@A32RT_STATS=1 $(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/sbin/apk --version
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@printf "\033[32mPASS\033[0m: M6-hl\n"
 
-test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima ## Run complete M0..M5 suite inside Lima VM
+test-m6-lima: $(A32RT_BIN) $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M6 real-world multi-library dynamic linking & relocatable .so AOT cache inside Lima VM
+	@printf "\033[32m▸ Verifying M6 (apk, scanelf, getconf dynamic linking)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@out="$$($(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/sbin/apk --version)"; \
+	echo "$$out" | grep -q "apk-tools" || { printf "\033[31mFAIL\033[0m: apk --version failed:\n%s\n" "$$out"; exit 1; }; \
+	printf "M6 apk --version: PASS (%s)\n" "$$out"
+	@out="$$($(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/usr/bin/scanelf -V)"; \
+	echo "$$out" | grep -q "scanelf" || { printf "\033[31mFAIL\033[0m: scanelf -V failed:\n%s\n" "$$out"; exit 1; }; \
+	printf "M6 scanelf -V: PASS (%s)\n" "$$out"
+	@out="$$($(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/usr/bin/getconf LONG_BIT)"; \
+	[ "$$out" = "32" ] || { printf "\033[31mFAIL\033[0m: getconf LONG_BIT failed: expected 32, got '%s'\n" "$$out"; exit 1; }; \
+	printf "M6 getconf LONG_BIT: PASS (32)\n"
+	@printf "\033[32m▸ Verifying M6 (Relocatable Shared-Library .so AOT Cache)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot $(SYSROOT_ARMV7)/usr/lib/libz.so.1.3.2
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --aot --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/sbin/apk
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --stats --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/sbin/apk --version
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@printf "\033[32mPASS\033[0m: M6 on Lima\n"
+
+test-all-hl: test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl ## Run complete M0..M6 suite under hyper-linux
+
+test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima test-m6-lima ## Run complete M0..M6 suite inside Lima VM
 
 BENCH_BINS := $(BUILD_DIR)/bench-suite-armhf \
               $(BUILD_DIR)/bench-suite-thumb \

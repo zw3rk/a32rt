@@ -196,7 +196,11 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     if (host_info) {
         frame->info.si_code = host_info->si_code;
     } else {
-        frame->info.si_code = 128; /* SI_KERNEL */
+        frame->info.si_code = (sig == 11 ? 1 /* SEGV_MAPERR */ :
+                               sig == 4  ? 1 /* ILL_ILLOPC */  :
+                               sig == 8  ? 1 /* FPE_INTDIV */  :
+                               sig == 5  ? 1 /* TRAP_BRKPT */  :
+                               128 /* SI_KERNEL */);
     }
     if (host_info != NULL && host_info->si_code < 0) {
         frame->info._pad[0] = (uint32_t)host_info->si_pid;
@@ -297,6 +301,29 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     ctx->exit_reason = A32_EXIT_BRANCH;
 }
 
+static void enqueue_async_signal(a32_ctx_t *ctx, int sig, const siginfo_t *info)
+{
+    if (sig < 1 || sig > 64) {
+        return;
+    }
+    guest_sigaction_t *act = &g_guest_sigactions[sig];
+    if (act->handler == 1U /* SIG_IGN */ ||
+        (act->handler == 0U /* SIG_DFL */ &&
+         (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
+        return;
+    }
+    if (g_preset_siginfo[sig].si_signo == sig) {
+        g_pending_siginfo[sig] = g_preset_siginfo[sig];
+        memset(&g_preset_siginfo[sig], 0, sizeof(siginfo_t));
+    } else if (info != NULL) {
+        g_pending_siginfo[sig] = *info;
+    } else {
+        memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
+        g_pending_siginfo[sig].si_signo = sig;
+    }
+    __atomic_fetch_or(&ctx->pending_signals, 1ULL << (sig - 1), __ATOMIC_SEQ_CST);
+}
+
 static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 {
     a32_ctx_t *ctx = g_tls_ctx;
@@ -307,24 +334,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     bool is_sync_trap = (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL ||
                          sig == SIGFPE  || sig == SIGTRAP);
     if (!is_sync_trap || (info != NULL && info->si_code <= 0)) {
-        if (sig >= 1 && sig <= 64) {
-            guest_sigaction_t *act = &g_guest_sigactions[sig];
-            if (act->handler == 1U /* SIG_IGN */ ||
-                (act->handler == 0U /* SIG_DFL */ &&
-                 (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
-                return;
-            }
-            if (g_preset_siginfo[sig].si_signo == sig) {
-                g_pending_siginfo[sig] = g_preset_siginfo[sig];
-                memset(&g_preset_siginfo[sig], 0, sizeof(siginfo_t));
-            } else if (info != NULL) {
-                g_pending_siginfo[sig] = *info;
-            } else {
-                memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
-                g_pending_siginfo[sig].si_signo = sig;
-            }
-            __atomic_fetch_or(&ctx->pending_signals, 1ULL << (sig - 1), __ATOMIC_SEQ_CST);
-        }
+        enqueue_async_signal(ctx, sig, info);
         return;
     }
 
@@ -380,24 +390,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         _exit(128 + sig);
     }
 
-    if (sig >= 1 && sig <= 64) {
-        guest_sigaction_t *act = &g_guest_sigactions[sig];
-        if (act->handler == 1U /* SIG_IGN */ ||
-            (act->handler == 0U /* SIG_DFL */ &&
-             (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))) {
-            return;
-        }
-        if (g_preset_siginfo[sig].si_signo == sig) {
-            g_pending_siginfo[sig] = g_preset_siginfo[sig];
-            memset(&g_preset_siginfo[sig], 0, sizeof(siginfo_t));
-        } else if (info != NULL) {
-            g_pending_siginfo[sig] = *info;
-        } else {
-            memset(&g_pending_siginfo[sig], 0, sizeof(siginfo_t));
-            g_pending_siginfo[sig].si_signo = sig;
-        }
-        __atomic_fetch_or(&ctx->pending_signals, 1ULL << (sig - 1), __ATOMIC_SEQ_CST);
-    }
+    enqueue_async_signal(ctx, sig, info);
 }
 
 struct a64_kernel_sigaction {

@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    4U
+#define A32_AOT_VERSION    5U
 #define A32_MAX_AOT_SCAN   4096U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  2048U
@@ -106,14 +106,10 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path)
     return (h != 0ULL) ? h : 1ULL;
 }
 
-static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
-                              char *out_path, size_t out_size, bool create_dir)
+static int format_cache_path(const a32_ctx_t *ctx, const char *prefix, uint64_t hash,
+                             char *out, size_t out_sz, bool create_dir)
 {
-    if (out_path == NULL || out_size == 0U) {
-        return -1;
-    }
-    uint64_t h = compute_elf_hash(ctx, elf_path);
-    if (h == 0ULL) {
+    if (out == NULL || out_sz == 0U || hash == 0ULL || prefix == NULL) {
         return -1;
     }
     const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
@@ -128,15 +124,28 @@ static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
         if (create_dir) {
             (void)mkdir(dir, 0755);
         }
-        n = snprintf(out_path, out_size, "%s/a32rt-cache-%016llx.bin", dir, (unsigned long long)h);
+        n = snprintf(out, out_sz, "%s/%s-%016llx.bin", dir, prefix, (unsigned long long)hash);
     } else {
-        n = snprintf(out_path, out_size, "/tmp/a32rt-cache-%016llx.bin", (unsigned long long)h);
+        n = snprintf(out, out_sz, "/tmp/%s-%016llx.bin", prefix, (unsigned long long)hash);
     }
-    if (n < 0 || (size_t)n >= out_size) {
-        out_path[0] = '\0';
+    if (n < 0 || (size_t)n >= out_sz) {
+        out[0] = '\0';
         return -1;
     }
     return 0;
+}
+
+static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
+                              char *out_path, size_t out_size, bool create_dir)
+{
+    if (elf_path == NULL) {
+        return -1;
+    }
+    uint64_t h = compute_elf_hash(ctx, elf_path);
+    if (h == 0ULL) {
+        return -1;
+    }
+    return format_cache_path(ctx, "a32rt-cache", h, out_path, out_size, create_dir);
 }
 
 static uint64_t compute_fd_hash(int fd)
@@ -176,30 +185,7 @@ static uint64_t compute_fd_hash(int fd)
 static int resolve_fd_cache_path(const a32_ctx_t *ctx, uint64_t fd_hash,
                                  char *out_path, size_t out_size, bool create_dir)
 {
-    if (out_path == NULL || out_size == 0U || fd_hash == 0ULL) {
-        return -1;
-    }
-    const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
-    if (dir == NULL || dir[0] == '\0') {
-        dir = getenv("A32RT_CACHE");
-    }
-    if (dir == NULL || dir[0] == '\0') {
-        dir = getenv("XDG_CACHE_HOME");
-    }
-    int n;
-    if (dir != NULL && dir[0] != '\0') {
-        if (create_dir) {
-            (void)mkdir(dir, 0755);
-        }
-        n = snprintf(out_path, out_size, "%s/a32rt-fdcache-%016llx.bin", dir, (unsigned long long)fd_hash);
-    } else {
-        n = snprintf(out_path, out_size, "/tmp/a32rt-fdcache-%016llx.bin", (unsigned long long)fd_hash);
-    }
-    if (n < 0 || (size_t)n >= out_size) {
-        out_path[0] = '\0';
-        return -1;
-    }
-    return 0;
+    return format_cache_path(ctx, "a32rt-fdcache", fd_hash, out_path, out_size, create_dir);
 }
 
 static void copy_file(const char *src_path, const char *dst_path)
@@ -208,7 +194,7 @@ static void copy_file(const char *src_path, const char *dst_path)
     if (src_fd < 0) {
         return;
     }
-    char tmp_dst[540];
+    char tmp_dst[PATH_MAX + 64];
     int n = snprintf(tmp_dst, sizeof(tmp_dst), "%s.tmp.%d", dst_path, (int)getpid());
     if (n < 0 || (size_t)n >= sizeof(tmp_dst)) {
         close(src_fd);
@@ -357,12 +343,12 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
     if (ctx != NULL) {
         a32_vm_sync_ctx(ctx);
     }
-    char cache_path[512];
+    char cache_path[PATH_MAX];
     if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), true) != 0) {
         return -1;
     }
 
-    char tmp_path[540];
+    char tmp_path[PATH_MAX + 64];
     int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", cache_path, (int)getpid());
     if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
         return -1;
@@ -427,7 +413,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
             uint64_t fdh = compute_fd_hash(efd);
             close(efd);
             if (fdh != 0ULL) {
-                char fd_cache_path[512];
+                char fd_cache_path[PATH_MAX];
                 if (resolve_fd_cache_path(ctx, fdh, fd_cache_path, sizeof(fd_cache_path), true) == 0) {
                     (void)unlink(fd_cache_path);
                     if (link(cache_path, fd_cache_path) != 0) {
@@ -441,12 +427,125 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
     return 0;
 }
 
+static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_bias,
+                                       bool allow_reloc, const char *cache_path_for_unlink)
+{
+    if (ctx == NULL || f == NULL) {
+        return -1;
+    }
+
+    a32_aot_header_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1U, f) != 1U) {
+        return -1;
+    }
+    if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION ||
+        hdr.num_blocks > A32_AOT_MAX_BLOCKS) {
+        if (cache_path_for_unlink != NULL) {
+            (void)unlink(cache_path_for_unlink);
+        }
+        return -1;
+    }
+    if (!allow_reloc && hdr.reserved != load_bias) {
+        return -1;
+    }
+
+    uint32_t delta = allow_reloc ? (load_bias - hdr.reserved) : 0U;
+
+    uint32_t *words_buf = (uint32_t *)malloc(sizeof(uint32_t) * A32_AOT_MAX_WORDS);
+    a32_pc_map_stage_t *pc_map_buf = (a32_pc_map_stage_t *)malloc(sizeof(a32_pc_map_stage_t) * A32_AOT_MAX_PC_MAP);
+    if (words_buf == NULL || pc_map_buf == NULL) {
+        free(words_buf);
+        free(pc_map_buf);
+        return -1;
+    }
+
+    uint32_t i = 0U;
+    for (; i < hdr.num_blocks; i++) {
+        a32_aot_block_header_t bh;
+        if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
+            break;
+        }
+        if ((bh.is_thumb & ~3U) != 0U ||
+            (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
+            (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
+            bh.guest_end_pc <= bh.guest_pc ||
+            bh.guest_end_pc - bh.guest_pc > 512U ||
+            bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
+            bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
+            break;
+        }
+        if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
+            break;
+        }
+        if (bh.pc_map_count > 0U) {
+            if (fread(pc_map_buf, sizeof(a32_pc_map_stage_t), bh.pc_map_count, f) != bh.pc_map_count) {
+                break;
+            }
+        }
+        if (delta != 0U && bh.guest_pc < 0xFFFF0000U) {
+            bh.guest_pc += delta;
+            bh.guest_end_pc += delta;
+            for (uint32_t m = 0U; m < bh.pc_map_count; m++) {
+                pc_map_buf[m].guest_pc += delta;
+            }
+            for (uint32_t w = 0U; w + 1U < bh.word_count; w++) {
+                uint32_t w0 = words_buf[w];
+                uint32_t w1 = words_buf[w + 1U];
+                if ((w0 & 0xFFE00000U) == 0x52A00000U &&
+                    (w1 & 0xFFE00000U) == 0x72800000U &&
+                    (w0 & 31U) == (w1 & 31U)) {
+                    uint32_t orig_pc = (((w0 >> 5U) & 0xFFFFU) << 16U) | ((w1 >> 5U) & 0xFFFFU);
+                    if (orig_pc >= 0x10000U && orig_pc < 0xFFFF0000U) {
+                        uint32_t reloc_pc = orig_pc + delta;
+                        words_buf[w]      = (w0 & ~(0xFFFFU << 5U)) | (((reloc_pc >> 16U) & 0xFFFFU) << 5U);
+                        words_buf[w + 1U] = (w1 & ~(0xFFFFU << 5U)) | ((reloc_pc & 0xFFFFU) << 5U);
+                    }
+                    w++; /* skip second word of pair */
+                }
+            }
+        }
+        if (!aot_range_executable(ctx, bh.guest_pc, bh.guest_end_pc - bh.guest_pc)) {
+            continue;
+        }
+        if (a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
+                                      (bh.is_thumb & 1U) != 0U,
+                                      (bh.is_thumb & 2U) != 0U,
+                                      words_buf, (size_t)bh.word_count,
+                                      bh.pc_map_count > 0U ? pc_map_buf : NULL,
+                                      (size_t)bh.pc_map_count) != 0) {
+            break;
+        }
+    }
+
+    bool eof_ok = (i == hdr.num_blocks && fgetc(f) == EOF && ferror(f) == 0);
+    free(words_buf);
+    free(pc_map_buf);
+
+    if (!eof_ok) {
+        (void)a32_jit_flush_batch(ctx);
+        if (!allow_reloc) {
+            (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
+        }
+        if (cache_path_for_unlink != NULL) {
+            (void)unlink(cache_path_for_unlink);
+        }
+        return -1;
+    }
+    if (a32_jit_flush_batch(ctx) != 0) {
+        if (!allow_reloc) {
+            (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
 {
     if (ctx == NULL || elf_path == NULL) {
         return -1;
     }
-    char cache_path[512];
+    char cache_path[PATH_MAX];
     if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), false) != 0) {
         return -1;
     }
@@ -466,66 +565,10 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
         return -1;
     }
 
-    a32_aot_header_t hdr;
-    if (fread(&hdr, sizeof(hdr), 1U, f) != 1U) {
-        fclose(f);
-        return -1;
-    }
-    if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION ||
-        hdr.num_blocks > A32_AOT_MAX_BLOCKS) {
-        fclose(f);
-        return -1;
-    }
-
-    static uint32_t           words_buf[A32_AOT_MAX_WORDS];
-    static a32_pc_map_stage_t pc_map_buf[A32_AOT_MAX_PC_MAP];
-    uint32_t i = 0U;
-    for (; i < hdr.num_blocks; i++) {
-        a32_aot_block_header_t bh;
-        if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
-            break;
-        }
-        if ((bh.is_thumb & ~3U) != 0U ||
-            (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
-            (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
-            bh.guest_end_pc <= bh.guest_pc ||
-            bh.guest_end_pc - bh.guest_pc > 512U ||
-            !aot_range_executable(ctx, bh.guest_pc, bh.guest_end_pc - bh.guest_pc) ||
-            bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
-            bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
-            break;
-        }
-        if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
-            break;
-        }
-        if (bh.pc_map_count > 0U) {
-            if (fread(pc_map_buf, sizeof(a32_pc_map_stage_t), bh.pc_map_count, f) != bh.pc_map_count) {
-                break;
-            }
-        }
-        if (a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
-                                      (bh.is_thumb & 1U) != 0U,
-                                      (bh.is_thumb & 2U) != 0U,
-                                      words_buf, (size_t)bh.word_count,
-                                      bh.pc_map_count > 0U ? pc_map_buf : NULL,
-                                      (size_t)bh.pc_map_count) != 0) {
-            break;
-        }
-    }
-
-    bool eof_ok = (i == hdr.num_blocks && fgetc(f) == EOF && ferror(f) == 0);
+    uint32_t load_bias = ctx->elf_base;
+    int rc = deserialize_aot_cache_stream(ctx, f, load_bias, false, cache_path);
     fclose(f);
-    if (!eof_ok) {
-        (void)a32_jit_flush_batch(ctx);
-        (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
-        unlink(cache_path);
-        return -1;
-    }
-    if (a32_jit_flush_batch(ctx) != 0) {
-        (void)a32_jit_invalidate_range(ctx, 0U, 0xFFFFFFFFU);
-        return -1;
-    }
-    return 0;
+    return rc;
 }
 
 int a32_aot_load_fd(a32_ctx_t *ctx, int fd, const char *label, uint32_t load_bias)
@@ -538,7 +581,7 @@ int a32_aot_load_fd(a32_ctx_t *ctx, int fd, const char *label, uint32_t load_bia
     if (fd_hash == 0ULL) {
         return -1;
     }
-    char cache_path[512];
+    char cache_path[PATH_MAX];
     if (resolve_fd_cache_path(ctx, fd_hash, cache_path, sizeof(cache_path), false) != 0) {
         return -1;
     }
@@ -558,77 +601,9 @@ int a32_aot_load_fd(a32_ctx_t *ctx, int fd, const char *label, uint32_t load_bia
         return -1;
     }
 
-    a32_aot_header_t hdr;
-    if (fread(&hdr, sizeof(hdr), 1U, f) != 1U) {
-        fclose(f);
-        return -1;
-    }
-    if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION ||
-        hdr.num_blocks > A32_AOT_MAX_BLOCKS || hdr.reserved != load_bias) {
-        fclose(f);
-        return -1;
-    }
-
-    uint32_t *words_buf = (uint32_t *)malloc(sizeof(uint32_t) * A32_AOT_MAX_WORDS);
-    a32_pc_map_stage_t *pc_map_buf = (a32_pc_map_stage_t *)malloc(sizeof(a32_pc_map_stage_t) * A32_AOT_MAX_PC_MAP);
-    if (words_buf == NULL || pc_map_buf == NULL) {
-        free(words_buf);
-        free(pc_map_buf);
-        fclose(f);
-        return -1;
-    }
-
-    uint32_t i = 0U;
-    uint32_t installed_count = 0U;
-    for (; i < hdr.num_blocks; i++) {
-        a32_aot_block_header_t bh;
-        if (fread(&bh, sizeof(bh), 1U, f) != 1U) {
-            break;
-        }
-        if ((bh.is_thumb & ~3U) != 0U ||
-            (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
-            (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
-            bh.guest_end_pc <= bh.guest_pc ||
-            bh.guest_end_pc - bh.guest_pc > 512U ||
-            bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
-            bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
-            break;
-        }
-        if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
-            break;
-        }
-        if (bh.pc_map_count > 0U) {
-            if (fread(pc_map_buf, sizeof(a32_pc_map_stage_t), bh.pc_map_count, f) != bh.pc_map_count) {
-                break;
-            }
-        }
-        if (!aot_range_executable(ctx, bh.guest_pc, bh.guest_end_pc - bh.guest_pc)) {
-            continue;
-        }
-        if (a32_jit_install_aot_block(ctx, bh.guest_pc, bh.guest_end_pc,
-                                      (bh.is_thumb & 1U) != 0U,
-                                      (bh.is_thumb & 2U) != 0U,
-                                      words_buf, (size_t)bh.word_count,
-                                      bh.pc_map_count > 0U ? pc_map_buf : NULL,
-                                      (size_t)bh.pc_map_count) != 0) {
-            break;
-        }
-        installed_count++;
-    }
-
-    bool eof_ok = (i == hdr.num_blocks && fgetc(f) == EOF && ferror(f) == 0);
-    free(words_buf);
-    free(pc_map_buf);
+    int rc = deserialize_aot_cache_stream(ctx, f, load_bias, true, cache_path);
     fclose(f);
-
-    if (!eof_ok) {
-        (void)a32_jit_flush_batch(ctx);
-        return -1;
-    }
-    if (a32_jit_flush_batch(ctx) != 0) {
-        return -1;
-    }
-    return 0;
+    return rc;
 }
 
 static void add_target(uint32_t pc, bool thumb,
@@ -695,7 +670,7 @@ static void scan_text_range(a32_ctx_t *ctx, uint32_t r_start, uint32_t r_end,
     if (prefer_thumb) {
         uint32_t scan_start = (r_start + 1U) & ~1U;
         for (uint32_t pc = scan_start;
-             pc >= scan_start && pc + 2U <= r_end && *disc_count < max_count;
+             pc + 2U <= r_end && *disc_count < max_count;
              pc += 2U) {
             if (!aot_range_executable(ctx, pc, 2U)) {
                 continue;
@@ -843,7 +818,7 @@ static void scan_text_range(a32_ctx_t *ctx, uint32_t r_start, uint32_t r_end,
     } else {
         uint32_t scan_start = (r_start + 3U) & ~3U;
         for (uint32_t pc = scan_start;
-             pc >= scan_start && pc + 4U <= r_end && *disc_count < max_count;
+             pc + 4U <= r_end && *disc_count < max_count;
              pc += 4U) {
             if (!aot_range_executable(ctx, pc, 4U)) {
                 continue;

@@ -11,15 +11,6 @@
 
 #define T32_MAX_BLOCK_INSNS 128U
 
-static uint32_t ror32_t(uint32_t val, unsigned rot)
-{
-    rot &= 31U;
-    if (rot == 0U) {
-        return val;
-    }
-    return (val >> rot) | (val << (32U - rot));
-}
-
 static uint32_t thumb_expand_imm(uint32_t imm12, bool *out_has_carry, unsigned *out_carry)
 {
     *out_has_carry = false;
@@ -39,19 +30,10 @@ static uint32_t thumb_expand_imm(uint32_t imm12, bool *out_has_carry, unsigned *
     }
     uint32_t unrotated = 0x80U | (imm12 & 0x7FU);
     unsigned rot = (imm12 >> 7) & 0x1FU;
-    uint32_t res = ror32_t(unrotated, rot);
+    uint32_t res = a32_ror32(unrotated, rot);
     *out_has_carry = true;
     *out_carry = (res >> 31) & 1U;
     return res;
-}
-
-static unsigned load_t32_reg(a64_buf_t *b, unsigned reg, uint32_t pc_val, unsigned scratch)
-{
-    if (reg == 15U) {
-        a64_emit_mov_imm32(b, scratch, pc_val);
-        return scratch;
-    }
-    return reg;
 }
 
 #define T32_MAX_PRESCAN_INSNS (T32_MAX_BLOCK_INSNS + 8U)
@@ -561,8 +543,8 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         unsigned rdn = ((insn >> 4) & 8U) | (insn & 7U);
         if (op == 0U) {
             /* ADD Rdn, Rm */
-            unsigned src_n = load_t32_reg(b, rdn, pc_val, A64_TMP0);
-            unsigned src_m = load_t32_reg(b, rm, pc_val, A64_TMP1);
+            unsigned src_n = a32_load_reg(b, rdn, pc_val, A64_TMP0);
+            unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP1);
             unsigned dst = (rdn == 15U) ? A64_TMP0 : rdn;
             a64_emit_add_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
             if (rdn == 15U) {
@@ -575,14 +557,14 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         }
         if (op == 1U) {
             /* CMP Rn, Rm */
-            unsigned src_n = load_t32_reg(b, rdn, pc_val, A64_TMP0);
-            unsigned src_m = load_t32_reg(b, rm, pc_val, A64_TMP1);
+            unsigned src_n = a32_load_reg(b, rdn, pc_val, A64_TMP0);
+            unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP1);
             a64_emit_sub_reg_w(b, true, A64_ZR, src_n, src_m, A64_SHIFT_LSL, 0U);
             return true;
         }
         if (op == 2U) {
             /* MOV Rd, Rm (BranchWritePC when Rd == PC: stays in Thumb state) */
-            unsigned src_m = load_t32_reg(b, rm, pc_val, A64_TMP1);
+            unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP1);
             if (rdn == 15U) {
                 a64_emit_exit_branch_reg(b, src_m, false);
                 if (is_uncond) {
@@ -601,10 +583,10 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         if ((insn & 7U) != 0U || (is_blx && rm == 15U)) {
             return false;
         }
-        unsigned src_m = load_t32_reg(b, rm, pc_val, A64_TMP0);
+        unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP0);
         a64_emit_mov_w(b, A64_TMP0, src_m);
         if (is_blx) {
-            a64_emit_mov_imm32(b, 14U, (pc + 2U) | 1U);
+            a64_emit_mov_pc32(b, 14U, (pc + 2U) | 1U);
             if (is_uncond) {
                 b->is_call = true;
             }
@@ -620,7 +602,7 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
     if ((insn >> 11) == 0x09U) {
         unsigned rt = (insn >> 8) & 7U;
         uint32_t addr = pc_align4 + ((uint32_t)(insn & 0xFFU) << 2);
-        a64_emit_mov_imm32(b, A64_ADDR, addr);
+        a64_emit_mov_pc32(b, A64_ADDR, addr);
         a64_emit_guest_ldr_w(b, rt, A64_ADDR);
         return true;
     }
@@ -707,7 +689,7 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         if (from_sp) {
             a64_emit_add_imm_w(b, false, rd, 13U, offset, 0U);
         } else {
-            a64_emit_mov_imm32(b, rd, pc_align4 + offset);
+            a64_emit_mov_pc32(b, rd, pc_align4 + offset);
         }
         return true;
     }
@@ -932,7 +914,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 offset |= (int32_t)0xFE000000U;
             }
             if (is_link) {
-                a64_emit_mov_imm32(b, 14U, (pc + 4U) | 1U);
+                a64_emit_mov_pc32(b, 14U, (pc + 4U) | 1U);
                 if (is_uncond) {
                     b->is_call = true;
                 }
@@ -1004,7 +986,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 ((hw2 >> 8) & 0xFU) != 0U) {
                 /* MSR APSR/CPSR_<fields>, Rn */
                 unsigned rn = hw1 & 0xFU;
-                unsigned src = load_t32_reg(b, rn, pc_val, A64_TMP0);
+                unsigned src = a32_load_reg(b, rn, pc_val, A64_TMP0);
                 if ((hw2 & 0x0800U) != 0U) {
                     a64_emit_movz_w(b, A64_TMP1, 0xF000U, 1U);
                     a64_emit_and_reg_w(b, false, A64_TMP1, src, A64_TMP1, A64_SHIFT_LSL, 0U);
@@ -1045,7 +1027,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         uint32_t imm32 = thumb_expand_imm(imm12, &has_carry, &carry);
         a64_emit_mov_imm32(b, A64_TMP1, imm32);
 
-        unsigned src_n = (op != 0x2U && op != 0x3U) ? load_t32_reg(b, rn, pc_val, A64_TMP2) : rn;
+        unsigned src_n = (op != 0x2U && op != 0x3U) ? a32_load_reg(b, rn, pc_val, A64_TMP2) : rn;
         unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
         bool handled = false;
 
@@ -1161,7 +1143,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         if (op == 0x00U) {
             /* ADDW Rd, Rn, #imm12 / ADR.W (when Rn == 15) */
             if (rn == 15U) {
-                a64_emit_mov_imm32(b, rd, pc_align4 + imm12);
+                a64_emit_mov_pc32(b, rd, pc_align4 + imm12);
             } else {
                 a64_emit_add_imm_w(b, false, rd, rn, imm12, 0U);
             }
@@ -1175,7 +1157,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         if (op == 0x0AU) {
             /* SUBW Rd, Rn, #imm12 / ADR.W (when Rn == 15) */
             if (rn == 15U) {
-                a64_emit_mov_imm32(b, rd, pc_align4 - imm12);
+                a64_emit_mov_pc32(b, rd, pc_align4 - imm12);
             } else {
                 a64_emit_sub_imm_w(b, false, rd, rn, imm12, 0U);
             }
@@ -1221,7 +1203,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             /* SSAT / SSAT16 */
             bool is_asr = (op == 0x12U);
             unsigned shift_imm = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
-            unsigned src = load_t32_reg(b, rn, pc_val, A64_TMP2);
+            unsigned src = a32_load_reg(b, rn, pc_val, A64_TMP2);
 
             if (is_asr && shift_imm == 0U) {
                 /* SSAT16 Rd, #sat_imm, Rn */
@@ -1245,13 +1227,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit_csel_w(b, A64_TMP2, A64_ADDR, A64_TMP2, A64_COND_LT);
 
                 a64_emit_bfm_w(b, A64_TMP0, A64_TMP2, 16U, 15U);
-                unsigned orig_src = load_t32_reg(b, rn, pc_val, A64_TMP1);
+                unsigned orig_src = a32_load_reg(b, rn, pc_val, A64_TMP1);
                 a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, orig_src, A64_SHIFT_LSL, 0U);
-                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
-                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_set_q_cond(b, A64_COND_NE);
                 a64_emit_msr_nzcv(b, A64_TMP3);
                 a64_emit_mov_w(b, rd, A64_TMP0);
                 return true;
@@ -1277,11 +1255,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
                 a64_emit_csel_w(b, rd, A64_TMP2, A64_TMP1, A64_COND_LT);
                 a64_emit_sub_reg_w(b, true, A64_ZR, rd, A64_TMP0, A64_SHIFT_LSL, 0U);
-                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
-                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_set_q_cond(b, A64_COND_NE);
                 a64_emit_msr_nzcv(b, A64_TMP3);
             } else {
                 a64_emit_mov_w(b, rd, A64_TMP0);
@@ -1292,7 +1266,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             /* USAT / USAT16 */
             bool is_asr = (op == 0x1AU);
             unsigned shift_imm = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
-            unsigned src = load_t32_reg(b, rn, pc_val, A64_TMP2);
+            unsigned src = a32_load_reg(b, rn, pc_val, A64_TMP2);
 
             if (is_asr && shift_imm == 0U) {
                 /* USAT16 Rd, #sat_imm, Rn */
@@ -1314,13 +1288,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit_csel_w(b, A64_TMP2, A64_TMP1, A64_TMP2, A64_COND_HI);
 
                 a64_emit_bfm_w(b, A64_TMP0, A64_TMP2, 16U, 15U);
-                unsigned orig_src = load_t32_reg(b, rn, pc_val, A64_TMP1);
+                unsigned orig_src = a32_load_reg(b, rn, pc_val, A64_TMP1);
                 a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, orig_src, A64_SHIFT_LSL, 0U);
-                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
-                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_set_q_cond(b, A64_COND_NE);
                 a64_emit_msr_nzcv(b, A64_TMP3);
                 a64_emit_mov_w(b, rd, A64_TMP0);
                 return true;
@@ -1343,11 +1313,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
             a64_emit_csel_w(b, rd, A64_TMP1, A64_TMP2, A64_COND_HI);
             a64_emit_sub_reg_w(b, true, A64_ZR, rd, A64_TMP0, A64_SHIFT_LSL, 0U);
-            a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-            a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
-            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-            a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_set_q_cond(b, A64_COND_NE);
             a64_emit_msr_nzcv(b, A64_TMP3);
             return true;
         }
@@ -1398,7 +1364,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         unsigned imm5 = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
 
         /* Compute shifted rm into A64_TMP1 and shifter carry-out into A64_TMP2 */
-        unsigned src_m = load_t32_reg(b, rm, pc_val, A64_TMP0);
+        unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP0);
         bool has_carry = false;
         if (shift_type == A64_SHIFT_LSL && imm5 == 0U) {
             a64_emit_mov_w(b, A64_TMP1, src_m);
@@ -1442,7 +1408,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             }
         }
 
-        unsigned src_n = (op != 0x2U && op != 0x3U) ? load_t32_reg(b, rn, pc_val, A64_TMP0) : rn;
+        unsigned src_n = (op != 0x2U && op != 0x3U) ? a32_load_reg(b, rn, pc_val, A64_TMP0) : rn;
         unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
         bool handled = false;
 
@@ -1615,14 +1581,13 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             bool is_double = (subop & 1U) != 0U;
             bool is_sub = (subop & 2U) != 0U;
             a64_emit_mrs_nzcv(b, A64_TMP3);
-            a64_emit_movz_w(b, A64_ADDR, 0x0800U, 1U);
             a64_emit_mov_w(b, A64_TMP0, rn);
             if (is_double) {
                 a64_emit_add_reg_w(b, true, A64_TMP0, A64_TMP0, A64_TMP0, A64_SHIFT_LSL, 0U);
                 a64_emit_movz_w(b, A64_TMP2, 0x8000U, 1U);
                 a64_emit_eor_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_ASR, 31U);
                 a64_emit_csel_w(b, A64_TMP0, A64_TMP2, A64_TMP0, A64_COND_VS);
-                a64_emit_csel_w(b, A64_TMP1, A64_ADDR, A64_ZR, A64_COND_VS);
+                a64_emit_set_q_cond(b, A64_COND_VS);
             }
             if (is_sub) {
                 a64_emit_sub_reg_w(b, true, A64_TMP0, rm, A64_TMP0, A64_SHIFT_LSL, 0U);
@@ -1632,10 +1597,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             a64_emit_movz_w(b, A64_TMP2, 0x8000U, 1U);
             a64_emit_eor_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP0, A64_SHIFT_ASR, 31U);
             a64_emit_csel_w(b, rd, A64_TMP2, A64_TMP0, A64_COND_VS);
-            a64_emit_csel_w(b, A64_TMP1, A64_ADDR, is_double ? A64_TMP1 : A64_ZR, A64_COND_VS);
-            a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-            a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-            a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+            a64_emit_set_q_cond(b, A64_COND_VS);
             a64_emit_msr_nzcv(b, A64_TMP3);
             return true;
         }
@@ -1990,11 +1952,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit_mrs_nzcv(b, A64_TMP3);
                 a64_emit_madd_w(b, A64_TMP2, A64_TMP0, A64_TMP1, A64_ZR);
                 a64_emit_add_reg_w(b, true, rd, A64_TMP2, ra, A64_SHIFT_LSL, 0U);
-                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_VS);
-                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_set_q_cond(b, A64_COND_VS);
                 a64_emit_msr_nzcv(b, A64_TMP3);
             } else {
                 a64_emit_madd_w(b, rd, A64_TMP0, A64_TMP1, A64_ZR);
@@ -2031,11 +1989,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit(b, 0x93407C00U | ((rd & 31U) << 5) | A64_TMP0);
                 /* SUBS XZR, X15, X17 */
                 a64_emit(b, 0xEB000000U | (A64_TMP2 << 16) | (A64_TMP0 << 5) | A64_ZR);
-                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_NE);
-                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_set_q_cond(b, A64_COND_NE);
                 a64_emit_msr_nzcv(b, A64_TMP3);
             }
             return true;
@@ -2050,11 +2004,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 a64_emit_mrs_nzcv(b, A64_TMP3);
                 a64_emit_ubfx_x_to_w(b, A64_TMP2, A64_TMP0, 16U, 32U);
                 a64_emit_add_reg_w(b, true, rd, A64_TMP2, ra, A64_SHIFT_LSL, 0U);
-                a64_emit_movz_w(b, A64_TMP1, 0x0800U, 1U);
-                a64_emit_csel_w(b, A64_TMP1, A64_TMP1, A64_ZR, A64_COND_VS);
-                a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
-                a64_emit_orr_reg_w(b, A64_TMP2, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
-                a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, cpsr));
+                a64_emit_set_q_cond(b, A64_COND_VS);
                 a64_emit_msr_nzcv(b, A64_TMP3);
             } else {
                 a64_emit_ubfx_x_to_w(b, rd, A64_TMP0, 16U, 32U);
@@ -2241,14 +2191,14 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             bool is_tbh = ((hw2 >> 4) & 1U) != 0U;
             unsigned rn = hw1 & 0xFU;
             unsigned rm = hw2 & 0xFU;
-            unsigned base = load_t32_reg(b, rn, pc_val, A64_TMP0);
+            unsigned base = a32_load_reg(b, rn, pc_val, A64_TMP0);
             a64_emit_add_reg_w(b, false, A64_ADDR, base, rm, A64_SHIFT_LSL, is_tbh ? 1U : 0U);
             if (is_tbh) {
                 a64_emit_guest_ldrh_w(b, A64_TMP1, A64_ADDR);
             } else {
                 a64_emit_guest_ldrb_w(b, A64_TMP1, A64_ADDR);
             }
-            a64_emit_mov_imm32(b, A64_TMP0, pc_val);
+            a64_emit_mov_pc32(b, A64_TMP0, pc_val);
             a64_emit_add_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 1U);
             a64_emit_exit_branch_reg(b, A64_TMP0, false);
             if (is_uncond) {
@@ -2322,7 +2272,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         unsigned rt  = (hw2 >> 12) & 0xFU;
         unsigned rt2 = (hw2 >> 8) & 0xFU;
         uint16_t offset = (uint16_t)((hw2 & 0xFFU) << 2);
-        unsigned base = load_t32_reg(b, rn, pc_align4, A64_TMP2);
+        unsigned base = a32_load_reg(b, rn, pc_align4, A64_TMP2);
         if (p_bit) {
             if (u_bit) {
                 a64_emit_add_imm_w(b, false, A64_ADDR, base, offset, 0U);
@@ -2384,7 +2334,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             /* Literal load [PC, #+/-imm12] */
             uint16_t imm12 = (uint16_t)(hw2 & 0xFFFU);
             uint32_t addr = u_imm12 ? (pc_align4 + imm12) : (pc_align4 - imm12);
-            a64_emit_mov_imm32(b, A64_ADDR, addr);
+            a64_emit_mov_pc32(b, A64_ADDR, addr);
         } else if (u_imm12) {
             /* 12-bit unsigned offset [Rn, #imm12] */
             uint16_t imm12 = (uint16_t)(hw2 & 0xFFFU);

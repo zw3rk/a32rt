@@ -14,7 +14,7 @@
     .type a32_jit_run_block, %function
 a32_jit_run_block:
     stp     x29, x30, [sp, #-160]!
-    mov     x29, #0                 /* x29 = accumulated in-trampoline chain_hits delta */
+    mov     x29, sp
     stp     x19, x20, [sp, #16]
     stp     x21, x22, [sp, #32]
     stp     x23, x24, [sp, #48]
@@ -24,6 +24,7 @@ a32_jit_run_block:
     stp     d10, d11, [sp, #112]
     stp     d12, d13, [sp, #128]
     stp     d14, d15, [sp, #144]
+    mov     x24, #0                 /* x24 = accumulated in-trampoline chain_hits delta */
 
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
@@ -83,27 +84,25 @@ a32_jit_run_block:
     eor     w17, w17, w26           /* bit 0 must match current is_thumb */
     cbnz    w17, .Lslow_exit
 .Lmode_ok:
-    ldp     x17, x23, [x19, #368]   /* pending_signals (64b), trace|gdb|single_step|sync_sig (32b) */
-    ldr     w22, [x19, #88]         /* ctx->itstate */
-    orr     w22, w23, w22           /* w22 = flags | itstate (zero-extended to x22) */
-    orr     x23, x17, x22           /* x23 = pending_signals | flags | itstate */
-    cbnz    x23, .Lcheck_signals_slow
+    ldp     x17, x23, [x19, #368]   /* x17 = pending_signals (64b), x23 = flags (lo32) | itstate (hi32) */
+    orr     x22, x17, x23
+    cbnz    x22, .Lcheck_signals_slow
 .Lsignals_ok:
-    ldr     w21, [x28]              /* cur_epoch = g_cache_epoch */
-    and     w24, w15, w25           /* aligned_pc = w15 & align_mask */
+    ldar    w21, [x28]              /* cur_epoch = g_cache_epoch (acquire load) */
+    and     w30, w15, w25           /* aligned_pc = w15 & align_mask */
     cbz     w21, .Lslow_exit
-    orr     w24, w24, w26           /* next_key = aligned_pc | is_thumb */
-    orr     x24, x24, x21, lsl #32  /* x24 = next_key (lo32) | cur_epoch (hi32) */
+    orr     w30, w30, w26           /* next_key = aligned_pc | is_thumb */
+    orr     x30, x30, x21, lsl #32  /* x30 = next_key (lo32) | cur_epoch (hi32) */
 
 .Ltry_chain0:
     ldr     x23, [x27, #48]         /* x23 = cur_entry->chain_entry[0] */
     cbz     x23, .Lslow_exit        /* slot 0 empty -> let C chain it */
     ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
-    eor     x21, x21, x24
+    eor     x21, x21, x30
     cbnz    x21, .Ltry_chain1
     cbz     x17, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
-    add     x29, x29, #1            /* chain_hits_delta++ */
+    add     x24, x24, #1            /* chain_hits_delta++ */
     b       .Lrun_loop
 
 .Ltry_chain1:
@@ -112,23 +111,23 @@ a32_jit_run_block:
     ldr     x23, [x27, #56]         /* x23 = cur_entry->chain_entry[1] */
     cbz     x23, .Lslow_exit        /* slot 1 empty -> let C chain it */
     ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
-    eor     x21, x21, x24
+    eor     x21, x21, x30
     cbnz    x21, .Ltry_ibtc
     cbz     x17, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
-    add     x29, x29, #1            /* chain_hits_delta++ */
+    add     x24, x24, #1            /* chain_hits_delta++ */
     b       .Lrun_loop
 
 .Ltry_ibtc:
     lsr     x21, x21, #32           /* if slot 1 missed due to stale epoch, re-chain in C */
     cbnz    x21, .Lslow_exit
-    eor     w17, w26, w24, lsr #1   /* (next_key >> 1) ^ is_thumb */
+    eor     w17, w26, w30, lsr #1   /* (next_key >> 1) ^ is_thumb */
     and     w17, w17, #0x3ff        /* ibtc_idx = ... & 1023 */
     add     x22, x19, x17, lsl #5   /* x22 = (uint8_t *)ctx + ibtc_idx * 32 */
     ldr     x23, [x22, #432]        /* x23 = ibtc.entry */
     cbz     x23, .Lcheck_ras_pop
     ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
-    eor     x21, x21, x24
+    eor     x21, x21, x30
     cbnz    x21, .Lcheck_ras_pop
     cbz     x17, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
@@ -141,46 +140,48 @@ a32_jit_run_block:
     b       .Lrun_loop
 
 .Lcheck_ras_pop:
-    add     x30, x19, #8, lsl #12   /* x30 = x19 + 0x8000 */
-    ldr     w17, [x30, #0x9a8]      /* w17 = ctx->ras_top */
+    add     x21, x19, #8, lsl #12   /* x21 = x19 + 0x8000 */
+    ldr     w17, [x21, #0x9a8]      /* w17 = ctx->ras_top */
+    cbz     w17, .Lslow_exit        /* Guard against empty stack underflow */
     sub     w17, w17, #1
     ubfx    x22, x17, #0, #6        /* x22 = r_idx = (ras_top - 1) & 63 */
-    add     x22, x30, x22, lsl #5   /* x22 = x19 + 0x8000 + r_idx * 32 */
+    add     x22, x21, x22, lsl #5   /* x22 = x19 + 0x8000 + r_idx * 32 */
     ldr     x23, [x22, #0x1a0]      /* ras[r_idx].key | (ras[r_idx].epoch << 32) */
-    eor     x23, x23, x24
+    eor     x23, x23, x30
     cbnz    x23, .Lslow_exit
     and     w17, w17, #0x3f
-    str     w17, [x30, #0x9a8]      /* ctx->ras_top = r_idx */
+    str     w17, [x21, #0x9a8]      /* ctx->ras_top = r_idx */
     str     xzr, [x22, #0x1a0]      /* clear popped RAS slot */
     ldp     x17, x23, [x22, #0x1a8] /* x17 = host_code, x23 = entry */
     cbz     x17, .Lslow_exit
     cbz     x23, .Lslow_exit
     ldp     x21, x22, [x23]         /* next_entry->key|epoch, next_entry->host_code */
-    eor     x24, x24, x21
+    eor     x21, x21, x30
     eor     x22, x22, x17
-    orr     x24, x24, x22
-    cbnz    x24, .Lslow_exit
+    orr     x21, x21, x22
+    cbnz    x21, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
     ldr     x21, [x19, #384]        /* blocks_executed */
-    ldr     x22, [x30, #0x9a0]      /* ras_hits */
+    add     x22, x19, #8, lsl #12
+    ldr     x23, [x22, #0x9a0]      /* ras_hits */
     add     x21, x21, #1
-    add     x22, x22, #1
+    add     x23, x23, #1
     str     x21, [x19, #384]
-    str     x22, [x30, #0x9a0]
+    str     x23, [x22, #0x9a0]
     b       .Lrun_loop
 
 .Lcheck_signals_slow:
-    cbnz    w22, .Lslow_exit        /* flags or itstate non-zero -> slow exit */
+    cbnz    x23, .Lslow_exit        /* flags or itstate non-zero -> slow exit */
     ldr     x23, [x19, #360]        /* ctx->sig_mask */
     bic     x17, x17, x23           /* unmasked pending_signals */
     cbnz    x17, .Lslow_exit
     b       .Lsignals_ok
 
 .Lslow_exit:
-    cbz     x29, 4f
+    cbz     x24, 4f
     ldp     x21, x22, [x19, #384]   /* blocks_executed, chain_hits */
-    add     x21, x21, x29
-    add     x22, x22, x29
+    add     x21, x21, x24
+    add     x22, x22, x24
     stp     x21, x22, [x19, #384]
 4:
     str     x27, [x19, #400]        /* ctx->last_exec_entry = cur_entry */
