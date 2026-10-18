@@ -1594,14 +1594,20 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
     unsigned        num_insns = 0U;
     unsigned        max_insns = ctx->single_step ? 1U : T32_MAX_BLOCK_INSNS;
 
-    uint32_t start_page = pc & ~0xFFFU;
+    uint32_t cur_page = pc & ~0xFFFU;
     uint32_t scan_pc = pc;
     uint8_t  scan_itstate = itstate;
 
     /* Pre-pass: scan guest instructions in the basic block */
     for (unsigned count = 0U; (count < max_insns || (!ctx->single_step && scan_itstate != 0U)) && num_insns < T32_MAX_PRESCAN_INSNS; count++) {
-        if (count > 0U && ((scan_pc & ~0xFFFU) != start_page || (scan_itstate == 0U && (scan_pc - pc) >= 496U))) {
+        if (count > 0U && scan_itstate == 0U && (scan_pc - pc) >= 496U) {
             break;
+        }
+        if ((scan_pc & ~0xFFFU) != cur_page) {
+            if (!a32_jit_range_executable(ctx, scan_pc, 2U)) {
+                break;
+            }
+            cur_page = scan_pc & ~0xFFFU;
         }
         if (ctx->gdb_enabled && count > 0U && a32_gdb_has_breakpoint(scan_pc)) {
             break;
@@ -1639,30 +1645,11 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         bool ends_uncond = false;
 
         if (is_32bit) {
-            if (((scan_pc + 2U) & ~0xFFFU) != start_page) {
-                if (count > 0U) {
-                    break;
-                }
-                bool mapped = false;
-                uint32_t hw2_pc = scan_pc + 2U;
-                for (size_t r_idx = 0U; r_idx < ctx->region_count; r_idx++) {
-                    const a32_region_t *r = &ctx->regions[r_idx];
-                    if (hw2_pc >= r->start && hw2_pc < r->end && (r->prot & 0x4U) != 0U) {
-                        mapped = true;
+            if (((scan_pc + 2U) & ~0xFFFU) != cur_page) {
+                if (!a32_jit_range_executable(ctx, scan_pc + 2U, 2U)) {
+                    if (count > 0U) {
                         break;
                     }
-                }
-                if (!mapped) {
-                    a32_vm_sync_ctx(ctx);
-                    for (size_t r_idx = 0U; r_idx < ctx->region_count; r_idx++) {
-                        const a32_region_t *r = &ctx->regions[r_idx];
-                        if (hw2_pc >= r->start && hw2_pc < r->end && (r->prot & 0x4U) != 0U) {
-                            mapped = true;
-                            break;
-                        }
-                    }
-                }
-                if (!mapped) {
                     if (itstate != 0U) {
                         a64_emit_mov_imm32(b, A64_TMP0, itstate);
                         a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, itstate));
@@ -1671,6 +1658,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
                     b->guest_end_pc = pc + 2U;
                     return true;
                 }
+                cur_page = (scan_pc + 2U) & ~0xFFFU;
             }
             uint16_t hw2 = guest_hw[1];
             info->hw2 = hw2;

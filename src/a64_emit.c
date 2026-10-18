@@ -547,7 +547,6 @@ static void vfp_record_preheader_access(a64_buf_t *b, uint8_t kind, uint8_t reg,
         }
     }
     if (b->vfp_preheader_count >= A64_VFP_CACHE_SLOTS) {
-        b->vfp_preheader_ineligible = true;
         return;
     }
     unsigned idx = b->vfp_preheader_count++;
@@ -686,6 +685,8 @@ static void vfp_ldr_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
                 return;
             }
         }
+        vfp_emit_raw_ldr(b, kind, vt, idx);
+        return;
     }
     for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
         if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&
@@ -717,6 +718,8 @@ static void vfp_str_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
                 return;
             }
         }
+        vfp_emit_raw_str(b, kind, vt, idx);
+        return;
     }
     for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
         if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&

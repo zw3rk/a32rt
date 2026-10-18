@@ -2301,7 +2301,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         bool time64 = (nr == ARM_NR_clock_gettime64);
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, time64 ? 16U : 8U, PROT_WRITE));
         struct timespec ts;
-        if (clock_gettime((clockid_t)a0, &ts) != 0) {
+        if (syscall(SYS_clock_gettime, (long)a0, &ts) != 0) {
             FAIL_ERR(errno);
         }
         (void)write_guest_timespec(ctx, a1, time64, &ts);

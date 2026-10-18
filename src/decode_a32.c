@@ -1053,7 +1053,7 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
     /* Pre-pass: scan guest instructions in the basic block */
     for (unsigned i = 0U; i < max_insns; i++) {
         uint32_t insn_pc = pc + (i * 4U);
-        if (i > 0U && (insn_pc & 0xFFFU) == 0U) {
+        if (i > 0U && (insn_pc & 0xFFFU) == 0U && !a32_jit_range_executable(ctx, insn_pc, 4U)) {
             break;
         }
         if (ctx->gdb_enabled && i > 0U && a32_gdb_has_breakpoint(insn_pc)) {
