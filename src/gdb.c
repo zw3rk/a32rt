@@ -34,6 +34,67 @@ static int              g_server_sock = -1;
 static int              g_client_sock = -1;
 static gdb_breakpoint_t g_breakpoints[GDB_MAX_BREAKPOINTS];
 
+static const char g_gdb_target_xml[] =
+    "<?xml version=\"1.0\"?>\n"
+    "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n"
+    "<target version=\"1.0\">\n"
+    "  <architecture>arm</architecture>\n"
+    "  <feature name=\"org.gnu.gdb.arm.core\">\n"
+    "    <reg name=\"r0\" bitsize=\"32\" type=\"uint32\" regnum=\"0\"/>\n"
+    "    <reg name=\"r1\" bitsize=\"32\" type=\"uint32\" regnum=\"1\"/>\n"
+    "    <reg name=\"r2\" bitsize=\"32\" type=\"uint32\" regnum=\"2\"/>\n"
+    "    <reg name=\"r3\" bitsize=\"32\" type=\"uint32\" regnum=\"3\"/>\n"
+    "    <reg name=\"r4\" bitsize=\"32\" type=\"uint32\" regnum=\"4\"/>\n"
+    "    <reg name=\"r5\" bitsize=\"32\" type=\"uint32\" regnum=\"5\"/>\n"
+    "    <reg name=\"r6\" bitsize=\"32\" type=\"uint32\" regnum=\"6\"/>\n"
+    "    <reg name=\"r7\" bitsize=\"32\" type=\"uint32\" regnum=\"7\"/>\n"
+    "    <reg name=\"r8\" bitsize=\"32\" type=\"uint32\" regnum=\"8\"/>\n"
+    "    <reg name=\"r9\" bitsize=\"32\" type=\"uint32\" regnum=\"9\"/>\n"
+    "    <reg name=\"r10\" bitsize=\"32\" type=\"uint32\" regnum=\"10\"/>\n"
+    "    <reg name=\"r11\" bitsize=\"32\" type=\"uint32\" regnum=\"11\"/>\n"
+    "    <reg name=\"r12\" bitsize=\"32\" type=\"uint32\" regnum=\"12\"/>\n"
+    "    <reg name=\"sp\" bitsize=\"32\" type=\"data_ptr\" regnum=\"13\"/>\n"
+    "    <reg name=\"lr\" bitsize=\"32\" type=\"int\" regnum=\"14\"/>\n"
+    "    <reg name=\"pc\" bitsize=\"32\" type=\"code_ptr\" regnum=\"15\"/>\n"
+    "    <reg name=\"cpsr\" bitsize=\"32\" regnum=\"25\"/>\n"
+    "  </feature>\n"
+    "  <feature name=\"org.gnu.gdb.arm.vfp\">\n"
+    "    <reg name=\"d0\" bitsize=\"64\" type=\"ieee_double\" regnum=\"26\"/>\n"
+    "    <reg name=\"d1\" bitsize=\"64\" type=\"ieee_double\" regnum=\"27\"/>\n"
+    "    <reg name=\"d2\" bitsize=\"64\" type=\"ieee_double\" regnum=\"28\"/>\n"
+    "    <reg name=\"d3\" bitsize=\"64\" type=\"ieee_double\" regnum=\"29\"/>\n"
+    "    <reg name=\"d4\" bitsize=\"64\" type=\"ieee_double\" regnum=\"30\"/>\n"
+    "    <reg name=\"d5\" bitsize=\"64\" type=\"ieee_double\" regnum=\"31\"/>\n"
+    "    <reg name=\"d6\" bitsize=\"64\" type=\"ieee_double\" regnum=\"32\"/>\n"
+    "    <reg name=\"d7\" bitsize=\"64\" type=\"ieee_double\" regnum=\"33\"/>\n"
+    "    <reg name=\"d8\" bitsize=\"64\" type=\"ieee_double\" regnum=\"34\"/>\n"
+    "    <reg name=\"d9\" bitsize=\"64\" type=\"ieee_double\" regnum=\"35\"/>\n"
+    "    <reg name=\"d10\" bitsize=\"64\" type=\"ieee_double\" regnum=\"36\"/>\n"
+    "    <reg name=\"d11\" bitsize=\"64\" type=\"ieee_double\" regnum=\"37\"/>\n"
+    "    <reg name=\"d12\" bitsize=\"64\" type=\"ieee_double\" regnum=\"38\"/>\n"
+    "    <reg name=\"d13\" bitsize=\"64\" type=\"ieee_double\" regnum=\"39\"/>\n"
+    "    <reg name=\"d14\" bitsize=\"64\" type=\"ieee_double\" regnum=\"40\"/>\n"
+    "    <reg name=\"d15\" bitsize=\"64\" type=\"ieee_double\" regnum=\"41\"/>\n"
+    "    <reg name=\"d16\" bitsize=\"64\" type=\"ieee_double\" regnum=\"42\"/>\n"
+    "    <reg name=\"d17\" bitsize=\"64\" type=\"ieee_double\" regnum=\"43\"/>\n"
+    "    <reg name=\"d18\" bitsize=\"64\" type=\"ieee_double\" regnum=\"44\"/>\n"
+    "    <reg name=\"d19\" bitsize=\"64\" type=\"ieee_double\" regnum=\"45\"/>\n"
+    "    <reg name=\"d20\" bitsize=\"64\" type=\"ieee_double\" regnum=\"46\"/>\n"
+    "    <reg name=\"d21\" bitsize=\"64\" type=\"ieee_double\" regnum=\"47\"/>\n"
+    "    <reg name=\"d22\" bitsize=\"64\" type=\"ieee_double\" regnum=\"48\"/>\n"
+    "    <reg name=\"d23\" bitsize=\"64\" type=\"ieee_double\" regnum=\"49\"/>\n"
+    "    <reg name=\"d24\" bitsize=\"64\" type=\"ieee_double\" regnum=\"50\"/>\n"
+    "    <reg name=\"d25\" bitsize=\"64\" type=\"ieee_double\" regnum=\"51\"/>\n"
+    "    <reg name=\"d26\" bitsize=\"64\" type=\"ieee_double\" regnum=\"52\"/>\n"
+    "    <reg name=\"d27\" bitsize=\"64\" type=\"ieee_double\" regnum=\"53\"/>\n"
+    "    <reg name=\"d28\" bitsize=\"64\" type=\"ieee_double\" regnum=\"54\"/>\n"
+    "    <reg name=\"d29\" bitsize=\"64\" type=\"ieee_double\" regnum=\"55\"/>\n"
+    "    <reg name=\"d30\" bitsize=\"64\" type=\"ieee_double\" regnum=\"56\"/>\n"
+    "    <reg name=\"d31\" bitsize=\"64\" type=\"ieee_double\" regnum=\"57\"/>\n"
+    "    <reg name=\"fpscr\" bitsize=\"32\" type=\"int\" regnum=\"58\"/>\n"
+    "  </feature>\n"
+    "</target>\n";
+
 static inline uint8_t hex_val(char c)
 {
     if (c >= '0' && c <= '9') {
@@ -641,7 +702,32 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             }
             send_packet(g_client_sock, "");
         } else if (strncmp(cmd, "qSupported", 10) == 0) {
-            send_packet(g_client_sock, "PacketSize=4000;swbreak+");
+            send_packet(g_client_sock, "PacketSize=4000;swbreak+;qXfer:features:read+");
+        } else if (strncmp(cmd, "qXfer:features:read:target.xml:", 31) == 0) {
+            char *comma = strchr(cmd + 31, ',');
+            if (comma != NULL) {
+                size_t offset = (size_t)strtoul(cmd + 31, NULL, 16);
+                size_t len    = (size_t)strtoul(comma + 1, NULL, 16);
+                size_t xml_len = sizeof(g_gdb_target_xml) - 1U;
+                if (offset >= xml_len || len == 0U) {
+                    send_packet(g_client_sock, "l");
+                } else {
+                    size_t chunk = xml_len - offset;
+                    if (chunk > len) {
+                        chunk = len;
+                    }
+                    if (chunk > GDB_PKT_BUF_SIZE - 16U) {
+                        chunk = GDB_PKT_BUF_SIZE - 16U;
+                    }
+                    char resp[GDB_PKT_BUF_SIZE];
+                    resp[0] = (offset + chunk >= xml_len) ? 'l' : 'm';
+                    memcpy(resp + 1, g_gdb_target_xml + offset, chunk);
+                    resp[1U + chunk] = '\0';
+                    send_packet(g_client_sock, resp);
+                }
+            } else {
+                send_packet(g_client_sock, "E01");
+            }
         } else if (cmd[0] == 'D') {
             /* Detach */
             send_packet(g_client_sock, "OK");

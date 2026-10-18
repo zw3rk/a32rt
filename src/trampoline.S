@@ -124,7 +124,7 @@ a32_jit_run_block:
     eor     w17, w26, w30, lsr #1   /* (next_key >> 1) ^ is_thumb */
     and     w17, w17, #0x3ff        /* ibtc_idx = ... & 1023 */
     add     x22, x19, x17, lsl #5   /* x22 = (uint8_t *)ctx + ibtc_idx * 32 */
-    ldr     x23, [x22, #432]        /* x23 = ibtc.entry */
+    ldr     x23, [x22, #2496]       /* x23 = ibtc.entry */
     cbz     x23, .Lcheck_ras_pop
     ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
     eor     x21, x21, x30
@@ -140,19 +140,16 @@ a32_jit_run_block:
     b       .Lrun_loop
 
 .Lcheck_ras_pop:
-    add     x21, x19, #8, lsl #12   /* x21 = x19 + 0x8000 */
-    ldr     w17, [x21, #0x9a8]      /* w17 = ctx->ras_top */
-    cbz     w17, .Lslow_exit        /* Guard against empty stack underflow */
+    ldr     w17, [x19, #424]        /* w17 = ctx->ras_top */
     sub     w17, w17, #1
-    ubfx    x22, x17, #0, #6        /* x22 = r_idx = (ras_top - 1) & 63 */
-    add     x22, x21, x22, lsl #5   /* x22 = x19 + 0x8000 + r_idx * 32 */
-    ldr     x23, [x22, #0x1a0]      /* ras[r_idx].key | (ras[r_idx].epoch << 32) */
+    and     w17, w17, #0x3f         /* r_idx = (ras_top - 1) & 63 */
+    add     x22, x19, x17, lsl #5   /* x22 = ctx + r_idx * 32 */
+    ldr     x23, [x22, #432]        /* ras[r_idx].key | (ras[r_idx].epoch << 32) */
     eor     x23, x23, x30
     cbnz    x23, .Lslow_exit
-    and     w17, w17, #0x3f
-    str     w17, [x21, #0x9a8]      /* ctx->ras_top = r_idx */
-    str     xzr, [x22, #0x1a0]      /* clear popped RAS slot */
-    ldp     x17, x23, [x22, #0x1a8] /* x17 = host_code, x23 = entry */
+    str     w17, [x19, #424]        /* ctx->ras_top = r_idx */
+    str     xzr, [x22, #432]        /* clear popped RAS slot */
+    ldp     x17, x23, [x22, #440]   /* x17 = host_code, x23 = entry */
     cbz     x17, .Lslow_exit
     cbz     x23, .Lslow_exit
     ldp     x21, x22, [x23]         /* next_entry->key|epoch, next_entry->host_code */
@@ -162,12 +159,11 @@ a32_jit_run_block:
     cbnz    x21, .Lslow_exit
     mov     x27, x23                /* cur_entry = next_entry */
     ldr     x21, [x19, #384]        /* blocks_executed */
-    add     x22, x19, #8, lsl #12
-    ldr     x23, [x22, #0x9a0]      /* ras_hits */
+    ldr     x23, [x19, #416]        /* ras_hits */
     add     x21, x21, #1
     add     x23, x23, #1
     str     x21, [x19, #384]
-    str     x23, [x22, #0x9a0]
+    str     x23, [x19, #416]
     b       .Lrun_loop
 
 .Lcheck_signals_slow:

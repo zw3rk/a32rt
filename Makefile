@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build tests \
+.PHONY: help all build tests check-headers \
         test-hello-hl test-hello-lima \
         test-m1-hl test-m1-lima \
         test-m2-hl test-m2-lima \
@@ -21,25 +21,19 @@ HL_BIN    ?= $(HL_DIR)/_build/hl
 LIMA_VM   ?= hl-rosetta
 
 # Locate aarch64-unknown-linux-musl-gcc (from PATH or cached /nix/store wrapper)
-A64_CC_PATH := $(shell command -v aarch64-unknown-linux-musl-gcc 2>/dev/null)
-ifeq ($(A64_CC_PATH),)
-  A64_CC_PATH := $(shell ls -d /nix/store/*-aarch64-unknown-linux-musl-gcc-wrapper-15.3*/bin/aarch64-unknown-linux-musl-gcc 2>/dev/null | head -n 1)
-endif
+A64_CC_CACHED := /nix/store/h4svaqanhy15x4c3mwx5rp6kcjm4d1hp-aarch64-unknown-linux-musl-gcc-wrapper-15.3.0/bin/aarch64-unknown-linux-musl-gcc
+A64_CC_PATH   := $(shell command -v aarch64-unknown-linux-musl-gcc 2>/dev/null || ([ -x $(A64_CC_CACHED) ] && echo $(A64_CC_CACHED)))
 ifneq ($(origin CC),command line)
   CC := $(A64_CC_PATH)
 endif
 
 # Locate unwrapped clang + ld.lld for fast local armv7 ELF32 fixture builds
-ARM32_CC_PATH := $(shell command -v armv7l-unknown-linux-musleabihf-gcc 2>/dev/null)
-CLANG_RAW     := $(shell ls -d /nix/store/*-clang-21.*/bin/clang /nix/store/*-clang-19.*/bin/clang 2>/dev/null | tail -n 1)
-ifeq ($(CLANG_RAW),)
-  CLANG_RAW := clang
-endif
-LLD_RAW       := $(shell ls -d /nix/store/*-lld-21.*/bin/ld.lld /nix/store/*-lld-19.*/bin/ld.lld 2>/dev/null | tail -n 1)
-ifeq ($(LLD_RAW),)
-  LLD_RAW := ld.lld
-endif
-LIMACTL       ?= $(shell command -v limactl 2>/dev/null || ls -d /nix/store/*-lima-*/bin/limactl 2>/dev/null | tail -n 1)
+CLANG_CACHED  := /nix/store/15n3slfdsd5zhyxrvaa7vm36f1jydwqp-clang-21.1.8/bin/clang
+LLD_CACHED    := /nix/store/smnrx7kvgcxbl6s2scgwk6zp0np6yw7q-lld-21.1.8/bin/ld.lld
+CLANG_RAW     := $(shell [ -x $(CLANG_CACHED) ] && echo $(CLANG_CACHED) || command -v clang 2>/dev/null)
+LLD_RAW       := $(shell [ -x $(LLD_CACHED) ] && echo $(LLD_CACHED) || command -v ld.lld 2>/dev/null)
+LIMACTL_CACHED := /nix/store/piidmzyl8dvi91i5y6hs8kaclbalk7bf-lima-2.1.4/bin/limactl
+LIMACTL       ?= $(shell command -v limactl 2>/dev/null || ([ -x $(LIMACTL_CACHED) ] && echo $(LIMACTL_CACHED)))
 
 CFLAGS := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
           -fno-stack-protector -Iinclude -Isrc
@@ -138,6 +132,10 @@ $(BUILD_DIR)/sysroot-armv7/bin/busybox: | $(BUILD_DIR)
 	@curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armv7/alpine-minirootfs-3.21.8-armv7.tar.gz \
 		| tar -xz -C $(BUILD_DIR)/sysroot-armv7
 
+check-headers: ## Verify include/a32host.h matches $(HL_DIR)/src/a32host.h
+	@cmp -s include/a32host.h $(HL_DIR)/src/a32host.h || (echo "ERROR: include/a32host.h out of sync with $(HL_DIR)/src/a32host.h" && exit 1)
+	@echo "=== check-headers: PASS ==="
+
 test-hello-hl: $(A32RT_BIN) $(BUILD_DIR)/hello-armhf-static $(BUILD_DIR)/hello-thumb-static ## Run M0-hl smoke test under hyper-linux (primary target)
 	@printf "\033[32m▸ Verifying M0-hl (A32)\033[0m under $(HL_BIN)\n"
 	@out="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/hello-armhf-static))"; \
@@ -225,15 +223,16 @@ test-m4-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m4-armhf $(BUILD_DIR)/test-m4-thumb
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/test-m4-thumb)
 	@printf "\033[32mPASS\033[0m: M4 on Lima\n"
 
-test-m5-hl: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf ## Run M5 LTP syscall conformance and GDB RSP verification under hl
+test-m5-hl: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf $(BUILD_DIR)/hello-armhf-static ## Run M5 LTP syscall conformance and GDB RSP verification under hl
 	@printf "\033[32m▸ Verifying M5-hl (LTP syscall conformance + compat shims)\033[0m under $(HL_BIN)\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/test-m5-armhf)
+	@$(TIMEOUT_RUN) python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["$(HL_BIN)", "$(abspath $(A32RT_BIN))", "--gdb", "14322", "$(abspath $(BUILD_DIR)/hello-armhf-static)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); time.sleep(0.2); s = socket.create_connection(("127.0.0.1", 14322), timeout=3); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode("latin1"))(); send = lambda cmd: (s.sendall(b"$$" + cmd.encode("latin1") + b"#" + ("%02x" % (sum(cmd.encode("latin1")) & 0xff)).encode("latin1")), rpkt())[1]; r1 = send("?"); r2 = send("g"); r_sup = send("qSupported"); assert "qXfer:features:read+" in r_sup, r_sup; r_xml = send("qXfer:features:read:target.xml:0,fff"); assert "org.gnu.gdb.arm.vfp" in r_xml, r_xml; assert "OK" in send("P1a=0123456789abcdef"); assert "0123456789abcdef" in send("p1a"); assert "OK" in send("P3a=12345678"); assert "12345678" in send("p3a"); r3 = send("s"); send("c"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5-hl GDB RSP Stub: PASS")'
 	@printf "\033[32mPASS\033[0m: M5-hl\n"
 
 test-m5-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf $(BUILD_DIR)/hello-armhf-static ## Run M5 LTP syscall conformance and GDB RSP verification inside Lima VM
 	@printf "\033[32m▸ Verifying M5 (LTP syscall conformance + GDB RSP)\033[0m inside Lima VM ($(LIMA_VM))\n"
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/test-m5-armhf)
-	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["./_build/a32rt", "--gdb", "14321", "./_build/hello-armhf-static"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); time.sleep(0.2); s = socket.create_connection(("127.0.0.1", 14321), timeout=3); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode())(); s.sendall(b"$$?#3f"); r1 = rpkt(); s.sendall(b"$$g#67"); r2 = rpkt(); s.sendall(b"$$s#73"); r3 = rpkt(); s.sendall(b"$$c#63"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5 GDB RSP Stub: PASS")'
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["./_build/a32rt", "--gdb", "14321", "./_build/hello-armhf-static"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); time.sleep(0.2); s = socket.create_connection(("127.0.0.1", 14321), timeout=3); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode("latin1"))(); send = lambda cmd: (s.sendall(b"$$" + cmd.encode("latin1") + b"#" + ("%02x" % (sum(cmd.encode("latin1")) & 0xff)).encode("latin1")), rpkt())[1]; r1 = send("?"); r2 = send("g"); r_sup = send("qSupported"); assert "qXfer:features:read+" in r_sup, r_sup; r_xml = send("qXfer:features:read:target.xml:0,fff"); assert "org.gnu.gdb.arm.vfp" in r_xml, r_xml; assert "OK" in send("P1a=0123456789abcdef"); assert "0123456789abcdef" in send("p1a"); assert "OK" in send("P3a=12345678"); assert "12345678" in send("p3a"); r3 = send("s"); send("c"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5 GDB RSP Stub: PASS")'
 	@printf "\033[32mPASS\033[0m: M5 on Lima\n"
 
 test-m6-hl: $(A32RT_BIN) $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M6 real-world multi-library dynamic linking & relocatable .so AOT cache under hl
@@ -274,7 +273,7 @@ test-m6-lima: $(A32RT_BIN) $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M6 real
 	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
 	@printf "\033[32mPASS\033[0m: M6 on Lima\n"
 
-test-all-hl: test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl ## Run complete M0..M6 suite under hyper-linux
+test-all-hl: check-headers test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl ## Run complete M0..M6 suite under hyper-linux
 
 test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima test-m6-lima ## Run complete M0..M6 suite inside Lima VM
 

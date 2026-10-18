@@ -77,30 +77,49 @@ typedef struct a64_buf {
     uint32_t  vfp_slot_dirty;
     uint8_t   vfp_next_evict;
     unsigned  cond_branch_depth;
+    uint32_t  guest_start_pc;
     uint32_t  guest_end_pc;
     bool      is_call;
+    bool      has_self_loop;
+    bool      vfp_preheader_ineligible;
+    bool      self_loop_vfp_active;
+    uint8_t   vfp_preheader_kinds[A64_VFP_CACHE_SLOTS];
+    uint8_t   vfp_preheader_regs[A64_VFP_CACHE_SLOTS];
+    uint32_t  vfp_preheader_written;
+    unsigned  vfp_preheader_count;
+    size_t    loop_body_offset;
     uint32_t  exit_slot_pcs[A64_MAX_EXIT_SLOTS];
     unsigned  exit_slot_count;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
 {
-    b->words             = storage;
-    b->count             = 0U;
-    b->cap               = cap;
-    b->overflow          = false;
+    b->words                    = storage;
+    b->count                    = 0U;
+    b->cap                      = cap;
+    b->overflow                 = false;
     for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-        b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
-        b->vfp_slot_reg[i]  = 0U;
+        b->vfp_slot_kind[i]       = A64_VFP_KIND_NONE;
+        b->vfp_slot_reg[i]        = 0U;
+        b->vfp_preheader_kinds[i] = A64_VFP_KIND_NONE;
+        b->vfp_preheader_regs[i]  = 0U;
     }
-    b->vfp_slot_dirty    = 0U;
-    b->vfp_next_evict    = 0U;
-    b->cond_branch_depth = 0U;
-    b->guest_end_pc      = 0U;
-    b->is_call           = false;
-    b->exit_slot_count   = 0U;
+    b->vfp_slot_dirty           = 0U;
+    b->vfp_next_evict           = 0U;
+    b->cond_branch_depth        = 0U;
+    b->guest_start_pc           = 0U;
+    b->guest_end_pc             = 0U;
+    b->is_call                  = false;
+    b->has_self_loop            = false;
+    b->vfp_preheader_ineligible = false;
+    b->self_loop_vfp_active     = false;
+    b->vfp_preheader_written    = 0U;
+    b->vfp_preheader_count      = 0U;
+    b->loop_body_offset         = 0U;
+    b->exit_slot_count          = 0U;
 }
 
+void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs, unsigned count, uint32_t written_mask);
 void a64_vfp_cache_flush(a64_buf_t *b, bool invalidate);
 
 static inline void a64_emit(a64_buf_t *b, uint32_t insn)

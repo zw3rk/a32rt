@@ -188,11 +188,12 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 return false;
             }
             unsigned sn = (((insn >> 16) & 0xFU) << 1) | ((insn >> 7) & 1U);
-            uint32_t off = A32_CTX_VFP_OFFSET + (sn * 4U);
             if (l_bit) {
-                a64_emit_ldr_imm_w(b, rt, A64_XCTX, off);
+                a64_emit_ldr_s_ctx(b, 0U, sn);
+                a64_emit_fmov_s_to_w(b, rt, 0U);
             } else {
-                a64_emit_str_imm_w(b, rt, A64_XCTX, off);
+                a64_emit_fmov_w_to_s(b, 0U, rt);
+                a64_emit_str_s_ctx(b, 0U, sn);
             }
             return true;
         }
@@ -585,7 +586,8 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 if (is_double) {
                     unsigned d = (d_bit << 4) | vd_b;
                     unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (m * 4U));
+                    a64_emit_ldr_s_ctx(b, 1U, m);
+                    a64_emit_fmov_s_to_w(b, A64_TMP0, 1U);
                     if (is_signed) {
                         a64_emit_scvtf_w_to_d(b, 0U, A64_TMP0);
                     } else {
@@ -595,7 +597,8 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 } else {
                     unsigned s = (vd_b << 1) | d_bit;
                     unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (m * 4U));
+                    a64_emit_ldr_s_ctx(b, 1U, m);
+                    a64_emit_fmov_s_to_w(b, A64_TMP0, 1U);
                     if (is_signed) {
                         a64_emit_scvtf_w_to_s(b, 0U, A64_TMP0);
                     } else {
@@ -690,7 +693,8 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     } else {
                         a64_emit_fcvtzu_d_to_w(b, A64_TMP0, 1U);
                     }
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (s * 4U));
+                    a64_emit_fmov_w_to_s(b, 0U, A64_TMP0);
+                    a64_emit_str_s_ctx(b, 0U, s);
                 } else {
                     unsigned s = (vd_b << 1) | d_bit;
                     unsigned m = (vm_b << 1) | m_bit;
@@ -703,7 +707,8 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     } else {
                         a64_emit_fcvtzu_s_to_w(b, A64_TMP0, 1U);
                     }
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (s * 4U));
+                    a64_emit_fmov_w_to_s(b, 0U, A64_TMP0);
+                    a64_emit_str_s_ctx(b, 0U, s);
                 }
                 return true;
             }
@@ -2426,7 +2431,8 @@ static bool decode_vfp_uncond(a64_buf_t *b, uint32_t insn)
         uint32_t insn_a64 = base | (is_double ? 0x00400000U : 0U) |
                             (is_signed ? 0U : 0x00010000U) | (1U << 5) | A64_TMP0;
         a64_emit(b, insn_a64);
-        a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (sd * 4U));
+        a64_emit_fmov_w_to_s(b, 0U, A64_TMP0);
+        a64_emit_str_s_ctx(b, 0U, sd);
         return true;
     }
 

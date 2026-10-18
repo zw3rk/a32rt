@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    5U
+#define A32_AOT_VERSION    6U
 #define A32_MAX_AOT_SCAN   4096U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  2048U
@@ -901,8 +901,13 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
         }
     }
 
-    static uint32_t disc_pcs[A32_MAX_AOT_SCAN];
-    static bool     disc_thumb[A32_MAX_AOT_SCAN];
+    uint32_t *disc_pcs   = (uint32_t *)calloc(A32_MAX_AOT_SCAN, sizeof(uint32_t));
+    bool     *disc_thumb = (bool *)calloc(A32_MAX_AOT_SCAN, sizeof(bool));
+    if (disc_pcs == NULL || disc_thumb == NULL) {
+        free(disc_pcs);
+        free(disc_thumb);
+        return -1;
+    }
     size_t          disc_count = 0U;
 
     bool has_aux_exec = false;
@@ -968,7 +973,12 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     }
 
     if (a32_jit_flush_batch(ctx) != 0) {
+        free(disc_pcs);
+        free(disc_thumb);
         return -1;
     }
-    return a32_aot_save_cache(ctx, elf_path);
+    int save_rc = a32_aot_save_cache(ctx, elf_path);
+    free(disc_pcs);
+    free(disc_thumb);
+    return save_rc;
 }

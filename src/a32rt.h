@@ -93,11 +93,11 @@ typedef struct a32_ctx {
     uint64_t          chain_hits;         /* 0x188 (392) */
     void             *last_exec_entry;    /* 0x190 (400) */
     uint64_t          ibtc_hits;          /* 0x198 (408) */
-    a32_ibtc_entry_t  ibtc[A32_IBTC_SIZE];/* 0x1a0 (416) */
-    a32_ibtc_entry_t  ras[A32_RAS_SIZE];  /* 0x81a0 (33184) */
-    uint64_t          ras_hits;           /* 0x89a0 (35232) */
-    uint32_t          ras_top;            /* 0x89a8 (35240) */
-    uint32_t          pad2;               /* 0x89ac (35244) */
+    uint64_t          ras_hits;           /* 0x1a0 (416) */
+    uint32_t          ras_top;            /* 0x1a8 (424) */
+    uint32_t          pad2;               /* 0x1ac (428) */
+    a32_ibtc_entry_t  ras[A32_RAS_SIZE];  /* 0x1b0 (432) */
+    a32_ibtc_entry_t  ibtc[A32_IBTC_SIZE];/* 0x9b0 (2480) */
 
     /* Guest memory layout & allocator inside [G, G + 4GiB) */
     uint32_t brk_base;
@@ -170,10 +170,10 @@ _Static_assert(offsetof(a32_ctx_t, blocks_executed) == 384, "blocks_executed mus
 _Static_assert(offsetof(a32_ctx_t, chain_hits) == 392, "chain_hits must be at offset 392");
 _Static_assert(offsetof(a32_ctx_t, last_exec_entry) == 400, "last_exec_entry must be at offset 400");
 _Static_assert(offsetof(a32_ctx_t, ibtc_hits) == 408, "ibtc_hits must be at offset 408");
-_Static_assert(offsetof(a32_ctx_t, ibtc) == 416, "ibtc must be at offset 416");
-_Static_assert(offsetof(a32_ctx_t, ras) == 33184, "ras must be at offset 33184 (0x81a0)");
-_Static_assert(offsetof(a32_ctx_t, ras_hits) == 35232, "ras_hits must be at offset 35232 (0x89a0)");
-_Static_assert(offsetof(a32_ctx_t, ras_top) == 35240, "ras_top must be at offset 35240 (0x89a8)");
+_Static_assert(offsetof(a32_ctx_t, ras_hits) == 416, "ras_hits must be at offset 416 (0x1a0)");
+_Static_assert(offsetof(a32_ctx_t, ras_top) == 424, "ras_top must be at offset 424 (0x1a8)");
+_Static_assert(offsetof(a32_ctx_t, ras) == 432, "ras must be at offset 432 (0x1b0)");
+_Static_assert(offsetof(a32_ctx_t, ibtc) == 2480, "ibtc must be at offset 2480 (0x9b0)");
 
 static inline void *a32_guest_ptr(const a32_ctx_t *ctx, uint32_t guest_va)
 {

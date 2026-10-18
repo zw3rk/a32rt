@@ -306,8 +306,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             uint32_t h_bit = ((insn >> 24) & 1U) << 1;
             uint32_t target = (pc_val + (uint32_t)(imm24 << 2) + h_bit) | 1U;
             a64_emit_mov_pc32(b, 14U, pc + 4U);
-            a64_emit_exit_branch_imm(b, target, true);
             b->is_call = true;
+            a64_emit_exit_branch_imm(b, target, true);
             *out_ends_block = true;
             return true;
         }
@@ -1286,11 +1286,11 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             unsigned target = a32_load_reg(b, rm, pc_val, A64_TMP0);
             a64_emit_mov_w(b, A64_TMP0, target);
             a64_emit_mov_pc32(b, 14U, pc + 4U);
-            a64_emit_exit_branch_reg(b, A64_TMP0, true);
             if (cond == A64_COND_AL) {
                 b->is_call = true;
                 *out_ends_block = true;
             }
+            a64_emit_exit_branch_reg(b, A64_TMP0, true);
             handled = true;
         } else if (op1 == 0U && (insn & 0x0FFF0FF0U) == 0x016F0F10U) {
             /* CLZ Rd, Rm */

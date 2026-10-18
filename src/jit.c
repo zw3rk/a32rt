@@ -651,7 +651,8 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
                                      uint32_t guest_pc, uint32_t guest_end_pc, uint32_t code_bytes,
                                      bool is_call, size_t side_start, size_t side_count,
                                      uint32_t cur_epoch,
-                                     const uint32_t *words, size_t word_count)
+                                     const uint32_t *words, size_t word_count,
+                                     bool link_reverse)
 {
     uint32_t old_ep  = atomic_load_explicit(&entry->epoch, memory_order_relaxed);
     uint32_t old_key = atomic_load_explicit(&entry->key, memory_order_relaxed);
@@ -700,33 +701,89 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     entry->side_count = side_count;
 
     if (words != NULL && word_count > 0U) {
-        for (size_t i = 0U; i + 10U < word_count; i++) {
+        for (size_t i = 0U; i + 9U < word_count; i++) {
             if ((words[i] & 0xFFC003FFU) == (0xF9400000U | (27U << 5) | 23U)) {
                 unsigned uimm = (words[i] >> 10U) & 0xFFFU;
                 if (uimm >= 19U && uimm < 19U + A32_MAX_EXIT_SLOTS) {
-                    if ((words[i + 9U] & 0xFFE0001FU) == (0x52A00000U | 15U) &&
-                        (words[i + 10U] & 0xFFE0001FU) == (0x72800000U | 15U)) {
-                        uint32_t target_pc = (((words[i + 9U] >> 5U) & 0xFFFFU) << 16U) |
-                                             ((words[i + 10U] >> 5U) & 0xFFFFU);
+                    size_t off_movz = (i + 9U < word_count &&
+                                       (words[i + 9U] & 0xFFE0001FU) == (0x52A00000U | 15U))
+                                          ? (i + 9U)
+                                          : (i + 20U);
+                    if (off_movz + 1U < word_count &&
+                        (words[off_movz] & 0xFFE0001FU) == (0x52A00000U | 15U) &&
+                        (words[off_movz + 1U] & 0xFFE0001FU) == (0x72800000U | 15U)) {
+                        uint32_t target_pc = (((words[off_movz] >> 5U) & 0xFFFFU) << 16U) |
+                                             ((words[off_movz + 1U] >> 5U) & 0xFFFFU);
                         uint32_t is_t = key & 1U;
                         uint32_t s_key = (target_pc & (is_t ? ~1U : ~3U)) | is_t;
                         unsigned s_idx_slot = uimm - 19U;
                         atomic_store_explicit(&entry->slot_key[s_idx_slot], s_key, memory_order_relaxed);
-                        if (cur_epoch != 0U && s_key != 0U && s_key != key) {
-                            uint32_t h_slot = hash_key(s_key);
-                            for (size_t probe = 0U; probe < 16U; probe++) {
-                                uint32_t h_idx = (h_slot + (uint32_t)probe) & A32_HT_MASK;
-                                if (&g_ht[h_idx] != entry &&
-                                    atomic_load_explicit(&g_ht[h_idx].epoch, memory_order_relaxed) == cur_epoch &&
-                                    atomic_load_explicit(&g_ht[h_idx].key, memory_order_relaxed) == s_key &&
-                                    atomic_load_explicit(&g_ht[h_idx].host_code, memory_order_relaxed) != NULL) {
-                                    atomic_store_explicit(&entry->slot_entry[s_idx_slot], &g_ht[h_idx], memory_order_relaxed);
-                                    break;
+                        if (cur_epoch != 0U && s_key != 0U) {
+                            if (s_key == key) {
+                                atomic_store_explicit(&entry->slot_entry[s_idx_slot], entry, memory_order_relaxed);
+                            } else {
+                                uint32_t h_slot = hash_key(s_key);
+                                for (size_t probe = 0U; probe < 16U; probe++) {
+                                    uint32_t h_idx = (h_slot + (uint32_t)probe) & A32_HT_MASK;
+                                    if (&g_ht[h_idx] != entry &&
+                                        atomic_load_explicit(&g_ht[h_idx].epoch, memory_order_relaxed) == cur_epoch &&
+                                        atomic_load_explicit(&g_ht[h_idx].key, memory_order_relaxed) == s_key &&
+                                        atomic_load_explicit(&g_ht[h_idx].host_code, memory_order_relaxed) != NULL) {
+                                        atomic_store_explicit(&entry->slot_entry[s_idx_slot], &g_ht[h_idx], memory_order_relaxed);
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if (is_call && guest_end_pc > guest_pc) {
+        uint32_t is_t = key & 1U;
+        uint32_t r_key = (guest_end_pc & (is_t ? ~1U : ~3U)) | is_t;
+        atomic_store_explicit(&entry->ret_key, r_key, memory_order_relaxed);
+        if (cur_epoch != 0U && r_key != 0U) {
+            uint32_t h_slot = hash_key(r_key);
+            for (size_t probe = 0U; probe < 16U; probe++) {
+                uint32_t h_idx = (h_slot + (uint32_t)probe) & A32_HT_MASK;
+                if (&g_ht[h_idx] != entry &&
+                    atomic_load_explicit(&g_ht[h_idx].epoch, memory_order_relaxed) == cur_epoch &&
+                    atomic_load_explicit(&g_ht[h_idx].key, memory_order_relaxed) == r_key &&
+                    atomic_load_explicit(&g_ht[h_idx].host_code, memory_order_relaxed) != NULL) {
+                    atomic_store_explicit(&entry->ret_code,
+                                          atomic_load_explicit(&g_ht[h_idx].host_code, memory_order_relaxed),
+                                          memory_order_relaxed);
+                    atomic_store_explicit(&entry->ret_entry, &g_ht[h_idx], memory_order_relaxed);
+                    atomic_store_explicit(&entry->ret_epoch, cur_epoch, memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (link_reverse && cur_epoch != 0U) {
+        for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+            if (&g_ht[i] == entry) {
+                continue;
+            }
+            if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != cur_epoch) {
+                continue;
+            }
+            for (unsigned s = 0U; s < A32_MAX_EXIT_SLOTS; s++) {
+                if (atomic_load_explicit(&g_ht[i].slot_key[s], memory_order_relaxed) == key &&
+                    atomic_load_explicit(&g_ht[i].slot_entry[s], memory_order_relaxed) == NULL) {
+                    atomic_store_explicit(&g_ht[i].slot_entry[s], entry, memory_order_release);
+                }
+            }
+            if (atomic_load_explicit(&g_ht[i].is_call, memory_order_relaxed) &&
+                atomic_load_explicit(&g_ht[i].ret_key, memory_order_relaxed) == key &&
+                atomic_load_explicit(&g_ht[i].ret_entry, memory_order_relaxed) == NULL) {
+                atomic_store_explicit(&g_ht[i].ret_code, dst, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].ret_entry, entry, memory_order_relaxed);
+                atomic_store_explicit(&g_ht[i].ret_epoch, cur_epoch, memory_order_release);
             }
         }
     }
@@ -831,7 +888,7 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
         if (k == 0U || hc == NULL || ep != cur_epoch || k == key) {
             populate_ht_entry_locked(&g_ht[idx], key, dst, aligned_pc, end_pc,
                                      (uint32_t)code_bytes, is_call, side_start, side_count,
-                                     cur_epoch, words, word_count);
+                                     cur_epoch, words, word_count, false);
             break;
         }
     }
@@ -932,11 +989,36 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     uint32_t stage_words[A32_AOT_MAX_WORDS];
     a64_buf_t buf;
     a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
+    buf.guest_start_pc = aligned_pc;
+    if (uncached) {
+        buf.vfp_preheader_ineligible = true;
+    }
 
     if (is_thumb) {
         a32_translate_t32_block(ctx, &buf, aligned_pc);
     } else {
         a32_translate_a32_block(ctx, &buf, aligned_pc);
+    }
+
+    if (!uncached && !buf.overflow && buf.has_self_loop &&
+        !buf.vfp_preheader_ineligible && buf.vfp_preheader_count > 0U) {
+        uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
+        uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
+        unsigned saved_count   = buf.vfp_preheader_count;
+        uint32_t saved_written = buf.vfp_preheader_written;
+        memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
+        memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
+
+        g_stage_pc_map_count = 0U;
+        a32_jit_record_pc_map(0U, aligned_pc, entry_itstate);
+        a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
+        buf.guest_start_pc = aligned_pc;
+        a64_buf_start_self_loop(&buf, saved_kinds, saved_regs, saved_count, saved_written);
+        if (is_thumb) {
+            a32_translate_t32_block(ctx, &buf, aligned_pc);
+        } else {
+            a32_translate_a32_block(ctx, &buf, aligned_pc);
+        }
     }
 
     if (buf.overflow) {
@@ -972,7 +1054,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     if (uncached && oneshot_entry != NULL) {
         populate_ht_entry_locked(oneshot_entry, key, dst, aligned_pc, end_pc,
                                  (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                 0U, stage_words, buf.count);
+                                 0U, stage_words, buf.count, false);
         res_entry = oneshot_entry;
     } else {
         for (size_t probe = 0U; probe < 16U; probe++) {
@@ -983,7 +1065,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
             if (k == 0U || hc == NULL || ep != cur_epoch || k == key) {
                 populate_ht_entry_locked(&g_ht[idx], key, dst, aligned_pc, end_pc,
                                          (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                         cur_epoch, stage_words, buf.count);
+                                         cur_epoch, stage_words, buf.count, flush_now);
                 res_entry = &g_ht[idx];
                 break;
             }
@@ -991,7 +1073,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         if (res_entry == NULL) {
             populate_ht_entry_locked(&g_ht[slot], key, dst, aligned_pc, end_pc,
                                      (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                     cur_epoch, stage_words, buf.count);
+                                     cur_epoch, stage_words, buf.count, flush_now);
             res_entry = &g_ht[slot];
         }
     }
