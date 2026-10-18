@@ -37,12 +37,10 @@ void a32_host_probe(a32_ctx_t *ctx)
         return;
     }
 
-    a32h_info_t info;
-    memset(&info, 0, sizeof(info));
+    a32h_info_t info = {0};
     if (syscall(SYS_ioctl, fd, (unsigned long)A32H_GET_INFO, &info) == 0 &&
         info.abi_major == A32H_ABI_MAJOR) {
         ctx->host_info = info;
-        ctx->host_info.aot_socket[sizeof(ctx->host_info.aot_socket) - 1U] = '\0';
         ctx->has_host_info = true;
     }
 

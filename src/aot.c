@@ -30,8 +30,13 @@ typedef struct a32_aot_header {
     uint32_t magic;
     uint32_t version;
     uint32_t num_blocks;
-    uint32_t reserved;
+    uint32_t load_bias;
 } a32_aot_header_t;
+
+static inline int32_t sign_extend_24(uint32_t v)
+{
+    return (v & 0x00800000U) ? (int32_t)(v | 0xFF000000U) : (int32_t)(v & 0x00FFFFFFU);
+}
 
 typedef struct a32_aot_block_header {
     uint32_t guest_pc;
@@ -311,7 +316,7 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         .magic      = A32_AOT_MAGIC,
         .version    = A32_AOT_VERSION,
         .num_blocks = count_st.count,
-        .reserved   = (ctx != NULL) ? ctx->elf_base : 0U,
+        .load_bias  = (ctx != NULL) ? ctx->elf_base : 0U,
     };
 
     if (fwrite(&hdr, sizeof(hdr), 1U, f) != 1U) {
@@ -366,11 +371,11 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
         }
         return -1;
     }
-    if (!allow_reloc && hdr.reserved != load_bias) {
+    if (!allow_reloc && hdr.load_bias != load_bias) {
         return -1;
     }
 
-    uint32_t delta = allow_reloc ? (load_bias - hdr.reserved) : 0U;
+    uint32_t delta = allow_reloc ? (load_bias - hdr.load_bias) : 0U;
 
     uint32_t *words_buf = (uint32_t *)malloc(sizeof(uint32_t) * A32_AOT_MAX_WORDS);
     a32_pc_map_stage_t *pc_map_buf = (a32_pc_map_stage_t *)malloc(sizeof(a32_pc_map_stage_t) * A32_AOT_MAX_PC_MAP);
@@ -514,6 +519,7 @@ typedef struct aot_scan_buf {
     const a32_ctx_t *ctx;
     uint32_t        *pcs;
     bool            *thumbs;
+    uint32_t        *seen_keys;
     size_t           count;
     size_t           limit;
 } aot_scan_buf_t;
@@ -523,9 +529,24 @@ static void add_target(aot_scan_buf_t *sb, uint32_t pc, bool thumb)
     if (sb->count >= sb->limit) {
         return;
     }
-    for (size_t i = 0U; i < sb->count; i++) {
-        if (sb->pcs[i] == pc && sb->thumbs[i] == thumb) {
-            return;
+    if (sb->seen_keys != NULL) {
+        uint32_t key = a32_make_key(pc, thumb);
+        if (key == 0U) {
+            key = 0xFFFFFFFFU;
+        }
+        uint32_t idx = (key * 2654435761U) & 8191U;
+        while (sb->seen_keys[idx] != 0U) {
+            if (sb->seen_keys[idx] == key) {
+                return;
+            }
+            idx = (idx + 1U) & 8191U;
+        }
+        sb->seen_keys[idx] = key;
+    } else {
+        for (size_t i = 0U; i < sb->count; i++) {
+            if (sb->pcs[i] == pc && sb->thumbs[i] == thumb) {
+                return;
+            }
         }
     }
     sb->pcs[sb->count]    = pc;
@@ -693,10 +714,7 @@ static void scan_text_range(aot_scan_buf_t *sb, uint32_t r_start, uint32_t r_end
             }
             /* Branch / call: B / BL */
             else if ((insn & 0x0E000000U) == 0x0A000000U) {
-                int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
-                if ((imm24 & 0x00800000) != 0) {
-                    imm24 |= (int32_t)0xFF000000U;
-                }
+                int32_t imm24 = sign_extend_24(insn);
                 uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2));
                 aot_try_add_target(sb, tgt, false, 4U);
                 if (((insn >> 24U) & 1U) != 0U && pc <= 0xFFFFFFF7U && pc + 8U <= r_end) {
@@ -705,10 +723,7 @@ static void scan_text_range(aot_scan_buf_t *sb, uint32_t r_start, uint32_t r_end
             }
             /* Branch with Link and Exchange: BLX (imm) */
             else if ((insn & 0xFE000000U) == 0xFA000000U) {
-                int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
-                if ((imm24 & 0x00800000) != 0) {
-                    imm24 |= (int32_t)0xFF000000U;
-                }
+                int32_t imm24 = sign_extend_24(insn);
                 uint32_t h   = (insn >> 24U) & 1U;
                 uint32_t tgt = (uint32_t)((int32_t)pc + 8 + (imm24 << 2) + (int32_t)(h << 1U));
                 aot_try_add_target(sb, tgt, true, 4U);
@@ -773,17 +788,20 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
 
     uint32_t *disc_pcs   = (uint32_t *)calloc(A32_MAX_AOT_SCAN, sizeof(uint32_t));
     bool     *disc_thumb = (bool *)calloc(A32_MAX_AOT_SCAN, sizeof(bool));
-    if (disc_pcs == NULL || disc_thumb == NULL) {
+    uint32_t *seen_keys  = (uint32_t *)calloc(8192, sizeof(uint32_t));
+    if (disc_pcs == NULL || disc_thumb == NULL || seen_keys == NULL) {
         free(disc_pcs);
         free(disc_thumb);
+        free(seen_keys);
         return -1;
     }
     aot_scan_buf_t sb = {
-        .ctx    = ctx,
-        .pcs    = disc_pcs,
-        .thumbs = disc_thumb,
-        .count  = 0U,
-        .limit  = A32_MAX_AOT_SCAN,
+        .ctx       = ctx,
+        .pcs       = disc_pcs,
+        .thumbs    = disc_thumb,
+        .seen_keys = seen_keys,
+        .count     = 0U,
+        .limit     = A32_MAX_AOT_SCAN,
     };
 
     bool has_aux_exec = false;
@@ -832,5 +850,6 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     int save_rc = (a32_jit_flush_batch(ctx) == 0) ? a32_aot_save_cache(ctx, elf_path) : -1;
     free(disc_pcs);
     free(disc_thumb);
+    free(seen_keys);
     return save_rc;
 }

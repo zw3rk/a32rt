@@ -154,14 +154,35 @@ static uint64_t decode_u64_le(const char *in)
     return val;
 }
 
+static char   g_read_buf[512];
+static size_t g_read_buf_pos = 0U;
+static size_t g_read_buf_len = 0U;
+
+static void gdb_reset_read_buf(void)
+{
+    g_read_buf_pos = 0U;
+    g_read_buf_len = 0U;
+}
+
 static ssize_t gdb_read_byte(int fd, char *out)
 {
+    if (g_read_buf_pos < g_read_buf_len) {
+        *out = g_read_buf[g_read_buf_pos++];
+        return 1;
+    }
+    g_read_buf_pos = 0U;
+    g_read_buf_len = 0U;
     for (;;) {
-        ssize_t r = read(fd, out, 1U);
+        ssize_t r = read(fd, g_read_buf, sizeof(g_read_buf));
         if (r < 0 && errno == EINTR) {
             continue;
         }
-        return r;
+        if (r <= 0) {
+            return r;
+        }
+        g_read_buf_len = (size_t)r;
+        *out = g_read_buf[g_read_buf_pos++];
+        return 1;
     }
 }
 
@@ -203,6 +224,22 @@ static void send_packet(int fd, const char *payload)
             written += (size_t)w;
         }
     }
+}
+
+static void send_u32_le(int fd, uint32_t val)
+{
+    char resp[9];
+    encode_u32_le(resp, val);
+    resp[8] = '\0';
+    send_packet(fd, resp);
+}
+
+static void send_u64_le(int fd, uint64_t val)
+{
+    char resp[17];
+    encode_u64_le(resp, val);
+    resp[16] = '\0';
+    send_packet(fd, resp);
 }
 
 static int recv_packet(int fd, char *buf, size_t buf_cap)
@@ -303,6 +340,7 @@ int a32_gdb_init(a32_ctx_t *ctx, int port)
     int nodelay = 1;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     g_client_sock    = client;
+    gdb_reset_read_buf();
     ctx->gdb_enabled = true;
     ctx->single_step = true;
     fprintf(stderr, "[a32rt] GDB client connected on 127.0.0.1:%d\n", port);
@@ -320,45 +358,13 @@ bool a32_gdb_has_breakpoint(uint32_t guest_pc)
     return false;
 }
 
-static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
-{
-    if (!ctx || addr < A32_LOW_GUARD_SIZE) {
-        return false;
-    }
-    a32_vm_sync_ctx((a32_ctx_t *)ctx);
-    uint64_t end = (uint64_t)addr + (uint64_t)(len == 0U ? 1U : len);
-    if (end > 0x100000000ULL) {
-        return false;
-    }
-    uint64_t cur = (uint64_t)addr;
-    size_t idx = 0U;
-    while (cur < end) {
-        if (cur >= (uint64_t)A32_KUSER_BASE_32 &&
-            cur < (uint64_t)A32_KUSER_BASE_32 + A32_PAGE_SIZE) {
-            cur = (uint64_t)A32_KUSER_BASE_32 + A32_PAGE_SIZE;
-            continue;
-        }
-        while (idx < ctx->region_count && (uint64_t)ctx->regions[idx].end <= cur) {
-            idx++;
-        }
-        if (idx >= ctx->region_count) {
-            return false;
-        }
-        const a32_region_t *r = &ctx->regions[idx];
-        if ((r->prot & 0x7U) == 0U || (uint64_t)r->start > cur) {
-            return false;
-        }
-        cur = (uint64_t)r->end;
-    }
-    return true;
-}
-
 static void gdb_disconnect_client(a32_ctx_t *ctx)
 {
     if (g_client_sock >= 0) {
         close(g_client_sock);
         g_client_sock = -1;
     }
+    gdb_reset_read_buf();
     ctx->gdb_enabled = false;
     ctx->single_step = false;
     memset(g_breakpoints, 0, sizeof(g_breakpoints));
@@ -415,29 +421,16 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
             a32_normalize_pc(ctx);
             send_packet(g_client_sock, "OK");
         } else if (cmd[0] == 'p') {
-            /* Read single register: 0..15, 25 (0x19) = cpsr, 26..57 = d0..d31, 58 = fpscr */
             char *endp = NULL;
             unsigned reg = (unsigned)strtoul(cmd + 1, &endp, 16);
             if (reg < 16U) {
-                char resp[9];
-                encode_u32_le(resp, ctx->regs[reg]);
-                resp[8] = '\0';
-                send_packet(g_client_sock, resp);
+                send_u32_le(g_client_sock, ctx->regs[reg]);
             } else if (reg == 25U) {
-                char resp[9];
-                encode_u32_le(resp, ctx->cpsr);
-                resp[8] = '\0';
-                send_packet(g_client_sock, resp);
+                send_u32_le(g_client_sock, ctx->cpsr);
             } else if (reg >= 26U && reg < 58U) {
-                char resp[17];
-                encode_u64_le(resp, ctx->vfp_d[reg - 26U]);
-                resp[16] = '\0';
-                send_packet(g_client_sock, resp);
+                send_u64_le(g_client_sock, ctx->vfp_d[reg - 26U]);
             } else if (reg == 58U) {
-                char resp[9];
-                encode_u32_le(resp, ctx->fpscr);
-                resp[8] = '\0';
-                send_packet(g_client_sock, resp);
+                send_u32_le(g_client_sock, ctx->fpscr);
             } else {
                 send_packet(g_client_sock, "00000000");
             }
@@ -487,7 +480,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                 if (len > 1024U) {
                     len = 1024U;
                 }
-                if (!gdb_range_mapped(ctx, addr, (uint32_t)len)) {
+                if (!a32_guest_range_ok((a32_ctx_t *)ctx, addr, (uint32_t)len, PROT_READ)) {
                     send_packet(g_client_sock, "E14");
                     continue;
                 }
@@ -519,7 +512,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     send_packet(g_client_sock, "E01");
                     continue;
                 }
-                if (!gdb_range_mapped(ctx, addr, (uint32_t)len) ||
+                if (!a32_guest_range_ok((a32_ctx_t *)ctx, addr, (uint32_t)len, PROT_READ) ||
                     (uint64_t)addr + (uint64_t)len > (uint64_t)A32_KUSER_BASE_32) {
                     send_packet(g_client_sock, "E14");
                     continue;
@@ -585,7 +578,9 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     }
                 }
             }
-            a32_jit_invalidate_range(ctx, addr, addr + len);
+            if (ok) {
+                a32_jit_invalidate_range(ctx, addr, addr + len);
+            }
             send_packet(g_client_sock, ok ? "OK" : "E01");
         } else if (cmd[0] == 's' || cmd[0] == 'S' || cmd[0] == 'c' || cmd[0] == 'C') {
             /* Step (s/S) or continue (c/C): s[addr], c[addr], Ssig[;addr], Csig[;addr] */

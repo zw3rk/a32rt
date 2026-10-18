@@ -8,6 +8,8 @@
 #ifndef A32RT_H
 #define A32RT_H
 
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -33,7 +35,7 @@
 #define A32_EXIT_FAULT     5U /* Guest memory fault */
 #define A32_EXIT_BKPT      6U /* Breakpoint / GDB trap */
 
-/* Maximum number of tracked guest VMA regions */
+/* Architectural limits, cache capacities, and page constants */
 #define A32_MAX_REGIONS    512U
 #define A32_RAS_SIZE       64U
 #define A32_IBTC_SIZE      1024U
@@ -71,35 +73,35 @@ typedef struct a32_pc_map_stage {
  * and `src/a64_emit.h`.
  */
 typedef struct a32_ctx {
-    uint32_t regs[16];          /* 0x00: r0..r15 (r13=sp, r14=lr, r15=pc) */
-    uint32_t cpsr;              /* 0x40: NZCV(31:28), Q(27), GE(19:16), IT, T(5) */
-    uint32_t tls_tp;            /* 0x44: CP15 c13 TPIDRURO */
-    uint64_t guest_base;        /* 0x48: Host base address G of [G, G+4GiB) window */
-    uint32_t exit_reason;       /* 0x50: A32_EXIT_* */
-    uint32_t svc_imm;           /* 0x54: SVC immediate */
-    uint32_t pad_it;            /* 0x58: Reserved alignment slot */
-    uint32_t fault_addr;        /* 0x5c: Faulting guest address */
-    uint64_t vfp_d[32];         /* 0x60: VFPv4-D32 / NEON registers (D0..D31 / S0..S31 / Q0..Q15) */
-    uint32_t fpscr;             /* 0x160: VFP/NEON Floating-Point Status and Control Register */
-    uint32_t pad0;              /* 0x164: Alignment padding */
+    uint32_t regs[16];          /* r0..r15 (r13=sp, r14=lr, r15=pc) */
+    uint32_t cpsr;              /* NZCV(31:28), Q(27), GE(19:16), IT, T(5) */
+    uint32_t tls_tp;            /* CP15 c13 TPIDRURO */
+    uint64_t guest_base;        /* Host base address G of [G, G+4GiB) window */
+    uint32_t exit_reason;       /* A32_EXIT_* */
+    uint32_t svc_imm;           /* SVC immediate */
+    uint32_t pad_it;            /* Reserved alignment slot */
+    uint32_t fault_addr;        /* Faulting guest address */
+    uint64_t vfp_d[32];         /* VFPv4-D32 / NEON registers (D0..D31 / S0..S31 / Q0..Q15) */
+    uint32_t fpscr;             /* VFP/NEON Floating-Point Status and Control Register */
+    uint32_t pad0;              /* Alignment padding */
 
     /* ABI-locked fast-dispatch fields for `src/trampoline.S` (offsets 360..35248) */
-    uint64_t          sig_mask;           /* 0x168 (360) */
-    volatile uint64_t pending_signals;    /* 0x170 (368) */
-    bool              trace_enabled;      /* 0x178 (376) */
-    bool              gdb_enabled;        /* 0x179 (377) */
-    bool              single_step;        /* 0x17a (378) */
-    volatile bool     sync_sig_delivered; /* 0x17b (379) */
-    uint32_t          itstate;            /* 0x17c (380): Thumb IT block state (packed in 128b load at 368) */
-    uint64_t          blocks_executed;    /* 0x180 (384) */
-    uint64_t          chain_hits;         /* 0x188 (392) */
-    void             *last_exec_entry;    /* 0x190 (400) */
-    uint64_t          ibtc_hits;          /* 0x198 (408) */
-    uint64_t          ras_hits;           /* 0x1a0 (416) */
-    uint32_t          ras_top;            /* 0x1a8 (424) */
-    uint32_t          pad2;               /* 0x1ac (428) */
-    a32_ibtc_entry_t  ras[A32_RAS_SIZE];  /* 0x1b0 (432) */
-    a32_ibtc_entry_t  ibtc[A32_IBTC_SIZE];/* 0x9b0 (2480) */
+    uint64_t          sig_mask;
+    volatile uint64_t pending_signals;
+    bool              trace_enabled;
+    bool              gdb_enabled;
+    bool              single_step;
+    volatile bool     sync_sig_delivered;
+    uint32_t          itstate;            /* Thumb IT block state (packed in 128b load at 368) */
+    uint64_t          blocks_executed;
+    uint64_t          chain_hits;
+    void             *last_exec_entry;
+    uint64_t          ibtc_hits;
+    uint64_t          ras_hits;
+    uint32_t          ras_top;
+    uint32_t          pad2;
+    a32_ibtc_entry_t  ras[A32_RAS_SIZE];
+    a32_ibtc_entry_t  ibtc[A32_IBTC_SIZE];
 
     /* Guest memory layout & allocator inside [G, G + 4GiB) */
     uint32_t brk_base;
@@ -177,6 +179,18 @@ _Static_assert(offsetof(a32_ctx_t, ras_top) == 424, "ras_top must be at offset 4
 _Static_assert(offsetof(a32_ctx_t, ras) == 432, "ras must be at offset 432 (0x1b0)");
 _Static_assert(offsetof(a32_ctx_t, ibtc) == 2480, "ibtc must be at offset 2480 (0x9b0)");
 
+static inline void a32_spin_lock(_Atomic uint32_t *lock)
+{
+    while (atomic_exchange_explicit(lock, 1U, memory_order_acquire) != 0U) {
+        sched_yield();
+    }
+}
+
+static inline void a32_spin_unlock(_Atomic uint32_t *lock)
+{
+    atomic_store_explicit(lock, 0U, memory_order_release);
+}
+
 static inline void *a32_guest_ptr(const a32_ctx_t *ctx, uint32_t guest_va)
 {
     return (void *)(uintptr_t)(ctx->guest_base + (uint64_t)guest_va);
@@ -190,6 +204,18 @@ static inline uint32_t a32_page_down(uint32_t x)
 static inline uint32_t a32_page_up(uint32_t x)
 {
     return (x + (A32_PAGE_SIZE - 1U)) & ~(A32_PAGE_SIZE - 1U);
+}
+
+static inline uint32_t a32_make_key(uint32_t pc, bool is_thumb)
+{
+    return (pc & (is_thumb ? ~1U : ~3U)) | (is_thumb ? 1U : 0U);
+}
+
+static inline void a32_ctx_normalize_itstate(a32_ctx_t *ctx, bool is_thumb)
+{
+    if (!is_thumb || (ctx->itstate & 0x0FU) == 0U || (ctx->itstate & 0xF0U) == 0xF0U) {
+        ctx->itstate = 0U;
+    }
 }
 
 static inline void a32_set_pc_interwork(a32_ctx_t *ctx, uint32_t target)

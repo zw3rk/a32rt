@@ -24,7 +24,7 @@ a32_jit_run_block:
     stp     d10, d11, [sp, #112]
     stp     d12, d13, [sp, #128]
     stp     d14, d15, [sp, #144]
-    mov     x24, #0                 /* x24 = accumulated in-trampoline chain_hits delta */
+    mov     x24, #0                 /* x24 = accumulated in-trampoline block & chain_hits delta */
 
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
@@ -92,27 +92,25 @@ a32_jit_run_block:
     orr     x30, x30, x21, lsl #32  /* x30 = next_key (lo32) | cur_epoch (hi32) */
 
 .Ltry_chain0:
-    ldr     x23, [x27, #48]         /* x23 = cur_entry->chain_entry[0] */
-    cbz     x23, .Lslow_exit        /* slot 0 empty -> let C chain it */
-    ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    ldr     x23, [x27, #48]         /* cur_entry->chain_entry[0] */
+    cbz     x23, .Lslow_exit
+    ldp     x21, x17, [x23]
     eor     x21, x21, x30
-    cbnz    x21, .Ltry_chain1
-    cbz     x17, .Lslow_exit
-    mov     x27, x23                /* cur_entry = next_entry */
-    add     x24, x24, #1            /* chain_hits_delta++ */
-    b       .Lrun_loop
+    cbz     x21, .Lcheck_chain_entry
 
 .Ltry_chain1:
-    lsr     x21, x21, #32           /* if slot 0 missed due to stale epoch, re-chain in C */
+    lsr     x21, x21, #32           /* If slot 0 missed due to stale epoch, re-chain in C */
     cbnz    x21, .Lslow_exit
-    ldr     x23, [x27, #56]         /* x23 = cur_entry->chain_entry[1] */
-    cbz     x23, .Lslow_exit        /* slot 1 empty -> let C chain it */
-    ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    ldr     x23, [x27, #56]         /* cur_entry->chain_entry[1] */
+    cbz     x23, .Lslow_exit
+    ldp     x21, x17, [x23]
     eor     x21, x21, x30
     cbnz    x21, .Ltry_ibtc
+
+.Lcheck_chain_entry:
     cbz     x17, .Lslow_exit
-    mov     x27, x23                /* cur_entry = next_entry */
-    add     x24, x24, #1            /* chain_hits_delta++ */
+    mov     x27, x23
+    add     x24, x24, #1
     b       .Lrun_loop
 
 .Ltry_ibtc:

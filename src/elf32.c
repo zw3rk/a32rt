@@ -274,16 +274,9 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
             }
         }
 
-        uint32_t guest_prot = 0U;
-        if (ph->p_flags & PF_R) {
-            guest_prot |= (uint32_t)PROT_READ;
-        }
-        if (ph->p_flags & PF_W) {
-            guest_prot |= (uint32_t)PROT_WRITE;
-        }
-        if (ph->p_flags & PF_X) {
-            guest_prot |= (uint32_t)PROT_EXEC;
-        }
+        uint32_t guest_prot = ((ph->p_flags & PF_R) ? (uint32_t)PROT_READ : 0U) |
+                              ((ph->p_flags & PF_W) ? (uint32_t)PROT_WRITE : 0U) |
+                              ((ph->p_flags & PF_X) ? (uint32_t)PROT_EXEC : 0U);
 
         uint32_t shared_end  = (map_end < map_start) ? map_end : map_start;
         uint32_t merged_prot = highest_mapped_prot | guest_prot;
@@ -514,8 +507,6 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         0xe8bd00f0U,
         0xe12fff1eU,
     };
-    memcpy((uint8_t *)host_page + 0x0F60U, kuser_cmpxchg64, sizeof(kuser_cmpxchg64));
-
     /*
      * 0xffff0fa0: __kuser_memory_barrier
      *   dmb     ish
@@ -525,8 +516,6 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         0xf57ff05bU,
         0xe12fff1eU,
     };
-    memcpy((uint8_t *)host_page + 0x0FA0U, kuser_dmb, sizeof(kuser_dmb));
-
     /*
      * 0xffff0fa8: rt_sigreturn restorer
      *   mov r7, #173
@@ -536,8 +525,6 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         0xe3a070adU,
         0xef000000U,
     };
-    memcpy((uint8_t *)host_page + 0x0FA8U, kuser_rt_sigreturn, sizeof(kuser_rt_sigreturn));
-
     /*
      * 0xffff0fb0: sigreturn restorer
      *   mov r7, #119
@@ -547,8 +534,6 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         0xe3a07077U,
         0xef000000U,
     };
-    memcpy((uint8_t *)host_page + 0x0FB0U, kuser_sigreturn, sizeof(kuser_sigreturn));
-
     /*
      * 0xffff0fc0: __kuser_cmpxchg
      * 1:ldrex   r3, [r2]
@@ -570,8 +555,6 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         0xf57ff05bU,
         0xe12fff1eU,
     };
-    memcpy((uint8_t *)host_page + 0x0FC0U, kuser_cmpxchg, sizeof(kuser_cmpxchg));
-
     /*
      * 0xffff0fe0: __kuser_get_tls
      *   mrc     p15, 0, r0, c13, c0, 3
@@ -581,11 +564,26 @@ int a32_kuser_setup(a32_ctx_t *ctx)
         0xee1d0f70U,
         0xe12fff1eU,
     };
-    memcpy((uint8_t *)host_page + 0x0FE0U, kuser_get_tls, sizeof(kuser_get_tls));
-
     /* 0xffff0ffc: __kuser_helper_version = 5 */
-    uint32_t kuser_ver = 5U;
-    memcpy((uint8_t *)host_page + 0x0FFCU, &kuser_ver, sizeof(kuser_ver));
+    static const uint32_t kuser_ver = 5U;
+
+    static const struct {
+        uint16_t    off;
+        const void *data;
+        size_t      sz;
+    } kuser_entries[] = {
+        { 0x0F60U, kuser_cmpxchg64,    sizeof(kuser_cmpxchg64) },
+        { 0x0FA0U, kuser_dmb,          sizeof(kuser_dmb) },
+        { 0x0FA8U, kuser_rt_sigreturn, sizeof(kuser_rt_sigreturn) },
+        { 0x0FB0U, kuser_sigreturn,    sizeof(kuser_sigreturn) },
+        { 0x0FC0U, kuser_cmpxchg,      sizeof(kuser_cmpxchg) },
+        { 0x0FE0U, kuser_get_tls,      sizeof(kuser_get_tls) },
+        { 0x0FFCU, &kuser_ver,         sizeof(kuser_ver) },
+    };
+    for (size_t i = 0U; i < sizeof(kuser_entries) / sizeof(kuser_entries[0]); i++) {
+        memcpy((uint8_t *)host_page + kuser_entries[i].off,
+               kuser_entries[i].data, kuser_entries[i].sz);
+    }
 
     if (mprotect(host_page, 4096U, PROT_READ | PROT_EXEC) != 0) {
         fprintf(stderr, "a32rt: failed to mprotect kuser page: %s\n", strerror(errno));

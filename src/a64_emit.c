@@ -392,7 +392,7 @@ void a64_emit_msr_nzcv(a64_buf_t *b, unsigned rt)
  */
 void a64_emit_update_nz_keep_cv(a64_buf_t *b, unsigned res_reg)
 {
-    /* Save old C and V in w21[29:28], compute new N and Z via ANDS wzr, res_reg, res_reg */
+    /* Save old C and V in TMP3[29:28], compute new N and Z via ANDS wzr, res_reg, res_reg */
     a64_emit_mrs_nzcv(b, A64_TMP3);
     a64_emit_and_reg_w(b, true, A64_ZR, res_reg, res_reg, A64_SHIFT_LSL, 0U);
     a64_emit_mrs_nzcv(b, A64_TMP2);
@@ -457,6 +457,16 @@ static void vfp_emit_raw_str(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned i
     uint32_t byte_offset = A32_CTX_VFP_OFFSET + (idx << shift);
     a64_emit(b, k_str_opc[kind] | (((byte_offset >> shift) & 0xFFFU) << 10) |
                     (A64_XCTX << 5) | (vt & 31U));
+}
+
+static void a64_emit_fmov_s(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x1E204000U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+static void a64_emit_fmov_d(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x1E604000U | ((vn & 31U) << 5) | (vd & 31U));
 }
 
 static void vfp_emit_reg_mov(a64_buf_t *b, uint8_t kind, unsigned vd, unsigned vn)
@@ -815,135 +825,6 @@ void a64_emit_fmov_s_to_w(a64_buf_t *b, unsigned rd_w, unsigned vn)
     a64_emit(b, 0x1E260000U | ((vn & 31U) << 5) | (rd_w & 31U));
 }
 
-void a64_emit_fmov_s(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E204000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmov_d(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E604000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E202800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E602800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E203800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E603800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmul_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E200800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmul_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E600800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fdiv_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E201800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fdiv_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm)
-{
-    a64_emit(b, 0x1E601800U | ((vm & 31U) << 16) | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fabs_s(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E20C000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fabs_d(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E60C000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fneg_s(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E214000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fneg_d(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E614000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fsqrt_s(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E21C000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fsqrt_d(a64_buf_t *b, unsigned vd, unsigned vn)
-{
-    a64_emit(b, 0x1E61C000U | ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F000000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F400000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F008000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fmsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F408000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fnmadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F200000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fnmadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F600000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fnmsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F208000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-void a64_emit_fnmsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va)
-{
-    a64_emit(b, 0x1F608000U | ((vm & 31U) << 16) | ((va & 31U) << 10) |
-                    ((vn & 31U) << 5) | (vd & 31U));
-}
-
-
 void a64_emit_fcvt_s_to_d(a64_buf_t *b, unsigned vd, unsigned vn)
 {
     a64_emit(b, 0x1E22C000U | ((vn & 31U) << 5) | (vd & 31U));
@@ -1218,27 +1099,27 @@ static size_t emit_exit_sig_check(a64_buf_t *b, uint32_t bail_disp)
 
 static void emit_ras_push_inline(a64_buf_t *b)
 {
-    /* [0] ldr x16, [x27, #80] (cur_entry->ret_key | (ret_epoch << 32)) */
+    /* ldr x16, [x27, #80] (cur_entry->ret_key | (ret_epoch << 32)) */
     a64_emit(b, 0xF9402B70U);
-    /* [1] ldp x21, x22, [x27, #88] (cur_entry->ret_code, cur_entry->ret_entry) */
-    a64_emit(b, 0xA945DB75U);
-    /* [2] cbz x22, .Lskip_push (+9 words) */
+    /* ldr x22, [x27, #96] (cur_entry->ret_entry) */
+    a64_emit(b, 0xF9403376U);
+    /* cbz x22, .Lskip_push (+9 words) */
     a64_emit(b, 0xB4000016U | (9U << 5));
-    /* [3] ldr w21, [x19, #424] (w21 = ctx->ras_top, uimm = 424/4 = 106) */
+    /* ldr w21, [x19, #424] (w21 = ctx->ras_top, uimm = 424/4 = 106) */
     a64_emit(b, 0xB9400000U | (106U << 10) | (A64_XCTX << 5) | 21U);
-    /* [4] add w22, w21, #1 */
+    /* add w22, w21, #1 */
     a64_emit(b, 0x110006B6U);
-    /* [5] and w22, w22, #0x3f */
+    /* and w22, w22, #0x3f */
     a64_emit(b, 0x120016D6U);
-    /* [6] str w22, [x19, #424] (ctx->ras_top = (ras_top + 1) & 63) */
+    /* str w22, [x19, #424] (ctx->ras_top = (ras_top + 1) & 63) */
     a64_emit(b, 0xB9000000U | (106U << 10) | (A64_XCTX << 5) | 22U);
-    /* [7] add x21, x19, x21, lsl #5 (x21 = ctx + ras_top * 32) */
+    /* add x21, x19, x21, lsl #5 (x21 = ctx + ras_top * 32) */
     a64_emit(b, 0x8B151675U);
-    /* [8] str x16, [x21, #432] (ras[top].key | (ras[top].epoch << 32), uimm = 432/8 = 54) */
+    /* str x16, [x21, #432] (ras[top].key|epoch, uimm = 432/8 = 54) */
     a64_emit(b, 0xF9000000U | (54U << 10) | (21U << 5) | 16U);
-    /* [9] ldp x16, x22, [x27, #88] (cur_entry->ret_code, cur_entry->ret_entry) */
+    /* ldp x16, x22, [x27, #88] (cur_entry->ret_code, cur_entry->ret_entry) */
     a64_emit(b, 0xA945DB70U);
-    /* [10] stp x16, x22, [x21, #440] (ras[top].host_code, ras[top].entry, imm7 = 440/8 = 55) */
+    /* stp x16, x22, [x21, #440] (ras[top].host_code, ras[top].entry, imm7 = 440/8 = 55) */
     a64_emit(b, 0xA9000000U | (1U << 31) | (55U << 15) | (22U << 10) | (21U << 5) | 16U);
 }
 
@@ -1300,17 +1181,17 @@ void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc)
     if (s < A64_MAX_EXIT_SLOTS) {
         uint32_t call_extra = b->is_call ? 11U : 0U;
         emit_exit_sig_check(b, 10U + call_extra);
-        /* [3] ldr x23, [x27, #(152 + s*8)] (cur_entry->slot_entry[s], uimm = 19 + s) */
+        /* ldr x23, [x27, #(152 + s*8)] (cur_entry->slot_entry[s], uimm = 19 + s) */
         a64_emit(b, 0xF9400000U | (((19U + s) & 0xFFFU) << 10) | (27U << 5) | 23U);
-        /* [4] cbz x23, .Lbail */
+        /* cbz x23, .Lbail */
         a64_emit(b, 0xB4000017U | ((8U + call_extra) << 5));
-        /* [5] ldar w21, [x28] (cur_epoch = g_cache_epoch) */
+        /* ldar w21, [x28] (cur_epoch = g_cache_epoch) */
         a64_emit(b, 0x88DFFC00U | (28U << 5) | 21U);
-        /* [6] ldp x22, x17, [x23, #0] (x22 = key|epoch, x17 = host_code) */
+        /* ldp x22, x17, [x23, #0] (x22 = key|epoch, x17 = host_code) */
         a64_emit(b, 0xA9400000U | (1U << 31) | (17U << 10) | (23U << 5) | 22U);
-        /* [7] eor x21, x21, x22, lsr #32 */
+        /* eor x21, x21, x22, lsr #32 */
         a64_emit(b, 0xCA5682B5U);
-        /* [8] cbnz x21, .Lbail */
+        /* cbnz x21, .Lbail */
         a64_emit(b, 0xB5000015U | ((4U + call_extra) << 5));
         if (b->is_call) {
             emit_ras_push_inline(b);
@@ -1337,6 +1218,9 @@ void a64_emit_exit_branch_imm(a64_buf_t *b, uint32_t target_pc, bool interwork)
 
 void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
 {
+    if (b->lr_written_from_pc) {
+        b->is_call = true;
+    }
     vfp_emit_exit_flush(b);
     a64_emit_mov_w(b, A64_TMP0, target_reg);
 
@@ -1415,7 +1299,7 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
     a64_emit(b, 0x12002631U);
     /* add x22, x19, x17, lsl #5 */
     a64_emit(b, 0x8B111676U);
-    /* ldr x23, [x22, #2496] */
+    /* ldr x23, [x22, #2496] (offsetof(a32_ctx_t, ibtc) + offsetof(a32_ibtc_entry_t, entry), uimm = 312) */
     a64_emit(b, 0xF9400000U | (312U << 10) | (22U << 5) | 23U);
     /* cbz x23, .Lbail */
     size_t patch_ibtc_null = b->count;

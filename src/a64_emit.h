@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "a32rt.h"
 
@@ -22,7 +23,7 @@
  *   w17/x17 : Scratch 2
  *   x19     : Pointer to `a32_ctx_t` (xCtx)
  *   x20     : Guest window base `G` (xG)
- *   w21/x21 : Saved NZCV / scratch 3
+ *   w21/x21 : Scratch 3 / epoch & key scratch
  *   w22/x22 : Guest effective address scratch
  *   x23     : Chaining / IBTC / RAS target entry scratch
  *   x24     : Accumulated in-trampoline chain_hits delta
@@ -87,6 +88,7 @@ typedef struct a64_buf {
     uint32_t  guest_start_pc;
     uint32_t  guest_end_pc;
     bool      is_call;
+    bool      lr_written_from_pc;
     bool      has_self_loop;
     bool      vfp_preheader_ineligible;
     bool      self_loop_vfp_active;
@@ -101,29 +103,9 @@ typedef struct a64_buf {
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
 {
-    b->words                    = storage;
-    b->count                    = 0U;
-    b->cap                      = cap;
-    b->overflow                 = false;
-    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-        b->vfp_slot_kind[i]       = A64_VFP_KIND_NONE;
-        b->vfp_slot_reg[i]        = 0U;
-        b->vfp_preheader_kinds[i] = A64_VFP_KIND_NONE;
-        b->vfp_preheader_regs[i]  = 0U;
-    }
-    b->vfp_slot_dirty           = 0U;
-    b->vfp_next_evict           = 0U;
-    b->cond_branch_depth        = 0U;
-    b->guest_start_pc           = 0U;
-    b->guest_end_pc             = 0U;
-    b->is_call                  = false;
-    b->has_self_loop            = false;
-    b->vfp_preheader_ineligible = false;
-    b->self_loop_vfp_active     = false;
-    b->vfp_preheader_written    = 0U;
-    b->vfp_preheader_count      = 0U;
-    b->loop_body_offset         = 0U;
-    b->exit_slot_count          = 0U;
+    memset(b, 0, sizeof(*b));
+    b->words = storage;
+    b->cap   = cap;
 }
 
 void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs, unsigned count, uint32_t written_mask);
@@ -299,30 +281,6 @@ void a64_emit_guest_str_d(a64_buf_t *b, unsigned vt, unsigned addr_w);
 /* Scalar FP instructions */
 void a64_emit_fmov_w_to_s(a64_buf_t *b, unsigned vd, unsigned rn_w);
 void a64_emit_fmov_s_to_w(a64_buf_t *b, unsigned rd_w, unsigned vn);
-void a64_emit_fmov_s(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fmov_d(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fmul_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fmul_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fdiv_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fdiv_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm);
-void a64_emit_fabs_s(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fabs_d(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fneg_s(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fneg_d(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fsqrt_s(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fsqrt_d(a64_buf_t *b, unsigned vd, unsigned vn);
-void a64_emit_fmadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fmadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fmsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fmsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fnmadd_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fnmadd_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fnmsub_s(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
-void a64_emit_fnmsub_d(a64_buf_t *b, unsigned vd, unsigned vn, unsigned vm, unsigned va);
 void a64_emit_fcvt_s_to_d(a64_buf_t *b, unsigned vd, unsigned vn);
 void a64_emit_fcvt_d_to_s(a64_buf_t *b, unsigned vd, unsigned vn);
 void a64_emit_fcvtzs_s_to_w(a64_buf_t *b, unsigned rd_w, unsigned vn);
@@ -383,7 +341,7 @@ void a64_emit_exit_bkpt(a64_buf_t *b, uint32_t bkpt_pc);
 /* Decoder entrypoints (`src/decode_a32.c`, `src/decode_t32.c`, `src/vfp_neon.c`) */
 bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc);
 bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc);
-bool a32_decode_vfp_neon_a32(a32_ctx_t *ctx, a64_buf_t *b, uint32_t insn, uint32_t pc);
-bool a32_decode_vfp_neon_t32(a32_ctx_t *ctx, a64_buf_t *b, uint16_t hw1, uint16_t hw2, uint32_t pc);
+bool a32_decode_vfp_neon_a32(a64_buf_t *b, uint32_t insn, uint32_t pc);
+bool a32_decode_vfp_neon_t32(a64_buf_t *b, uint16_t hw1, uint16_t hw2, uint32_t pc);
 
 #endif /* A64_EMIT_H */

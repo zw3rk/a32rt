@@ -544,7 +544,7 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
                 }
             } else {
                 if (is_uncond && rdn == 14U && rm == 15U) {
-                    b->is_call = true;
+                    b->lr_written_from_pc = true;
                 }
                 a64_emit_mov_w(b, rdn, src_m);
             }
@@ -884,7 +884,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
         (hw1 & 0xFF10U) == 0xF900U ||
         (((hw1 & 0xEE00U) == 0xEC00U || (hw1 & 0xFF00U) == 0xEE00U || (hw1 & 0xFF00U) == 0xFE00U) &&
          (((hw2 >> 8) & 0xEU) == 0xAU))) {
-        return a32_decode_vfp_neon_t32(ctx, b, hw1, hw2, pc);
+        return a32_decode_vfp_neon_t32(b, hw1, hw2, pc);
     }
 
     uint32_t pc_val = pc + 4U;
@@ -1359,7 +1359,7 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             return true;
         }
         if ((hw1 & 0xFFE0U) == 0xE840U) {
-            /* LDREX / STREXRt, [Rn, #imm8*4] */
+            /* LDREX / STREX Rt, [Rn, #imm8*4] */
             bool is_load = ((hw1 >> 4) & 1U) != 0U;
             unsigned rn = hw1 & 0xFU;
             unsigned rt = (hw2 >> 12) & 0xFU;

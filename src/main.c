@@ -17,6 +17,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+static bool getenv_bool(const char *name)
+{
+    const char *s = getenv(name);
+    return s != NULL && strcmp(s, "1") == 0;
+}
+
 static bool ends_with(const char *str, const char *suffix)
 {
     size_t slen = strlen(str);
@@ -81,13 +87,17 @@ int main(int argc, char **argv, char **envp)
     if (env_sysroot && env_sysroot[0] != '\0') {
         ctx.sysroot = env_sysroot;
     }
-    const char *env_stats = getenv("A32RT_STATS");
-    if (env_stats && strcmp(env_stats, "1") == 0) {
+    if (getenv_bool("A32RT_STATS")) {
         ctx.stats_enabled = true;
     }
-    const char *env_trace = getenv("A32RT_TRACE");
-    if (env_trace && strcmp(env_trace, "1") == 0) {
+    if (getenv_bool("A32RT_TRACE")) {
         ctx.trace_enabled = true;
+    }
+    if (getenv_bool("A32RT_AOT")) {
+        ctx.aot_mode = true;
+    }
+    if (getenv_bool("A32RT_SINGLE_STEP")) {
+        ctx.single_step = true;
     }
     const char *env_cache = getenv("A32RT_CACHE");
     if (env_cache && env_cache[0] != '\0') {
@@ -98,20 +108,12 @@ int main(int argc, char **argv, char **envp)
         env_gdb = getenv("A32RT_GDB_PORT");
     }
     (void)parse_port(env_gdb, &ctx.gdb_port);
-    const char *env_aot = getenv("A32RT_AOT");
-    if (env_aot && strcmp(env_aot, "1") == 0) {
-        ctx.aot_mode = true;
-    }
 
     const char *exec_path = NULL;
     int         guest_argc = 0;
     char      **guest_argv = NULL;
 
-    bool is_binfmt_p = ends_with(argv[0], "a32rt-binfmt-p");
-    const char *env_binfmt_p = getenv("A32RT_BINFMT_P");
-    if (env_binfmt_p && strcmp(env_binfmt_p, "1") == 0) {
-        is_binfmt_p = true;
-    }
+    bool is_binfmt_p = ends_with(argv[0], "a32rt-binfmt-p") || getenv_bool("A32RT_BINFMT_P");
 
     int i = 1;
     bool explicit_sep = false;
@@ -176,39 +178,21 @@ int main(int argc, char **argv, char **envp)
 
     const char *raw_sysroot = ctx.sysroot;
     if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {
-        static char sysroot_abs[4096];
+        static char sysroot_abs[PATH_MAX];
         if (realpath(ctx.sysroot, sysroot_abs) != NULL) {
             ctx.sysroot = sysroot_abs;
         }
     }
 
-    if (explicit_sep) {
-        if (i >= argc) {
-            usage(argv[0]);
-            return 1;
-        }
-        exec_path = argv[i];
-        if (i + 1 < argc) {
-            guest_argc = argc - (i + 1);
-            guest_argv = &argv[i + 1];
-        } else {
-            guest_argc = 1;
-            guest_argv = &argv[i];
-        }
-    } else if (is_binfmt_p) {
-        if (i + 1 >= argc) {
-            usage(argv[0]);
-            return 1;
-        }
-        exec_path  = argv[i];
+    if (i >= argc || (is_binfmt_p && i + 1 >= argc)) {
+        usage(argv[0]);
+        return 1;
+    }
+    exec_path = argv[i];
+    if (is_binfmt_p || (explicit_sep && i + 1 < argc)) {
         guest_argc = argc - (i + 1);
         guest_argv = &argv[i + 1];
     } else {
-        if (i >= argc) {
-            usage(argv[0]);
-            return 1;
-        }
-        exec_path  = argv[i];
         guest_argc = argc - i;
         guest_argv = &argv[i];
     }

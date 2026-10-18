@@ -40,12 +40,34 @@
 #define A32_SS_ONSTACK   1U
 #define A32_SS_DISABLE   2U
 
-typedef struct guest_sigaction {
+#define A32_UNMASKABLE_SIGNALS ((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)))
+
+typedef struct __attribute__((packed, aligned(4))) guest_sigaction {
     uint32_t handler;
     uint32_t flags;
     uint32_t restorer;
     uint64_t mask;
 } guest_sigaction_t;
+
+_Static_assert(sizeof(guest_sigaction_t) == 20, "guest_sigaction_t must be 20 bytes");
+
+static inline bool guest_read(a32_ctx_t *ctx, void *dst, uint32_t va, uint32_t len)
+{
+    if (!a32_guest_range_ok(ctx, va, len, PROT_READ)) {
+        return false;
+    }
+    memcpy(dst, a32_guest_ptr(ctx, va), len);
+    return true;
+}
+
+static inline bool guest_write(a32_ctx_t *ctx, uint32_t va, const void *src, uint32_t len)
+{
+    if (!a32_guest_range_ok(ctx, va, len, PROT_WRITE)) {
+        return false;
+    }
+    memcpy(a32_guest_ptr(ctx, va), src, len);
+    return true;
+}
 
 typedef struct a32_sigcontext {
     uint32_t trap_no;
@@ -196,7 +218,7 @@ static void fill_guest_siginfo(a32_siginfo_t *dst, int sig,
         if (host_info->si_code < 0) {
             dst->_pad[0] = (uint32_t)host_info->si_pid;
             dst->_pad[1] = (uint32_t)host_info->si_uid;
-            if (!for_sigwait || host_info->si_code != -6 /* SI_TKILL */) {
+            if (!for_sigwait || host_info->si_code != SI_TKILL) {
                 dst->_pad[2] = (uint32_t)host_info->si_value.sival_int;
             }
         } else if (host_info->si_code == 0 || sig == SIGCHLD) {
@@ -210,13 +232,13 @@ static void fill_guest_siginfo(a32_siginfo_t *dst, int sig,
             dst->_pad[0] = fault_addr;
         }
     } else if (for_sigwait) {
-        dst->si_code = -6; /* SI_TKILL */
+        dst->si_code = SI_TKILL;
     } else {
-        dst->si_code = (sig == SIGSEGV ? 1 /* SEGV_MAPERR */ :
-                        sig == SIGILL  ? 1 /* ILL_ILLOPC */  :
-                        sig == SIGFPE  ? 1 /* FPE_INTDIV */  :
-                        sig == SIGTRAP ? 1 /* TRAP_BRKPT */  :
-                        128 /* SI_KERNEL */);
+        dst->si_code = (sig == SIGSEGV ? SEGV_MAPERR :
+                        sig == SIGILL  ? ILL_ILLOPC  :
+                        sig == SIGFPE  ? FPE_INTDIV  :
+                        sig == SIGTRAP ? TRAP_BRKPT  :
+                        SI_KERNEL);
     }
 }
 
@@ -294,7 +316,7 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
         ctx->sig_mask |= (1ULL << (sig - 1));
     }
     ctx->sig_mask |= act->mask;
-    ctx->sig_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    ctx->sig_mask &= ~A32_UNMASKABLE_SIGNALS;
 
     uint32_t info_va = frame_va + (uint32_t)offsetof(a32_rt_sigframe_t, info);
     uint32_t uc_va   = frame_va + (uint32_t)offsetof(a32_rt_sigframe_t, uc);
@@ -549,41 +571,35 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
     if (sigsetsize != sizeof(uint64_t)) {
         return -EINVAL;
     }
-    if ((act_va != 0U && !a32_guest_range_ok(ctx, act_va, 20U, (uint32_t)PROT_READ)) ||
-        (oldact_va != 0U && !a32_guest_range_ok(ctx, oldact_va, 20U, (uint32_t)PROT_WRITE))) {
+    if ((act_va != 0U && !a32_guest_range_ok(ctx, act_va, sizeof(guest_sigaction_t), PROT_READ)) ||
+        (oldact_va != 0U && !a32_guest_range_ok(ctx, oldact_va, sizeof(guest_sigaction_t), PROT_WRITE))) {
         return -EFAULT;
     }
 
     guest_sigaction_t cur = g_guest_sigactions[signum];
-    uint32_t old_words[5];
-    old_words[0] = cur.handler;
-    old_words[1] = cur.flags;
-    old_words[2] = cur.restorer;
-    memcpy(&old_words[3], &cur.mask, sizeof(uint64_t));
 
     if (act_va != 0U) {
-        uint32_t new_words[5];
-        memcpy(new_words, a32_guest_ptr(ctx, act_va), sizeof(new_words));
-        g_guest_sigactions[signum].handler  = new_words[0];
-        g_guest_sigactions[signum].flags    = new_words[1];
-        g_guest_sigactions[signum].restorer = new_words[2];
-        memcpy(&g_guest_sigactions[signum].mask, &new_words[3], sizeof(uint64_t));
-        g_guest_sigactions[signum].mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-        ctx->sig_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        guest_sigaction_t new_act;
+        if (!guest_read(ctx, &new_act, act_va, sizeof(new_act))) {
+            return -EFAULT;
+        }
+        g_guest_sigactions[signum] = new_act;
+        g_guest_sigactions[signum].mask &= ~A32_UNMASKABLE_SIGNALS;
+        ctx->sig_mask &= ~A32_UNMASKABLE_SIGNALS;
 
         if (sig_is_ignored(signum, g_guest_sigactions[signum].handler)) {
             __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (signum - 1)), __ATOMIC_SEQ_CST);
         }
 
         unsigned long sa_flags = (unsigned long)(SA_SIGINFO | SA_NODEFER);
-        if (new_words[0] <= 1U || (new_words[1] & A32_SA_RESTART) != 0U) {
+        if (new_act.handler <= 1U || (new_act.flags & A32_SA_RESTART) != 0U) {
             sa_flags |= (unsigned long)SA_RESTART;
         }
         if (signum == SIGCHLD) {
-            if ((new_words[1] & A32_SA_NOCLDSTOP) != 0U) {
+            if ((new_act.flags & A32_SA_NOCLDSTOP) != 0U) {
                 sa_flags |= (unsigned long)SA_NOCLDSTOP;
             }
-            if ((new_words[1] & A32_SA_NOCLDWAIT) != 0U || new_words[0] == A32_SIG_IGN) {
+            if ((new_act.flags & A32_SA_NOCLDWAIT) != 0U || new_act.handler == A32_SIG_IGN) {
                 sa_flags |= (unsigned long)SA_NOCLDWAIT;
             }
         }
@@ -591,7 +607,9 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
     }
 
     if (oldact_va != 0U) {
-        memcpy(a32_guest_ptr(ctx, oldact_va), old_words, sizeof(old_words));
+        if (!guest_write(ctx, oldact_va, &cur, sizeof(cur))) {
+            return -EFAULT;
+        }
     }
 
     return 0;
@@ -613,23 +631,23 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
     if (set_va != 0U) {
         uint64_t set = 0ULL;
         memcpy(&set, a32_guest_ptr(ctx, set_va), sizeof(set));
-        set &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        set &= ~A32_UNMASKABLE_SIGNALS;
 
         switch (how) {
-        case 0: /* SIG_BLOCK */
+        case SIG_BLOCK:
             ctx->sig_mask |= set;
             break;
-        case 1: /* SIG_UNBLOCK */
+        case SIG_UNBLOCK:
             ctx->sig_mask &= ~set;
             break;
-        case 2: /* SIG_SETMASK */
+        case SIG_SETMASK:
             ctx->sig_mask = set;
             break;
         default:
             return -EINVAL;
         }
 
-        if (how == 0 || how == 2) {
+        if (how == SIG_BLOCK || how == SIG_SETMASK) {
             uint64_t need_install = ctx->sig_mask & ~g_host_handler_installed_mask;
             while (need_install != 0ULL) {
                 int s = __builtin_ctzll(need_install) + 1;
@@ -665,7 +683,7 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     const a32_sigcontext_t *sc = &frame->uc.uc_mcontext;
     memcpy(ctx->regs, &sc->arm_r0, sizeof(ctx->regs));
     ctx->cpsr     = sc->arm_cpsr;
-    ctx->sig_mask = frame->uc.uc_sigmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    ctx->sig_mask = frame->uc.uc_sigmask & ~A32_UNMASKABLE_SIGNALS;
     if (frame->magic == A32_SIGFRAME_MAGIC) {
         if (frame->saved_pad == 1U && (frame->saved_altstack_flags & 0x80000000U) != 0U) {
             ctx->altstack_sp    = frame->saved_altstack_sp;
@@ -686,8 +704,6 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
         } else {
             ctx->itstate = 0U;
         }
-        ctx->fpscr      = frame->saved_fpscr;
-        memcpy(ctx->vfp_d, frame->saved_vfp_d, sizeof(ctx->vfp_d));
     } else {
         ctx->itstate = 0U;
     }
@@ -696,6 +712,9 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
     if (vfp->magic == A32_VFP_MAGIC && vfp->size == (uint32_t)sizeof(a32_vfp_sigframe_t)) {
         memcpy(ctx->vfp_d, vfp->fpregs, sizeof(ctx->vfp_d));
         ctx->fpscr = vfp->fpscr;
+    } else if (frame->magic == A32_SIGFRAME_MAGIC) {
+        memcpy(ctx->vfp_d, frame->saved_vfp_d, sizeof(ctx->vfp_d));
+        ctx->fpscr = frame->saved_fpscr;
     }
 
     a32_normalize_pc(ctx);

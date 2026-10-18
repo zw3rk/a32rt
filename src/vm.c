@@ -23,7 +23,7 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
-#define A32_WINDOW_SIZE         0x100000000ULL /* 4 GiB */
+#define A32_WINDOW_SIZE         0x100000000ULL
 #define A32_MMAP_BASE_32        0x40000000U    /* Guest non-fixed mmap region base (1 GiB) */
 #define A32_MMAP_TOP_32         0xDF000000U    /* Below stack (0xE0000000) and kuser (0xFFFF0000) */
 #define A32_MAP_FIXED           0x10U
@@ -42,21 +42,27 @@ static size_t           g_vm_region_count = 0U;
 
 static inline void vm_lock_acquire(void)
 {
-    while (atomic_exchange_explicit(&g_vm_lock, 1U, memory_order_acquire) != 0U) {
-#if defined(__aarch64__)
-        __asm__ volatile("yield");
-#endif
-    }
+    a32_spin_lock(&g_vm_lock);
 }
 
 static inline void vm_lock_release(void)
 {
-    atomic_store_explicit(&g_vm_lock, 0U, memory_order_release);
+    a32_spin_unlock(&g_vm_lock);
 }
 
 static uint64_t page_align_up(uint64_t v)
 {
     return (v + 0xFFFULL) & ~0xFFFULL;
+}
+
+static int vm_reserve_prot_none(a32_ctx_t *ctx, uint32_t start, uint32_t len)
+{
+    void *res = mmap(a32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (res == MAP_FAILED) {
+        return -errno;
+    }
+    return 0;
 }
 
 static inline void vm_invalidate_jit(a32_ctx_t *ctx, uint32_t start, uint32_t end)
@@ -149,20 +155,24 @@ static int vm_insert_region_raw(uint32_t start, uint32_t end,
 
 static void vm_coalesce_regions_locked(void)
 {
-    size_t i = 0U;
-    while (i + 1U < g_vm_region_count) {
-        a32_region_t *cur  = &g_vm_regions[i];
-        a32_region_t *next = &g_vm_regions[i + 1U];
-        if (cur->end == next->start &&
-            cur->prot == next->prot &&
-            (cur->flags & 0x23U) == (next->flags & 0x23U) &&
-            strcmp(cur->name, next->name) == 0) {
-            cur->end = next->end;
-            vm_remove_region_at(i + 1U);
+    if (g_vm_region_count < 2U) {
+        return;
+    }
+    size_t dst = 0U;
+    for (size_t src = 1U; src < g_vm_region_count; src++) {
+        a32_region_t *prev = &g_vm_regions[dst];
+        const a32_region_t *curr = &g_vm_regions[src];
+        if (prev->end == curr->start && prev->prot == curr->prot &&
+            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0) {
+            prev->end = curr->end;
         } else {
-            i++;
+            dst++;
+            if (dst != src) {
+                g_vm_regions[dst] = *curr;
+            }
         }
     }
+    g_vm_region_count = dst + 1U;
 }
 
 static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
@@ -524,10 +534,8 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
-        void *host_addr = a32_guest_ptr(ctx, new_page);
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
-        (void)mmap(host_addr, len, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        (void)vm_reserve_prot_none(ctx, new_page, len);
         vm_unmap_regions_locked(new_page, old_page);
     }
 
@@ -700,10 +708,9 @@ static int vm_munmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len)
 
     uint32_t start = a32_page_down(addr);
     /* Keep the [G, G+4GiB) reservation intact by replacing unmapped pages with PROT_NONE */
-    void *res = mmap(a32_guest_ptr(ctx, start), (size_t)aligned_len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
-        return -errno;
+    int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
+    if (rc != 0) {
+        return rc;
     }
 
     uint32_t end = (uint32_t)((uint64_t)start + aligned_len);

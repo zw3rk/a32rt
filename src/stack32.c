@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #define A32_STACK_TOP  0xE0000000U
-#define A32_STACK_SIZE (8U * 1024U * 1024U) /* 8 MiB stack */
+#define A32_STACK_SIZE (8U * 1024U * 1024U)
 
 /* Standard Linux ELF auxiliary vector types */
 #define AT_NULL         0U
@@ -189,10 +189,8 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     memcpy(&w[pos], arg_ptrs, (size_t)argc * sizeof(uint32_t));
     pos += (size_t)argc;
     w[pos++] = 0U;
-    if (envc > 0) {
-        memcpy(&w[pos], env_ptrs, (size_t)envc * sizeof(uint32_t));
-        pos += (size_t)envc;
-    }
+    memcpy(&w[pos], env_ptrs, (size_t)envc * sizeof(uint32_t));
+    pos += (size_t)envc;
     w[pos++] = 0U;
     memcpy(&w[pos], auxv, aux_idx * sizeof(uint32_t));
 

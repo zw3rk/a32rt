@@ -268,7 +268,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         /* VFPv4-D32 / NEON unconditional instructions */
         if ((insn & 0xFE000000U) == 0xF2000000U || (insn & 0xFF100000U) == 0xF4000000U ||
             (insn & 0xFE000000U) == 0xFE000000U) {
-            return a32_decode_vfp_neon_a32(ctx, b, insn, pc);
+            return a32_decode_vfp_neon_a32(b, insn, pc);
         }
         return false;
     }
@@ -331,7 +331,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             unsigned cp = (insn >> 8) & 0xFU;
             if (cp == 10U || cp == 11U) {
                 /* VFPv4-D32 / NEON delegation */
-                handled = a32_decode_vfp_neon_a32(ctx, b, insn, pc);
+                handled = a32_decode_vfp_neon_a32(b, insn, pc);
             } else if (cp == 15U) {
                 handled = a64_emit_cp15(b, insn);
             }
@@ -351,7 +351,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             handled = true;
         }
     }
-    /* 4. Single Data Transfer LDR / STR / LDRB / STRB & Media (op1 == 2 or op1 == 3) */
+    /* 4. Single Data Transfer LDR / STR / LDRB / STRB (op1 == 2 or op1 == 3, bit 4 == 0) */
     else if (op1 == 2U || (op1 == 3U && ((insn & 0x10U) == 0U))) {
         bool reg_off = (op1 == 3U);
         bool p_bit = ((insn >> 24) & 1U) != 0U;
@@ -925,19 +925,16 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             }
 
             unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
+            bool is_logical = false;
             switch (opc) {
             case 0x0U: /* AND */
                 a64_emit_and_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                if (set_flags) {
-                    a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
-                }
+                is_logical = true;
                 handled = true;
                 break;
             case 0x1U: /* EOR */
                 a64_emit_eor_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                if (set_flags) {
-                    a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
-                }
+                is_logical = true;
                 handled = true;
                 break;
             case 0x2U: /* SUB */
@@ -966,12 +963,12 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 break;
             case 0x8U: /* TST */
                 a64_emit_and_reg_w(b, false, A64_TMP0, src_n, src_m, A64_SHIFT_LSL, 0U);
-                a64_emit_logical_flags(b, A64_TMP0, has_imm_carry, imm_carry, shift_carry_reg);
+                is_logical = true;
                 handled = true;
                 break;
             case 0x9U: /* TEQ */
                 a64_emit_eor_reg_w(b, A64_TMP0, src_n, src_m, A64_SHIFT_LSL, 0U);
-                a64_emit_logical_flags(b, A64_TMP0, has_imm_carry, imm_carry, shift_carry_reg);
+                is_logical = true;
                 handled = true;
                 break;
             case 0xAU: /* CMP */
@@ -984,42 +981,39 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 break;
             case 0xCU: /* ORR */
                 a64_emit_orr_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                if (set_flags) {
-                    a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
-                }
+                is_logical = true;
                 handled = true;
                 break;
             case 0xDU: /* MOV */
                 a64_emit_mov_w(b, dst, src_m);
-                if (set_flags) {
-                    a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
-                }
+                is_logical = true;
                 handled = true;
                 break;
             case 0xEU: /* BIC */
                 a64_emit_bic_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                if (set_flags) {
-                    a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
-                }
+                is_logical = true;
                 handled = true;
                 break;
             case 0xFU: /* MVN */
                 a64_emit_mvn_reg_w(b, dst, src_m, A64_SHIFT_LSL, 0U);
-                if (set_flags) {
-                    a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
-                }
+                is_logical = true;
                 handled = true;
                 break;
             default:
                 break;
             }
 
+            if (is_logical && set_flags) {
+                a64_emit_logical_flags(b, (opc == 0x8U || opc == 0x9U) ? A64_TMP0 : dst,
+                                       has_imm_carry, imm_carry, shift_carry_reg);
+            }
+
             if (handled && cond == A64_COND_AL && rd == 14U && (opc < 0x8U || opc >= 0xCU) &&
                 (rn == 15U || (!is_imm && (insn & 0xFU) == 15U))) {
-                b->is_call = true;
+                b->lr_written_from_pc = true;
             }
             if (handled && rd == 15U && (opc < 0x8U || opc >= 0xCU)) {
-                a64_emit_exit_branch_reg(b, A64_TMP0, true);
+                a64_emit_exit_branch_reg(b, A64_TMP0, false);
                 if (cond == A64_COND_AL) {
                     *out_ends_block = true;
                 }
