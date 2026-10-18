@@ -3137,6 +3137,70 @@ static int __attribute__((noinline)) run_m6_neon_aliasing_tests(void)
         return 306;
     }
 
+    /* 2. Self-Loop VFP/NEON Preheader Promotion + Register-Cached VMOV/VCVT + Early Exit Flush */
+    {
+        double loop_d0 = 1.5;
+        double loop_d1 = 0.5;
+        int32_t gpr_sum = 0;
+        int32_t final_s4 = 0;
+        /* Single-block self-loop with early conditional break at iter 20 (out of 50):
+         * Verifies both normal loop iterations (with d0, d1, s4 promoted into v8..v31)
+         * and dirty VFP write-back on early mid-block conditional exit! */
+        __asm__ volatile(
+            "vldr d0, %[d0]\n\t"
+            "vldr d1, %[d1]\n\t"
+            "mov r2, #0\n\t"
+            "mov %[sum], #0\n"
+            "1:\n\t"
+            "vadd.f64 d0, d0, d1\n\t"
+            "vcvt.s32.f64 s4, d0\n\t"
+            "vmov r3, s4\n\t"
+            "add %[sum], %[sum], r3\n\t"
+            "add r2, r2, #1\n\t"
+            "cmp r2, #20\n\t"
+            "beq 2f\n\t"
+            "cmp r2, #50\n\t"
+            "blt 1b\n"
+            "2:\n\t"
+            "vstr d0, %[d0]\n\t"
+            "vmov %[s4], s4\n\t"
+            : [d0] "+m"(loop_d0), [sum] "=&r"(gpr_sum), [s4] "=&r"(final_s4)
+            : [d1] "m"(loop_d1)
+            : "r2", "r3", "d0", "d1", "d2", "memory", "cc"
+        );
+        /* After 20 iterations: loop_d0 = 1.5 + 20 * 0.5 = 11.5, final_s4 = 11,
+         * gpr_sum = sum_{k=1..20} trunc(1.5 + 0.5*k) = 2+2+3+3+...+11+11 = 130 */
+        if (loop_d0 != 11.5 || final_s4 != 11 || gpr_sum != 130) {
+            return 307;
+        }
+    }
+
+    /* 3. Self-Loop with Cross-Width S/D/Q Aliasing (vfp_preheader_ineligible fallback) */
+    {
+        uint32_t q_buf[4] = { 1U, 2U, 3U, 4U };
+        __asm__ volatile(
+            "mov r1, %[buf]\n\t"
+            "vld1.32 {d0-d1}, [r1]\n\t"
+            "mov r2, #10\n"
+            "1:\n\t"
+            "vadd.i32 q0, q0, q0\n\t"
+            "vmov r3, s1\n\t"
+            "add r3, r3, #1\n\t"
+            "vmov s1, r3\n\t"
+            "subs r2, r2, #1\n\t"
+            "bne 1b\n\t"
+            "vst1.32 {d0-d1}, [r1]\n\t"
+            :
+            : [buf] "r"(q_buf)
+            : "r1", "r2", "r3", "q0", "memory", "cc"
+        );
+        /* Lane 0: 1 << 10 = 1024; Lane 1 (s1): ((2*2+1)*2+1)... = 2*1024 + 1023 = 3071;
+         * Lane 2: 3 << 10 = 3072; Lane 3: 4 << 10 = 4096 */
+        if (q_buf[0] != 1024U || q_buf[1] != 3071U || q_buf[2] != 3072U || q_buf[3] != 4096U) {
+            return 308;
+        }
+    }
+
     static const char pass_msg[] = "M6 NEON Q-D-S Cross-Width Aliasing: PASS\n";
     sys3(4U /* write */, 1U, (uint32_t)(uintptr_t)pass_msg, (uint32_t)(sizeof(pass_msg) - 1U));
     return 0;

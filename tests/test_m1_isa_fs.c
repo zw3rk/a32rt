@@ -3581,6 +3581,101 @@ static int run_test(void)
         if (un != 0) {
             return 245;
         }
+
+        /* 5. Negative (-EFAULT / -EINVAL / -ENOENT) checks for M6 syscalls */
+        if (sys2(385U /* memfd_create */, 0x100U /* unmapped */, 0U) != -14 /* -EFAULT */) {
+            return 246;
+        }
+        if (sys2(385U /* memfd_create */, (uint32_t)(uintptr_t)mfd_name, 0x80000000U /* invalid flags */) != -22 /* -EINVAL */) {
+            return 247;
+        }
+        if (sys4(439U /* faccessat2 */, (uint32_t)-100, 0x100U /* unmapped */, 0U, 0U) != -14 /* -EFAULT */) {
+            return 248;
+        }
+        static const char missing_path[] = "/tmp/a32rt_nonexistent_m6_file_12345";
+        if (sys4(439U /* faccessat2 */, (uint32_t)-100, (uint32_t)(uintptr_t)missing_path, 0U, 0U) != -2 /* -ENOENT */) {
+            return 249;
+        }
+        if (sys4(439U /* faccessat2 */, (uint32_t)-100, (uint32_t)(uintptr_t)proc_maps, 0U, 0x12340000U) != -22 /* -EINVAL */) {
+            return 250;
+        }
+        if (sys3(436U /* close_range */, 510U, 500U /* first > last */, 0U) != -22 /* -EINVAL */) {
+            return 251;
+        }
+        if (sys3(436U /* close_range */, 500U, 505U, 0x80000000U /* bad flags */) != -22 /* -EINVAL */) {
+            return 252;
+        }
+
+        /* 6. preadv (361) / pwritev (362) positive & negative (-EFAULT / -EINVAL) checks */
+        int32_t pv_fd = sys2(385U /* memfd_create */, (uint32_t)(uintptr_t)mfd_name, 1U);
+        if (pv_fd < 0) {
+            return 253;
+        }
+        struct {
+            uint32_t iov_base;
+            uint32_t iov_len;
+        } iov[2];
+        uint32_t wpart0 = 0x11223344U, wpart1 = 0x55667788U;
+        iov[0].iov_base = (uint32_t)(uintptr_t)&wpart0;
+        iov[0].iov_len  = 4U;
+        iov[1].iov_base = (uint32_t)(uintptr_t)&wpart1;
+        iov[1].iov_len  = 4U;
+        if (sys6(362U /* pwritev */, (uint32_t)pv_fd, (uint32_t)(uintptr_t)iov, 2U, 8U, 0U, 0U) != 8) {
+            sys1(6U, (uint32_t)pv_fd);
+            return 254;
+        }
+        uint32_t rpart0 = 0U, rpart1 = 0U;
+        iov[0].iov_base = (uint32_t)(uintptr_t)&rpart0;
+        iov[1].iov_base = (uint32_t)(uintptr_t)&rpart1;
+        if (sys6(361U /* preadv */, (uint32_t)pv_fd, (uint32_t)(uintptr_t)iov, 2U, 8U, 0U, 0U) != 8 ||
+            rpart0 != 0x11223344U || rpart1 != 0x55667788U) {
+            sys1(6U, (uint32_t)pv_fd);
+            return 255;
+        }
+        if (sys6(361U /* preadv */, (uint32_t)pv_fd, 0x100U /* unmapped iov */, 2U, 0U, 0U, 0U) != -14 /* -EFAULT */ ||
+            sys6(361U /* preadv */, (uint32_t)pv_fd, (uint32_t)(uintptr_t)iov, (uint32_t)-1, 0U, 0U, 0U) != -22 /* -EINVAL */) {
+            sys1(6U, (uint32_t)pv_fd);
+            return 256;
+        }
+        sys1(6U, (uint32_t)pv_fd);
+
+        /* 7. Deep RAS wrap (> 64 call levels) & non-local RAS mismatch fallback regression */
+        uint32_t ras_acc = 0U;
+        __asm__ volatile(
+            "mov r0, #100\n\t"
+            "mov r1, #0\n\t"
+            "bl 1f\n\t"
+            "b 4f\n"
+            "1:\n\t"
+            "push {lr}\n\t"
+            "add r1, r1, r0\n\t"
+            "subs r0, r0, #1\n\t"
+            "beq 2f\n\t"
+            "bl 1b\n"
+            "2:\n\t"
+            "pop {pc}\n"
+            "4:\n\t"
+            /* Now test non-local return (skipping a call frame so RAS top mismatches) */
+            "bl 5f\n\t"
+            "add r1, r1, #1000\n\t"
+            "b 7f\n"
+            "5:\n\t"
+            "mov r2, lr\n\t"
+            "bl 6f\n\t"
+            "add r1, r1, #255\n\t"  /* skipped by non-local return! */
+            "bx r2\n"
+            "6:\n\t"
+            "bx r2\n"               /* returns directly to 5f's caller (4f+4), mismatching RAS top (5f+8)! */
+            "7:\n\t"
+            "mov %[out], r1\n\t"
+            : [out] "=r"(ras_acc)
+            :
+            : "r0", "r1", "r2", "lr", "memory", "cc"
+        );
+        /* Sum(1..100) = 5050, plus 1000 from non-local return = 6050 */
+        if (ras_acc != 6050U) {
+            return 257;
+        }
     }
 
     static const char pass_msg[] = "M1 ISA & FS: PASS\n";

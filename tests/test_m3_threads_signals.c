@@ -2889,6 +2889,180 @@ static int test22_vfp_sigframe_uc_regspace(void)
     return 0;
 }
 
+static volatile uint32_t g_m6_sigill_count = 0U;
+
+static void m6_sigill_advance4_handler(int sig, void *info, void *ucontext)
+{
+    if (sig != 4 /* SIGILL */ || info == NULL || ucontext == NULL) {
+        return;
+    }
+    const struct siginfo32 *si = (const struct siginfo32 *)info;
+    uint8_t *uc = (uint8_t *)ucontext;
+    if (si->si_signo == 4 && si->si_code == 1 /* ILL_ILLOPC */) {
+        g_m6_sigill_count++;
+    }
+    *(uint32_t *)(void *)(uc + 92U) += 4U;
+}
+
+static void m6_corrupt_vfp_uc_handler(int sig, void *info, void *ucontext)
+{
+    (void)sig;
+    (void)info;
+    if (ucontext == NULL) {
+        return;
+    }
+    uint8_t *uc = (uint8_t *)ucontext;
+    /* Corrupt VFP_MAGIC and fpregs[0] so rt_sigreturn must reject the corrupted frame */
+    *(uint32_t *)(void *)(uc + 120U) = 0xDEADBEEFU;
+    *(uint64_t *)(void *)(uc + 128U) = 0x409999999999999AULL;
+}
+
+static int test23_m6_adversarial_regressions(void)
+{
+    /* 1. Adversarial Finding 2.1: futex uaddr2 bounds check on FUTEX_CMP_REQUEUE / FUTEX_WAKE_OP */
+    uint32_t fword = 42U;
+    /* FUTEX_CMP_REQUEUE (4) and FUTEX_WAKE_OP (5) with unmapped uaddr2=0x100 must return -EFAULT (-14) */
+    if (sys6(240U /* futex */, (uint32_t)(uintptr_t)&fword, 4U /* FUTEX_CMP_REQUEUE */,
+             1U, 1U, 0x100U /* invalid uaddr2 */, 42U) != -14 /* -EFAULT */) {
+        return 230;
+    }
+    if (sys6(240U /* futex */, (uint32_t)(uintptr_t)&fword, 5U /* FUTEX_WAKE_OP */,
+             1U, 1U, 0x100U /* invalid uaddr2 */, 0U) != -14 /* -EFAULT */) {
+        return 231;
+    }
+    /* FUTEX_WAIT (0) ignores uaddr2 (a4), so passing a4=0x100 when fword != val must return -EAGAIN (-11), NOT -EFAULT */
+    if (sys6(240U /* futex */, (uint32_t)(uintptr_t)&fword, 0U /* FUTEX_WAIT */,
+             99U /* != 42 */, 0U, 0x100U, 0U) != -11 /* -EAGAIN */) {
+        return 232;
+    }
+
+    /* 2. Adversarial Finding 3.1 & M6 Decoder SIGILL negative checks:
+     *    - VDUP.32 D0, D16[0] (m=16 > 15: 0xf3b40c20)
+     *    - VDUP.32 Q0 (odd d=1: 0xf3f41c00)
+     *    - CRC32 with sz=3 (0xe1600040)
+     *    - AESE.8 with odd Qd (d=1: 0xf3b01300)
+     */
+    g_m6_sigill_count = 0U;
+    struct sigaction32 act;
+    act.sa_handler  = (uint32_t)(uintptr_t)m6_sigill_advance4_handler;
+    act.sa_flags    = 0x04000004U; /* SA_SIGINFO | SA_RESTORER */
+    act.sa_restorer = (uint32_t)(uintptr_t)my_rt_restorer;
+    act.sa_mask[0]  = 0U;
+    act.sa_mask[1]  = 0U;
+    if (sys4(174U /* rt_sigaction */, 4U /* SIGILL */,
+             (uint32_t)(uintptr_t)&act, 0U, 8U) != 0) {
+        return 233;
+    }
+
+    __asm__ volatile(
+        ".inst 0xf3b80c00\n\t" /* invalid VDUP scalar with imm4=8 ((imm4 & 7) == 0) */
+        ".inst 0xf3f41c40\n\t" /* invalid VDUP.32 Q with is_q=1 (bit 6) and odd Qd (d=17) */
+        ".inst 0xe1600040\n\t" /* invalid CRC32 with sz=3 */
+        ".inst 0xf3b01300\n\t" /* invalid AESE.8 with odd Qd (d=1) */
+        :
+        :
+        : "memory", "cc"
+    );
+
+    struct sigaction32 dfl;
+    dfl.sa_handler  = 0U;
+    dfl.sa_flags    = 0U;
+    dfl.sa_restorer = 0U;
+    dfl.sa_mask[0]  = 0U;
+    dfl.sa_mask[1]  = 0U;
+    sys4(174U /* rt_sigaction */, 4U /* SIGILL */,
+         (uint32_t)(uintptr_t)&dfl, 0U, 8U);
+
+    if (g_m6_sigill_count != 4U) {
+        return 234;
+    }
+
+    /* 3. Negative VFP_MAGIC uc_regspace test: corrupted magic in uc_regspace is ignored on rt_sigreturn */
+    act.sa_handler = (uint32_t)(uintptr_t)m6_corrupt_vfp_uc_handler;
+    if (sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+             (uint32_t)(uintptr_t)&act, 0U, 8U) != 0) {
+        return 235;
+    }
+    uint32_t tid = (uint32_t)sys1(224U /* gettid */, 0U);
+    uint64_t in_d0  = 0x405EE00000000000ULL; /* 123.5 */
+    uint64_t out_d0 = 0ULL;
+    const uint64_t *p_in_d0 = &in_d0;
+    uint64_t *p_out_d0 = &out_d0;
+    __asm__ volatile(
+        "vldmia %1, {d0}\n\t"
+        "mov r0, %2\n\t"
+        "mov r1, #10\n\t"
+        "mov r7, #238\n\t"
+        "svc #0\n\t"
+        "vstmia %0, {d0}\n\t"
+        :
+        : "r"(p_out_d0), "r"(p_in_d0), "r"(tid)
+        : "r0", "r1", "r7", "d0", "memory", "cc"
+    );
+    sys4(174U /* rt_sigaction */, 10U /* SIGUSR1 */,
+         (uint32_t)(uintptr_t)&dfl, 0U, 8U);
+    if (out_d0 != 0x405EE00000000000ULL) {
+        return 236;
+    }
+
+    /* 4. SMC (cacheflush) invalidation of an active inline RAS return block */
+    uint32_t rwx = (uint32_t)sys6(192U /* mmap2 */, 0U, 4096U,
+                                  7U /* PROT_READ|PROT_WRITE|PROT_EXEC */,
+                                  0x22U /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                                  0xFFFFFFFFU, 0U);
+    if (rwx > 0xFFFFF000U) {
+        return 237;
+    }
+    uint32_t *code = (uint32_t *)(uintptr_t)rwx;
+    /* caller at code[0..3]:
+     *   [0] push {r4, lr}      (0xe92d4010)
+     *   [1] bl callee (+12)    (0xeb000002 -> code[5])
+     *   [2] mov r0, #11        (0xe3a0000b)  <-- return site in RAS, patched by callee to mov r0, #77!
+     *   [3] pop {r4, pc}       (0xe8bd8010)
+     *   [4] nop                (0xe1a00000)
+     * callee at code[5..12]:
+     *   [5] cmp r0, #0         (0xe3500000)
+     *   [6] bxeq lr            (0x012fff1e)  <-- warmup call returns without patching so RAS/ret_entry is linked!
+     *   [7] mov r1, #77        (0xe3a0104d)
+     *   [8] orr r1, r1, #0xe3a00000 (movw/movt or ldr literal: let's load 0xe3a0004d from code[14]!)
+     */
+    code[0]  = 0xE92D4010U; /* push {r4, lr} */
+    code[1]  = 0xEB000002U; /* bl code[5] */
+    code[2]  = 0xE3A0000BU; /* mov r0, #11 */
+    code[3]  = 0xE8BD8010U; /* pop {r4, pc} */
+    code[4]  = 0xE1A00000U; /* nop */
+    code[5]  = 0xE3500000U; /* cmp r0, #0 */
+    code[6]  = 0x012FFF1EU; /* bxeq lr */
+    code[7]  = 0xE59F1014U; /* ldr r1, [pc, #20] -> code[14] */
+    code[8]  = 0xE58E1000U; /* str r1, [lr] (overwrite code[2] with mov r0, #77) */
+    code[9]  = 0xE1A0000EU; /* mov r0, lr */
+    code[10] = 0xE2801004U; /* add r1, r0, #4 */
+    code[11] = 0xE3A02000U; /* mov r2, #0 */
+    code[12] = 0xE59F7004U; /* ldr r7, [pc, #4] -> code[15] (0x0f0002 cacheflush) */
+    code[13] = 0xEF000000U; /* svc #0 */
+    code[14] = 0xE12FFF1EU; /* bx lr */
+    code[15] = 0xE3A0004DU; /* literal: mov r0, #77 */
+    code[16] = 0x000F0002U; /* literal: __ARM_NR_cacheflush */
+    /* Fix PC-relative offsets for code[7] and code[12]:
+     * At code[7], PC is code + 9*4; code[15] is at offset (15 - 9)*4 = 24 (0x18).
+     * At code[12], PC is code + 14*4; code[16] is at offset (16 - 14)*4 = 8 (0x08). */
+    code[7]  = 0xE59F1018U;
+    code[12] = 0xE59F7008U;
+
+    sys3(0x0F0002U /* cacheflush */, rwx, rwx + 128U, 0U);
+    uint32_t (*smc_fn)(uint32_t) = (uint32_t (*)(uint32_t))(uintptr_t)rwx;
+    /* Warmup call (arg=0): compiles caller, callee, and return block code[2..3], linking ret_entry and RAS */
+    uint32_t res_warm = smc_fn(0U);
+    /* Second call (arg=1): callee overwrites return block at [lr] and calls cacheflush before bx lr */
+    uint32_t res_patched = smc_fn(1U);
+    sys2(91U /* munmap */, rwx, 4096U);
+    if (res_warm != 11U || res_patched != 77U) {
+        return 238;
+    }
+
+    return 0;
+}
+
 static int run_all_m3(void)
 {
     int rc = test1_threads_futex();
@@ -2976,6 +3150,10 @@ static int run_all_m3(void)
         return rc;
     }
     rc = test22_vfp_sigframe_uc_regspace();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test23_m6_adversarial_regressions();
     if (rc != 0) {
         return rc;
     }
