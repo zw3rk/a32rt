@@ -77,6 +77,25 @@ static uint32_t push_cstring(a32_ctx_t *ctx, uint32_t *sp, const char *s)
     return push_bytes(ctx, sp, s, len);
 }
 
+static int push_string_table(a32_ctx_t *ctx, uint32_t *sp, char **strs,
+                             int max_count, uint32_t *out_ptrs, int *out_count)
+{
+    int count = 0;
+    if (strs) {
+        while (count < max_count && count < 511 && strs[count] != NULL) {
+            count++;
+        }
+        for (int i = count - 1; i >= 0; i--) {
+            out_ptrs[i] = push_cstring(ctx, sp, strs[i]);
+            if (out_ptrs[i] == 0U) {
+                return -1;
+            }
+        }
+    }
+    *out_count = count;
+    return 0;
+}
+
 int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
                     int guest_argc, char **guest_argv, char **host_envp,
                     uint32_t *out_sp)
@@ -100,58 +119,31 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
 
     uint32_t sp = A32_STACK_TOP - 64U;
 
-    /* Push 16 random bytes for AT_RANDOM */
     uint8_t rand_bytes[16];
     if (getrandom(rand_bytes, sizeof(rand_bytes), 0) != (ssize_t)sizeof(rand_bytes)) {
         for (size_t i = 0; i < sizeof(rand_bytes); i++) {
             rand_bytes[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
         }
     }
-    uint32_t at_random_va = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
-    if (at_random_va == 0U) {
-        return -1;
-    }
-
-    /* Push AT_PLATFORM ("v8l") and AT_EXECFN */
+    uint32_t at_random_va   = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
     uint32_t at_platform_va = push_cstring(ctx, &sp, "v8l");
-    const char *execfn_str = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : guest_argv[0];
-    uint32_t at_execfn_va = push_cstring(ctx, &sp, execfn_str);
-    if (at_platform_va == 0U || at_execfn_va == 0U) {
+    const char *execfn_str  = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : guest_argv[0];
+    uint32_t at_execfn_va   = push_cstring(ctx, &sp, execfn_str);
+    if (at_random_va == 0U || at_platform_va == 0U || at_execfn_va == 0U) {
         return -1;
     }
 
-    /* Count and push environment strings in reverse index order so envp[0] < envp[1] < ... */
     uint32_t env_ptrs[512];
-    int envc = 0;
-    if (host_envp) {
-        while (host_envp[envc] != NULL && envc < 511) {
-            envc++;
-        }
-        for (int i = envc - 1; i >= 0; i--) {
-            env_ptrs[i] = push_cstring(ctx, &sp, host_envp[i]);
-            if (env_ptrs[i] == 0U) {
-                return -1;
-            }
-        }
-    }
-
-    /* Push argv strings in reverse index order so argv[0] < argv[1] < ... */
     uint32_t arg_ptrs[512];
+    int envc = 0;
     int argc = 0;
-    while (argc < guest_argc && argc < 511 && guest_argv[argc] != NULL) {
-        argc++;
-    }
-    for (int i = argc - 1; i >= 0; i--) {
-        arg_ptrs[i] = push_cstring(ctx, &sp, guest_argv[i]);
-        if (arg_ptrs[i] == 0U) {
-            return -1;
-        }
+    if (push_string_table(ctx, &sp, host_envp, 511, env_ptrs, &envc) != 0 ||
+        push_string_table(ctx, &sp, guest_argv, guest_argc, arg_ptrs, &argc) != 0) {
+        return -1;
     }
 
-    /* Align string table bottom to 16 bytes */
     sp &= ~0xFU;
 
-    /* Build 32-bit auxv table (pairs of uint32_t) */
     uint32_t hwcap = ARM_HWCAP_HALF | ARM_HWCAP_THUMB | ARM_HWCAP_FAST_MULT |
                      ARM_HWCAP_VFP | ARM_HWCAP_EDSP | ARM_HWCAP_NEON |
                      ARM_HWCAP_VFPv3 | ARM_HWCAP_TLS | ARM_HWCAP_VFPv4 |
@@ -165,7 +157,7 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     PUSH_AUX(AT_PHDR,     elf_info->phdr_vaddr);
     PUSH_AUX(AT_PHENT,    elf_info->phent);
     PUSH_AUX(AT_PHNUM,    elf_info->phnum);
-    PUSH_AUX(AT_PAGESZ,   4096U);
+    PUSH_AUX(AT_PAGESZ,   A32_PAGE_SIZE);
     PUSH_AUX(AT_BASE,     elf_info->interp_base);
     PUSH_AUX(AT_FLAGS,    0U);
     PUSH_AUX(AT_ENTRY,    elf_info->entry);
@@ -183,12 +175,8 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     PUSH_AUX(AT_NULL,     0U);
 #undef PUSH_AUX
 
-    /*
-     * Total words below sp:
-     *   1 (argc) + (argc + 1) + (envc + 1) + aux_idx
-     * Keep final sp 16-byte aligned (AAPCS requires 8-byte alignment at entry).
-     */
-    size_t total_words = 1U + ((size_t)argc + 1U) + ((size_t)envc + 1U) + aux_idx;
+    /* Frame layout: argc, argv[0..argc-1], NULL, envp[0..envc-1], NULL, auxv[] (16B-aligned) */
+    size_t total_words   = 1U + ((size_t)argc + 1U) + ((size_t)envc + 1U) + aux_idx;
     uint32_t frame_bytes = (uint32_t)(total_words * sizeof(uint32_t));
     if (sp < ctx->stack_base || (sp - ctx->stack_base) < frame_bytes + 16U) {
         return -1;
@@ -198,17 +186,15 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     uint32_t *w = (uint32_t *)a32_guest_ptr(ctx, final_sp);
     size_t pos = 0;
     w[pos++] = (uint32_t)argc;
-    for (int i = 0; i < argc; i++) {
-        w[pos++] = arg_ptrs[i];
+    memcpy(&w[pos], arg_ptrs, (size_t)argc * sizeof(uint32_t));
+    pos += (size_t)argc;
+    w[pos++] = 0U;
+    if (envc > 0) {
+        memcpy(&w[pos], env_ptrs, (size_t)envc * sizeof(uint32_t));
+        pos += (size_t)envc;
     }
     w[pos++] = 0U;
-    for (int i = 0; i < envc; i++) {
-        w[pos++] = env_ptrs[i];
-    }
-    w[pos++] = 0U;
-    for (size_t i = 0; i < aux_idx; i++) {
-        w[pos++] = auxv[i];
-    }
+    memcpy(&w[pos], auxv, aux_idx * sizeof(uint32_t));
 
     ctx->guest_argc = argc;
     ctx->guest_argv = guest_argv;

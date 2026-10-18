@@ -24,19 +24,6 @@ static uint32_t vfp_expand_imm_single(uint8_t imm8)
     return (a << 31) | (exp << 23) | frac;
 }
 
-static uint64_t vfp_expand_imm_double(uint8_t imm8)
-{
-    uint64_t a = ((uint64_t)imm8 >> 7) & 1ULL;
-    uint64_t b = ((uint64_t)imm8 >> 6) & 1ULL;
-    uint64_t c = ((uint64_t)imm8 >> 5) & 1ULL;
-    uint64_t d = ((uint64_t)imm8 >> 4) & 1ULL;
-    uint64_t efgh = (uint64_t)imm8 & 0xFULL;
-    uint64_t exp = ((1ULL - b) << 10) | (((b ? 0xFFULL : 0ULL) & 0xFFULL) << 2) |
-                   (c << 1) | d;
-    uint64_t frac = efgh << 48;
-    return (a << 63) | (exp << 52) | frac;
-}
-
 static bool neon_expand_imm(uint8_t cmode, uint8_t op, uint8_t imm8, uint64_t *out_val64)
 {
     uint32_t w = 0U;
@@ -104,6 +91,76 @@ static bool neon_expand_imm(uint8_t cmode, uint8_t op, uint8_t imm8, uint64_t *o
         return true;
     }
     return false;
+}
+
+static inline unsigned vfp_reg_idx(bool is_double, bool hi_bit, unsigned lo4)
+{
+    return is_double ? ((hi_bit ? 16U : 0U) | lo4) : ((lo4 << 1) | (hi_bit ? 1U : 0U));
+}
+
+static inline void vfp_ldr_ctx(a64_buf_t *b, bool is_double, unsigned vt, unsigned idx)
+{
+    if (is_double) {
+        a64_emit_ldr_d_ctx(b, vt, idx);
+    } else {
+        a64_emit_ldr_s_ctx(b, vt, idx);
+    }
+}
+
+static inline void vfp_str_ctx(a64_buf_t *b, bool is_double, unsigned vt, unsigned idx)
+{
+    if (is_double) {
+        a64_emit_str_d_ctx(b, vt, idx);
+    } else {
+        a64_emit_str_s_ctx(b, vt, idx);
+    }
+}
+
+static inline void vfp_emit_unary(a64_buf_t *b, bool is_double, unsigned d_idx, unsigned m_idx, uint32_t op_s)
+{
+    vfp_ldr_ctx(b, is_double, 1U, m_idx);
+    a64_emit(b, op_s | (is_double ? 0x00400000U : 0U) | (1U << 5) | 0U);
+    vfp_str_ctx(b, is_double, 0U, d_idx);
+}
+
+static inline void neon_ldr_ctx(a64_buf_t *b, bool is_q, unsigned vt, unsigned d_idx)
+{
+    if (is_q) {
+        a64_emit_ldr_q_ctx(b, vt, d_idx >> 1);
+    } else {
+        a64_emit_ldr_d_ctx(b, vt, d_idx);
+    }
+}
+
+static inline void neon_str_ctx(a64_buf_t *b, bool is_q, unsigned vt, unsigned d_idx)
+{
+    if (is_q) {
+        a64_emit_str_q_ctx(b, vt, d_idx >> 1);
+    } else {
+        a64_emit_str_d_ctx(b, vt, d_idx);
+    }
+}
+
+static inline void neon_emit_unary(a64_buf_t *b, bool is_q, unsigned d, unsigned m,
+                                   uint32_t base_op, bool needs_dst)
+{
+    if (needs_dst) {
+        neon_ldr_ctx(b, is_q, 0U, d);
+    }
+    neon_ldr_ctx(b, is_q, 1U, m);
+    a64_emit(b, base_op | (is_q ? 0x40000000U : 0U) | (1U << 5) | 0U);
+    neon_str_ctx(b, is_q, 0U, d);
+}
+
+static inline void neon_emit_wb(a64_buf_t *b, unsigned rn, unsigned rm, uint16_t imm_bytes)
+{
+    if (rm != 0xFU && rn != 15U) {
+        if (rm == 0xDU) {
+            a64_emit_add_imm_w(b, false, rn, rn, imm_bytes, 0U);
+        } else {
+            a64_emit_add_reg_w(b, false, rn, rn, rm, A64_SHIFT_LSL, 0U);
+        }
+    }
 }
 
 static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
@@ -211,17 +268,10 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             if (rt == 15U || (q_bit && (vd & 1U) != 0U)) {
                 return false;
             }
-            if (q_bit) {
-                vd >>= 1;
-            }
             uint32_t a64_insn = (q_bit ? 0x4E000C00U : 0x0E000C00U) |
                                 ((1U << size) << 16) | ((rt & 31U) << 5) | 0U;
             a64_emit(b, a64_insn);
-            if (q_bit) {
-                a64_emit_str_q_ctx(b, 0U, vd);
-            } else {
-                a64_emit_str_d_ctx(b, 0U, vd);
-            }
+            neon_str_ctx(b, q_bit, 0U, vd);
             return true;
         }
 
@@ -283,34 +333,22 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
         /* VLDR / VSTR */
         if (p_bit && !w_bit) {
             uint32_t byte_disp = imm8 * 4U;
-            unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
-            if (rn == 15U) {
-                a64_emit_mov_pc32(b, A64_TMP0, pc + 8U);
-            }
+            unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
             if (u_bit) {
                 a64_emit_add_imm_w(b, false, A64_ADDR, base_reg, (uint16_t)byte_disp, 0U);
             } else {
                 a64_emit_sub_imm_w(b, false, A64_ADDR, base_reg, (uint16_t)byte_disp, 0U);
             }
 
-            if (is_double) {
-                unsigned d = (d_bit << 4) | vd_bits;
-                if (l_bit) {
-                    a64_emit_guest_ldr_d(b, 0U, A64_ADDR);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 0U, d);
-                    a64_emit_guest_str_d(b, 0U, A64_ADDR);
-                }
+            unsigned reg = vfp_reg_idx(is_double, d_bit, vd_bits);
+            if (l_bit) {
+                if (is_double) a64_emit_guest_ldr_d(b, 0U, A64_ADDR);
+                else a64_emit_guest_ldr_s(b, 0U, A64_ADDR);
+                vfp_str_ctx(b, is_double, 0U, reg);
             } else {
-                unsigned s = (vd_bits << 1) | d_bit;
-                if (l_bit) {
-                    a64_emit_guest_ldr_s(b, 0U, A64_ADDR);
-                    a64_emit_str_s_ctx(b, 0U, s);
-                } else {
-                    a64_emit_ldr_s_ctx(b, 0U, s);
-                    a64_emit_guest_str_s(b, 0U, A64_ADDR);
-                }
+                vfp_ldr_ctx(b, is_double, 0U, reg);
+                if (is_double) a64_emit_guest_str_d(b, 0U, A64_ADDR);
+                else a64_emit_guest_str_s(b, 0U, A64_ADDR);
             }
             return true;
         }
@@ -332,41 +370,28 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             }
         }
         uint32_t total_bytes = imm8 * 4U;
-        unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
-        if (rn == 15U) {
-            a64_emit_mov_pc32(b, A64_TMP0, pc + 8U);
-        }
+        unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
         if (!u_bit) {
             a64_emit_sub_imm_w(b, false, A64_ADDR, base_reg, (uint16_t)total_bytes, 0U);
         } else {
             a64_emit_mov_w(b, A64_ADDR, base_reg);
         }
 
-        if (is_double) {
-            for (unsigned i = 0U; i < num_d; i++) {
-                unsigned reg = (d_start + i) & 31U;
-                if (l_bit) {
-                    a64_emit_guest_ldr_d(b, 0U, A64_ADDR);
-                    a64_emit_str_d_ctx(b, 0U, reg);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 0U, reg);
-                    a64_emit_guest_str_d(b, 0U, A64_ADDR);
-                }
-                a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 8U, 0U);
+        unsigned count = is_double ? num_d : imm8;
+        unsigned start = is_double ? d_start : s_start;
+        uint16_t step_bytes = is_double ? 8U : 4U;
+        for (unsigned i = 0U; i < count; i++) {
+            unsigned reg = (start + i) & 31U;
+            if (l_bit) {
+                if (is_double) a64_emit_guest_ldr_d(b, 0U, A64_ADDR);
+                else a64_emit_guest_ldr_s(b, 0U, A64_ADDR);
+                vfp_str_ctx(b, is_double, 0U, reg);
+            } else {
+                vfp_ldr_ctx(b, is_double, 0U, reg);
+                if (is_double) a64_emit_guest_str_d(b, 0U, A64_ADDR);
+                else a64_emit_guest_str_s(b, 0U, A64_ADDR);
             }
-        } else {
-            unsigned num_s = imm8;
-            for (unsigned i = 0U; i < num_s; i++) {
-                unsigned reg = (s_start + i) & 31U;
-                if (l_bit) {
-                    a64_emit_guest_ldr_s(b, 0U, A64_ADDR);
-                    a64_emit_str_s_ctx(b, 0U, reg);
-                } else {
-                    a64_emit_ldr_s_ctx(b, 0U, reg);
-                    a64_emit_guest_str_s(b, 0U, A64_ADDR);
-                }
-                a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 4U, 0U);
-            }
+            a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, step_bytes, 0U);
         }
 
         if (w_bit && rn != 15U) {
@@ -390,25 +415,16 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
         bool n_bit    = ((insn >> 7) & 1U) != 0U;
         bool op_bit   = ((insn >> 6) & 1U) != 0U;
         bool m_bit    = ((insn >> 5) & 1U) != 0U;
+        unsigned d_idx = vfp_reg_idx(is_double, d_bit, vd_b);
+        unsigned m_idx = vfp_reg_idx(is_double, m_bit, vm_b);
 
         /* Unary, VCVT, VCMP, VMOV imm (opc1 == 0b1011) */
         if (opc1 == 0xBU) {
-            /* VMOV immediate */
+            /* VMOV immediate: AArch64 FMOV S0/D0, #imm8 uses identical 8-bit encoding */
             if ((insn & 0xC0U) == 0U) {
-                uint8_t imm8 = (uint8_t)(((insn >> 16) & 0xFU) << 4 | (insn & 0xFU));
-                if (is_double) {
-                    uint64_t w = vfp_expand_imm_double(imm8);
-                    unsigned d = (d_bit << 4) | vd_b;
-                    a64_emit_mov_imm32(b, A64_TMP0, (uint32_t)w);
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (d * 8U));
-                    a64_emit_mov_imm32(b, A64_TMP0, (uint32_t)(w >> 32));
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (d * 8U) + 4U);
-                } else {
-                    uint32_t w = vfp_expand_imm_single(imm8);
-                    unsigned s = (vd_b << 1) | d_bit;
-                    a64_emit_mov_imm32(b, A64_TMP0, w);
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (s * 4U));
-                }
+                uint32_t imm8 = (((insn >> 16) & 0xFU) << 4) | (insn & 0xFU);
+                a64_emit(b, (is_double ? 0x1E601000U : 0x1E201000U) | (imm8 << 13));
+                vfp_str_ctx(b, is_double, 0U, d_idx);
                 return true;
             }
 
@@ -418,62 +434,20 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
             /* VMOV reg / VABS */
             if (opc2 == 0U) {
-                if (is_double) {
-                    unsigned d = (d_bit << 4) | vd_b;
-                    unsigned m = (m_bit << 4) | vm_b;
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    if (n_bit) {
-                        a64_emit_fabs_d(b, 0U, 1U);
-                    } else {
-                        a64_emit_fmov_d(b, 0U, 1U);
-                    }
-                    a64_emit_str_d_ctx(b, 0U, d);
-                } else {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    if (n_bit) {
-                        a64_emit_fabs_s(b, 0U, 1U);
-                    } else {
-                        a64_emit_fmov_s(b, 0U, 1U);
-                    }
-                    a64_emit_str_s_ctx(b, 0U, s);
-                }
+                vfp_emit_unary(b, is_double, d_idx, m_idx, n_bit ? 0x1E20C000U : 0x1E204000U);
                 return true;
             }
 
             /* VNEG / VSQRT */
             if (opc2 == 1U) {
-                if (is_double) {
-                    unsigned d = (d_bit << 4) | vd_b;
-                    unsigned m = (m_bit << 4) | vm_b;
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    if (n_bit) {
-                        a64_emit_fsqrt_d(b, 0U, 1U);
-                    } else {
-                        a64_emit_fneg_d(b, 0U, 1U);
-                    }
-                    a64_emit_str_d_ctx(b, 0U, d);
-                } else {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    if (n_bit) {
-                        a64_emit_fsqrt_s(b, 0U, 1U);
-                    } else {
-                        a64_emit_fneg_s(b, 0U, 1U);
-                    }
-                    a64_emit_str_s_ctx(b, 0U, s);
-                }
+                vfp_emit_unary(b, is_double, d_idx, m_idx, n_bit ? 0x1E21C000U : 0x1E214000U);
                 return true;
             }
 
             /* VCVTB / VCVTT between half-precision and single-precision */
             if (!is_double && (opc2 == 2U || opc2 == 3U)) {
-                unsigned s = (vd_b << 1) | d_bit;
-                unsigned m = (vm_b << 1) | m_bit;
                 if (opc2 == 2U) { /* VCVTB.F32.F16 / VCVTT.F32.F16 Sd, Sm */
-                    a64_emit_ldr_s_ctx(b, 1U, m);
+                    a64_emit_ldr_s_ctx(b, 1U, m_idx);
                     a64_emit_fmov_s_to_w(b, A64_TMP0, 1U);
                     if (n_bit) {
                         a64_emit_ubfm_w(b, A64_TMP0, A64_TMP0, 16U, 31U);
@@ -482,10 +456,10 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     }
                     a64_emit_fmov_w_to_s(b, 1U, A64_TMP0);
                     a64_emit(b, 0x1EE24000U | (1U << 5) | 0U); /* FCVT s0, h1 */
-                    a64_emit_str_s_ctx(b, 0U, s);
+                    a64_emit_str_s_ctx(b, 0U, d_idx);
                 } else { /* VCVTB.F16.F32 / VCVTT.F16.F32 Sd, Sm */
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    a64_emit_ldr_s_ctx(b, 2U, s);
+                    a64_emit_ldr_s_ctx(b, 1U, m_idx);
+                    a64_emit_ldr_s_ctx(b, 2U, d_idx);
                     a64_emit(b, 0x1E23C000U | (1U << 5) | 0U); /* FCVT h0, s1 */
                     a64_emit_fmov_s_to_w(b, A64_TMP0, 0U);
                     a64_emit_fmov_s_to_w(b, A64_TMP1, 2U);
@@ -495,7 +469,7 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                         a64_emit_bfm_w(b, A64_TMP1, A64_TMP0, 0U, 15U);
                     }
                     a64_emit_fmov_w_to_s(b, 0U, A64_TMP1);
-                    a64_emit_str_s_ctx(b, 0U, s);
+                    a64_emit_str_s_ctx(b, 0U, d_idx);
                 }
                 return true;
             }
@@ -504,27 +478,14 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             if (opc2 == 4U || opc2 == 5U) {
                 bool zero = (opc2 == 5U);
                 uint32_t e_bit = n_bit ? 0x00000010U : 0U;
+                uint32_t sz_bit = is_double ? 0x00400000U : 0U;
                 a64_emit_mrs_nzcv(b, A64_TMP1);
-                if (is_double) {
-                    unsigned d = (d_bit << 4) | vd_b;
-                    unsigned m = (m_bit << 4) | vm_b;
-                    a64_emit_ldr_d_ctx(b, 0U, d);
-                    if (zero) {
-                        a64_emit(b, 0x1E602008U | e_bit | (0U << 5));
-                    } else {
-                        a64_emit_ldr_d_ctx(b, 1U, m);
-                        a64_emit(b, 0x1E602000U | e_bit | (1U << 16) | (0U << 5));
-                    }
+                vfp_ldr_ctx(b, is_double, 0U, d_idx);
+                if (zero) {
+                    a64_emit(b, 0x1E202008U | sz_bit | e_bit);
                 } else {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 0U, s);
-                    if (zero) {
-                        a64_emit(b, 0x1E202008U | e_bit | (0U << 5));
-                    } else {
-                        a64_emit_ldr_s_ctx(b, 1U, m);
-                        a64_emit(b, 0x1E202000U | e_bit | (1U << 16) | (0U << 5));
-                    }
+                    vfp_ldr_ctx(b, is_double, 1U, m_idx);
+                    a64_emit(b, 0x1E202000U | sz_bit | e_bit | (1U << 16));
                 }
                 a64_emit_mrs_nzcv(b, A64_TMP0);
                 a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
@@ -541,14 +502,12 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             if (opc2 == 7U && n_bit) {
                 if (is_double) { /* vcvt.f32.f64 Sd, Dm */
                     unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (m_bit << 4) | vm_b;
-                    a64_emit_ldr_d_ctx(b, 1U, m);
+                    a64_emit_ldr_d_ctx(b, 1U, m_idx);
                     a64_emit_fcvt_d_to_s(b, 0U, 1U);
                     a64_emit_str_s_ctx(b, 0U, s);
                 } else { /* vcvt.f64.f32 Dd, Sm */
                     unsigned d = (d_bit << 4) | vd_b;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
+                    a64_emit_ldr_s_ctx(b, 1U, m_idx);
                     a64_emit_fcvt_s_to_d(b, 0U, 1U);
                     a64_emit_str_d_ctx(b, 0U, d);
                 }
@@ -557,55 +516,24 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
             /* VRINTZ / VRINTR (opc2 == 6) and VRINTX (opc2 == 7 && !n_bit) */
             if (opc2 == 6U || (opc2 == 7U && !n_bit)) {
-                uint32_t a64_op;
-                if (opc2 == 6U) {
-                    bool is_z = n_bit;
-                    a64_op = is_z ? 0x1E25C000U : 0x1E27C000U; /* FRINTZ or FRINTI */
-                } else {
-                    a64_op = 0x1E274000U; /* FRINTX */
-                }
-                if (is_double) {
-                    unsigned d = (d_bit << 4) | vd_b;
-                    unsigned m = (m_bit << 4) | vm_b;
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, a64_op | 0x00400000U | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                } else {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    a64_emit(b, a64_op | (1U << 5) | 0U);
-                    a64_emit_str_s_ctx(b, 0U, s);
-                }
+                uint32_t a64_op = (opc2 == 6U) ? (n_bit ? 0x1E25C000U : 0x1E27C000U) : 0x1E274000U;
+                vfp_emit_unary(b, is_double, d_idx, m_idx, a64_op);
                 return true;
             }
 
             /* VCVT int to float */
             if (opc2 == 8U) {
-                bool is_signed = n_bit;
+                unsigned m = (vm_b << 1) | m_bit;
+                a64_emit_ldr_s_ctx(b, 1U, m);
+                a64_emit_fmov_s_to_w(b, A64_TMP0, 1U);
                 if (is_double) {
-                    unsigned d = (d_bit << 4) | vd_b;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    a64_emit_fmov_s_to_w(b, A64_TMP0, 1U);
-                    if (is_signed) {
-                        a64_emit_scvtf_w_to_d(b, 0U, A64_TMP0);
-                    } else {
-                        a64_emit_ucvtf_w_to_d(b, 0U, A64_TMP0);
-                    }
-                    a64_emit_str_d_ctx(b, 0U, d);
+                    if (n_bit) a64_emit_scvtf_w_to_d(b, 0U, A64_TMP0);
+                    else a64_emit_ucvtf_w_to_d(b, 0U, A64_TMP0);
                 } else {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    a64_emit_fmov_s_to_w(b, A64_TMP0, 1U);
-                    if (is_signed) {
-                        a64_emit_scvtf_w_to_s(b, 0U, A64_TMP0);
-                    } else {
-                        a64_emit_ucvtf_w_to_s(b, 0U, A64_TMP0);
-                    }
-                    a64_emit_str_s_ctx(b, 0U, s);
+                    if (n_bit) a64_emit_scvtf_w_to_s(b, 0U, A64_TMP0);
+                    else a64_emit_ucvtf_w_to_s(b, 0U, A64_TMP0);
                 }
+                vfp_str_ctx(b, is_double, 0U, d_idx);
                 return true;
             }
 
@@ -620,8 +548,7 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 }
                 unsigned fbits   = int_bits - imm5_raw;
                 unsigned scale   = 64U - fbits;
-                unsigned reg_idx = is_double ? ((d_bit << 4) | vd_b) : ((vd_b << 1) | d_bit);
-                uint32_t ctx_off = A32_CTX_VFP_OFFSET + (reg_idx * (is_double ? 8U : 4U));
+                uint32_t ctx_off = A32_CTX_VFP_OFFSET + (d_idx * (is_double ? 8U : 4U));
                 if (!to_fixed) {
                     a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, ctx_off);
                     if (!n_bit) {
@@ -634,17 +561,9 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     uint32_t base = (is_double ? 0x1E400000U : 0x1E000000U) |
                                     (is_unsigned ? 0x00030000U : 0x00020000U);
                     a64_emit(b, base | (scale << 10) | (A64_TMP0 << 5) | 0U);
-                    if (is_double) {
-                        a64_emit_str_d_ctx(b, 0U, reg_idx);
-                    } else {
-                        a64_emit_str_s_ctx(b, 0U, reg_idx);
-                    }
+                    vfp_str_ctx(b, is_double, 0U, d_idx);
                 } else {
-                    if (is_double) {
-                        a64_emit_ldr_d_ctx(b, 0U, reg_idx);
-                    } else {
-                        a64_emit_ldr_s_ctx(b, 0U, reg_idx);
-                    }
+                    vfp_ldr_ctx(b, is_double, 0U, d_idx);
                     uint32_t base = (is_double ? 0x1E580000U : 0x1E180000U) |
                                     (is_unsigned ? 0x00010000U : 0x00000000U);
                     a64_emit(b, base | (scale << 10) | (0U << 5) | A64_TMP0);
@@ -680,36 +599,21 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
             /* VCVT / VCVTR float to int */
             if (opc2 == 12U || opc2 == 13U) {
                 bool is_signed  = (opc2 == 13U);
-                bool round_zero = ((insn >> 7) & 1U) != 0U;
-                if (is_double) {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (m_bit << 4) | vm_b;
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    if (!round_zero) {
-                        a64_emit(b, 0x1E674000U | (1U << 5) | 1U); /* FRINTX d1, d1 */
-                    }
-                    if (is_signed) {
-                        a64_emit_fcvtzs_d_to_w(b, A64_TMP0, 1U);
-                    } else {
-                        a64_emit_fcvtzu_d_to_w(b, A64_TMP0, 1U);
-                    }
-                    a64_emit_fmov_w_to_s(b, 0U, A64_TMP0);
-                    a64_emit_str_s_ctx(b, 0U, s);
-                } else {
-                    unsigned s = (vd_b << 1) | d_bit;
-                    unsigned m = (vm_b << 1) | m_bit;
-                    a64_emit_ldr_s_ctx(b, 1U, m);
-                    if (!round_zero) {
-                        a64_emit(b, 0x1E274000U | (1U << 5) | 1U); /* FRINTX s1, s1 */
-                    }
-                    if (is_signed) {
-                        a64_emit_fcvtzs_s_to_w(b, A64_TMP0, 1U);
-                    } else {
-                        a64_emit_fcvtzu_s_to_w(b, A64_TMP0, 1U);
-                    }
-                    a64_emit_fmov_w_to_s(b, 0U, A64_TMP0);
-                    a64_emit_str_s_ctx(b, 0U, s);
+                bool round_zero = n_bit;
+                unsigned s = (vd_b << 1) | d_bit;
+                vfp_ldr_ctx(b, is_double, 1U, m_idx);
+                if (!round_zero) {
+                    a64_emit(b, (is_double ? 0x1E674000U : 0x1E274000U) | (1U << 5) | 1U);
                 }
+                if (is_double) {
+                    if (is_signed) a64_emit_fcvtzs_d_to_w(b, A64_TMP0, 1U);
+                    else a64_emit_fcvtzu_d_to_w(b, A64_TMP0, 1U);
+                } else {
+                    if (is_signed) a64_emit_fcvtzs_s_to_w(b, A64_TMP0, 1U);
+                    else a64_emit_fcvtzu_s_to_w(b, A64_TMP0, 1U);
+                }
+                a64_emit_fmov_w_to_s(b, 0U, A64_TMP0);
+                a64_emit_str_s_ctx(b, 0U, s);
                 return true;
             }
 
@@ -720,124 +624,36 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
         if (!(opc1 <= 3U || (opc1 == 8U && !op_bit) || opc1 == 9U || opc1 == 10U)) {
             return false;
         }
-        unsigned d_reg = 0U;
-        if (is_double) {
-            d_reg = (d_bit << 4) | vd_b;
-            unsigned n_reg = (n_bit << 4) | vn_b;
-            unsigned m_reg = (m_bit << 4) | vm_b;
-            a64_emit_ldr_d_ctx(b, 1U, n_reg);
-            a64_emit_ldr_d_ctx(b, 2U, m_reg);
-        } else {
-            d_reg = (vd_b << 1) | d_bit;
-            unsigned n_reg = (vn_b << 1) | n_bit;
-            unsigned m_reg = (vm_b << 1) | m_bit;
-            a64_emit_ldr_s_ctx(b, 1U, n_reg);
-            a64_emit_ldr_s_ctx(b, 2U, m_reg);
-        }
+        unsigned n_idx = vfp_reg_idx(is_double, n_bit, vn_b);
+        vfp_ldr_ctx(b, is_double, 1U, n_idx);
+        vfp_ldr_ctx(b, is_double, 2U, m_idx);
+        uint32_t sz_bit = is_double ? 0x00400000U : 0U;
 
-        bool handled = false;
-        if (opc1 == 3U) {
-            if (!op_bit) { /* VADD */
-                if (is_double) a64_emit_fadd_d(b, 0U, 1U, 2U);
-                else a64_emit_fadd_s(b, 0U, 1U, 2U);
-            } else { /* VSUB */
-                if (is_double) a64_emit_fsub_d(b, 0U, 1U, 2U);
-                else a64_emit_fsub_s(b, 0U, 1U, 2U);
-            }
-            handled = true;
-        } else if (opc1 == 2U) {
-            if (!op_bit) { /* VMUL */
-                if (is_double) a64_emit_fmul_d(b, 0U, 1U, 2U);
-                else a64_emit_fmul_s(b, 0U, 1U, 2U);
-            } else { /* VNMUL -> FNMUL */
-                if (is_double) {
-                    a64_emit(b, 0x1E608800U | (2U << 16) | (1U << 5) | 0U);
-                } else {
-                    a64_emit(b, 0x1E208800U | (2U << 16) | (1U << 5) | 0U);
-                }
-            }
-            handled = true;
-        } else if (opc1 == 8U && !op_bit) { /* VDIV */
-            if (is_double) a64_emit_fdiv_d(b, 0U, 1U, 2U);
-            else a64_emit_fdiv_s(b, 0U, 1U, 2U);
-            handled = true;
-        } else if (opc1 == 0U) {
-            if (is_double) a64_emit_ldr_d_ctx(b, 3U, d_reg);
-            else a64_emit_ldr_s_ctx(b, 3U, d_reg);
-
-            if (!op_bit) { /* VMLA: d + n*m */
-                if (is_double) {
-                    a64_emit_fmul_d(b, 0U, 1U, 2U);
-                    a64_emit_fadd_d(b, 0U, 3U, 0U);
-                } else {
-                    a64_emit_fmul_s(b, 0U, 1U, 2U);
-                    a64_emit_fadd_s(b, 0U, 3U, 0U);
-                }
-            } else { /* VMLS: d + (-(n * m)) = FPAdd(d, FPNeg(FPMul(n, m))) */
-                a64_emit(b, (is_double ? 0x1E608800U : 0x1E208800U) | (2U << 16) | (1U << 5) | 0U); /* fnmul s0/d0, s1/d1, s2/d2 */
-                if (is_double) {
-                    a64_emit_fadd_d(b, 0U, 3U, 0U);
-                } else {
-                    a64_emit_fadd_s(b, 0U, 3U, 0U);
-                }
-            }
-            handled = true;
-        } else if (opc1 == 1U) {
-            if (is_double) a64_emit_ldr_d_ctx(b, 3U, d_reg);
-            else a64_emit_ldr_s_ctx(b, 3U, d_reg);
-
-            if (op_bit) { /* VNMLA: d = (-d) + (-(n * m)) = FPAdd(FPNeg(d), FPNeg(FPMul(n, m))) */
-                a64_emit(b, (is_double ? 0x1E608800U : 0x1E208800U) | (2U << 16) | (1U << 5) | 0U); /* fnmul s0/d0, s1/d1, s2/d2 */
-                if (is_double) {
-                    a64_emit_fneg_d(b, 3U, 3U);
-                    a64_emit_fadd_d(b, 0U, 3U, 0U);
-                } else {
-                    a64_emit_fneg_s(b, 3U, 3U);
-                    a64_emit_fadd_s(b, 0U, 3U, 0U);
-                }
-            } else { /* VNMLS: (-d) + (n * m) = FPAdd(FPNeg(d), FPMul(n, m)) */
-                if (is_double) {
-                    a64_emit_fmul_d(b, 0U, 1U, 2U);
-                    a64_emit_fneg_d(b, 3U, 3U);
-                    a64_emit_fadd_d(b, 0U, 3U, 0U);
-                } else {
-                    a64_emit_fmul_s(b, 0U, 1U, 2U);
-                    a64_emit_fneg_s(b, 3U, 3U);
-                    a64_emit_fadd_s(b, 0U, 3U, 0U);
-                }
-            }
-            handled = true;
+        if (opc1 == 3U) { /* VADD / VSUB */
+            a64_emit(b, (op_bit ? 0x1E203800U : 0x1E202800U) | sz_bit | (2U << 16) | (1U << 5) | 0U);
+        } else if (opc1 == 2U) { /* VMUL / VNMUL */
+            a64_emit(b, (op_bit ? 0x1E208800U : 0x1E200800U) | sz_bit | (2U << 16) | (1U << 5) | 0U);
+        } else if (opc1 == 8U) { /* VDIV */
+            a64_emit(b, 0x1E201800U | sz_bit | (2U << 16) | (1U << 5) | 0U);
+        } else if (opc1 == 0U) { /* VMLA / VMLS */
+            vfp_ldr_ctx(b, is_double, 3U, d_idx);
+            a64_emit(b, (op_bit ? 0x1E208800U : 0x1E200800U) | sz_bit | (2U << 16) | (1U << 5) | 0U);
+            a64_emit(b, 0x1E202800U | sz_bit | (0U << 16) | (3U << 5) | 0U);
+        } else if (opc1 == 1U) { /* VNMLA / VNMLS */
+            vfp_ldr_ctx(b, is_double, 3U, d_idx);
+            a64_emit(b, (op_bit ? 0x1E208800U : 0x1E200800U) | sz_bit | (2U << 16) | (1U << 5) | 0U);
+            a64_emit(b, 0x1E214000U | sz_bit | (3U << 5) | 3U);
+            a64_emit(b, 0x1E202800U | sz_bit | (0U << 16) | (3U << 5) | 0U);
         } else if (opc1 == 10U) { /* VFMA / VFMS */
-            if (is_double) a64_emit_ldr_d_ctx(b, 3U, d_reg);
-            else a64_emit_ldr_s_ctx(b, 3U, d_reg);
-
-            if (!op_bit) { /* VFMA: d + n*m */
-                if (is_double) a64_emit_fmadd_d(b, 0U, 1U, 2U, 3U);
-                else a64_emit_fmadd_s(b, 0U, 1U, 2U, 3U);
-            } else { /* VFMS: d - n*m */
-                if (is_double) a64_emit_fmsub_d(b, 0U, 1U, 2U, 3U);
-                else a64_emit_fmsub_s(b, 0U, 1U, 2U, 3U);
-            }
-            handled = true;
-        } else if (opc1 == 9U) { /* VFNMA / VFNMS */
-            if (is_double) a64_emit_ldr_d_ctx(b, 3U, d_reg);
-            else a64_emit_ldr_s_ctx(b, 3U, d_reg);
-
-            if (op_bit) { /* VFNMA: -(d + n*m) */
-                if (is_double) a64_emit_fnmadd_d(b, 0U, 1U, 2U, 3U);
-                else a64_emit_fnmadd_s(b, 0U, 1U, 2U, 3U);
-            } else { /* VFNMS: -d + n*m */
-                if (is_double) a64_emit_fnmsub_d(b, 0U, 1U, 2U, 3U);
-                else a64_emit_fnmsub_s(b, 0U, 1U, 2U, 3U);
-            }
-            handled = true;
+            vfp_ldr_ctx(b, is_double, 3U, d_idx);
+            a64_emit(b, (op_bit ? 0x1F008000U : 0x1F000000U) | sz_bit | (2U << 16) | (3U << 10) | (1U << 5) | 0U);
+        } else { /* VFNMA / VFNMS (opc1 == 9U) */
+            vfp_ldr_ctx(b, is_double, 3U, d_idx);
+            a64_emit(b, (op_bit ? 0x1F200000U : 0x1F208000U) | sz_bit | (2U << 16) | (3U << 10) | (1U << 5) | 0U);
         }
 
-        if (handled) {
-            if (is_double) a64_emit_str_d_ctx(b, 0U, d_reg);
-            else a64_emit_str_s_ctx(b, 0U, d_reg);
-            return true;
-        }
+        vfp_str_ctx(b, is_double, 0U, d_idx);
+        return true;
     }
 
     return false;
@@ -845,7 +661,6 @@ static bool decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
 static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 {
-    (void)pc;
     /* 1. VLD1 / VST1 / VLD2 / VST2 (0xF4...) */
     if ((insn & 0xFF100000U) == 0xF4000000U) {
         bool l_bit    = ((insn >> 21) & 1U) != 0U;
@@ -868,10 +683,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             if (size == 3U && (!l_bit || dup_size > 2U)) {
                 return false;
             }
-            unsigned base_reg    = (rn == 15U) ? A64_TMP0 : rn;
-            if (rn == 15U) {
-                a64_emit_mov_imm32(b, A64_TMP0, pc + 8U);
-            }
+            unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
             a64_emit_mov_w(b, A64_ADDR, base_reg);
 
             if (size < 3U) {
@@ -915,13 +727,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                         a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, (uint16_t)elem_bytes, 0U);
                     }
                 }
-                if (rm != 0xFU && rn != 15U) {
-                    if (rm == 0xDU) {
-                        a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)(n_structs * elem_bytes), 0U);
-                    } else {
-                        a64_emit_add_reg_w(b, false, rn, rn, rm, A64_SHIFT_LSL, 0U);
-                    }
-                }
+                neon_emit_wb(b, rn, rm, (uint16_t)(n_structs * elem_bytes));
                 return true;
             }
             if (size == 3U && l_bit) {
@@ -961,13 +767,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                         }
                     }
                 }
-                if (rm != 0xFU && rn != 15U) {
-                    if (rm == 0xDU) {
-                        a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)(n_structs * elem_bytes), 0U);
-                    } else {
-                        a64_emit_add_reg_w(b, false, rn, rn, rm, A64_SHIFT_LSL, 0U);
-                    }
-                }
+                neon_emit_wb(b, rn, rm, (uint16_t)(n_structs * elem_bytes));
                 return true;
             }
         } else {
@@ -983,10 +783,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             }
 
             if (nregs > 0U) {
-                unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
-                if (rn == 15U) {
-                    a64_emit_mov_imm32(b, A64_TMP0, pc + 8U);
-                }
+                unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
                 a64_emit_mov_w(b, A64_ADDR, base_reg);
                 for (unsigned i = 0U; i < nregs; i++) {
                     unsigned reg = (d_start + i) & 31U;
@@ -1001,14 +798,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                         a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 8U, 0U);
                     }
                 }
-
-                if (rm != 0xFU && rn != 15U) {
-                    if (rm == 0xDU) {
-                        a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)(nregs * 8U), 0U);
-                    } else {
-                        a64_emit_add_reg_w(b, false, rn, rn, rm, A64_SHIFT_LSL, 0U);
-                    }
-                }
+                neon_emit_wb(b, rn, rm, (uint16_t)(nregs * 8U));
                 return true;
             }
 
@@ -1018,10 +808,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 if (elem_sz > 2U) {
                     return false;
                 }
-                unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
-                if (rn == 15U) {
-                    a64_emit_mov_imm32(b, A64_TMP0, pc + 8U);
-                }
+                unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
                 a64_emit_mov_w(b, A64_ADDR, base_reg);
                 a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_ADDR);
                 if (type == 0x3U) {
@@ -1068,14 +855,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                         a64_emit_guest_str_d(b, 3U, A64_ADDR);
                     }
                 }
-                if (rm != 0xFU && rn != 15U) {
-                    uint16_t wb_bytes = (type == 0x3U) ? 32U : 16U;
-                    if (rm == 0xDU) {
-                        a64_emit_add_imm_w(b, false, rn, rn, wb_bytes, 0U);
-                    } else {
-                        a64_emit_add_reg_w(b, false, rn, rn, rm, A64_SHIFT_LSL, 0U);
-                    }
-                }
+                neon_emit_wb(b, rn, rm, (type == 0x3U) ? 32U : 16U);
                 return true;
             }
 
@@ -1088,10 +868,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 unsigned n_st = (type == 0x4U || type == 0x5U) ? 3U : 4U;
                 unsigned step = ((type & 1U) != 0U) ? 2U : 1U;
                 uint32_t opc  = (n_st == 3U) ? 0x00004000U : 0x00000000U;
-                unsigned base_reg = (rn == 15U) ? A64_TMP0 : rn;
-                if (rn == 15U) {
-                    a64_emit_mov_imm32(b, A64_TMP0, pc + 8U);
-                }
+                unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
                 a64_emit_mov_w(b, A64_ADDR, base_reg);
                 a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_ADDR);
                 if (l_bit) {
@@ -1105,13 +882,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     }
                     a64_emit(b, 0x0C000000U | opc | (elem_sz << 10) | (A64_TMP1 << 5) | 0U);
                 }
-                if (rm != 0xFU && rn != 15U) {
-                    if (rm == 0xDU) {
-                        a64_emit_add_imm_w(b, false, rn, rn, (uint16_t)(n_st * 8U), 0U);
-                    } else {
-                        a64_emit_add_reg_w(b, false, rn, rn, rm, A64_SHIFT_LSL, 0U);
-                    }
-                }
+                neon_emit_wb(b, rn, rm, (uint16_t)(n_st * 8U));
                 return true;
             }
         }
@@ -1132,40 +903,28 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
         uint64_t val64 = 0ULL;
         if (neon_expand_imm(cmode, op, imm8, &val64)) {
+            unsigned count_d = is_q ? 2U : 1U;
             if ((cmode & 1U) == 0U || cmode >= 12U) { /* VMOV or VMVN */
                 if (op != 0U && cmode != 14U) {
                     val64 = ~val64;
                 }
-                unsigned count_d = is_q ? 2U : 1U;
+                a64_emit_mov_imm32(b, A64_TMP0, (uint32_t)val64);
+                a64_emit_mov_imm32(b, A64_TMP1, (uint32_t)(val64 >> 32));
+                a64_emit_bfi_x(b, A64_TMP0, A64_TMP1, 32U, 32U);
+                a64_emit(b, 0x9E670000U | (A64_TMP0 << 5) | 0U); /* FMOV d0, x15 */
                 for (unsigned i = 0U; i < count_d; i++) {
-                    unsigned reg = d + i;
-                    a64_emit_mov_imm32(b, A64_TMP0, (uint32_t)val64);
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (reg * 8U));
-                    a64_emit_mov_imm32(b, A64_TMP0, (uint32_t)(val64 >> 32));
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (reg * 8U) + 4U);
+                    a64_emit_str_d_ctx(b, 0U, d + i);
                 }
             } else { /* VORR or VBIC */
-                unsigned count_d = is_q ? 2U : 1U;
+                a64_emit_mov_imm32(b, A64_TMP0, (uint32_t)val64);
+                a64_emit_mov_imm32(b, A64_TMP1, (uint32_t)(val64 >> 32));
+                a64_emit_bfi_x(b, A64_TMP0, A64_TMP1, 32U, 32U);
+                a64_emit(b, 0x9E670000U | (A64_TMP0 << 5) | 1U); /* FMOV d1, x15 */
+                uint32_t vec_op = (op == 0U) ? 0x0EA01C00U : 0x0E601C00U;
                 for (unsigned i = 0U; i < count_d; i++) {
-                    unsigned reg = d + i;
-                    /* Low word */
-                    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (reg * 8U));
-                    a64_emit_mov_imm32(b, A64_TMP1, (uint32_t)val64);
-                    if (op == 0U) {
-                        a64_emit_orr_reg_w(b, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                    } else {
-                        a64_emit_bic_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                    }
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (reg * 8U));
-                    /* High word */
-                    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (reg * 8U) + 4U);
-                    a64_emit_mov_imm32(b, A64_TMP1, (uint32_t)(val64 >> 32));
-                    if (op == 0U) {
-                        a64_emit_orr_reg_w(b, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                    } else {
-                        a64_emit_bic_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
-                    }
-                    a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX, A32_CTX_VFP_OFFSET + (reg * 8U) + 4U);
+                    a64_emit_ldr_d_ctx(b, 0U, d + i);
+                    a64_emit(b, vec_op | (1U << 16) | (0U << 5) | 0U);
+                    a64_emit_str_d_ctx(b, 0U, d + i);
                 }
             }
             return true;
@@ -1242,11 +1001,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             uint32_t a64_insn = (is_q ? 0x4E000400U : 0x0E000400U) |
                                 (imm5 << 16) | (1U << 5) | 0U;
             a64_emit(b, a64_insn);
-            if (is_q) {
-                a64_emit_str_q_ctx(b, 0U, d >> 1);
-            } else {
-                a64_emit_str_d_ctx(b, 0U, d);
-            }
+            neon_str_ctx(b, is_q, 0U, d);
             return true;
         }
 
@@ -1262,99 +1017,41 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 uint32_t rev_base = (op5 == 0U) ? 0x0E200800U
                                   : (op5 == 1U) ? 0x2E200800U
                                                 : 0x0E201800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, rev_base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, rev_base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, rev_base | (size << 22), false);
                 return true;
             }
             /* VPADDL (op5 == 4 signed, op5 == 5 unsigned) */
             if ((op5 == 4U || op5 == 5U) && size < 3U) {
                 uint32_t base = (op5 == 5U) ? 0x2E202800U : 0x0E202800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, base | (size << 22), false);
                 return true;
             }
             /* VCLS (op5 == 8), VCLZ (op5 == 9) */
             if ((op5 == 8U || op5 == 9U) && size < 3U) {
                 uint32_t base = (op5 == 9U) ? 0x2E204800U : 0x0E204800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, base | (size << 22), false);
                 return true;
             }
             /* VCNT (op5 == 10, size == 0) */
             if (op5 == 10U && size == 0U) {
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, 0x4E205800U | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, 0x0E205800U | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, 0x0E205800U, false);
                 return true;
             }
             /* VMVN (op5 == 11, size == 0) */
             if (op5 == 11U && size == 0U) {
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, 0x6E205800U | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, 0x2E205800U | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, 0x2E205800U, false);
                 return true;
             }
             /* VPADAL (op5 == 12 signed, op5 == 13 unsigned) */
             if ((op5 == 12U || op5 == 13U) && size < 3U) {
                 uint32_t base = (op5 == 13U) ? 0x2E206800U : 0x0E206800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 0U, d >> 1);
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 0U, d);
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, base | (size << 22), true);
                 return true;
             }
             /* VQABS (op5 == 14), VQNEG (op5 == 15) */
             if ((op5 == 14U || op5 == 15U) && size < 3U) {
                 uint32_t base = (op5 == 15U) ? 0x2E207800U : 0x0E207800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, base | (size << 22), false);
                 return true;
             }
             /* ARMv8-A Crypto: AESE.8, AESD.8, AESMC.8, AESIMC.8 (size == 0, op5 == 6 or 7) */
@@ -1365,55 +1062,18 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 unsigned qd = d >> 1;
                 unsigned qm = m >> 1;
                 unsigned opc = (insn >> 6) & 0x1FU;
-                if (opc == 0x0CU) { /* AESE.8 Qd, Qm */
+                if (opc == 0x0CU || opc == 0x0DU) { /* AESE.8 / AESD.8 Qd, Qm */
                     a64_emit_ldr_q_ctx(b, 0U, qd);
                     a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_aese(b, 0U, 1U);
+                    if (opc == 0x0CU) a64_emit_aese(b, 0U, 1U);
+                    else a64_emit_aesd(b, 0U, 1U);
                     a64_emit_str_q_ctx(b, 0U, qd);
                     return true;
                 }
-                if (opc == 0x0DU) { /* AESD.8 Qd, Qm */
-                    a64_emit_ldr_q_ctx(b, 0U, qd);
+                if (opc == 0x0EU || opc == 0x0FU) { /* AESMC.8 / AESIMC.8 Qd, Qm */
                     a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_aesd(b, 0U, 1U);
-                    a64_emit_str_q_ctx(b, 0U, qd);
-                    return true;
-                }
-                if (opc == 0x0EU) { /* AESMC.8 Qd, Qm */
-                    a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_aesmc(b, 0U, 1U);
-                    a64_emit_str_q_ctx(b, 0U, qd);
-                    return true;
-                }
-                if (opc == 0x0FU) { /* AESIMC.8 Qd, Qm */
-                    a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_aesimc(b, 0U, 1U);
-                    a64_emit_str_q_ctx(b, 0U, qd);
-                    return true;
-                }
-            }
-            /* ARMv8-A Crypto: SHA1H.32, SHA1SU1.32, SHA256SU0.32 (alternate opc1 == 0 encoding) */
-            if (((insn >> 24) & 1U) != 0U && size == 2U && (d & 1U) == 0U && (m & 1U) == 0U) {
-                unsigned qd = d >> 1;
-                unsigned qm = m >> 1;
-                unsigned opc = (insn >> 6) & 0x1FU;
-                if (opc == 0x0AU) { /* SHA1H.32 Qd, Qm */
-                    a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_sha1h(b, 0U, 1U);
-                    a64_emit_str_q_ctx(b, 0U, qd);
-                    return true;
-                }
-                if (opc == 0x0BU) { /* SHA1SU1.32 Qd, Qm */
-                    a64_emit_ldr_q_ctx(b, 0U, qd);
-                    a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_sha1su1(b, 0U, 1U);
-                    a64_emit_str_q_ctx(b, 0U, qd);
-                    return true;
-                }
-                if (opc == 0x0CU) { /* SHA256SU0.32 Qd, Qm */
-                    a64_emit_ldr_q_ctx(b, 0U, qd);
-                    a64_emit_ldr_q_ctx(b, 1U, qm);
-                    a64_emit_sha256su0(b, 0U, 1U);
+                    if (opc == 0x0EU) a64_emit_aesmc(b, 0U, 1U);
+                    else a64_emit_aesimc(b, 0U, 1U);
                     a64_emit_str_q_ctx(b, 0U, qd);
                     return true;
                 }
@@ -1426,69 +1086,35 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 if ((d & 1U) != 0U || (m & 1U) != 0U) {
                     return false;
                 }
-                unsigned qd = d >> 1;
-                unsigned qm = m >> 1;
-                a64_emit_ldr_q_ctx(b, 1U, qm);
+                a64_emit_ldr_q_ctx(b, 1U, m >> 1);
                 a64_emit_sha1h(b, 0U, 1U);
-                a64_emit_str_q_ctx(b, 0U, qd);
+                a64_emit_str_q_ctx(b, 0U, d >> 1);
                 return true;
             }
             /* Integer compare-with-zero: VCGT (0), VCGE (1), VCEQ (2), VCLE (3), VCLT (4) #0 */
             if (op5 <= 4U && size < 3U) {
                 uint32_t base = ((op5 & 1U) ? 0x2E200800U : 0x0E200800U) |
-                                (((8U + (op5 >> 1)) & 0x1FU) << 12);
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                                (((8U + (op5 >> 1)) & 0x1FU) << 12) | (size << 22);
+                neon_emit_unary(b, is_q, d, m, base, false);
                 return true;
             }
             /* VABS.S<8/16/32> (op5 == 6), VNEG.S<8/16/32> (op5 == 7) */
             if ((op5 == 6U || op5 == 7U) && size < 3U) {
-                uint32_t base = (op5 == 7U) ? 0x2E20B800U : 0x0E20B800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (size << 22) | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                uint32_t base = ((op5 == 7U) ? 0x2E20B800U : 0x0E20B800U) | (size << 22);
+                neon_emit_unary(b, is_q, d, m, base, false);
                 return true;
             }
             /* Float compare-with-zero: VCGT (8), VCGE (9), VCEQ (10), VCLE (11), VCLT (12) #0 */
             if (op5 >= 8U && op5 <= 12U && size == 2U) {
                 uint32_t base = ((op5 & 1U) ? 0x2EA00800U : 0x0EA00800U) |
                                 (((8U + (op5 >> 1)) & 0x1FU) << 12);
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, base, false);
                 return true;
             }
             /* VABS.F32 (op5 == 14), VNEG.F32 (op5 == 15) */
             if ((op5 == 14U || op5 == 15U) && size == 2U) {
                 uint32_t base = (op5 == 15U) ? 0x2EA0F800U : 0x0EA0F800U;
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit(b, base | 0x40000000U | (1U << 5) | 0U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit(b, base | (1U << 5) | 0U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                }
+                neon_emit_unary(b, is_q, d, m, base, false);
                 return true;
             }
         }
@@ -1514,41 +1140,24 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
             /* VSWP (op5 == 0, size == 0) */
             if (op5 == 0U && size == 0U) {
-                if (is_q) {
-                    a64_emit_ldr_q_ctx(b, 0U, d >> 1);
-                    a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                    a64_emit_str_q_ctx(b, 1U, d >> 1);
-                    a64_emit_str_q_ctx(b, 0U, m >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 0U, d);
-                    a64_emit_ldr_d_ctx(b, 1U, m);
-                    a64_emit_str_d_ctx(b, 1U, d);
-                    a64_emit_str_d_ctx(b, 0U, m);
-                }
+                neon_ldr_ctx(b, is_q, 0U, d);
+                neon_ldr_ctx(b, is_q, 1U, m);
+                neon_str_ctx(b, is_q, 1U, d);
+                neon_str_ctx(b, is_q, 0U, m);
                 return true;
             }
 
             /* VTRN (op5 == 1), VUZP (op5 == 2), VZIP (op5 == 3) */
             if (op5 >= 1U && op5 <= 3U && size < 3U) {
-                uint32_t op1_base = (op5 == 1U) ? 0x0E002800U : (op5 == 2U) ? 0x0E001800U : 0x0E003800U;
-                uint32_t op2_base = (op5 == 1U) ? 0x0E006800U : (op5 == 2U) ? 0x0E005800U : 0x0E007800U;
-                if (is_q) {
-                    op1_base |= 0x40000000U;
-                    op2_base |= 0x40000000U;
-                    a64_emit_ldr_q_ctx(b, 1U, d >> 1);
-                    a64_emit_ldr_q_ctx(b, 2U, m >> 1);
-                    a64_emit(b, op1_base | (size << 22) | (2U << 16) | (1U << 5) | 0U);
-                    a64_emit(b, op2_base | (size << 22) | (2U << 16) | (1U << 5) | 3U);
-                    a64_emit_str_q_ctx(b, 0U, d >> 1);
-                    a64_emit_str_q_ctx(b, 3U, m >> 1);
-                } else {
-                    a64_emit_ldr_d_ctx(b, 1U, d);
-                    a64_emit_ldr_d_ctx(b, 2U, m);
-                    a64_emit(b, op1_base | (size << 22) | (2U << 16) | (1U << 5) | 0U);
-                    a64_emit(b, op2_base | (size << 22) | (2U << 16) | (1U << 5) | 3U);
-                    a64_emit_str_d_ctx(b, 0U, d);
-                    a64_emit_str_d_ctx(b, 3U, m);
-                }
+                uint32_t q_bit = is_q ? 0x40000000U : 0U;
+                uint32_t op1_base = ((op5 == 1U) ? 0x0E002800U : (op5 == 2U) ? 0x0E001800U : 0x0E003800U) | q_bit;
+                uint32_t op2_base = ((op5 == 1U) ? 0x0E006800U : (op5 == 2U) ? 0x0E005800U : 0x0E007800U) | q_bit;
+                neon_ldr_ctx(b, is_q, 1U, d);
+                neon_ldr_ctx(b, is_q, 2U, m);
+                a64_emit(b, op1_base | (size << 22) | (2U << 16) | (1U << 5) | 0U);
+                a64_emit(b, op2_base | (size << 22) | (2U << 16) | (1U << 5) | 3U);
+                neon_str_ctx(b, is_q, 0U, d);
+                neon_str_ctx(b, is_q, 3U, m);
                 return true;
             }
 
@@ -1596,15 +1205,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                           : (op5 == 13U) ? 0x2E21D800U
                           : (op5 == 14U) ? 0x0EA1B800U
                                          : 0x2EA1B800U;
-            if (is_q) {
-                a64_emit_ldr_q_ctx(b, 1U, m >> 1);
-                a64_emit(b, base | 0x40000000U | (1U << 5) | 0U);
-                a64_emit_str_q_ctx(b, 0U, d >> 1);
-            } else {
-                a64_emit_ldr_d_ctx(b, 1U, m);
-                a64_emit(b, base | (1U << 5) | 0U);
-                a64_emit_str_d_ctx(b, 0U, d);
-            }
+            neon_emit_unary(b, is_q, d, m, base, false);
             return true;
         }
     }
@@ -1616,23 +1217,15 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         if (!is_q && (imm4 & 8U) != 0U) {
             return false;
         }
-        if (is_q) {
-            unsigned qd = ((((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU)) >> 1;
-            unsigned qn = ((((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU)) >> 1;
-            unsigned qm = ((((insn >> 5) & 1U) << 4) | (insn & 0xFU)) >> 1;
-            a64_emit_ldr_q_ctx(b, 1U, qn);
-            a64_emit_ldr_q_ctx(b, 2U, qm);
-            a64_emit(b, 0x6E000000U | (2U << 16) | ((imm4 & 15U) << 11) | (1U << 5) | 0U);
-            a64_emit_str_q_ctx(b, 0U, qd);
-        } else {
-            unsigned dd = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
-            unsigned dn = (((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU);
-            unsigned dm = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
-            a64_emit_ldr_d_ctx(b, 1U, dn);
-            a64_emit_ldr_d_ctx(b, 2U, dm);
-            a64_emit(b, 0x2E000000U | (2U << 16) | ((imm4 & 7U) << 11) | (1U << 5) | 0U);
-            a64_emit_str_d_ctx(b, 0U, dd);
-        }
+        unsigned d = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+        unsigned n = (((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU);
+        unsigned m = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
+        neon_ldr_ctx(b, is_q, 1U, n);
+        neon_ldr_ctx(b, is_q, 2U, m);
+        uint32_t ext_op = is_q ? (0x6E000000U | ((imm4 & 15U) << 11))
+                               : (0x2E000000U | ((imm4 & 7U) << 11));
+        a64_emit(b, ext_op | (2U << 16) | (1U << 5) | 0U);
+        neon_str_ctx(b, is_q, 0U, d);
         return true;
     }
 
@@ -1671,30 +1264,17 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
         if ((sh_op == 0xEU || sh_op == 0xFU) && l_sh == 0U && imm6 >= 32U) {
             /* Vector fixed-point VCVT.F32.<S32/U32> (0xE) and VCVT.<S32/U32>.F32 (0xF) */
-            uint32_t opc = (sh_op == 0xFU) ? 0xFC00U : 0xE400U;
-            if (is_q) {
-                unsigned qd = ((((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU)) >> 1;
-                unsigned qm = ((((insn >> 5) & 1U) << 4) | (insn & 0xFU)) >> 1;
-                a64_emit_ldr_q_ctx(b, 1U, qm);
-                uint32_t base = (is_u ? 0x6F000000U : 0x4F000000U) | opc;
-                a64_emit(b, base | (imm6 << 16) | (1U << 5) | 0U);
-                a64_emit_str_q_ctx(b, 0U, qd);
-            } else {
-                unsigned dd = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
-                unsigned dm = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
-                a64_emit_ldr_d_ctx(b, 1U, dm);
-                uint32_t base = (is_u ? 0x2F000000U : 0x0F000000U) | opc;
-                a64_emit(b, base | (imm6 << 16) | (1U << 5) | 0U);
-                a64_emit_str_d_ctx(b, 0U, dd);
-            }
+            unsigned d = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+            unsigned m = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
+            uint32_t base = (is_u ? 0x2F000000U : 0x0F000000U) |
+                            ((sh_op == 0xFU) ? 0xFC00U : 0xE400U) |
+                            (imm6 << 16);
+            neon_emit_unary(b, is_q, d, m, base, false);
             return true;
         }
 
         if ((sh_op <= 0x7U) && (l_sh != 0U || imm6 >= 8U)) {
-            if (sh_op == 0x4U && !is_u) {
-                return false;
-            }
-            if (sh_op == 0x6U && !is_u) {
+            if ((sh_op == 0x4U || sh_op == 0x6U) && !is_u) {
                 return false;
             }
             uint32_t opc = (sh_op == 0x0U) ? 0x0400U   /* VSHR: SSHR / USHR */
@@ -1707,29 +1287,17 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                                            : 0x7400U;  /* VQSHL: SQSHL / UQSHL */
             bool needs_dst = (sh_op == 0x1U || sh_op == 0x3U || sh_op == 0x4U ||
                               (sh_op == 0x5U && is_u));
-            if (is_q) {
-                unsigned qd = ((((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU)) >> 1;
-                unsigned qm = ((((insn >> 5) & 1U) << 4) | (insn & 0xFU)) >> 1;
-                if (needs_dst) {
-                    a64_emit_ldr_q_ctx(b, 0U, qd);
-                }
-                a64_emit_ldr_q_ctx(b, 1U, qm);
-                uint32_t base = (is_u ? 0x6F000000U : 0x4F000000U) | opc;
-                a64_emit(b, base | (imm7 << 16) | (1U << 5) | 0U);
-                a64_emit_str_q_ctx(b, 0U, qd);
-            } else {
-                unsigned dd = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
-                unsigned dm = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
-                if (needs_dst) {
-                    a64_emit_ldr_d_ctx(b, 0U, dd);
-                }
-                a64_emit_ldr_d_ctx(b, 1U, dm);
-                uint32_t base = (l_sh != 0U)
-                                    ? ((is_u ? 0x7F000000U : 0x5F000000U) | opc)
-                                    : ((is_u ? 0x2F000000U : 0x0F000000U) | opc);
-                a64_emit(b, base | (imm7 << 16) | (1U << 5) | 0U);
-                a64_emit_str_d_ctx(b, 0U, dd);
+            unsigned d = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+            unsigned m = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
+            if (needs_dst) {
+                neon_ldr_ctx(b, is_q, 0U, d);
             }
+            neon_ldr_ctx(b, is_q, 1U, m);
+            uint32_t base = is_q ? ((is_u ? 0x6F000000U : 0x4F000000U) | opc)
+                          : (l_sh != 0U) ? ((is_u ? 0x7F000000U : 0x5F000000U) | opc)
+                                         : ((is_u ? 0x2F000000U : 0x0F000000U) | opc);
+            a64_emit(b, base | (imm7 << 16) | (1U << 5) | 0U);
+            neon_str_ctx(b, is_q, 0U, d);
             return true;
         }
     }

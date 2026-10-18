@@ -34,9 +34,12 @@
 #define A32_EXIT_BKPT      6U /* Breakpoint / GDB trap */
 
 /* Maximum number of tracked guest VMA regions */
-#define A32_MAX_REGIONS 512U
-#define A32_RAS_SIZE    64U
-#define A32_IBTC_SIZE   1024U
+#define A32_MAX_REGIONS    512U
+#define A32_RAS_SIZE       64U
+#define A32_IBTC_SIZE      1024U
+#define A32_PAGE_SIZE      4096U
+#define A32_LOW_GUARD_SIZE 0x00010000U
+#define A32_KUSER_BASE_32  0xFFFF0000U
 
 typedef struct a32_region {
     uint32_t start;
@@ -60,8 +63,7 @@ typedef struct a32_pc_map_stage {
     uint32_t host_word_idx;
     uint32_t guest_pc;
     uint32_t itstate;
-} a32_pc_map_stage;
-typedef a32_pc_map_stage a32_pc_map_stage_t;
+} a32_pc_map_stage_t;
 
 /*
  * Architectural + runtime state for a 32-bit ARM guest thread.
@@ -102,7 +104,7 @@ typedef struct a32_ctx {
     /* Guest memory layout & allocator inside [G, G + 4GiB) */
     uint32_t brk_base;
     uint32_t brk_curr;
-    uint32_t mmap_cursor;       /* Top-down or bottom-up cursor for guest mmap2 */
+    uint32_t mmap_cursor;       /* Bottom-up allocation cursor for guest mmap2 */
     uint32_t interp_base;
     uint32_t elf_base;
     uint32_t elf_entry;
@@ -113,11 +115,11 @@ typedef struct a32_ctx {
     a32h_info_t host_info;
     bool        has_host_info;
 
-    /* Tracked guest regions for /proc/self/maps and gap finding */
+    /* Tracked guest regions (sorted by start) for /proc/self/maps and gap finding */
     a32_region_t regions[A32_MAX_REGIONS];
     size_t       region_count;
 
-    /* Thread, futex, and signal state (M3) */
+    /* Thread, futex, and signal state */
     uint32_t          clear_child_tid;
     uint32_t          robust_list_head;
     uint32_t          robust_list_len;
@@ -127,14 +129,14 @@ typedef struct a32_ctx {
     int               host_tid;
     bool              is_thread_clone;
 
-    /* Guest startup metadata for /proc/self/{cmdline,auxv,exe} (M1) */
+    /* Guest startup metadata for /proc/self/{cmdline,auxv,exe} */
     int      guest_argc;
     char   **guest_argv;
     char   **host_envp;
     uint32_t auxv_data[64];
     size_t   auxv_bytes;
 
-    /* Configuration, AOT, GDB & instrumentation (M0..M5) */
+    /* Configuration, AOT, GDB & instrumentation */
     const char *sysroot;
     const char *exec_path;
     const char *cache_dir;
@@ -180,6 +182,50 @@ static inline void *a32_guest_ptr(const a32_ctx_t *ctx, uint32_t guest_va)
     return (void *)(uintptr_t)(ctx->guest_base + (uint64_t)guest_va);
 }
 
+static inline uint32_t a32_page_down(uint32_t x)
+{
+    return x & ~(A32_PAGE_SIZE - 1U);
+}
+
+static inline uint32_t a32_page_up(uint32_t x)
+{
+    return (x + (A32_PAGE_SIZE - 1U)) & ~(A32_PAGE_SIZE - 1U);
+}
+
+static inline void a32_set_pc_interwork(a32_ctx_t *ctx, uint32_t target)
+{
+    if ((target & 1U) != 0U) {
+        ctx->cpsr |= A32_CPSR_T;
+        ctx->regs[15] = target & ~1U;
+    } else {
+        ctx->cpsr &= ~A32_CPSR_T;
+        ctx->regs[15] = target & ~3U;
+    }
+}
+
+static inline void a32_normalize_pc(a32_ctx_t *ctx)
+{
+    if ((ctx->regs[15] & 1U) != 0U) {
+        ctx->cpsr |= A32_CPSR_T;
+        ctx->regs[15] &= ~1U;
+    } else {
+        ctx->regs[15] &= (ctx->cpsr & A32_CPSR_T) ? ~1U : ~3U;
+    }
+}
+
+static inline int a32_host_prot(const a32_ctx_t *ctx, uint32_t guest_prot)
+{
+    uint32_t p = guest_prot & 0x7U;
+    if ((p & 0x4U) != 0U) {
+        p |= 0x1U; /* PROT_EXEC implies PROT_READ on host */
+        if (ctx != NULL && (ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
+            (p & 0x2U) != 0U) {
+            p &= ~0x4U;
+        }
+    }
+    return (int)p;
+}
+
 /* Host handshake (`src/host.c`) */
 void a32_host_probe(a32_ctx_t *ctx);
 
@@ -210,6 +256,7 @@ typedef struct a32_elf_info {
     char     interp_path[256];
 } a32_elf_info_t;
 
+int a32_open_guest_ro(const a32_ctx_t *ctx, const char *guest_path);
 int a32_elf_load(a32_ctx_t *ctx, int exec_fd, const char *path, a32_elf_info_t *out_info);
 int a32_kuser_setup(a32_ctx_t *ctx);
 int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
@@ -224,6 +271,7 @@ typedef void (*a32_block_iter_fn)(uint32_t guest_pc, uint32_t guest_end_pc,
                                   void *arg);
 
 int         a32_jit_init(a32_ctx_t *ctx);
+bool        a32_jit_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len);
 int         a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end);
 int         a32_jit_run(a32_ctx_t *ctx);
 uint32_t    a32_jit_run_block(a32_ctx_t *ctx, const void *code_ptr,
@@ -238,13 +286,13 @@ int         a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_
 void        a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg);
 int         a32_jit_flush_batch(a32_ctx_t *ctx);
 
-/* AOT pre-translator & disk cache (`src/aot.c`, M2) */
+/* AOT pre-translator & disk cache (`src/aot.c`) */
 int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char *elf_path);
 int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path);
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path);
-int a32_aot_load_fd(a32_ctx_t *ctx, int fd, const char *label, uint32_t load_bias);
+int a32_aot_load_fd(a32_ctx_t *ctx, int fd, uint32_t load_bias);
 
-/* Syscalls & signals (`src/syscalls.c`, `src/signals.c`, M0..M5) */
+/* Syscalls & signals (`src/syscalls.c`, `src/signals.c`) */
 bool       a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_prot);
 int        a32_resolve_guest_path(const a32_ctx_t *ctx, const char *guest_path,
                                   char *buf, size_t size);
@@ -265,7 +313,7 @@ int        a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
 int        a32_sys_rt_sigreturn(a32_ctx_t *ctx);
 int        a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va);
 
-/* GDB RSP stub (`src/gdb.c`, M5) */
+/* GDB RSP stub (`src/gdb.c`) */
 int  a32_gdb_init(a32_ctx_t *ctx, int port);
 bool a32_gdb_has_breakpoint(uint32_t guest_pc);
 int  a32_gdb_handle_stop(a32_ctx_t *ctx, int sig);

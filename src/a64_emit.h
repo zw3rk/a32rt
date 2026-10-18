@@ -24,8 +24,15 @@
  *   x20     : Guest window base `G` (xG)
  *   w21/x21 : Saved NZCV / scratch 3
  *   w22/x22 : Guest effective address scratch
+ *   x23     : Chaining / IBTC / RAS target entry scratch
+ *   x24     : Accumulated in-trampoline chain_hits delta
+ *   w25     : Guest PC alignment mask (~1U in Thumb, ~3U in ARM)
+ *   w26     : Guest Thumb state flag (is_thumb: 0 or 1)
+ *   x27     : Current block cache entry pointer (cur_entry)
+ *   x28     : Pointer to `g_cache_epoch` (&g_cache_epoch)
  *   x30     : Host link register (points back to `a32_jit_run_block`)
  *   v0..v7  : Scratch FP/NEON registers for VFPv4-D32 / NEON lowering
+ *   v8..v31 : Intra-block & loop-preheader VFP/NEON register cache slots (24 slots)
  */
 #define A64_TMP0 15U
 #define A64_TMP1 16U
@@ -177,6 +184,8 @@ void a64_emit_eor_reg_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, uns
 void a64_emit_shift_reg_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned shift_type);
 void a64_emit_arm_shift_reg_w(a64_buf_t *b, unsigned dst_w, unsigned src_m, unsigned src_s,
                               unsigned shift_type, bool want_carry);
+void a64_emit_shift_imm_w(a64_buf_t *b, unsigned dst_w, unsigned src_m, unsigned shift_type,
+                          unsigned imm5, bool want_carry, unsigned *out_carry_reg);
 void a64_emit_ubfm_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned immr, unsigned imms);
 void a64_emit_sbfm_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned immr, unsigned imms);
 void a64_emit_bfm_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned immr, unsigned imms);
@@ -204,12 +213,58 @@ void a64_emit_msr_nzcv(a64_buf_t *b, unsigned rt);
 
 /*
  * Flag helpers for A32/T32 logical operations with S=1:
- *   Updates N and Z from `res_reg`, sets C = `carry_reg[0]` (if `update_c` is true,
- *   setting C to `carry_imm` when `carry_reg == A64_ZR`), and preserves V!
+ *   - a64_emit_update_nz_keep_cv: updates N and Z from `res_reg`, preserves C and V.
+ *   - a64_emit_update_nzc_keep_v_imm: updates N and Z from `res_reg`, sets C = `carry_bit`, preserves V.
+ *   - a64_emit_update_nzc_keep_v_reg: updates N and Z from `res_reg`, sets C = `carry_reg[0]`, preserves V.
  */
 void a64_emit_update_nz_keep_cv(a64_buf_t *b, unsigned res_reg);
 void a64_emit_update_nzc_keep_v_imm(a64_buf_t *b, unsigned res_reg, unsigned carry_bit);
 void a64_emit_update_nzc_keep_v_reg(a64_buf_t *b, unsigned res_reg, unsigned carry_reg);
+void a64_emit_logical_flags(a64_buf_t *b, unsigned res_reg, bool has_imm_carry,
+                            unsigned imm_carry, unsigned shift_carry_reg);
+
+/* Shared A32/T32 lowering helpers (saturation, parallel add/sub, DSP, system, LDM/STM) */
+enum {
+    A32_PADD_S  = 0,
+    A32_PADD_Q  = 1,
+    A32_PADD_SH = 2,
+    A32_PADD_U  = 4,
+    A32_PADD_UQ = 5,
+    A32_PADD_UH = 6
+};
+void a64_emit_parallel_addsub(a64_buf_t *b, unsigned kind, bool is_16, bool swap_rm,
+                              unsigned sub_mask, unsigned rd, unsigned rn, unsigned rm);
+void a64_emit_ssat(a64_buf_t *b, unsigned rd, unsigned sat_bits, unsigned src_reg,
+                   bool is_asr, unsigned shift_imm);
+void a64_emit_usat(a64_buf_t *b, unsigned rd, unsigned sat_bits, unsigned src_reg,
+                   bool is_asr, unsigned shift_imm);
+void a64_emit_sat16(a64_buf_t *b, bool is_signed, unsigned rd, unsigned sat_bits, unsigned src_reg);
+void a64_emit_qaddsub(a64_buf_t *b, unsigned rd, unsigned rm, unsigned rn, bool is_sub, bool is_double);
+void a64_emit_xt_add(a64_buf_t *b, bool is_signed, bool is_16, bool is_dual8,
+                     unsigned rd, unsigned rn, unsigned rm, unsigned rot);
+void a64_emit_pkh(a64_buf_t *b, bool is_tb, unsigned rd, unsigned rn, unsigned rm, unsigned shift_imm);
+void a64_emit_sel(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm);
+void a64_emit_usad8(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned ra);
+void a64_emit_smla_xy(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned ra,
+                      bool n_top, bool m_top);
+void a64_emit_smlaw_y(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned ra, bool m_top);
+void a64_emit_smlal_xy(a64_buf_t *b, unsigned rd_lo, unsigned rd_hi, unsigned rn, unsigned rm,
+                       bool n_top, bool m_top);
+void a64_emit_smlad(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned ra,
+                    bool is_sub, bool m_swap);
+void a64_emit_smlald(a64_buf_t *b, unsigned rd_lo, unsigned rd_hi, unsigned rn, unsigned rm,
+                     bool is_sub, bool m_swap);
+void a64_emit_smmla(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned ra,
+                    bool is_sub, bool round);
+void a64_emit_umaal(a64_buf_t *b, unsigned rd_lo, unsigned rd_hi, unsigned rn, unsigned rm);
+void a64_emit_mull(a64_buf_t *b, bool is_signed, bool accumulate, bool set_flags,
+                   unsigned rd_lo, unsigned rd_hi, unsigned rn, unsigned rm);
+void a64_emit_mrs_cpsr(a64_buf_t *b, unsigned rd);
+void a64_emit_msr_cpsr_reg(a64_buf_t *b, unsigned src_reg, unsigned mask);
+bool a64_emit_cp15(a64_buf_t *b, uint32_t insn28);
+void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
+                      bool l_bit, bool p_bit, bool u_bit, bool w_bit,
+                      uint32_t pc_val, bool is_uncond, bool *out_ends_block);
 
 /* Guest memory loads/stores via [xG, wAddr, uxtw] */
 void a64_emit_guest_ldr_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
@@ -229,7 +284,7 @@ void a64_emit_strh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte
 void a64_emit_ldr_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 
-/* VFPv4-D32 / NEON context & guest memory loads/stores (M4) */
+/* VFPv4-D32 / NEON context & guest memory loads/stores */
 void a64_emit_ldr_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx);
 void a64_emit_str_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx);
 void a64_emit_ldr_d_ctx(a64_buf_t *b, unsigned vt, unsigned d_idx);
@@ -241,7 +296,7 @@ void a64_emit_guest_str_s(a64_buf_t *b, unsigned vt, unsigned addr_w);
 void a64_emit_guest_ldr_d(a64_buf_t *b, unsigned vt, unsigned addr_w);
 void a64_emit_guest_str_d(a64_buf_t *b, unsigned vt, unsigned addr_w);
 
-/* Scalar FP instructions (M4) */
+/* Scalar FP instructions */
 void a64_emit_fmov_w_to_s(a64_buf_t *b, unsigned vd, unsigned rn_w);
 void a64_emit_fmov_s_to_w(a64_buf_t *b, unsigned rd_w, unsigned vn);
 void a64_emit_fmov_s(a64_buf_t *b, unsigned vd, unsigned vn);

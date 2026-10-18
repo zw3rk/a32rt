@@ -27,6 +27,35 @@ static bool ends_with(const char *str, const char *suffix)
     return strcmp(str + (slen - xlen), suffix) == 0;
 }
 
+static bool parse_port(const char *s, int *out_port)
+{
+    if (s == NULL || s[0] == '\0') {
+        return false;
+    }
+    char *endp = NULL;
+    long port = strtol(s, &endp, 10);
+    if (endp == NULL || endp == s || *endp != '\0' || port <= 0 || port > 65535) {
+        return false;
+    }
+    *out_port = (int)port;
+    return true;
+}
+
+static const char *strip_sysroot_prefix(const char *path, const char *prefix)
+{
+    if (prefix == NULL || prefix[0] == '\0') {
+        return NULL;
+    }
+    size_t len = strlen(prefix);
+    while (len > 1U && prefix[len - 1U] == '/') {
+        len--;
+    }
+    if (len > 1U && strncmp(path, prefix, len) == 0 && path[len] == '/') {
+        return path + len;
+    }
+    return NULL;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -68,13 +97,7 @@ int main(int argc, char **argv, char **envp)
     if (!env_gdb || env_gdb[0] == '\0') {
         env_gdb = getenv("A32RT_GDB_PORT");
     }
-    if (env_gdb && env_gdb[0] != '\0') {
-        char *endp = NULL;
-        long port = strtol(env_gdb, &endp, 10);
-        if (endp && endp != env_gdb && *endp == '\0' && port > 0 && port <= 65535) {
-            ctx.gdb_port = (int)port;
-        }
-    }
+    (void)parse_port(env_gdb, &ctx.gdb_port);
     const char *env_aot = getenv("A32RT_AOT");
     if (env_aot && strcmp(env_aot, "1") == 0) {
         ctx.aot_mode = true;
@@ -126,17 +149,10 @@ int main(int argc, char **argv, char **envp)
             ctx.cache_dir = argv[i + 1];
             i += 2;
         } else if (strcmp(argv[i], "--gdb") == 0) {
-            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+            if (i + 1 >= argc || !parse_port(argv[i + 1], &ctx.gdb_port)) {
                 usage(argv[0]);
                 return 1;
             }
-            char *endp = NULL;
-            long port = strtol(argv[i + 1], &endp, 10);
-            if (!endp || endp == argv[i + 1] || *endp != '\0' || port <= 0 || port > 65535) {
-                usage(argv[0]);
-                return 1;
-            }
-            ctx.gdb_port = (int)port;
             i += 2;
         } else if (strcmp(argv[i], "--aot") == 0) {
             ctx.aot_mode = true;
@@ -198,22 +214,12 @@ int main(int argc, char **argv, char **envp)
     }
 
     if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {
-        size_t sr_len = strlen(ctx.sysroot);
-        while (sr_len > 1U && ctx.sysroot[sr_len - 1U] == '/') {
-            sr_len--;
+        const char *stripped = strip_sysroot_prefix(exec_path, ctx.sysroot);
+        if (stripped == NULL && raw_sysroot != ctx.sysroot) {
+            stripped = strip_sysroot_prefix(exec_path, raw_sysroot);
         }
-        if (sr_len > 1U && strncmp(exec_path, ctx.sysroot, sr_len) == 0 &&
-            exec_path[sr_len] == '/') {
-            exec_path += sr_len;
-        } else if (raw_sysroot != NULL && raw_sysroot != ctx.sysroot) {
-            size_t raw_len = strlen(raw_sysroot);
-            while (raw_len > 1U && raw_sysroot[raw_len - 1U] == '/') {
-                raw_len--;
-            }
-            if (raw_len > 1U && strncmp(exec_path, raw_sysroot, raw_len) == 0 &&
-                exec_path[raw_len] == '/') {
-                exec_path += raw_len;
-            }
+        if (stripped != NULL) {
+            exec_path = stripped;
         }
         while (exec_path[0] == '/' && exec_path[1] == '/') {
             exec_path++;
@@ -222,51 +228,42 @@ int main(int argc, char **argv, char **envp)
 
     ctx.exec_path = exec_path;
 
-    /* 1. Probe /dev/a32host capability handshake */
     a32_host_probe(&ctx);
 
-    /* 2. Reserve [G, G + 4 GiB) guest window */
     if (a32_vm_init(&ctx, requested_window) != 0) {
         return 1;
     }
 
-    /* 3. Check AT_EXECFD from host auxiliary vector */
     int exec_fd = -1;
     unsigned long aux_execfd = getauxval(AT_EXECFD);
     if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
         exec_fd = (int)aux_execfd;
     }
 
-    /* 4. Load 32-bit ARM ELF (and PT_INTERP if present) into guest window */
     a32_elf_info_t elf_info;
     if (a32_elf_load(&ctx, exec_fd, exec_path, &elf_info) != 0) {
         return 1;
     }
 
-    /* 5. Set up architectural kuser helper page at G + 0xffff0000 */
     if (a32_kuser_setup(&ctx) != 0) {
         return 1;
     }
 
-    /* 6. Build 32-bit initial stack, argv, envp, and auxv */
     uint32_t initial_sp = 0U;
     if (a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, envp, &initial_sp) != 0) {
         return 1;
     }
 
-    /* 7. Initialize signals & JIT code cache */
     a32_signals_set_thread_ctx(&ctx);
     if (a32_signals_init(&ctx) != 0 || a32_jit_init(&ctx) != 0) {
         return 1;
     }
 
-    /* 8. Handle AOT generation or load cached code */
     if (ctx.aot_mode) {
         return a32_aot_generate(&ctx, &elf_info, exec_path);
     }
     a32_aot_load_cache(&ctx, exec_path);
 
-    /* 9. Initialize GDB stub if requested */
     if (ctx.gdb_port > 0) {
         if (a32_gdb_init(&ctx, ctx.gdb_port) != 0) {
             ctx.gdb_enabled = false;
@@ -275,15 +272,8 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
-    /* 10. Set initial architectural register state (SP = r13, PC = r15, CPSR.T from entry bit 0) */
     ctx.regs[13] = initial_sp;
-    if (ctx.elf_entry & 1U) {
-        ctx.cpsr |= A32_CPSR_T;
-        ctx.regs[15] = ctx.elf_entry & ~1U;
-    } else {
-        ctx.cpsr &= ~A32_CPSR_T;
-        ctx.regs[15] = ctx.elf_entry & ~3U;
-    }
+    a32_set_pc_interwork(&ctx, ctx.elf_entry);
 
     return a32_jit_run(&ctx);
 }

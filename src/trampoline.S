@@ -34,11 +34,8 @@ a32_jit_run_block:
     /* Extract is_thumb (w26) and align_mask (w25), and restore hardware NZCV */
     ldr     w16, [x19, #64]
     ubfx    w26, w16, #5, #1        /* w26 = is_thumb (0 or 1) */
-    sub     w25, wzr, w26           /* w25 = is_thumb ? 0xffffffff : 0 */
-    mov     w15, #2
-    bic     w15, w15, w25           /* w15 = is_thumb ? 0 : 2 */
-    orr     w15, w15, #1            /* w15 = is_thumb ? 1 : 3 */
-    mvn     w25, w15                /* w25 = is_thumb ? ~1u : ~3u */
+    mov     w25, #-4
+    orr     w25, w25, w26, lsl #1   /* w25 = is_thumb ? ~1u : ~3u */
 
     and     w16, w16, #0xf0000000
     msr     nzcv, x16
@@ -74,7 +71,7 @@ a32_jit_run_block:
     /* Execute translated block; block returns via `ret` (to x30) */
     blr     x17
 
-    /* Fast in-trampoline direct chain dispatch (preserves w0..w14, NZCV, FPCR/FPSR) */
+    /* Fast in-trampoline dispatch: direct chain, IBTC, and RAS pop */
     cbz     x27, .Lslow_exit
     eor     w17, w16, #1            /* A32_EXIT_BRANCH == 1 */
     cbz     w17, .Lmode_ok
@@ -207,13 +204,15 @@ a32_jit_run_block:
     str     w0,  [x19, #64]
 
     /* Merge cumulative FPSR bits into ctx->fpscr and reset host FPCR if needed */
+    ldr     w14, [x19, #352]
     mrs     x17, fpsr
+    cbz     w17, 2f
     movz    w15, #0x009f
     movk    w15, #0x0800, lsl #16
     and     w17, w17, w15
-    ldr     w14, [x19, #352]
     orr     w14, w14, w17
     str     w14, [x19, #352]
+2:
     and     w17, w14, #0x07c00000
     cbz     w17, 3f
     msr     fpcr, xzr

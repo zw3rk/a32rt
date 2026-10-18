@@ -1,5 +1,5 @@
 /*
- * src/gdb.c — GDB Remote Serial Protocol (RSP) stub (M5)
+ * src/gdb.c — GDB Remote Serial Protocol (RSP) stub
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
@@ -109,43 +109,48 @@ static inline uint8_t hex_val(char c)
     return 0U;
 }
 
-static void encode_u32_le(char *out, uint32_t val)
+static void hex_encode_bytes(char *out, const void *src_ptr, size_t len)
 {
     static const char hex[] = "0123456789abcdef";
-    for (unsigned i = 0U; i < 4U; i++) {
-        uint8_t b = (uint8_t)(val >> (i * 8U));
-        out[i * 2U]      = hex[(b >> 4U) & 0xFU];
-        out[i * 2U + 1U] = hex[b & 0xFU];
+    const uint8_t *src = (const uint8_t *)src_ptr;
+    for (size_t i = 0U; i < len; i++) {
+        out[i * 2U]      = hex[(src[i] >> 4U) & 0xFU];
+        out[i * 2U + 1U] = hex[src[i] & 0xFU];
     }
+}
+
+static void hex_decode_bytes(void *dst_ptr, const char *in, size_t len)
+{
+    uint8_t *dst = (uint8_t *)dst_ptr;
+    for (size_t i = 0U; i < len; i++) {
+        if (in[i * 2U] == '\0' || in[i * 2U + 1U] == '\0') {
+            break;
+        }
+        dst[i] = (uint8_t)((hex_val(in[i * 2U]) << 4U) | hex_val(in[i * 2U + 1U]));
+    }
+}
+
+static void encode_u32_le(char *out, uint32_t val)
+{
+    hex_encode_bytes(out, &val, sizeof(val));
 }
 
 static uint32_t decode_u32_le(const char *in)
 {
     uint32_t val = 0U;
-    for (unsigned i = 0U; i < 4U; i++) {
-        uint8_t b = (uint8_t)((hex_val(in[i * 2U]) << 4U) | hex_val(in[i * 2U + 1U]));
-        val |= ((uint32_t)b) << (i * 8U);
-    }
+    hex_decode_bytes(&val, in, sizeof(val));
     return val;
 }
 
 static void encode_u64_le(char *out, uint64_t val)
 {
-    static const char hex[] = "0123456789abcdef";
-    for (unsigned i = 0U; i < 8U; i++) {
-        uint8_t b = (uint8_t)(val >> (i * 8U));
-        out[i * 2U]      = hex[(b >> 4U) & 0xFU];
-        out[i * 2U + 1U] = hex[b & 0xFU];
-    }
+    hex_encode_bytes(out, &val, sizeof(val));
 }
 
 static uint64_t decode_u64_le(const char *in)
 {
     uint64_t val = 0ULL;
-    for (unsigned i = 0U; i < 8U; i++) {
-        uint8_t b = (uint8_t)((hex_val(in[i * 2U]) << 4U) | hex_val(in[i * 2U + 1U]));
-        val |= ((uint64_t)b) << (i * 8U);
-    }
+    hex_decode_bytes(&val, in, sizeof(val));
     return val;
 }
 
@@ -243,14 +248,7 @@ static bool g_initial_stop = true;
 int a32_gdb_init(a32_ctx_t *ctx, int port)
 {
     if (port <= 0) {
-        const char *env_port = getenv("A32RT_GDB_PORT");
-        if (env_port != NULL && env_port[0] != '\0') {
-            char *endp = NULL;
-            port = (int)strtol(env_port, &endp, 10);
-        }
-        if (port <= 0) {
-            port = 1234;
-        }
+        port = 1234;
     }
 
     ctx->gdb_enabled = false;
@@ -324,7 +322,7 @@ bool a32_gdb_has_breakpoint(uint32_t guest_pc)
 
 static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
 {
-    if (!ctx || addr < 0x1000U) {
+    if (!ctx || addr < A32_LOW_GUARD_SIZE) {
         return false;
     }
     a32_vm_sync_ctx((a32_ctx_t *)ctx);
@@ -333,26 +331,37 @@ static bool gdb_range_mapped(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         return false;
     }
     uint64_t cur = (uint64_t)addr;
+    size_t idx = 0U;
     while (cur < end) {
-        uint64_t next = cur;
-        if (cur >= 0xFFFF0000ULL && cur < 0xFFFF1000ULL) {
-            next = 0xFFFF1000ULL;
-        } else {
-            for (size_t i = 0U; i < ctx->region_count; i++) {
-                const a32_region_t *r = &ctx->regions[i];
-                if ((r->prot & 0x7U) != 0U && cur >= (uint64_t)r->start && cur < (uint64_t)r->end) {
-                    if ((uint64_t)r->end > next) {
-                        next = (uint64_t)r->end;
-                    }
-                }
-            }
+        if (cur >= (uint64_t)A32_KUSER_BASE_32 &&
+            cur < (uint64_t)A32_KUSER_BASE_32 + A32_PAGE_SIZE) {
+            cur = (uint64_t)A32_KUSER_BASE_32 + A32_PAGE_SIZE;
+            continue;
         }
-        if (next <= cur) {
+        while (idx < ctx->region_count && (uint64_t)ctx->regions[idx].end <= cur) {
+            idx++;
+        }
+        if (idx >= ctx->region_count) {
             return false;
         }
-        cur = next;
+        const a32_region_t *r = &ctx->regions[idx];
+        if ((r->prot & 0x7U) == 0U || (uint64_t)r->start > cur) {
+            return false;
+        }
+        cur = (uint64_t)r->end;
     }
     return true;
+}
+
+static void gdb_disconnect_client(a32_ctx_t *ctx)
+{
+    if (g_client_sock >= 0) {
+        close(g_client_sock);
+        g_client_sock = -1;
+    }
+    ctx->gdb_enabled = false;
+    ctx->single_step = false;
+    memset(g_breakpoints, 0, sizeof(g_breakpoints));
 }
 
 int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
@@ -372,11 +381,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
     for (;;) {
         int n = recv_packet(g_client_sock, cmd, sizeof(cmd));
         if (n <= 0) {
-            close(g_client_sock);
-            g_client_sock    = -1;
-            ctx->gdb_enabled = false;
-            ctx->single_step = false;
-            memset(g_breakpoints, 0, sizeof(g_breakpoints));
+            gdb_disconnect_client(ctx);
             return 0;
         }
 
@@ -390,9 +395,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
         } else if (cmd[0] == 'g') {
             /* 16 32-bit GPRs (r0..r15) + cpsr in little-endian hex */
             char resp[17U * 8U + 1U];
-            for (unsigned r = 0U; r < 16U; r++) {
-                encode_u32_le(&resp[r * 8U], ctx->regs[r]);
-            }
+            hex_encode_bytes(resp, ctx->regs, sizeof(ctx->regs));
             encode_u32_le(&resp[16U * 8U], ctx->cpsr);
             resp[17U * 8U] = '\0';
             send_packet(g_client_sock, resp);
@@ -403,20 +406,13 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                 continue;
             }
             const char *p = cmd + 1;
-            for (unsigned r = 0U; r < 16U; r++) {
-                ctx->regs[r] = decode_u32_le(p);
-                p += 8U;
-            }
+            hex_decode_bytes(ctx->regs, p, sizeof(ctx->regs));
+            p += 16U * 8U;
             if (strlen(p) >= 8U) {
                 ctx->cpsr = decode_u32_le(p);
             }
             ctx->itstate = 0U;
-            if (ctx->regs[15] & 1U) {
-                ctx->cpsr |= A32_CPSR_T;
-                ctx->regs[15] &= ~1U;
-            } else if (!(ctx->cpsr & A32_CPSR_T)) {
-                ctx->regs[15] &= ~3U;
-            }
+            a32_normalize_pc(ctx);
             send_packet(g_client_sock, "OK");
         } else if (cmd[0] == 'p') {
             /* Read single register: 0..15, 25 (0x19) = cpsr, 26..57 = d0..d31, 58 = fpscr */
@@ -457,21 +453,12 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     ctx->regs[reg] = decode_u32_le(val_str);
                     if (reg == 15U) {
                         ctx->itstate = 0U;
-                        if (ctx->regs[15] & 1U) {
-                            ctx->cpsr |= A32_CPSR_T;
-                            ctx->regs[15] &= ~1U;
-                        } else if (!(ctx->cpsr & A32_CPSR_T)) {
-                            ctx->regs[15] &= ~3U;
-                        }
+                        a32_normalize_pc(ctx);
                     }
                     send_packet(g_client_sock, "OK");
                 } else if (reg == 25U && val_len >= 8U) {
                     ctx->cpsr = decode_u32_le(val_str);
-                    if (ctx->cpsr & A32_CPSR_T) {
-                        ctx->regs[15] &= ~1U;
-                    } else {
-                        ctx->regs[15] &= ~3U;
-                    }
+                    a32_normalize_pc(ctx);
                     send_packet(g_client_sock, "OK");
                 } else if (reg >= 26U && reg < 58U && val_len >= 16U) {
                     ctx->vfp_d[reg - 26U] = decode_u64_le(val_str);
@@ -504,13 +491,8 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     send_packet(g_client_sock, "E14");
                     continue;
                 }
-                const uint8_t *src = (const uint8_t *)a32_guest_ptr(ctx, addr);
                 char resp[2049];
-                static const char hex[] = "0123456789abcdef";
-                for (size_t i = 0U; i < len; i++) {
-                    resp[i * 2U]      = hex[(src[i] >> 4U) & 0xFU];
-                    resp[i * 2U + 1U] = hex[src[i] & 0xFU];
-                }
+                hex_encode_bytes(resp, a32_guest_ptr(ctx, addr), len);
                 resp[len * 2U] = '\0';
                 send_packet(g_client_sock, resp);
             } else {
@@ -538,56 +520,41 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     continue;
                 }
                 if (!gdb_range_mapped(ctx, addr, (uint32_t)len) ||
-                    (uint64_t)addr + (uint64_t)len > 0xFFFF0000ULL) {
+                    (uint64_t)addr + (uint64_t)len > (uint64_t)A32_KUSER_BASE_32) {
                     send_packet(g_client_sock, "E14");
                     continue;
                 }
                 if (len > 0U) {
-                    uint32_t page_start = addr & ~0xFFFU;
-                    uint32_t page_end   = (uint32_t)(((uint64_t)addr + (uint64_t)len + 0xFFFULL) & ~0xFFFULL);
+                    uint32_t page_start = a32_page_down(addr);
+                    uint32_t page_end   = (uint32_t)a32_page_up((uint64_t)addr + (uint64_t)len);
                     if (mprotect(a32_guest_ptr(ctx, page_start),
                                  (size_t)(page_end - page_start),
                                  PROT_READ | PROT_WRITE) != 0) {
                         send_packet(g_client_sock, "E14");
                         continue;
                     }
-                    const char *hex_data = colon + 1;
-                    uint8_t *dst = (uint8_t *)a32_guest_ptr(ctx, addr);
-                    for (size_t i = 0U; i < len; i++) {
-                        if (hex_data[i * 2U] == '\0' || hex_data[i * 2U + 1U] == '\0') {
-                            break;
-                        }
-                        dst[i] = (uint8_t)((hex_val(hex_data[i * 2U]) << 4U) |
-                                           hex_val(hex_data[i * 2U + 1U]));
-                    }
+                    hex_decode_bytes(a32_guest_ptr(ctx, addr), colon + 1, len);
                     a32_jit_invalidate_range((a32_ctx_t *)ctx, addr, addr + (uint32_t)len);
-                    for (uint32_t pg = page_start; pg < page_end; pg += 0x1000U) {
+                    for (uint32_t pg = page_start; pg < page_end; pg += A32_PAGE_SIZE) {
                         int restore_prot = PROT_READ | PROT_WRITE;
                         for (size_t i = 0U; i < ctx->region_count; i++) {
                             const a32_region_t *r = &ctx->regions[i];
                             if (pg >= r->start && pg < r->end) {
-                                restore_prot = (int)(r->prot & 0x7U);
-                                if ((restore_prot & PROT_EXEC) != 0) {
-                                    restore_prot |= PROT_READ;
-                                }
-                                if ((ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
-                                    (restore_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
-                                    restore_prot = PROT_READ | PROT_WRITE;
-                                }
+                                restore_prot = a32_host_prot(ctx, r->prot);
                                 break;
                             }
                         }
-                        (void)mprotect(a32_guest_ptr(ctx, pg), 0x1000U, restore_prot);
+                        (void)mprotect(a32_guest_ptr(ctx, pg), A32_PAGE_SIZE, restore_prot);
                     }
                 }
                 send_packet(g_client_sock, "OK");
             } else {
                 send_packet(g_client_sock, "E01");
             }
-        } else if (cmd[0] == 'Z' && (cmd[1] == '0' || cmd[1] == '1') && cmd[2] == ',') {
-            /* Insert breakpoint: Z0,<addr>,<kind> */
+        } else if ((cmd[0] == 'Z' || cmd[0] == 'z') &&
+                   (cmd[1] == '0' || cmd[1] == '1') && cmd[2] == ',') {
+            /* Insert (Z) or remove (z) breakpoint: Z0,<addr>,<kind> */
             char *comma1 = strchr(cmd + 3, ',');
-            uint32_t addr;
             uint32_t len = 4U;
             if (comma1 != NULL) {
                 *comma1 = '\0';
@@ -596,98 +563,47 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     len = 4U;
                 }
             }
-            addr = (uint32_t)strtoul(cmd + 3, NULL, 16) & ~1U;
-
-            bool inserted = false;
-            for (size_t i = 0U; i < GDB_MAX_BREAKPOINTS; i++) {
-                if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == addr) {
-                    inserted = true;
-                    break;
+            uint32_t addr = (uint32_t)strtoul(cmd + 3, NULL, 16) & ~1U;
+            bool ok = true;
+            if (cmd[0] == 'Z') {
+                ok = a32_gdb_has_breakpoint(addr);
+                if (!ok) {
+                    for (size_t i = 0U; i < GDB_MAX_BREAKPOINTS; i++) {
+                        if (!g_breakpoints[i].active) {
+                            g_breakpoints[i].addr   = addr;
+                            g_breakpoints[i].active = true;
+                            ok = true;
+                            break;
+                        }
+                    }
                 }
-            }
-            if (!inserted) {
+            } else {
                 for (size_t i = 0U; i < GDB_MAX_BREAKPOINTS; i++) {
-                    if (!g_breakpoints[i].active) {
-                        g_breakpoints[i].addr   = addr;
-                        g_breakpoints[i].active = true;
-                        inserted = true;
+                    if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == addr) {
+                        g_breakpoints[i].active = false;
                         break;
                     }
                 }
             }
             a32_jit_invalidate_range(ctx, addr, addr + len);
-            send_packet(g_client_sock, inserted ? "OK" : "E01");
-        } else if (cmd[0] == 'z' && (cmd[1] == '0' || cmd[1] == '1') && cmd[2] == ',') {
-            /* Remove breakpoint: z0,<addr>,<kind> */
-            char *comma1 = strchr(cmd + 3, ',');
-            uint32_t addr;
-            uint32_t len = 4U;
-            if (comma1 != NULL) {
-                *comma1 = '\0';
-                len = (uint32_t)strtoul(comma1 + 1, NULL, 16);
-                if (len == 0U) {
-                    len = 4U;
-                }
-            }
-            addr = (uint32_t)strtoul(cmd + 3, NULL, 16) & ~1U;
-
-            for (size_t i = 0U; i < GDB_MAX_BREAKPOINTS; i++) {
-                if (g_breakpoints[i].active && (g_breakpoints[i].addr & ~1U) == addr) {
-                    g_breakpoints[i].active = false;
-                    break;
-                }
-            }
-            a32_jit_invalidate_range(ctx, addr, addr + len);
-            send_packet(g_client_sock, "OK");
-        } else if (cmd[0] == 's' || cmd[0] == 'S') {
-            /* Single step: s[addr] or Ssig[;addr] */
+            send_packet(g_client_sock, ok ? "OK" : "E01");
+        } else if (cmd[0] == 's' || cmd[0] == 'S' || cmd[0] == 'c' || cmd[0] == 'C') {
+            /* Step (s/S) or continue (c/C): s[addr], c[addr], Ssig[;addr], Csig[;addr] */
             const char *addr_str = NULL;
-            if (cmd[0] == 's' && cmd[1] != '\0') {
+            if ((cmd[0] == 's' || cmd[0] == 'c') && cmd[1] != '\0') {
                 addr_str = cmd + 1;
-            } else if (cmd[0] == 'S') {
+            } else if (cmd[0] == 'S' || cmd[0] == 'C') {
                 const char *semi = strchr(cmd + 1, ';');
                 if (semi != NULL && semi[1] != '\0') {
                     addr_str = semi + 1;
                 }
             }
             if (addr_str != NULL) {
-                uint32_t addr = (uint32_t)strtoul(addr_str, NULL, 16);
-                ctx->itstate = 0U;
-                if (addr & 1U) {
-                    ctx->cpsr |= A32_CPSR_T;
-                    ctx->regs[15] = addr & ~1U;
-                } else if (ctx->cpsr & A32_CPSR_T) {
-                    ctx->regs[15] = addr & ~1U;
-                } else {
-                    ctx->regs[15] = addr & ~3U;
-                }
+                ctx->regs[15] = (uint32_t)strtoul(addr_str, NULL, 16);
+                ctx->itstate  = 0U;
+                a32_normalize_pc(ctx);
             }
-            ctx->single_step = true;
-            break;
-        } else if (cmd[0] == 'c' || cmd[0] == 'C') {
-            /* Continue: c[addr] or Csig[;addr] */
-            const char *addr_str = NULL;
-            if (cmd[0] == 'c' && cmd[1] != '\0') {
-                addr_str = cmd + 1;
-            } else if (cmd[0] == 'C') {
-                const char *semi = strchr(cmd + 1, ';');
-                if (semi != NULL && semi[1] != '\0') {
-                    addr_str = semi + 1;
-                }
-            }
-            if (addr_str != NULL) {
-                uint32_t addr = (uint32_t)strtoul(addr_str, NULL, 16);
-                ctx->itstate = 0U;
-                if (addr & 1U) {
-                    ctx->cpsr |= A32_CPSR_T;
-                    ctx->regs[15] = addr & ~1U;
-                } else if (ctx->cpsr & A32_CPSR_T) {
-                    ctx->regs[15] = addr & ~1U;
-                } else {
-                    ctx->regs[15] = addr & ~3U;
-                }
-            }
-            ctx->single_step = false;
+            ctx->single_step = (cmd[0] == 's' || cmd[0] == 'S');
             break;
         } else if (strncmp(cmd, "vCont?", 6) == 0) {
             send_packet(g_client_sock, "vCont;c;C;s;S");
@@ -731,19 +647,12 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
         } else if (cmd[0] == 'D') {
             /* Detach */
             send_packet(g_client_sock, "OK");
-            close(g_client_sock);
-            g_client_sock    = -1;
-            ctx->gdb_enabled = false;
-            ctx->single_step = false;
-            memset(g_breakpoints, 0, sizeof(g_breakpoints));
+            gdb_disconnect_client(ctx);
             break;
         } else if (cmd[0] == 'k') {
             /* Kill */
             send_packet(g_client_sock, "OK");
-            if (g_client_sock >= 0) {
-                close(g_client_sock);
-                g_client_sock = -1;
-            }
+            gdb_disconnect_client(ctx);
             if (g_server_sock >= 0) {
                 close(g_server_sock);
                 g_server_sock = -1;
