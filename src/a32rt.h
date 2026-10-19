@@ -213,6 +213,12 @@ static inline uint32_t a32_make_key(uint32_t pc, bool is_thumb)
     return (pc & (is_thumb ? ~1U : ~3U)) | (is_thumb ? 1U : 0U);
 }
 
+static inline uint32_t a32_ibtc_hash(uint32_t aligned_pc, bool is_thumb)
+{
+    (void)is_thumb;
+    return (aligned_pc >> 1U) & (A32_IBTC_SIZE - 1U);
+}
+
 static inline void a32_ctx_normalize_itstate(a32_ctx_t *ctx, bool is_thumb)
 {
     if (!is_thumb || (ctx->itstate & 0x0FU) == 0U || (ctx->itstate & 0xF0U) == 0xF0U) {

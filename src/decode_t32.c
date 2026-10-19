@@ -556,14 +556,17 @@ static bool translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             return false;
         }
         unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP0);
-        a64_emit_mov_w(b, A64_TMP0, src_m);
         if (is_blx) {
+            if (rm == 14U) {
+                a64_emit_mov_w(b, A64_TMP0, src_m);
+                src_m = A64_TMP0;
+            }
             a64_emit_mov_pc32(b, 14U, (pc + 2U) | 1U);
             if (is_uncond) {
                 b->is_call = true;
             }
         }
-        a64_emit_exit_branch_reg(b, A64_TMP0, true);
+        a64_emit_exit_branch_reg(b, src_m, true);
         if (is_uncond) {
             *out_ends_block = true;
         }

@@ -1121,28 +1121,22 @@ static size_t emit_exit_sig_check(a64_buf_t *b, uint32_t bail_disp)
 
 static void emit_ras_push_inline(a64_buf_t *b)
 {
-    /* ldr x16, [x27, #80] (cur_entry->ret_key | (ret_epoch << 32)) */
-    a64_emit(b, 0xF9402B70U);
-    /* ldr x22, [x27, #96] (cur_entry->ret_entry) */
+    /* [0] ldr x22, [x27, #96] (cur_entry->ret_entry, uimm = 96/8 = 12) */
     a64_emit(b, 0xF9403376U);
-    /* cbz x22, .Lskip_push (+9 words) */
-    a64_emit(b, 0xB4000016U | (9U << 5));
-    /* ldr w21, [x19, #424] (w21 = ctx->ras_top, uimm = 424/4 = 106) */
+    /* [1] cbz x22, .Lskip_push (+7 words) */
+    a64_emit(b, 0xB4000016U | (7U << 5));
+    /* [2] ldr w21, [x19, #424] (w21 = ctx->ras_top, uimm = 424/4 = 106) */
     a64_emit(b, 0xB9400000U | (106U << 10) | (A64_XCTX << 5) | 21U);
-    /* add w22, w21, #1 */
-    a64_emit(b, 0x110006B6U);
-    /* and w22, w22, #0x3f */
-    a64_emit(b, 0x120016D6U);
-    /* str w22, [x19, #424] (ctx->ras_top = (ras_top + 1) & 63) */
-    a64_emit(b, 0xB9000000U | (106U << 10) | (A64_XCTX << 5) | 22U);
-    /* add x21, x19, x21, lsl #5 (x21 = ctx + ras_top * 32) */
+    /* [3] add w16, w21, #1 */
+    a64_emit(b, 0x110006B0U);
+    /* [4] and w16, w16, #0x3f */
+    a64_emit(b, 0x12001610U);
+    /* [5] str w16, [x19, #424] (ctx->ras_top = (ras_top + 1) & 63) */
+    a64_emit(b, 0xB9000000U | (106U << 10) | (A64_XCTX << 5) | 16U);
+    /* [6] add x21, x19, x21, lsl #5 (x21 = ctx + ras_top * 32) */
     a64_emit(b, 0x8B151675U);
-    /* str x16, [x21, #432] (ras[top].key|epoch, uimm = 432/8 = 54) */
-    a64_emit(b, 0xF9000000U | (54U << 10) | (21U << 5) | 16U);
-    /* ldp x16, x22, [x27, #88] (cur_entry->ret_code, cur_entry->ret_entry) */
-    a64_emit(b, 0xA945DB70U);
-    /* stp x16, x22, [x21, #440] (ras[top].host_code, ras[top].entry, imm7 = 440/8 = 55) */
-    a64_emit(b, 0xA9000000U | (1U << 31) | (55U << 15) | (22U << 10) | (21U << 5) | 16U);
+    /* [7] str x22, [x21, #448] (ras[top].entry = ret_entry, uimm = 448/8 = 56) */
+    a64_emit(b, 0xF9000000U | (56U << 10) | (21U << 5) | 22U);
 }
 
 static void emit_chain_jump_tail(a64_buf_t *b)
@@ -1201,7 +1195,7 @@ void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc)
     }
 
     if (s < A64_MAX_EXIT_SLOTS) {
-        uint32_t call_extra = b->is_call ? 11U : 0U;
+        uint32_t call_extra = b->is_call ? 8U : 0U;
         emit_exit_sig_check(b, 10U + call_extra);
         /* ldr x23, [x27, #(152 + s*8)] (cur_entry->slot_entry[s], uimm = 19 + s) */
         a64_emit(b, 0xF9400000U | (((19U + s) & 0xFFFU) << 10) | (27U << 5) | 23U);
@@ -1244,7 +1238,9 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
         b->is_call = true;
     }
     vfp_emit_exit_flush(b);
-    a64_emit_mov_w(b, A64_TMP0, target_reg);
+    if (target_reg != A64_TMP0) {
+        a64_emit_mov_w(b, A64_TMP0, target_reg);
+    }
 
     size_t patch_sig = emit_exit_sig_check(b, 0U);
 
@@ -1272,7 +1268,6 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
     /* orr x16, x16, x21, lsl #32 (x16 = next_key | (cur_epoch << 32)) */
     a64_emit(b, 0xAA158210U);
 
-    size_t patch_ras_stale = 0U;
     if (!b->is_call) {
         /* Inline RAS Pop */
         /* ldr w17, [x19, #424] (w17 = ctx->ras_top) */
@@ -1283,42 +1278,36 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
         a64_emit(b, 0x12001631U);
         /* add x22, x19, x17, lsl #5 */
         a64_emit(b, 0x8B111676U);
-        /* ldr x23, [x22, #432] */
-        a64_emit(b, 0xF9400000U | (54U << 10) | (22U << 5) | 23U);
-        /* eor x23, x23, x16 */
-        a64_emit(b, 0xCA1002F7U);
-        /* cbnz x23, .Ltry_ibtc */
-        size_t patch_ras_miss = b->count;
-        a64_emit(b, 0xB5000017U);
-        /* str w17, [x19, #424] */
-        a64_emit(b, 0xB9000000U | (106U << 10) | (A64_XCTX << 5) | 17U);
-        /* str xzr, [x22, #432] */
-        a64_emit(b, 0xF9000000U | (54U << 10) | (22U << 5) | 31U);
-        /* ldr x23, [x22, #448] */
+        /* ldr x23, [x22, #448] (ras[r_idx].entry, uimm = 448/8 = 56) */
         a64_emit(b, 0xF9400000U | (56U << 10) | (22U << 5) | 23U);
         /* cbz x23, .Ltry_ibtc */
         size_t patch_ras_null = b->count;
         a64_emit(b, 0xB4000017U);
-        /* ldp x21, x17, [x23, #0] */
-        a64_emit(b, 0xA9400000U | (1U << 31) | (17U << 10) | (23U << 5) | 21U);
+        /* ldp x21, x22, [x23, #0] (x21 = entry->key|epoch, x22 = entry->host_code) */
+        a64_emit(b, 0xA9400000U | (1U << 31) | (22U << 10) | (23U << 5) | 21U);
         /* eor x21, x21, x16 */
         a64_emit(b, 0xCA1002B5U);
-        /* cbnz x21, .Lbail */
-        patch_ras_stale = b->count;
+        /* cbnz x21, .Ltry_ibtc */
+        size_t patch_ras_miss = b->count;
         a64_emit(b, 0xB5000015U);
-        emit_chain_jump_tail(b);
+        /* str w17, [x19, #424] (commit pop: ctx->ras_top = r_idx) */
+        a64_emit(b, 0xB9000000U | (106U << 10) | (A64_XCTX << 5) | 17U);
+        /* mov x27, x23 (cur_entry = next_entry) */
+        a64_emit(b, 0xAA1703FBU);
+        /* add x24, x24, #1 (chain_hits_delta++) */
+        a64_emit(b, 0x91000718U);
+        /* br x22 */
+        a64_emit(b, 0xD61F02C0U);
 
-        /* Patch patch_ras_miss and patch_ras_null to here (.Ltry_ibtc) */
+        /* Patch patch_ras_null and patch_ras_miss to here (.Ltry_ibtc) */
         size_t try_ibtc_idx = b->count;
-        b->words[patch_ras_miss] |= (((uint32_t)(try_ibtc_idx - patch_ras_miss) & 0x7FFFFU) << 5);
         b->words[patch_ras_null] |= (((uint32_t)(try_ibtc_idx - patch_ras_null) & 0x7FFFFU) << 5);
+        b->words[patch_ras_miss] |= (((uint32_t)(try_ibtc_idx - patch_ras_miss) & 0x7FFFFU) << 5);
     }
 
     /* .Ltry_ibtc: */
-    /* eor w17, w26, w16, lsr #1 */
-    a64_emit(b, 0x4A500751U);
-    /* and w17, w17, #0x3ff */
-    a64_emit(b, 0x12002631U);
+    /* ubfx w17, w16, #1, #10 */
+    a64_emit(b, 0x53012A11U);
     /* add x22, x19, x17, lsl #5 */
     a64_emit(b, 0x8B111676U);
     /* ldr x23, [x22, #2496] (offsetof(a32_ctx_t, ibtc) + offsetof(a32_ibtc_entry_t, entry), uimm = 312) */
@@ -1346,9 +1335,6 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
         b->words[patch_iw] |= (((uint32_t)(bail_idx - patch_iw) & 0x7FFFFU) << 5);
     }
     b->words[patch_ep0] |= (((uint32_t)(bail_idx - patch_ep0) & 0x7FFFFU) << 5);
-    if (!b->is_call) {
-        b->words[patch_ras_stale] |= (((uint32_t)(bail_idx - patch_ras_stale) & 0x7FFFFU) << 5);
-    }
     b->words[patch_ibtc_null] |= (((uint32_t)(bail_idx - patch_ibtc_null) & 0x7FFFFU) << 5);
     b->words[patch_ibtc_miss] |= (((uint32_t)(bail_idx - patch_ibtc_miss) & 0x7FFFFU) << 5);
 
@@ -1898,12 +1884,13 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
 
     if (!u_bit) {
         a64_emit_sub_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
+        a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
     } else if (start_offset != 0U) {
         a64_emit_add_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
+        a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
     } else {
-        a64_emit_mov_w(b, A64_ADDR, rn);
+        a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, rn);
     }
-    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
 
     bool loads_pc = l_bit && ((reg_mask & (1U << 15)) != 0U);
     unsigned idx = 0U;

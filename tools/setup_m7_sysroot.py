@@ -21,8 +21,11 @@ DEBIAN_GLIBC_PKGS = [
     "libc6",
     "libc6-dev",
     "linux-libc-dev",
+    "gcc-12-base",
     "libgcc-s1",
+    "libgcc-12-dev",
     "libstdc++6",
+    "libstdc++-12-dev",
     "dash",
 ]
 
@@ -188,10 +191,12 @@ def extract_deb_pure_python(deb_path, dest_dir):
                 continue
             target_path = os.path.join(dest_dir, rel)
             if member.isdir():
+                if os.path.islink(target_path):
+                    os.unlink(target_path)
                 os.makedirs(target_path, exist_ok=True)
             elif member.isfile():
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                if os.path.lexists(target_path) and not os.path.isdir(target_path):
+                if os.path.islink(target_path) or (os.path.lexists(target_path) and not os.path.isdir(target_path)):
                     os.unlink(target_path)
                 src_f = tf.extractfile(member)
                 if src_f is not None:
@@ -200,8 +205,10 @@ def extract_deb_pure_python(deb_path, dest_dir):
                     os.chmod(target_path, member.mode & 0o777)
             elif member.issym():
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                if os.path.lexists(target_path) and not os.path.isdir(target_path):
+                if os.path.islink(target_path) or (os.path.lexists(target_path) and not os.path.isdir(target_path)):
                     os.unlink(target_path)
+                elif os.path.isdir(target_path):
+                    shutil.rmtree(target_path)
                 os.symlink(member.linkname, target_path)
             elif member.islnk():
                 hardlinks.append((member, target_path))
@@ -209,7 +216,7 @@ def extract_deb_pure_python(deb_path, dest_dir):
     for member, target_path in hardlinks:
         link_src = os.path.join(dest_dir, member.linkname.lstrip("./"))
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        if os.path.lexists(target_path) and not os.path.isdir(target_path):
+        if os.path.islink(target_path) or (os.path.lexists(target_path) and not os.path.isdir(target_path)):
             os.unlink(target_path)
         if os.path.exists(link_src):
             shutil.copy2(link_src, target_path)
@@ -219,7 +226,15 @@ def setup_glibc_sysroot(glibc_sysroot_dir, cache_dir=None):
     libc_so = os.path.join(glibc_sysroot_dir, "lib", "arm-linux-gnueabihf", "libc.so.6")
     dash_bin = os.path.join(glibc_sysroot_dir, "bin", "dash")
     ld_interp = os.path.join(glibc_sysroot_dir, "lib", "ld-linux-armhf.so.3")
-    if os.path.exists(libc_so) and os.path.exists(dash_bin) and os.path.exists(ld_interp):
+    cpp_iostream = os.path.join(glibc_sysroot_dir, "usr", "include", "c++", "12", "iostream")
+    gcc_crtbegin = os.path.join(glibc_sysroot_dir, "usr", "lib", "gcc", "arm-linux-gnueabihf", "12", "crtbeginS.o")
+    if (
+        os.path.exists(libc_so)
+        and os.path.exists(dash_bin)
+        and os.path.exists(ld_interp)
+        and os.path.exists(cpp_iostream)
+        and os.path.exists(gcc_crtbegin)
+    ):
         return
 
     if cache_dir is None:
@@ -278,19 +293,22 @@ def setup_glibc_sysroot(glibc_sysroot_dir, cache_dir=None):
     if not os.path.lexists(bin_sh):
         os.symlink("dash", bin_sh)
 
-    # Convert any absolute symlinks in usr/lib/arm-linux-gnueabihf to relative symlinks
-    # so host ld.lld resolves them inside glibc_sysroot_dir cleanly.
-    usr_lib_multi = os.path.join(glibc_sysroot_dir, "usr", "lib", "arm-linux-gnueabihf")
-    if os.path.isdir(usr_lib_multi):
-        for entry in os.listdir(usr_lib_multi):
-            full_p = os.path.join(usr_lib_multi, entry)
-            if os.path.islink(full_p):
-                target = os.readlink(full_p)
-                if target.startswith("/"):
-                    target_in_sysroot = os.path.join(glibc_sysroot_dir, target.lstrip("/"))
-                    rel_target = os.path.relpath(target_in_sysroot, usr_lib_multi)
-                    os.unlink(full_p)
-                    os.symlink(rel_target, full_p)
+    # Convert any absolute symlinks in usr/lib/arm-linux-gnueabihf and usr/lib/gcc/arm-linux-gnueabihf/12
+    # to relative symlinks so host ld.lld resolves them inside glibc_sysroot_dir cleanly.
+    for lib_subdir in [
+        os.path.join(glibc_sysroot_dir, "usr", "lib", "arm-linux-gnueabihf"),
+        os.path.join(glibc_sysroot_dir, "usr", "lib", "gcc", "arm-linux-gnueabihf", "12"),
+    ]:
+        if os.path.isdir(lib_subdir):
+            for entry in os.listdir(lib_subdir):
+                full_p = os.path.join(lib_subdir, entry)
+                if os.path.islink(full_p):
+                    target = os.readlink(full_p)
+                    if target.startswith("/"):
+                        target_in_sysroot = os.path.join(glibc_sysroot_dir, target.lstrip("/"))
+                        rel_target = os.path.relpath(target_in_sysroot, lib_subdir)
+                        os.unlink(full_p)
+                        os.symlink(rel_target, full_p)
 
     os.makedirs(os.path.join(glibc_sysroot_dir, "tmp"), exist_ok=True)
     print("▸ Debian bookworm armhf glibc 2.36 sysroot ready")

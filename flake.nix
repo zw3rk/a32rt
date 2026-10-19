@@ -22,6 +22,10 @@
         localSystem = linuxSystem;
         crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
       };
+      aarch64Armv7lMuslPkgs = import nixpkgs {
+        localSystem = "aarch64-linux";
+        crossSystem = { config = "armv7l-unknown-linux-musleabihf"; };
+      };
 
       mkA32rt = crossPkgs: crossPkgs.stdenv.mkDerivation {
         pname = "a32rt";
@@ -118,6 +122,24 @@
         enableStatic = true;
       };
 
+      aarch64BusyboxArmhfStatic = aarch64Armv7lMuslPkgs.busybox.override {
+        enableStatic = true;
+      };
+
+      aarch64LinuxSmokeCheck = aarch64LinuxPkgs.runCommand "a32rt-smoke-check" {} ''
+        export HOME="$TMPDIR"
+        A32RT="${self.packages.aarch64-linux.a32rt}/bin/a32rt"
+        TESTS="${self.packages.aarch64-linux.a32rt-tests}/bin"
+        "$A32RT" "$TESTS/hello-armhf-static"
+        "$A32RT" "$TESTS/hello-thumb-static"
+        "$A32RT" "$TESTS/test-m4-armhf"
+        "$A32RT" "$TESTS/test-m4-thumb"
+        "$A32RT" "$TESTS/bench-coremark-armhf"
+        "$A32RT" "$TESTS/bench-coremark-thumb"
+        mkdir -p $out
+        echo ok > $out/result
+      '';
+
     in {
       packages.${darwinSystem} = {
         a32rt       = mkA32rt darwinA64Musl;
@@ -137,11 +159,43 @@
         default              = self.packages.${linuxSystem}.a32rt;
       };
 
+      checks.${linuxSystem} = {
+        a32rt                = self.packages.${linuxSystem}.a32rt;
+        a32rt-tests          = self.packages.${linuxSystem}.a32rt-tests;
+        busybox-armhf-static = self.packages.${linuxSystem}.busybox-armhf-static;
+      };
+
       packages.aarch64-linux = {
         a32rt                = mkA32rt aarch64LinuxPkgs.pkgsMusl;
-        a32rt-tests          = mkA32rtTests armv7lMuslPkgs;
-        busybox-armhf-static = busyboxArmhfStatic;
+        a32rt-tests          = mkA32rtTests aarch64Armv7lMuslPkgs;
+        busybox-armhf-static = aarch64BusyboxArmhfStatic;
         default              = self.packages.aarch64-linux.a32rt;
+      };
+
+      checks.aarch64-linux = {
+        a32rt                = self.packages.aarch64-linux.a32rt;
+        a32rt-tests          = self.packages.aarch64-linux.a32rt-tests;
+        busybox-armhf-static = self.packages.aarch64-linux.busybox-armhf-static;
+        smoke                = aarch64LinuxSmokeCheck;
+      };
+
+      # ── Hydra Jobs (ci.zw3rk.com) ───────────────────────────────────
+      hydraJobs = {
+        ${linuxSystem} = {
+          a32rt                = self.packages.${linuxSystem}.a32rt;
+          a32rt-tests          = self.packages.${linuxSystem}.a32rt-tests;
+          busybox-armhf-static = self.packages.${linuxSystem}.busybox-armhf-static;
+        };
+        aarch64-linux = {
+          a32rt                = self.packages.aarch64-linux.a32rt;
+          a32rt-tests          = self.packages.aarch64-linux.a32rt-tests;
+          busybox-armhf-static = self.packages.aarch64-linux.busybox-armhf-static;
+          smoke                = aarch64LinuxSmokeCheck;
+        };
+        ${darwinSystem} = {
+          a32rt       = self.packages.${darwinSystem}.a32rt;
+          a32rt-tests = self.packages.${darwinSystem}.a32rt-tests;
+        };
       };
 
       devShells.${darwinSystem}.default = darwinPkgs.mkShell {

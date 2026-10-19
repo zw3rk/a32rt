@@ -132,9 +132,9 @@ make help
 | **M3** | `make test-m3-hl`<br>`make test-m3-lima` | `clone` threads (`CLONE_VM \| CLONE_THREAD \| CLONE_SETTLS`), `LDREX`/`STREX{B,H,D}` + kuser `__kuser_cmpxchg` / `__kuser_cmpxchg64` + `futex`, 3-class signal router (`SIGSEGV` fault recovery with exact guest `PC`, `SIGUSR1` + `SA_SIGINFO` `ucontext_t` + `VFP_MAGIC` `uc_regspace` `d0`–`d31` mutation, `sigaltstack`, real `rt_sigreturn`), and self-modifying code (`SMC`) via both `cacheflush` and write-protected page faults. |
 | **M4** | `make test-m4-hl`<br>`make test-m4-lima` | VFPv4-D32 (`s0`–`s31`, `d0`–`d31`, scalar arithmetic, `VFMA`/`VFMS`, `VSQRT`, `VCVT`, `VCMP` + `VMRS APSR_nzcv`, `FPSCR` rounding modes), NEON ASIMD (`q0`–`q15`, integer/float SIMD, `VLD1`–`VLD4`/`VST1`–`VST4`, `VTBL`/`VTBX`, saturating/widening/narrowing ops, auto-vectorized loops), ARMv8-A Directed-Rounding FP (`VSEL{EQ,VS,GE,GT}`, scalar & vector `VMAXNM`/`VMINNM`, `VRINT{A,N,P,M,Z,R,X}`, `VCVT{A,N,P,M}`), and ARMv8-A `CRC32`/`CRC32C` + Crypto (`AESE`/`AESD`/`AESMC`/`AESIMC`, `VMULL.P64`, `SHA1`, `SHA256`) in both A32 and Thumb-2. |
 | **M5** | `make test-m5-hl`<br>`make test-m5-lima` | LTP-style 32-to-64 syscall & struct conformance (`stat64`/`fstat64`/`fstatat64`, `statfs64`, `sysinfo`, `rusage`, `uname` `"armv7l"`, `fcntl64`, `epoll`, `socketpair` + `sendmsg`/`recvmsg` `SCM_RIGHTS` `cmsghdr` translation, `SIOCGIF*`/`SIOCGIFCONF`/`BLKGETSIZE*` `ioctl` shims, `/proc/self/auxv` `AT_HWCAP2`, `poll`/`ppoll`/`pselect6`, `clock_gettime64`, `prlimit64`, negative `EFAULT` checks) + GDB RSP stub (`?`, `g`/`G`, `m`/`M`, `s`, `c`, `Z0`/`z0`). |
-| **M6** | `make test-m6-hl`<br>`make test-m6-lima` | Direct In-Cache 8-Slot Chaining (`slot_key[0..7]` / `slot_entry[0..7]`, inline `br x17`), Base-Address-Independent Relocatable `.so` AOT Cache (`A32_AOT_VERSION 7`, `a64_emit_mov_pc32`), 128-Bit NEON `q0`–`q15` (`A64_VFP_KIND_Q`) Intra-Block Register Caching & Cross-Width (`Q` ↔ `D` ↔ `S`) Aliasing, and Multi-Library Dynamic Linking (`apk --version` linking `libapk.so.2.14.0`, `libcrypto.so.3`, `libssl.so.3`, `libz.so.1`, `scanelf -V`, `getconf LONG_BIT`, plus relocatable `libz.so.1.3.2` `.a32cache` loading). |
+| **M6** | `make test-m6-hl`<br>`make test-m6-lima` | Direct In-Cache 8-Slot Chaining (`slot_key[0..7]` / `slot_entry[0..7]`, inline `br x17`), Base-Address-Independent Relocatable `.so` AOT Cache (`A32_AOT_VERSION 8`, `a64_emit_mov_pc32`), 128-Bit NEON `q0`–`q15` (`A64_VFP_KIND_Q`) Intra-Block Register Caching & Cross-Width (`Q` ↔ `D` ↔ `S`) Aliasing, and Multi-Library Dynamic Linking (`apk --version` linking `libapk.so.2.14.0`, `libcrypto.so.3`, `libssl.so.3`, `libz.so.1`, `scanelf -V`, `getconf LONG_BIT`, plus relocatable `libz.so.1.3.2` `.a32cache` loading). |
 | **M7** | `make test-m7-hl`<br>`make test-m7-lima` | IEEE-754 `libm` & `fenv` rounding/exception conformance, `setjmp`/`longjmp` VFP `d8`–`d15` preservation, POSIX `regcomp`/`regexec`, `pthread` mutex/condvar/TLS (`tests/test_m7_libc_math.c` in A32 & Thumb-2), and the 19-package Alpine v3.21 `armv7` ecosystem suite (`bash`, `dash`, `coreutils`, `grep`, `sed`, `gawk`, `find`, `diff`, `tree`, `jq`, `sqlite3`, `lua5.4`, `luajit` with ARM32 JIT, `openssl`, `zstd`, `xz`, `git`, `python3.12`, and self-hosted `gcc 14.2.0` + `binutils` compiling, linking, inspecting, and running an `armhf` ELF binary). |
-| **M8** | `make test-m8-hl`<br>`make test-m8-lima` | Debian 12 (`bookworm`) `armhf` `glibc 2.36` conformance (`PT_INTERP = /lib/ld-linux-armhf.so.3`, `AT_PLATFORM = "v7l"`, `dlopen`/`dlsym`, NPTL `pthread_create` + `__thread` TLS, `qsort`, `libm`, and `/bin/dash`), C++17 & ARM EHABI `.ARM.exidx` zero-cost exception unwinding across 6 stack frames restoring callee-saved GPRs (`r4`–`r9`) and VFP (`d8`–`d15`), RAII destructors, RTTI (`dynamic_cast`/`typeid`), STL (`std::vector`, `std::map`, `std::sort`, `std::accumulate`), `std::thread`/`std::future` cross-thread exception propagation, self-hosted `armhf` `g++ 14.2.0` compilation, and `--auto-aot` (`A32RT_AUTO_AOT=1`) transparent cache persistence. |
+| **M8** | `make test-m8-hl`<br>`make test-m8-lima` | Debian 12 (`bookworm`) `armhf` `glibc 2.36` conformance (`PT_INTERP = /lib/ld-linux-armhf.so.3`, `AT_PLATFORM = "v7l"`, `dlopen`/`dlsym`, NPTL `pthread_create` + `__thread` TLS, `qsort`, `libm`, and `/bin/dash`), C++17 & ARM EHABI `.ARM.exidx` zero-cost exception unwinding across 6 stack frames restoring callee-saved GPRs (`r4`–`r9`) and VFP (`d8`–`d15`) on both Alpine `musl` (`test-m8-cpp-armhf` / `test-m8-cpp-thumb`) and Debian `bookworm` `glibc 2.36` (`test-m8-cpp-glibc-armhf` / `test-m8-cpp-glibc-thumb` with `libstdc++.so.6` + `libgcc_s.so.1`), RAII destructors, RTTI (`dynamic_cast`/`typeid`), STL (`std::vector`, `std::map`, `std::sort`, `std::accumulate`), `std::thread`/`std::future` cross-thread exception propagation, self-hosted `armhf` `g++ 14.2.0` compilation, and `--auto-aot` (`A32RT_AUTO_AOT=1`) transparent cache persistence. |
 
 ---
 
@@ -168,40 +168,41 @@ All times in microseconds (`us`, lower is better):
 
 | Translator / Target | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | **vs. `qemu-arm`** |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Native `aarch64-linux`** | `aarch64` | 778 | 867 | 412 | 2,765 | 833 | **5,655** | 10.35× |
-| **Apple `RosettaLinux`** | `x86_64` | 842 | 1,806 | 621 | 3,029 | 713 | **7,011** | 8.35× |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **2,358** | **2,036** | **1,997** | **6,390** | **1,066** | **13,847** | **4.23× faster** |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **2,606** | **2,037** | **2,088** | **9,315** | **952** | **16,998** | **3.44× faster** |
-| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (Thumb-2) | 7,312 | 3,725 | 16,889 | 28,608 | 2,007 | **58,541** | 1.00× |
-| **`qemu-i386` 10.1.0 (TCG)** | `i386` (32-bit x86) | 7,966 | 13,580 | 18,827 | 29,701 | 1,410 | **71,484** | 0.82× |
-| **`qemu-x86_64` 10.1.0 (TCG)** | `x86_64` | 26,430 | 5,289 | 32,943 | 39,025 | 1,692 | **105,379** | 0.56× |
-| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (A32) | 58,379 | 28,489 | 23,694 | 147,588 | 1,568 | **259,718** | 0.23× |
+| **Native `aarch64-linux`** | `aarch64` | 764 | 1,019 | 466 | 2,076 | 638 | **4,963** | 8.66× |
+| **Apple `RosettaLinux`** | `x86_64` | 901 | 1,707 | 823 | 3,494 | 759 | **7,684** | 5.59× |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **2,180** | **1,717** | **1,608** | **4,706** | **799** | **11,010** | **3.90× faster** |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **2,295** | **1,567** | **1,380** | **4,735** | **1,647** | **11,624** | **3.88× faster** |
+| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (Thumb-2) | 5,351 | 3,065 | 12,578 | 20,642 | 1,330 | **42,966** | 1.00× |
+| **`qemu-arm` 10.1.0 (TCG)** | `armhf` (A32) | 5,672 | 5,290 | 12,743 | 19,364 | 2,080 | **45,149** | 0.95× |
+| **`qemu-x86_64` 10.1.0 (TCG)** | `x86_64` | 20,606 | 4,267 | 17,495 | 24,211 | 1,305 | **67,884** | 0.63× |
+| **`qemu-i386` 10.1.0 (TCG)** | `i386` (32-bit x86) | 10,779 | 14,099 | 17,951 | 28,566 | 1,388 | **72,783** | 0.59× |
 
 Key takeaways:
-- **`a32rt` vs. `qemu-arm` 10.1.0 (TCG)**: With Direct In-Cache 8-Slot Chaining (`br x17`), Direct PC-Relative Self-Loop Back-Edges (`b loop_body_offset`), Self-Loop VFP/NEON Preheader Promotion (`v8`–`v31`), 64-bit `LDP`/`STP` Multi-Word Pairing (`LDM`/`STM`/`PUSH`/`POP` and `LDRD`/`STRD`), and In-Cache Inline `RAS` Call/Return Chaining & `IBTC` Dispatch, `a32rt` is **3.44×–4.23× faster** than `qemu-arm` (Thumb-2) and **15.28× faster** than `qemu-arm` (A32), winning on **every single workload**.
-- **`a32rt` vs. `qemu-x86_64` / `qemu-i386`**: `a32rt` is **4.21×–7.61× faster** than `qemu-i386` and `qemu-x86_64`.
+- **`a32rt` vs. `qemu-arm` 10.1.0 (TCG)**: With Direct In-Cache 8-Slot Chaining (`br x17`), Direct PC-Relative Self-Loop Back-Edges (`b loop_body_offset`), Self-Loop VFP/NEON Preheader Promotion (`v8`–`v31`), 64-bit `LDP`/`STP` Multi-Word Pairing (`LDM`/`STM`/`PUSH`/`POP` and `LDRD`/`STRD`), and 8-word Inline `RAS` Push + 13-word Inline `RAS` Pop + 1-instruction `ubfx` `IBTC` Dispatch, `a32rt` is **3.88×–3.90× faster** than `qemu-arm` across both A32 (`11,624 µs` vs. `45,149 µs`) and Thumb-2 (`11,010 µs` vs. `42,966 µs`), winning on **every single workload** and achieving **2.22×–2.34×** of native `aarch64-linux`.
+- **A32 vs. Thumb-2 Parity**: `calls_ibtc` executes in **`4,735 µs` on A32** and **`4,706 µs` on Thumb-2** (within `0.6%`), with `14,686,789` / `14,706,855` (`99.86%`) block transitions staying completely inside `g_code_cache`.
+- **`a32rt` vs. `qemu-x86_64` / `qemu-i386`**: `a32rt` is **5.84×–6.61× faster** than `qemu-x86_64` and `qemu-i386`.
 
 ### 2. `hyper-linux` (`hl` on macOS Apple M5, Offset Mode `G = 4 GiB`)
 
 | Translator / Target (`hl`) | Guest ISA | `coremark` (`us`) | `chacha20` (`us`) | `vfp_simd` (`us`) | `calls_ibtc` (`us`) | `syscalls` (`us`) | **Total (`us`)** | Runtime `blocks_compiled` |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Native `aarch64-linux`** | `aarch64` | 710 | 836 | 382 | 2,215 | 11,589 | **15,732** | — |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **1,921** | **2,094** | **1,120** | **4,231** | **9,845** | **19,211** | **`0`** |
-| **Apple `RosettaLinux`** | `x86_64` | 768 | 1,302 | 593 | 2,861 | 13,976 | **19,500** | — (AOT) |
-| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **1,503** | **1,174** | **1,050** | **6,225** | **13,496** | **23,448** | **`0`** |
-| **`a32rt` (Cold JIT)** | **`armhf` (A32)** | 2,654 | 2,094 | 1,849 | 7,292 | 14,861 | **28,750** | `137` |
-| **`a32rt` (Cold JIT)** | **`armhf` (Thumb-2)** | 1,542 | 1,526 | 1,464 | 7,967 | 17,710 | **30,209** | `136` |
+| **`a32rt` (Cold JIT)** | **`armhf` (Thumb-2)** | **1,173** | **2,535** | **767** | **3,480** | **6,852** | **14,807** | `136` |
+| **Native `aarch64-linux`** | `aarch64` | 1,001 | 1,372 | 553 | 2,075 | 13,907 | **18,908** | — |
+| **Apple `RosettaLinux`** | `x86_64` | 1,141 | 2,426 | 747 | 3,178 | 13,611 | **21,103** | — (AOT) |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (A32)** | **1,791** | **1,284** | **1,342** | **4,724** | **12,952** | **22,093** | **`0`** |
+| **`a32rt` (Warm `.a32cache`)** | **`armhf` (Thumb-2)** | **1,595** | **1,190** | **1,393** | **4,873** | **16,818** | **25,869** | **`0`** |
+| **`a32rt` (Cold JIT)** | **`armhf` (A32)** | 2,572 | 2,123 | 1,631 | 6,409 | 19,277 | **32,012** | `137` |
 
 ---
 
 ## Completed Architecture & Optimization Features (`M0`–`M8`)
 
 All `M0`–`M8` and `M0-hl`–`M8-hl` milestones specified in [`A32RT.md`](A32RT.md) are complete and verified:
-- **Direct In-Cache 8-Slot Chaining (`br x17`), Direct Self-Loop Back-Edges (`b loop_body_offset`) & Inline `RAS` / `IBTC` Dispatch**: Static branches, `BL` / `BLX` calls, `BX LR` / `POP {..., PC}` returns, and indirect branches transition directly between compiled blocks inside `g_code_cache` (`99.86%+` in-cache chain hit rate across `14.7M` executed blocks in `bench-suite`).
+- **Direct In-Cache 8-Slot Chaining (`br x17`), Direct Self-Loop Back-Edges (`b loop_body_offset`) & 8-Word Inline `RAS` / 1-Instruction `ubfx` `IBTC` Dispatch**: Static branches, `BL` / `BLX` calls, `BX LR` / `POP {..., PC}` returns, and indirect branches transition directly between compiled blocks inside `g_code_cache` (`99.86%+` in-cache chain hit rate across `14.7M` executed blocks in `bench-suite`).
 - **64-Bit `LDP`/`STP` Multi-Word Pairing & Self-Loop Conditional Back-Edge Termination**: `LDM`/`STM`/`PUSH`/`POP` and `LDRD`/`STRD` pair consecutive 32-bit guest registers into 64-bit host `LDP`/`STP` operations after a single `[xG, wAddr, uxtw]` address calculation, and conditional backward branches targeting `start_pc` terminate basic blocks so post-loop epilogue instructions never disqualify loop VFP promotion.
 - **24-Slot (`v8`–`v31`) Lazy-Write-Back VFP/NEON Register Cache & Self-Loop Preheader Promotion**: Caches `s0`–`s31`, `d0`–`d31`, and 128-bit `q0`–`q15` in AArch64 hardware SIMD registers, keeps `VMOV`/`VCVT` in-register via `FMOV`, and hoists loop-invariant VFP/NEON loads into a loop preheader while deferring dirty write-backs to loop exits.
-- **Base-Address-Independent Relocatable `.so` AOT Cache (`A32_AOT_VERSION 7`) & `--auto-aot` (`A32RT_AUTO_AOT=1`)**: Multi-region (`PT_INTERP` + `.so`) pre-translation with self-identifying `a64_emit_mov_pc32` immediate relocation, heap-allocated discovery tables, and automatic on-exit `.a32cache` persistence.
-- **Full `musl` & `glibc` 2.36 + C++17 / ARM EHABI Ecosystem Support (`M7`–`M8`)**: Verified on both Alpine v3.21 `armv7` (`ld-musl-armhf.so.1`, 19-package ecosystem including `LuaJIT`, `Python 3.12`, `git`, `sqlite3`, `openssl`, and self-hosted `gcc`/`g++ 14.2.0`) and Debian 12 `bookworm` `armhf` (`ld-linux-armhf.so.3` `glibc 2.36`, NPTL pthreads, `dlopen`, C++17 `.ARM.exidx` zero-cost exception unwinding).
+- **Base-Address-Independent Relocatable `.so` AOT Cache (`A32_AOT_VERSION 8`) & `--auto-aot` (`A32RT_AUTO_AOT=1`)**: Multi-region (`PT_INTERP` + `.so`) pre-translation with self-identifying `a64_emit_mov_pc32` immediate relocation, heap-allocated discovery tables, and automatic on-exit `.a32cache` persistence.
+- **Full `musl` & `glibc` 2.36 + C++17 / ARM EHABI Ecosystem Support (`M7`–`M8`)**: Verified on both Alpine v3.21 `armv7` (`ld-musl-armhf.so.1`, 19-package ecosystem including `LuaJIT`, `Python 3.12`, `git`, `sqlite3`, `openssl`, and self-hosted `gcc`/`g++ 14.2.0`) and Debian 12 `bookworm` `armhf` (`ld-linux-armhf.so.3` `glibc 2.36`, NPTL pthreads, `dlopen`, and `libstdc++.so.6` + `libgcc_s.so.1` C++17 `.ARM.exidx` zero-cost exception unwinding in both A32 and Thumb-2).
 - **GDB RSP `qXfer:features:read:target.xml` & `VFP_MAGIC` (`0x56465001`) Signal Frame**: Full ARMv7 + VFPv3-D32 (`d0`–`d31`, `fpscr`) XML target description for `gdb-multiarch`/`lldb` and `rt_sigframe.uc_regspace` coprocessor state preservation.
 
 ---
@@ -215,7 +216,7 @@ a32rt/
 ├── LICENSE              # Apache-2.0
 ├── Makefile             # Self-documenting top-level build & verification driver
 ├── README.md            # Overview, usage, benchmarks & verification guide
-├── flake.nix            # Nix flake for static-PIE aarch64-linux a32rt + armhf toolchains
+├── flake.nix            # Nix flake for static-PIE aarch64-linux a32rt, armhf toolchains & hydraJobs
 ├── docs/
 │   └── HOST-CONTRACT.md # Versioned host contract & /dev/a32host ABI (A32H_ABI 1.0)
 ├── include/

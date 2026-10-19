@@ -116,8 +116,7 @@ a32_jit_run_block:
 .Ltry_ibtc:
     lsr     x21, x21, #32           /* if slot 1 missed due to stale epoch, re-chain in C */
     cbnz    x21, .Lslow_exit
-    eor     w17, w26, w30, lsr #1   /* (next_key >> 1) ^ is_thumb */
-    and     w17, w17, #0x3ff        /* ibtc_idx = ... & 1023 */
+    ubfx    w17, w30, #1, #10       /* ibtc_idx = (next_key >> 1) & 1023 */
     add     x22, x19, x17, lsl #5   /* x22 = (uint8_t *)ctx + ibtc_idx * 32 */
     ldr     x23, [x22, #2496]       /* x23 = ibtc.entry */
     cbz     x23, .Lcheck_ras_pop
@@ -139,19 +138,14 @@ a32_jit_run_block:
     sub     w17, w17, #1
     and     w17, w17, #0x3f         /* r_idx = (ras_top - 1) & 63 */
     add     x22, x19, x17, lsl #5   /* x22 = ctx + r_idx * 32 */
-    ldr     x23, [x22, #432]        /* ras[r_idx].key | (ras[r_idx].epoch << 32) */
-    eor     x23, x23, x30
-    cbnz    x23, .Lslow_exit
-    str     w17, [x19, #424]        /* ctx->ras_top = r_idx */
-    str     xzr, [x22, #432]        /* clear popped RAS slot */
-    ldp     x17, x23, [x22, #440]   /* x17 = host_code, x23 = entry */
-    cbz     x17, .Lslow_exit
+    ldr     x23, [x22, #448]        /* x23 = ras[r_idx].entry */
     cbz     x23, .Lslow_exit
     ldp     x21, x22, [x23]         /* next_entry->key|epoch, next_entry->host_code */
     eor     x21, x21, x30
-    eor     x22, x22, x17
-    orr     x21, x21, x22
     cbnz    x21, .Lslow_exit
+    cbz     x22, .Lslow_exit
+    str     w17, [x19, #424]        /* ctx->ras_top = r_idx */
+    mov     x17, x22                /* x17 = host_code */
     mov     x27, x23                /* cur_entry = next_entry */
     ldr     x21, [x19, #384]        /* blocks_executed */
     ldr     x23, [x19, #416]        /* ras_hits */
