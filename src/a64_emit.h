@@ -251,6 +251,8 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
 /* Guest memory loads/stores via [xG, wAddr, uxtw] */
 void a64_emit_guest_ldr_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
 void a64_emit_guest_str_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
+void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w);
+void a64_emit_guest_strd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w);
 void a64_emit_guest_ldrb_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
 void a64_emit_guest_ldrsb_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
 void a64_emit_guest_strb_w(a64_buf_t *b, unsigned rt, unsigned addr_w);

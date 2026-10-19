@@ -144,6 +144,8 @@ typedef struct a32_ctx {
     const char *cache_dir;
     bool        stats_enabled;
     bool        aot_mode;
+    bool        auto_aot;
+    bool        aot_loaded;
     int         gdb_port;
     uint64_t    blocks_compiled;
     uint64_t    syscalls_executed;

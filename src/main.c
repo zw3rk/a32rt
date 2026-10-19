@@ -66,7 +66,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--stats] [--trace] [--aot] [--gdb <port>] -- <PATH> <ARGV0> [ARGS...]\n"
+            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] -- <PATH> <ARGV0> [ARGS...]\n"
             "  %s <PATH> [ARGS...]\n",
             prog, prog);
 }
@@ -95,6 +95,9 @@ int main(int argc, char **argv, char **envp)
     }
     if (getenv_bool("A32RT_AOT")) {
         ctx.aot_mode = true;
+    }
+    if (getenv_bool("A32RT_AUTO_AOT")) {
+        ctx.auto_aot = true;
     }
     if (getenv_bool("A32RT_SINGLE_STEP")) {
         ctx.single_step = true;
@@ -158,6 +161,9 @@ int main(int argc, char **argv, char **envp)
             i += 2;
         } else if (strcmp(argv[i], "--aot") == 0) {
             ctx.aot_mode = true;
+            i++;
+        } else if (strcmp(argv[i], "--auto-aot") == 0) {
+            ctx.auto_aot = true;
             i++;
         } else if (strcmp(argv[i], "--stats") == 0) {
             ctx.stats_enabled = true;
@@ -250,7 +256,7 @@ int main(int argc, char **argv, char **envp)
     if (ctx.aot_mode) {
         return a32_aot_generate(&ctx, &elf_info, exec_path);
     }
-    a32_aot_load_cache(&ctx, exec_path);
+    ctx.aot_loaded = (a32_aot_load_cache(&ctx, exec_path) == 0);
 
     if (ctx.gdb_port > 0) {
         if (a32_gdb_init(&ctx, ctx.gdb_port) != 0) {
@@ -263,5 +269,9 @@ int main(int argc, char **argv, char **envp)
     ctx.regs[13] = initial_sp;
     a32_set_pc_interwork(&ctx, ctx.elf_entry);
 
-    return a32_jit_run(&ctx);
+    int rc = a32_jit_run(&ctx);
+    if (ctx.auto_aot && !ctx.aot_loaded && ctx.blocks_compiled > 0U) {
+        (void)a32_aot_save_cache(&ctx, exec_path);
+    }
+    return rc;
 }

@@ -68,6 +68,44 @@
           $CC $FLAGS -marm   -o _build/test-m4-armhf        tests/test_m4_vfp_neon.c
           $CC $FLAGS -mthumb -o _build/test-m4-thumb        tests/test_m4_vfp_neon.c
           $CC $FLAGS -marm   -o _build/test-m5-armhf        tests/test_m5_ltp_gdb.c
+          $CC $FLAGS -marm   -o _build/bench-suite-armhf    tests/bench_suite.c
+          $CC $FLAGS -mthumb -o _build/bench-suite-thumb    tests/bench_suite.c
+        '';
+
+        installPhase = ''
+          mkdir -p $out/bin
+          cp _build/* $out/bin/
+        '';
+      };
+
+      mkDarwinA32rtTests = darwinPkgs.stdenvNoCC.mkDerivation {
+        pname = "a32rt-tests";
+        version = "0.1.0";
+        src = ./.;
+        nativeBuildInputs = [ darwinPkgs.llvmPackages.clang-unwrapped darwinPkgs.lld ];
+        dontStrip = true;
+        dontFixup = true;
+
+        buildPhase = ''
+          mkdir -p _build
+          CFLAGS="--target=armv7a-unknown-linux-eabihf -march=armv7ve -mfpu=neon-vfpv4 -mfloat-abi=hard -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 -ffreestanding -fno-stack-protector -nostdlib -DA32RT_FREESTANDING_TEST"
+          build_one() {
+            clang $CFLAGS "$3" -c "tests/$2" -o "_build/$1.o"
+            ld.lld -m armelf_linux_eabi -Bstatic --no-dynamic-linker --image-base=0x00010000 -e _start "_build/$1.o" -o "_build/$1"
+            rm -f "_build/$1.o"
+          }
+          build_one hello-armhf-static   hello.c                 -marm
+          build_one hello-thumb-static   hello.c                 -mthumb
+          build_one test-m1-armhf        test_m1_isa_fs.c        -marm
+          build_one test-m1-thumb        test_m1_isa_fs.c        -mthumb
+          build_one bench-coremark-armhf bench_coremark.c        -marm
+          build_one bench-coremark-thumb bench_coremark.c        -mthumb
+          build_one test-m3-armhf        test_m3_threads_signals.c -marm
+          build_one test-m4-armhf        test_m4_vfp_neon.c      -marm
+          build_one test-m4-thumb        test_m4_vfp_neon.c      -mthumb
+          build_one test-m5-armhf        test_m5_ltp_gdb.c       -marm
+          build_one bench-suite-armhf    bench_suite.c           -marm
+          build_one bench-suite-thumb    bench_suite.c           -mthumb
         '';
 
         installPhase = ''
@@ -82,8 +120,14 @@
 
     in {
       packages.${darwinSystem} = {
-        a32rt   = mkA32rt darwinA64Musl;
-        default = self.packages.${darwinSystem}.a32rt;
+        a32rt       = mkA32rt darwinA64Musl;
+        a32rt-tests = mkDarwinA32rtTests;
+        default     = self.packages.${darwinSystem}.a32rt;
+      };
+
+      checks.${darwinSystem} = {
+        a32rt       = self.packages.${darwinSystem}.a32rt;
+        a32rt-tests = self.packages.${darwinSystem}.a32rt-tests;
       };
 
       packages.${linuxSystem} = {

@@ -825,8 +825,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                     a64_emit_mov_w(b, A64_ADDR, base_reg);
                     if (!i_bit && (l_bit || op2 == 2U) &&
                         (rm == rt || (!l_bit && op2 == 2U && rm == ((rt + 1U) & 0xFU)))) {
-                        a64_emit_mov_w(b, A64_TMP2, rm);
-                        post_off_reg = A64_TMP2;
+                        a64_emit_mov_w(b, A64_TMP0, rm);
+                        post_off_reg = A64_TMP0;
                     }
                 }
 
@@ -843,17 +843,10 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                         a64_emit_guest_strh_w(b, rt, A64_ADDR);
                     } else if (op2 == 2U) {
                         /* LDRD Rt, Rt2, [addr] */
-                        a64_emit_guest_ldr_w(b, A64_TMP1, A64_ADDR);
-                        a64_emit_add_imm_w(b, false, A64_TMP0, A64_ADDR, 4U, 0U);
-                        a64_emit_guest_ldr_w(b, (rt + 1U) & 0xFU, A64_TMP0);
-                        a64_emit_mov_w(b, rt, A64_TMP1);
+                        a64_emit_guest_ldrd_w(b, rt, (rt + 1U) & 0xFU, A64_ADDR);
                     } else {
                         /* STRD Rt, Rt2, [addr] */
-                        unsigned src0 = a32_load_reg(b, rt, pc_val, A64_TMP1);
-                        unsigned src1 = a32_load_reg(b, (rt + 1U) & 0xFU, pc_val, A64_TMP2);
-                        a64_emit_guest_str_w(b, src0, A64_ADDR);
-                        a64_emit_add_imm_w(b, false, A64_TMP0, A64_ADDR, 4U, 0U);
-                        a64_emit_guest_str_w(b, src1, A64_TMP0);
+                        a64_emit_guest_strd_w(b, rt, (rt + 1U) & 0xFU, A64_ADDR);
                     }
                 }
 
@@ -870,8 +863,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                                 a64_emit_sub_imm_w(b, false, rn, base_reg, imm8, 0U);
                             }
                         } else {
-                            unsigned off_reg = (post_off_reg == A64_TMP2)
-                                                   ? A64_TMP2
+                            unsigned off_reg = (post_off_reg == A64_TMP0)
+                                                   ? A64_TMP0
                                                    : a32_load_reg(b, post_off_reg, pc_val, A64_TMP1);
                             if (u_bit) {
                                 a64_emit_add_reg_w(b, false, rn, base_reg, off_reg, A64_SHIFT_LSL, 0U);
@@ -1059,6 +1052,16 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         num_insns++;
         if (a32_insn_uncond_ends_block(insn)) {
             break;
+        }
+        if (((insn >> 28) & 0xFU) < 14U && ((insn >> 25) & 7U) == 5U && ((insn >> 24) & 1U) == 0U) {
+            int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
+            if (imm24 & 0x00800000) {
+                imm24 |= (int32_t)0xFF000000U;
+            }
+            uint32_t target = insn_pc + 8U + (uint32_t)(imm24 << 2);
+            if (target == pc) {
+                break;
+            }
         }
     }
 

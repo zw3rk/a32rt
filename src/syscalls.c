@@ -1132,12 +1132,19 @@ static void fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struc
     dst->st_ino        = (uint64_t)src->st_ino;
 }
 
-typedef struct fork_snap_span {
+typedef struct fork_subregion {
     uint32_t start;
-    uint32_t len;
+    uint32_t end;
     uint32_t prot;
     size_t   buf_off;
-} fork_snap_span_t;
+} fork_subregion_t;
+
+typedef struct fork_cluster {
+    uint32_t start;
+    uint32_t end;
+    size_t   first_idx;
+    size_t   count;
+} fork_cluster_t;
 
 static pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
 {
@@ -1146,13 +1153,21 @@ static pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     }
 
     a32_vm_sync_ctx(ctx);
-    fork_snap_span_t *spans = (fork_snap_span_t *)calloc(ctx->region_count, sizeof(fork_snap_span_t));
-    if (!spans) {
+    if (ctx->region_count == 0U) {
         return fork();
     }
 
-    size_t span_count = 0U;
-    size_t total_bytes = 0U;
+    fork_subregion_t *r_list   = (fork_subregion_t *)calloc(ctx->region_count, sizeof(fork_subregion_t));
+    fork_cluster_t   *clusters = (fork_cluster_t *)calloc(ctx->region_count, sizeof(fork_cluster_t));
+    if (!r_list || !clusters) {
+        free(clusters);
+        free(r_list);
+        return fork();
+    }
+
+    size_t   r_count     = 0U;
+    size_t   total_bytes = 0U;
+    uint32_t sp_low      = ctx->stack_base;
     for (size_t i = 0U; i < ctx->region_count; i++) {
         const a32_region_t *r = &ctx->regions[i];
         if (r->end <= r->start || (r->prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0U) {
@@ -1166,71 +1181,103 @@ static pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
                 sp_min = child_sp;
             }
             if (sp_min >= ctx->stack_base && sp_min < ctx->stack_top) {
-                uint32_t low = (sp_min > ctx->stack_base + 65536U)
-                               ? ((sp_min - 65536U) & ~4095U)
-                               : ctx->stack_base;
-                s_start = low;
+                sp_low = (sp_min > ctx->stack_base + 65536U)
+                         ? ((sp_min - 65536U) & ~4095U)
+                         : ctx->stack_base;
+                s_start = sp_low;
             }
         }
-        uint32_t s_len = s_end - s_start;
-        spans[span_count].start   = s_start;
-        spans[span_count].len     = s_len;
-        spans[span_count].prot    = r->prot;
-        spans[span_count].buf_off = total_bytes;
-        total_bytes += (size_t)s_len;
-        span_count++;
+        r_list[r_count].start   = s_start;
+        r_list[r_count].end     = s_end;
+        r_list[r_count].prot    = r->prot;
+        r_list[r_count].buf_off = total_bytes;
+        total_bytes += (size_t)(s_end - s_start);
+        r_count++;
     }
 
-    uint8_t *snap_buf = MAP_FAILED;
-    if (total_bytes > 0U) {
-        snap_buf = (uint8_t *)mmap(NULL, total_bytes, PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (snap_buf != MAP_FAILED) {
-            for (size_t i = 0U; i < span_count; i++) {
-                void *src = a32_guest_ptr(ctx, spans[i].start);
-                int hprot = a32_host_prot(ctx, spans[i].prot);
-                if ((hprot & PROT_READ) == 0) {
-                    (void)mprotect(src, spans[i].len, hprot | PROT_READ);
-                }
-                memcpy(snap_buf + spans[i].buf_off, src, spans[i].len);
-                (void)mprotect(src, spans[i].len, PROT_NONE);
-            }
-            if (ctx->stack_top > ctx->stack_base) {
-                (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
-                               ctx->stack_top - ctx->stack_base, PROT_NONE);
-            }
+    if (r_count == 0U || total_bytes == 0U) {
+        free(clusters);
+        free(r_list);
+        return fork();
+    }
+
+    size_t c_count = 0U;
+    for (size_t i = 0U; i < r_count; i++) {
+        if (c_count > 0U && r_list[i].start == clusters[c_count - 1U].end) {
+            clusters[c_count - 1U].end = r_list[i].end;
+            clusters[c_count - 1U].count++;
+        } else {
+            clusters[c_count].start     = r_list[i].start;
+            clusters[c_count].end       = r_list[i].end;
+            clusters[c_count].first_idx = i;
+            clusters[c_count].count     = 1U;
+            c_count++;
         }
+    }
+
+    uint8_t *snap_buf = (uint8_t *)mmap(NULL, total_bytes, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (snap_buf == MAP_FAILED) {
+        free(clusters);
+        free(r_list);
+        return fork();
+    }
+
+    for (size_t i = 0U; i < r_count; i++) {
+        void    *src   = a32_guest_ptr(ctx, r_list[i].start);
+        uint32_t s_len = r_list[i].end - r_list[i].start;
+        int      hprot = a32_host_prot(ctx, r_list[i].prot);
+        if ((hprot & PROT_READ) == 0) {
+            (void)mprotect(src, s_len, hprot | PROT_READ);
+        }
+        memcpy(snap_buf + r_list[i].buf_off, src, s_len);
+    }
+
+    for (size_t c = 0U; c < c_count; c++) {
+        (void)mprotect(a32_guest_ptr(ctx, clusters[c].start),
+                       clusters[c].end - clusters[c].start,
+                       PROT_NONE);
+    }
+    if (sp_low > ctx->stack_base) {
+        (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
+                       sp_low - ctx->stack_base, PROT_NONE);
     }
 
     pid_t pid = fork();
     int saved_errno = errno;
 
-    if (snap_buf != MAP_FAILED) {
-        if (ctx->stack_top > ctx->stack_base) {
-            (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
-                           ctx->stack_top - ctx->stack_base,
+    if (sp_low > ctx->stack_base) {
+        (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
+                       sp_low - ctx->stack_base, PROT_READ | PROT_WRITE);
+    }
+    if (pid == 0) {
+        for (size_t c = 0U; c < c_count; c++) {
+            (void)mprotect(a32_guest_ptr(ctx, clusters[c].start),
+                           clusters[c].end - clusters[c].start,
                            PROT_READ | PROT_WRITE);
         }
-        if (pid == 0) {
-            for (size_t i = 0U; i < span_count; i++) {
-                void *dst = a32_guest_ptr(ctx, spans[i].start);
-                int hprot = a32_host_prot(ctx, spans[i].prot);
-                (void)mprotect(dst, spans[i].len, hprot | PROT_WRITE);
-                memcpy(dst, snap_buf + spans[i].buf_off, spans[i].len);
-                if ((hprot & PROT_WRITE) == 0) {
-                    (void)mprotect(dst, spans[i].len, hprot);
-                }
-            }
-        } else {
-            for (size_t i = 0U; i < span_count; i++) {
-                void *dst = a32_guest_ptr(ctx, spans[i].start);
-                int hprot = a32_host_prot(ctx, spans[i].prot);
-                (void)mprotect(dst, spans[i].len, hprot);
+        for (size_t i = 0U; i < r_count; i++) {
+            memcpy(a32_guest_ptr(ctx, r_list[i].start),
+                   snap_buf + r_list[i].buf_off,
+                   r_list[i].end - r_list[i].start);
+            int hprot = a32_host_prot(ctx, r_list[i].prot);
+            if (hprot != (PROT_READ | PROT_WRITE)) {
+                (void)mprotect(a32_guest_ptr(ctx, r_list[i].start),
+                               r_list[i].end - r_list[i].start,
+                               hprot);
             }
         }
-        (void)munmap(snap_buf, total_bytes);
+    } else {
+        for (size_t i = 0U; i < r_count; i++) {
+            (void)mprotect(a32_guest_ptr(ctx, r_list[i].start),
+                           r_list[i].end - r_list[i].start,
+                           a32_host_prot(ctx, r_list[i].prot));
+        }
     }
-    free(spans);
+
+    (void)munmap(snap_buf, total_bytes);
+    free(clusters);
+    free(r_list);
     errno = saved_errno;
     return pid;
 }
@@ -1787,6 +1834,10 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             a32_signals_set_thread_ctx(NULL);
             free(ctx);
             pthread_exit(NULL);
+        }
+        if (ctx->auto_aot && !ctx->aot_loaded && ctx->blocks_compiled > 0U &&
+            ctx->exec_path != NULL && ctx->exec_path[0] != '\0') {
+            (void)a32_aot_save_cache(ctx, ctx->exec_path);
         }
         print_stats_if_enabled(ctx);
         syscall(SYS_exit_group, (int)a0);
@@ -2937,16 +2988,20 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         char sysroot_env[PATH_MAX + 32];
         char cache_env[PATH_MAX + 32];
         char *hl_envp[520];
-        if (ctx->has_host_info && ((ctx->sysroot && ctx->sysroot[0]) || (ctx->cache_dir && ctx->cache_dir[0]))) {
+        if (ctx->has_host_info &&
+            ((ctx->sysroot && ctx->sysroot[0]) || (ctx->cache_dir && ctx->cache_dir[0]) || ctx->auto_aot)) {
             int epos = 0;
             bool has_sr = false;
             bool has_ca = false;
+            bool has_aa = false;
             if (target_envp != NULL) {
                 for (; target_envp[epos] != NULL && epos < 516; epos++) {
                     if (strncmp(target_envp[epos], "A32RT_SYSROOT=", 14) == 0) {
                         has_sr = true;
                     } else if (strncmp(target_envp[epos], "A32RT_CACHE=", 12) == 0) {
                         has_ca = true;
+                    } else if (strncmp(target_envp[epos], "A32RT_AUTO_AOT=", 15) == 0) {
+                        has_aa = true;
                     }
                     hl_envp[epos] = target_envp[epos];
                 }
@@ -2958,6 +3013,9 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             if (!has_ca && ctx->cache_dir && ctx->cache_dir[0]) {
                 snprintf(cache_env, sizeof(cache_env), "A32RT_CACHE=%s", ctx->cache_dir);
                 hl_envp[epos++] = cache_env;
+            }
+            if (!has_aa && ctx->auto_aot) {
+                hl_envp[epos++] = (char *)"A32RT_AUTO_AOT=1";
             }
             hl_envp[epos] = NULL;
             target_envp = hl_envp;
@@ -2973,7 +3031,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             }
 
             char win_buf[32];
-            char *re_argv[524];
+            char *re_argv[525];
             int rpos = 0;
             re_argv[rpos++] = self_exe;
             if (ctx->guest_base != 0ULL) {
@@ -2989,9 +3047,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                 re_argv[rpos++] = (char *)"--cache";
                 re_argv[rpos++] = (char *)ctx->cache_dir;
             }
+            if (ctx->auto_aot) {
+                re_argv[rpos++] = (char *)"--auto-aot";
+            }
             re_argv[rpos++] = (char *)"--";
             re_argv[rpos++] = (char *)path;
-            for (int k = 0; k < argc_count && rpos < 523; k++) {
+            for (int k = 0; k < argc_count && rpos < 524; k++) {
                 re_argv[rpos++] = new_argv[k];
             }
             re_argv[rpos] = NULL;

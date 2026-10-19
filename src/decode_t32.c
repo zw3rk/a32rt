@@ -1435,14 +1435,9 @@ static bool translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16
             a64_emit_mov_w(b, A64_ADDR, base);
         }
         if (l_bit) {
-            a64_emit_guest_ldr_w(b, A64_TMP1, A64_ADDR);
-            a64_emit_add_imm_w(b, false, A64_TMP0, A64_ADDR, 4U, 0U);
-            a64_emit_guest_ldr_w(b, rt2, A64_TMP0);
-            a64_emit_mov_w(b, rt, A64_TMP1);
+            a64_emit_guest_ldrd_w(b, rt, rt2, A64_ADDR);
         } else {
-            a64_emit_guest_str_w(b, rt, A64_ADDR);
-            a64_emit_add_imm_w(b, false, A64_TMP0, A64_ADDR, 4U, 0U);
-            a64_emit_guest_str_w(b, rt2, A64_TMP0);
+            a64_emit_guest_strd_w(b, rt, rt2, A64_ADDR);
         }
         if (rn != 15U && !(l_bit && (rn == rt || rn == rt2))) {
             if (!p_bit) {
@@ -1665,11 +1660,31 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
             scan_pc += 4U;
             if (scan_uncond && t32_insn_uncond_ends_block(hw1, hw2)) {
                 ends_uncond = true;
+            } else if (!in_it && (hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U &&
+                       ((hw1 >> 6) & 0xFU) < 14U) {
+                uint32_t s  = (hw1 >> 10) & 1U;
+                uint32_t j1 = (hw2 >> 13) & 1U;
+                uint32_t j2 = (hw2 >> 11) & 1U;
+                uint32_t imm6  = hw1 & 0x3FU;
+                uint32_t imm11 = hw2 & 0x7FFU;
+                int32_t offset = (int32_t)((s << 20) | (j2 << 19) | (j1 << 18) |
+                                           (imm6 << 12) | (imm11 << 1));
+                if (s) {
+                    offset |= (int32_t)0xFFE00000U;
+                }
+                if ((info->pc + 4U + (uint32_t)offset) == pc) {
+                    ends_uncond = true;
+                }
             }
         } else {
             scan_pc += 2U;
             if ((scan_uncond && t16_insn_uncond_ends_block(hw1)) || (hw1 & 0xFF00U) == 0xBE00U) {
                 ends_uncond = true;
+            } else if (!in_it && (hw1 >> 12) == 0xDU && ((hw1 >> 8) & 0xFU) < 14U) {
+                int32_t offset = ((int32_t)(int8_t)(hw1 & 0xFFU)) << 1;
+                if ((info->pc + 4U + (uint32_t)offset) == pc) {
+                    ends_uncond = true;
+                }
             }
         }
 

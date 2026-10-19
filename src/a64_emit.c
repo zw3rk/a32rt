@@ -612,6 +612,28 @@ void a64_emit_guest_str_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
     emit_guest_mem(b, 0xB8204800U, rt, addr_w);
 }
 
+void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w)
+{
+    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+        a64_vfp_cache_flush(b, false);
+    }
+    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, addr_w);
+    if (rt != rt2) {
+        a64_emit(b, 0x29400000U | ((rt2 & 31U) << 10) | (A64_TMP2 << 5) | (rt & 31U));
+    } else {
+        a64_emit(b, 0xB9400000U | (1U << 10) | (A64_TMP2 << 5) | (rt & 31U));
+    }
+}
+
+void a64_emit_guest_strd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w)
+{
+    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+        a64_vfp_cache_flush(b, false);
+    }
+    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, addr_w);
+    a64_emit(b, 0x29000000U | ((rt2 & 31U) << 10) | (A64_TMP2 << 5) | (rt & 31U));
+}
+
 void a64_emit_guest_ldrb_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
     emit_guest_mem(b, 0x38604800U, rt, addr_w);
@@ -1860,10 +1882,15 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
                       bool l_bit, bool p_bit, bool u_bit, bool w_bit,
                       uint32_t pc_val, bool is_uncond, bool *out_ends_block)
 {
+    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+        a64_vfp_cache_flush(b, false);
+    }
+
+    unsigned regs[16];
     unsigned count = 0U;
-    for (unsigned i = 0U; i < 16U; i++) {
-        if (reg_mask & (1U << i)) {
-            count++;
+    for (unsigned r = 0U; r < 16U; r++) {
+        if ((reg_mask & (1U << r)) != 0U) {
+            regs[count++] = r;
         }
     }
     uint32_t total_bytes = count * 4U;
@@ -1876,20 +1903,41 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
     } else {
         a64_emit_mov_w(b, A64_ADDR, rn);
     }
+    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
 
     bool loads_pc = l_bit && ((reg_mask & (1U << 15)) != 0U);
-    for (unsigned r = 0U; r < 16U; r++) {
-        if ((reg_mask & (1U << r)) == 0U) {
-            continue;
+    unsigned idx = 0U;
+    while (idx < count) {
+        uint32_t byte_off = idx * 4U;
+        if (idx + 1U < count) {
+            unsigned r1 = regs[idx];
+            unsigned r2 = regs[idx + 1U];
+            if (l_bit) {
+                unsigned dst1 = (r1 == 15U) ? A64_TMP0 : ((r1 == rn) ? A64_TMP1 : r1);
+                unsigned dst2 = (r2 == 15U) ? A64_TMP0 : ((r2 == rn) ? A64_TMP1 : r2);
+                a64_emit(b, 0x29400000U | (((byte_off / 4U) & 0x7FU) << 15) |
+                                ((dst2 & 31U) << 10) | (A64_TMP2 << 5) | (dst1 & 31U));
+                idx += 2U;
+                continue;
+            }
+            if (r1 != 15U && r2 != 15U) {
+                a64_emit(b, 0x29000000U | (((byte_off / 4U) & 0x7FU) << 15) |
+                                ((r2 & 31U) << 10) | (A64_TMP2 << 5) | (r1 & 31U));
+                idx += 2U;
+                continue;
+            }
         }
+        unsigned r = regs[idx];
         if (l_bit) {
             unsigned dst = (r == 15U) ? A64_TMP0 : ((r == rn) ? A64_TMP1 : r);
-            a64_emit_guest_ldr_w(b, dst, A64_ADDR);
+            a64_emit(b, 0xB9400000U | (((byte_off / 4U) & 0xFFFU) << 10) |
+                            (A64_TMP2 << 5) | (dst & 31U));
         } else {
             unsigned src = a32_load_reg(b, r, pc_val, A64_TMP1);
-            a64_emit_guest_str_w(b, src, A64_ADDR);
+            a64_emit(b, 0xB9000000U | (((byte_off / 4U) & 0xFFFU) << 10) |
+                            (A64_TMP2 << 5) | (src & 31U));
         }
-        a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 4U, 0U);
+        idx++;
     }
 
     if (l_bit && (reg_mask & (1U << rn)) != 0U && rn != 15U) {

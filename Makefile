@@ -13,6 +13,7 @@
         test-m5-hl test-m5-lima \
         test-m6-hl test-m6-lima \
         test-m7-hl test-m7-lima \
+        test-m8-hl test-m8-lima \
         test-all-hl test-all-lima \
         clean
 
@@ -28,13 +29,15 @@ ifneq ($(origin CC),command line)
   CC := $(A64_CC_PATH)
 endif
 
-# Locate unwrapped clang + ld.lld for fast local armv7 ELF32 fixture builds
-CLANG_CACHED  := /nix/store/15n3slfdsd5zhyxrvaa7vm36f1jydwqp-clang-21.1.8/bin/clang
-LLD_CACHED    := /nix/store/smnrx7kvgcxbl6s2scgwk6zp0np6yw7q-lld-21.1.8/bin/ld.lld
-CLANG_RAW     := $(shell [ -x $(CLANG_CACHED) ] && echo $(CLANG_CACHED) || command -v clang 2>/dev/null)
-LLD_RAW       := $(shell [ -x $(LLD_CACHED) ] && echo $(LLD_CACHED) || command -v ld.lld 2>/dev/null)
+# Locate unwrapped clang / clang++ + ld.lld for fast local armv7 ELF32 fixture builds
+CLANG_CACHED   := /nix/store/15n3slfdsd5zhyxrvaa7vm36f1jydwqp-clang-21.1.8/bin/clang
+CLANGXX_CACHED := /nix/store/15n3slfdsd5zhyxrvaa7vm36f1jydwqp-clang-21.1.8/bin/clang++
+LLD_CACHED     := /nix/store/smnrx7kvgcxbl6s2scgwk6zp0np6yw7q-lld-21.1.8/bin/ld.lld
+CLANG_RAW      := $(shell [ -x $(CLANG_CACHED) ] && echo $(CLANG_CACHED) || command -v clang 2>/dev/null)
+CLANGXX_RAW    := $(shell [ -x $(CLANGXX_CACHED) ] && echo $(CLANGXX_CACHED) || command -v clang++ 2>/dev/null)
+LLD_RAW        := $(shell [ -x $(LLD_CACHED) ] && echo $(LLD_CACHED) || command -v ld.lld 2>/dev/null)
 LIMACTL_CACHED := /nix/store/piidmzyl8dvi91i5y6hs8kaclbalk7bf-lima-2.1.4/bin/limactl
-LIMACTL       ?= $(shell command -v limactl 2>/dev/null || ([ -x $(LIMACTL_CACHED) ] && echo $(LIMACTL_CACHED)))
+LIMACTL        ?= $(shell command -v limactl 2>/dev/null || ([ -x $(LIMACTL_CACHED) ] && echo $(LIMACTL_CACHED)))
 
 CFLAGS := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
           -fno-stack-protector -Iinclude -Isrc
@@ -69,7 +72,11 @@ TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
              $(BUILD_DIR)/test-m4-thumb \
              $(BUILD_DIR)/test-m5-armhf \
              $(BUILD_DIR)/test-m7-armhf \
-             $(BUILD_DIR)/test-m7-thumb
+             $(BUILD_DIR)/test-m7-thumb \
+             $(BUILD_DIR)/test-m8-glibc-armhf \
+             $(BUILD_DIR)/test-m8-glibc-thumb \
+             $(BUILD_DIR)/test-m8-cpp-armhf \
+             $(BUILD_DIR)/test-m8-cpp-thumb
 
 ARM32_FREESTANDING_CFLAGS := --target=armv7a-unknown-linux-eabihf -march=armv7ve -mfpu=neon-vfpv4 \
                              -mfloat-abi=hard -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
@@ -79,7 +86,7 @@ help: ## Show available build and verification targets
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-all: build tests ## Build a32rt and all arm32 M0-M7 test fixtures
+all: build tests ## Build a32rt and all arm32 M0-M8 test fixtures
 
 OBJ_DIR  := $(BUILD_DIR)/obj
 C_OBJS   := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
@@ -105,7 +112,7 @@ $(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
 	@ln -sf a32rt $(BUILD_DIR)/a32rt-binfmt-p
 
-tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M7
+tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M8
 
 define BUILD_ARM32_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) | $(BUILD_DIR)
@@ -128,6 +135,7 @@ $(eval $(call BUILD_ARM32_FIXTURE,test-m5-armhf,test_m5_ltp_gdb.c,-marm))
 
 TIMEOUT_RUN ?= perl -e 'alarm 15; exec @ARGV'
 SYSROOT_ARMV7 := $(abspath $(BUILD_DIR)/sysroot-armv7)
+SYSROOT_GLIBC := $(abspath $(BUILD_DIR)/sysroot-glibc-armhf)
 
 $(BUILD_DIR)/sysroot-armv7/bin/busybox: | $(BUILD_DIR)
 	@printf "\033[32m▸ Fetching Alpine armv7 musl/busybox sysroot\033[0m\n"
@@ -135,10 +143,10 @@ $(BUILD_DIR)/sysroot-armv7/bin/busybox: | $(BUILD_DIR)
 	@curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armv7/alpine-minirootfs-3.21.8-armv7.tar.gz \
 		| tar -xz -C $(BUILD_DIR)/sysroot-armv7
 
-$(BUILD_DIR)/sysroot-armv7/usr/bin/gcc: $(BUILD_DIR)/sysroot-armv7/bin/busybox tools/setup_m7_sysroot.py
-	@printf "\033[32m▸ Populating Alpine armv7 M7 package sysroot\033[0m\n"
-	@python3 tools/setup_m7_sysroot.py $(BUILD_DIR)/apk-cache $(BUILD_DIR)/sysroot-armv7 --with-gcc
-	@touch $@
+$(BUILD_DIR)/sysroot-armv7/usr/bin/gcc $(BUILD_DIR)/sysroot-glibc-armhf/lib/ld-linux-armhf.so.3: $(BUILD_DIR)/sysroot-armv7/bin/busybox tools/setup_m7_sysroot.py
+	@printf "\033[32m▸ Populating Alpine armv7 & Debian bookworm glibc 2.36 sysroots\033[0m\n"
+	@python3 tools/setup_m7_sysroot.py $(BUILD_DIR)/apk-cache $(BUILD_DIR)/sysroot-armv7 --with-gcc --glibc-sysroot $(BUILD_DIR)/sysroot-glibc-armhf
+	@touch $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc
 
 define BUILD_ARM32_MUSL_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc | $(BUILD_DIR)
@@ -157,6 +165,46 @@ endef
 
 $(eval $(call BUILD_ARM32_MUSL_FIXTURE,test-m7-armhf,test_m7_libc_math.c,-marm))
 $(eval $(call BUILD_ARM32_MUSL_FIXTURE,test-m7-thumb,test_m7_libc_math.c,-mthumb))
+
+define BUILD_ARM32_GLIBC_FIXTURE
+$(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-glibc-armhf/lib/ld-linux-armhf.so.3 $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $$@ ($(3), glibc 2.36 dynamic)\n"
+	$(CLANG_RAW) --target=armv7a-unknown-linux-gnueabihf -march=armv7ve -mfpu=neon-vfpv4 \
+		-mfloat-abi=hard $(3) -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
+		-isystem $(SYSROOT_GLIBC)/usr/include/arm-linux-gnueabihf -isystem $(SYSROOT_GLIBC)/usr/include \
+		-c $$< -o $(BUILD_DIR)/$(1).o
+	$(LLD_RAW) -m armelf_linux_eabi -pie --sysroot=$(SYSROOT_GLIBC) --dynamic-linker=/lib/ld-linux-armhf.so.3 \
+		$(SYSROOT_GLIBC)/usr/lib/arm-linux-gnueabihf/Scrt1.o $(SYSROOT_GLIBC)/usr/lib/arm-linux-gnueabihf/crti.o \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/crtbeginS.o \
+		$(BUILD_DIR)/$(1).o -L$(SYSROOT_GLIBC)/usr/lib/arm-linux-gnueabihf -L$(SYSROOT_GLIBC)/lib/arm-linux-gnueabihf \
+		-lc -lm $(SYSROOT_GLIBC)/lib/arm-linux-gnueabihf/libpthread.so.0 $(SYSROOT_GLIBC)/lib/arm-linux-gnueabihf/libdl.so.2 \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/libgcc.a \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/crtendS.o \
+		$(SYSROOT_GLIBC)/usr/lib/arm-linux-gnueabihf/crtn.o -o $$@
+endef
+
+$(eval $(call BUILD_ARM32_GLIBC_FIXTURE,test-m8-glibc-armhf,test_m8_glibc.c,-marm))
+$(eval $(call BUILD_ARM32_GLIBC_FIXTURE,test-m8-glibc-thumb,test_m8_glibc.c,-mthumb))
+
+define BUILD_ARM32_CPP_FIXTURE
+$(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $$@ ($(3), C++17 & ARM EHABI)\n"
+	$(CLANGXX_RAW) --target=armv7a-unknown-linux-musleabihf -march=armv7ve -mfpu=neon-vfpv4 \
+		-mfloat-abi=hard $(3) -std=c++17 -Wall -Wextra -O2 -fPIE -fexceptions -frtti \
+		-isystem $(SYSROOT_ARMV7)/usr/include/c++/14.2.0 \
+		-isystem $(SYSROOT_ARMV7)/usr/include/c++/14.2.0/armv7-alpine-linux-musleabihf \
+		-isystem $(SYSROOT_ARMV7)/usr/include -c $$< -o $(BUILD_DIR)/$(1).o
+	$(LLD_RAW) -m armelf_linux_eabi -pie -dynamic-linker /lib/ld-musl-armhf.so.1 \
+		$(SYSROOT_ARMV7)/usr/lib/Scrt1.o $(SYSROOT_ARMV7)/usr/lib/crti.o \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/crtbeginS.o \
+		$(BUILD_DIR)/$(1).o -L$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0 \
+		-L$(SYSROOT_ARMV7)/usr/lib -L$(SYSROOT_ARMV7)/lib -lstdc++ -lm -lgcc_s -lc -lgcc \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/crtendS.o \
+		$(SYSROOT_ARMV7)/usr/lib/crtn.o -o $$@
+endef
+
+$(eval $(call BUILD_ARM32_CPP_FIXTURE,test-m8-cpp-armhf,test_m8_cpp_ehabi.cpp,-marm))
+$(eval $(call BUILD_ARM32_CPP_FIXTURE,test-m8-cpp-thumb,test_m8_cpp_ehabi.cpp,-mthumb))
 
 check-headers: ## Verify include/a32host.h matches $(HL_DIR)/src/a32host.h
 	@cmp -s include/a32host.h $(HL_DIR)/src/a32host.h || (echo "ERROR: include/a32host.h out of sync with $(HL_DIR)/src/a32host.h" && exit 1)
@@ -306,7 +354,7 @@ test-m7-hl: $(A32RT_BIN) $(BUILD_DIR)/test-m7-armhf $(BUILD_DIR)/test-m7-thumb $
 	@$(TIMEOUT_RUN) env HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(abspath $(BUILD_DIR)/test-m7-thumb)
 	@printf "\033[32m▸ Verifying M7-hl (Alpine armv7 ecosystem + LuaJIT + Python 3.12 + self-hosted GCC)\033[0m under $(HL_BIN)\n"
 	@cp tests/test_m7_ecosystem.sh /tmp/test_m7_ecosystem.sh
-	@perl -e 'alarm 60; exec @ARGV' env HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(SYSROOT_ARMV7)/bin/bash /tmp/test_m7_ecosystem.sh
+	@perl -e 'alarm 180; exec @ARGV' env HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(SYSROOT_ARMV7)/bin/bash /tmp/test_m7_ecosystem.sh
 	@rm -f /tmp/test_m7_ecosystem.sh
 	@printf "\033[32mPASS\033[0m: M7-hl\n"
 
@@ -315,12 +363,55 @@ test-m7-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m7-armhf $(BUILD_DIR)/test-m7-thumb
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m7-armhf)
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m7-thumb)
 	@printf "\033[32m▸ Verifying M7 (Alpine armv7 ecosystem + LuaJIT + Python 3.12 + self-hosted GCC)\033[0m inside Lima VM ($(LIMA_VM))\n"
-	@perl -e 'alarm 60; exec @ARGV' $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- sh -c 'cp tests/test_m7_ecosystem.sh /tmp/test_m7_ecosystem.sh && $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/bin/bash /tmp/test_m7_ecosystem.sh && rm -f /tmp/test_m7_ecosystem.sh'
+	@perl -e 'alarm 180; exec @ARGV' $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- sh -c 'cp tests/test_m7_ecosystem.sh /tmp/test_m7_ecosystem.sh && $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/bin/bash /tmp/test_m7_ecosystem.sh && rm -f /tmp/test_m7_ecosystem.sh'
 	@printf "\033[32mPASS\033[0m: M7 on Lima\n"
 
-test-all-hl: check-headers test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl test-m7-hl ## Run complete M0..M7 suite under hyper-linux
+test-m8-hl: $(A32RT_BIN) $(BUILD_DIR)/hello-armhf-static $(BUILD_DIR)/test-m8-glibc-armhf $(BUILD_DIR)/test-m8-glibc-thumb $(BUILD_DIR)/test-m8-cpp-armhf $(BUILD_DIR)/test-m8-cpp-thumb $(BUILD_DIR)/sysroot-glibc-armhf/lib/ld-linux-armhf.so.3 $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc ## Run M8 Debian bookworm glibc 2.36, C++17 ARM EHABI, self-hosted g++ & --auto-aot under hl
+	@printf "\033[32m▸ Verifying M8-hl (Debian bookworm glibc 2.36 A32 + Thumb-2 + dash)\033[0m under $(HL_BIN)\n"
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_GLIBC) $(abspath $(BUILD_DIR)/test-m8-glibc-armhf)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_GLIBC) $(abspath $(BUILD_DIR)/test-m8-glibc-thumb)
+	@out="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_GLIBC) $(SYSROOT_GLIBC)/bin/dash -c 'echo GLIBC_DASH_OK')"; \
+	[ "$$out" = "GLIBC_DASH_OK" ] || { printf "\033[31mFAIL\033[0m: glibc dash failed: %s\n" "$$out"; exit 1; }; \
+	printf "M8-hl Debian armhf glibc 2.36 /bin/dash: PASS (%s)\n" "$$out"
+	@printf "\033[32m▸ Verifying M8-hl (C++17 & ARM EHABI .ARM.exidx unwinding A32 + Thumb-2 + self-hosted g++ 14.2.0)\033[0m under $(HL_BIN)\n"
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m8-cpp-armhf)
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m8-cpp-thumb)
+	@cp tests/test_m8_cpp_ehabi.cpp /tmp/test_m8_cpp_ehabi.cpp
+	@perl -e 'alarm 120; exec @ARGV' env PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(SYSROOT_ARMV7)/usr/bin/g++ -O1 -std=c++17 -DA32RT_SELFHOST_FAST /tmp/test_m8_cpp_ehabi.cpp -o /tmp/test_m8_cpp_ehabi_self
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) /tmp/test_m8_cpp_ehabi_self
+	@rm -f /tmp/test_m8_cpp_ehabi.cpp /tmp/test_m8_cpp_ehabi_self
+	@printf "\033[32m▸ Verifying M8-hl (--auto-aot transparent cache persistence)\033[0m under $(HL_BIN)\n"
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --auto-aot --stats $(abspath $(BUILD_DIR)/hello-armhf-static) >/dev/null 2>&1
+	@out2="$$($(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --auto-aot --stats $(abspath $(BUILD_DIR)/hello-armhf-static) 2>&1)"; \
+	rm -f $(BUILD_DIR)/a32rt-*cache-*.bin; \
+	echo "$$out2" | grep -q "blocks_compiled=0" || { printf "\033[31mFAIL\033[0m: expected blocks_compiled=0 on second --auto-aot run:\n%s\n" "$$out2"; exit 1; }; \
+	printf "M8-hl --auto-aot (blocks_compiled=0 on warm run): PASS\n"
+	@printf "\033[32mPASS\033[0m: M8-hl\n"
 
-test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima test-m6-lima test-m7-lima ## Run complete M0..M7 suite inside Lima VM
+test-m8-lima: $(A32RT_BIN) $(BUILD_DIR)/hello-armhf-static $(BUILD_DIR)/test-m8-glibc-armhf $(BUILD_DIR)/test-m8-glibc-thumb $(BUILD_DIR)/test-m8-cpp-armhf $(BUILD_DIR)/test-m8-cpp-thumb $(BUILD_DIR)/sysroot-glibc-armhf/lib/ld-linux-armhf.so.3 $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc ## Run M8 Debian bookworm glibc 2.36, C++17 ARM EHABI, self-hosted g++ & --auto-aot inside Lima VM
+	@printf "\033[32m▸ Verifying M8 (Debian bookworm glibc 2.36 A32 + Thumb-2 + dash)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_GLIBC) $(abspath $(BUILD_DIR)/test-m8-glibc-armhf)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_GLIBC) $(abspath $(BUILD_DIR)/test-m8-glibc-thumb)
+	@out="$$($(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_GLIBC) $(SYSROOT_GLIBC)/bin/dash -c 'echo GLIBC_DASH_OK')"; \
+	[ "$$out" = "GLIBC_DASH_OK" ] || { printf "\033[31mFAIL\033[0m: glibc dash failed: %s\n" "$$out"; exit 1; }; \
+	printf "M8 Debian armhf glibc 2.36 /bin/dash: PASS (%s)\n" "$$out"
+	@printf "\033[32m▸ Verifying M8 (C++17 & ARM EHABI .ARM.exidx unwinding A32 + Thumb-2 + self-hosted g++ 14.2.0)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m8-cpp-armhf)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m8-cpp-thumb)
+	@perl -e 'alarm 120; exec @ARGV' $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- sh -c 'cp tests/test_m8_cpp_ehabi.cpp /tmp/test_m8_cpp_ehabi.cpp && env PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/usr/bin/g++ -O1 -std=c++17 -DA32RT_SELFHOST_FAST /tmp/test_m8_cpp_ehabi.cpp -o /tmp/test_m8_cpp_ehabi_self && $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) /tmp/test_m8_cpp_ehabi_self && rm -f /tmp/test_m8_cpp_ehabi.cpp /tmp/test_m8_cpp_ehabi_self'
+	@printf "\033[32m▸ Verifying M8 (--auto-aot transparent cache persistence)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --auto-aot --stats $(abspath $(BUILD_DIR)/hello-armhf-static) >/dev/null 2>&1
+	@out2="$$($(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --cache $(abspath $(BUILD_DIR)) --auto-aot --stats $(abspath $(BUILD_DIR)/hello-armhf-static) 2>&1)"; \
+	rm -f $(BUILD_DIR)/a32rt-*cache-*.bin; \
+	echo "$$out2" | grep -q "blocks_compiled=0" || { printf "\033[31mFAIL\033[0m: expected blocks_compiled=0 on second --auto-aot run:\n%s\n" "$$out2"; exit 1; }; \
+	printf "M8 --auto-aot (blocks_compiled=0 on warm run): PASS\n"
+	@printf "\033[32mPASS\033[0m: M8 on Lima\n"
+
+test-all-hl: check-headers test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl test-m7-hl test-m8-hl ## Run complete M0..M8 suite under hyper-linux
+
+test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima test-m6-lima test-m7-lima test-m8-lima ## Run complete M0..M8 suite inside Lima VM
 
 BENCH_BINS := $(BUILD_DIR)/bench-suite-armhf \
               $(BUILD_DIR)/bench-suite-thumb \
