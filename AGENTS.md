@@ -21,7 +21,7 @@ This repository follows:
 3. **Host-Agnostic Contract**: Zero `#include` or build-time dependencies on `hyper-linux`. All host hints are negotiated at runtime via standard `auxv`, environment variables (`A32RT_WINDOW`, `A32RT_SYSROOT`, `A32RT_CACHE`), or the optional `/dev/a32host` ioctl (`include/a32host.h`, `A32H_ABI 1.0`).
 4. **Build Driver**: Self-documenting root `Makefile` (`make help` default goal, `##` target comments, `.PHONY` declarations) driven inside `nix develop -c make <target>`.
 5. **Verification Targets**:
-   - **Primary target**: **`M0-hl`..`M5-hl`** running under `hl` (`../hyper-linux/_build/hl --a32rt ...`) on macOS Apple Silicon.
+   - **Primary target**: **`M0-hl`..`M7-hl`** running under `hl` (`../hyper-linux/_build/hl --a32rt ...`) on macOS Apple Silicon.
    - **Ground-truth Linux oracle**: **`limactl`** (`lima-aarch64` VM) running the exact same static-PIE `a32rt` binary and `armhf` test fixtures on real AArch64 Linux.
 6. **License & Author**: `Apache-2.0`, `Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.` Never add `Co-Authored-By:` or AI attribution trailers to commits.
 
@@ -40,6 +40,8 @@ a32rt/
 │   └── HOST-CONTRACT.md # Versioned host contract & /dev/a32host ABI (A32H_ABI 1.0)
 ├── include/
 │   └── a32host.h        # Shared C11 header for /dev/a32host ioctls (vendored by hl)
+├── tools/
+│   └── setup_m7_sysroot.py # Alpine v3.21 armv7 package sysroot provisioner for M7
 ├── src/
 │   ├── main.c           # CLI parsing, AT_EXECFD, host probing, startup orchestration
 │   ├── host.c           # /dev/a32host handshake & capability detection
@@ -62,7 +64,9 @@ a32rt/
     ├── bench_coremark.c           # M2 / M2-hl CoreMark-style CRC & AOT cache benchmark
     ├── test_m3_threads_signals.c  # M3 / M3-hl clone threads, futex, RT signals, SIGSEGV & SMC
     ├── test_m4_vfp_neon.c         # M4 / M4-hl VFPv4-D32 (s0-s31, d0-d31) & NEON SIMD suite
-    └── test_m5_ltp_gdb.c          # M5 / M5-hl LTP compatibility & 32-to-64 struct conformance suite
+    ├── test_m5_ltp_gdb.c          # M5 / M5-hl LTP compatibility & 32-to-64 struct conformance suite
+    ├── test_m7_libc_math.c        # M7 / M7-hl IEEE-754 libm, fenv, regex, setjmp & pthread conformance
+    └── test_m7_ecosystem.sh       # M7 / M7-hl real-world Alpine armv7 apps & self-hosted gcc suite
 ```
 
 ---

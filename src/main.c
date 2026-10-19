@@ -188,8 +188,15 @@ int main(int argc, char **argv, char **envp)
         usage(argv[0]);
         return 1;
     }
+
+    int exec_fd = -1;
+    unsigned long aux_execfd = getauxval(AT_EXECFD);
+    if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
+        exec_fd = (int)aux_execfd;
+    }
+
     exec_path = argv[i];
-    if (is_binfmt_p || (explicit_sep && i + 1 < argc)) {
+    if (is_binfmt_p || (explicit_sep && exec_fd < 0 && i + 1 < argc)) {
         guest_argc = argc - (i + 1);
         guest_argv = &argv[i + 1];
     } else {
@@ -208,6 +215,9 @@ int main(int argc, char **argv, char **envp)
         while (exec_path[0] == '/' && exec_path[1] == '/') {
             exec_path++;
         }
+        if (guest_argv == &argv[i]) {
+            argv[i] = (char *)exec_path;
+        }
     }
 
     ctx.exec_path = exec_path;
@@ -216,12 +226,6 @@ int main(int argc, char **argv, char **envp)
 
     if (a32_vm_init(&ctx, requested_window) != 0) {
         return 1;
-    }
-
-    int exec_fd = -1;
-    unsigned long aux_execfd = getauxval(AT_EXECFD);
-    if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
-        exec_fd = (int)aux_execfd;
     }
 
     a32_elf_info_t elf_info;

@@ -363,6 +363,9 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 {
     a32_ctx_t *ctx = g_tls_ctx;
     if (!ctx) {
+        if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) {
+            _exit(128 + sig);
+        }
         return;
     }
 

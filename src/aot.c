@@ -534,12 +534,12 @@ static void add_target(aot_scan_buf_t *sb, uint32_t pc, bool thumb)
         if (key == 0U) {
             key = 0xFFFFFFFFU;
         }
-        uint32_t idx = (key * 2654435761U) & 8191U;
+        uint32_t idx = (key * 2654435761U) & 65535U;
         while (sb->seen_keys[idx] != 0U) {
             if (sb->seen_keys[idx] == key) {
                 return;
             }
-            idx = (idx + 1U) & 8191U;
+            idx = (idx + 1U) & 65535U;
         }
         sb->seen_keys[idx] = key;
     } else {
@@ -559,6 +559,86 @@ static void aot_try_add_target(aot_scan_buf_t *sb, uint32_t tgt, bool thumb, uin
     if (tgt >= A32_LOW_GUARD_SIZE && tgt <= A32_KUSER_BASE_32 - min_len &&
         a32_jit_range_executable(sb->ctx, tgt, min_len)) {
         add_target(sb, tgt, thumb);
+    }
+}
+
+static void seed_elf_symbols(aot_scan_buf_t *sb, const a32_ctx_t *ctx,
+                             const char *elf_path, bool *io_prefer_thumb)
+{
+    int fd = a32_open_guest_ro(ctx, elf_path);
+    if (fd < 0) {
+        return;
+    }
+    uint8_t ehdr[52];
+    if (pread(fd, ehdr, sizeof(ehdr), 0) != (ssize_t)sizeof(ehdr) ||
+        memcmp(ehdr, "\x7f""ELF\x01\x01\x01", 7U) != 0) {
+        close(fd);
+        return;
+    }
+    uint32_t e_shoff;
+    uint16_t e_shentsize, e_shnum;
+    memcpy(&e_shoff, ehdr + 32, 4U);
+    memcpy(&e_shentsize, ehdr + 46, 2U);
+    memcpy(&e_shnum, ehdr + 48, 2U);
+    if (e_shoff == 0U || e_shentsize != 40U || e_shnum == 0U || e_shnum > 1024U) {
+        close(fd);
+        return;
+    }
+
+    size_t thumb_syms = 0U;
+    size_t arm_syms   = 0U;
+    for (uint16_t i = 0U; i < e_shnum; i++) {
+        uint8_t sh[40];
+        if (pread(fd, sh, sizeof(sh), (off_t)e_shoff + (off_t)i * 40) != (ssize_t)sizeof(sh)) {
+            break;
+        }
+        uint32_t sh_type, sh_offset, sh_size, sh_entsize;
+        memcpy(&sh_type, sh + 4, 4U);
+        memcpy(&sh_offset, sh + 16, 4U);
+        memcpy(&sh_size, sh + 20, 4U);
+        memcpy(&sh_entsize, sh + 36, 4U);
+        if ((sh_type != 2U && sh_type != 11U) || sh_entsize != 16U ||
+            sh_size == 0U || sh_size > (16U * 1024U * 1024U)) {
+            continue;
+        }
+        uint8_t sym_buf[4096];
+        for (uint32_t off = 0U; off + 16U <= sh_size; off += (uint32_t)sizeof(sym_buf)) {
+            size_t chunk = sh_size - off;
+            if (chunk > sizeof(sym_buf)) {
+                chunk = sizeof(sym_buf);
+            }
+            chunk &= ~(size_t)15U;
+            if (pread(fd, sym_buf, chunk, (off_t)sh_offset + (off_t)off) != (ssize_t)chunk) {
+                break;
+            }
+            for (size_t s = 0U; s < chunk; s += 16U) {
+                uint32_t st_value;
+                uint8_t  st_info = sym_buf[s + 12U];
+                uint16_t st_shndx;
+                memcpy(&st_value, sym_buf + s + 4U, 4U);
+                memcpy(&st_shndx, sym_buf + s + 14U, 2U);
+                if ((st_info & 0xFU) != 2U || st_shndx == 0U || st_value == 0U) {
+                    continue;
+                }
+                bool     is_t   = (st_value & 1U) != 0U;
+                uint32_t sym_pc = st_value & (is_t ? ~1U : ~3U);
+                if (ctx->elf_base != 0U && sym_pc < ctx->elf_base) {
+                    sym_pc += ctx->elf_base;
+                }
+                if (sb->count < 1024U) {
+                    aot_try_add_target(sb, sym_pc, is_t, is_t ? 2U : 4U);
+                }
+                if (is_t) {
+                    thumb_syms++;
+                } else {
+                    arm_syms++;
+                }
+            }
+        }
+    }
+    close(fd);
+    if (io_prefer_thumb != NULL && (thumb_syms + arm_syms) > 0U) {
+        *io_prefer_thumb = (thumb_syms >= arm_syms);
     }
 }
 
@@ -774,11 +854,13 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     bool     entry_thumb = (elf_info->entry & 1U) != 0U;
     uint32_t entry_pc    = elf_info->entry & (entry_thumb ? ~1U : ~3U);
 
-    if (a32_jit_range_executable(ctx, entry_pc, entry_thumb ? 2U : 4U)) {
+    if (entry_pc != ctx->elf_base &&
+        a32_jit_range_executable(ctx, entry_pc, entry_thumb ? 2U : 4U)) {
         (void)a32_jit_compile_block(ctx, entry_pc, entry_thumb, NULL);
     }
 
-    if (ctx->elf_entry != 0U && ctx->elf_entry != elf_info->entry) {
+    if (ctx->elf_entry != 0U && ctx->elf_entry != elf_info->entry &&
+        (ctx->elf_entry & ~3U) != ctx->elf_base) {
         bool     main_thumb = (ctx->elf_entry & 1U) != 0U;
         uint32_t main_pc    = ctx->elf_entry & (main_thumb ? ~1U : ~3U);
         if (a32_jit_range_executable(ctx, main_pc, main_thumb ? 2U : 4U)) {
@@ -788,7 +870,7 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
 
     uint32_t *disc_pcs   = (uint32_t *)calloc(A32_MAX_AOT_SCAN, sizeof(uint32_t));
     bool     *disc_thumb = (bool *)calloc(A32_MAX_AOT_SCAN, sizeof(bool));
-    uint32_t *seen_keys  = (uint32_t *)calloc(8192, sizeof(uint32_t));
+    uint32_t *seen_keys  = (uint32_t *)calloc(65536, sizeof(uint32_t));
     if (disc_pcs == NULL || disc_thumb == NULL || seen_keys == NULL) {
         free(disc_pcs);
         free(disc_thumb);
@@ -803,6 +885,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
         .count     = 0U,
         .limit     = A32_MAX_AOT_SCAN,
     };
+
+    seed_elf_symbols(&sb, ctx, elf_path, (entry_pc == ctx->elf_base) ? &entry_thumb : NULL);
 
     bool has_aux_exec = false;
     for (size_t i = 0U; i < ctx->region_count; i++) {

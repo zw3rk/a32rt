@@ -407,3 +407,18 @@ Measured on Apple Silicon (`macOS` host running `../hyper-linux/_build/hl` and `
 | **`a32rt` T32 Cold JIT (`limactl`)** | `0x0` | `39` | `39` | `88` | N/A | `9.27 ms` | `215,773` |
 | **`a32rt` T32 Warm `.a32cache` (`limactl`)** | `0x0` | `20` (`-48.7%`) | `21` (`-46.2%`) | `73` | N/A | `10.72 ms` | `186,532` |
 
+---
+
+## 10. M6 & M7 Ecosystem, Conformance & Self-Hosting Verification
+
+- **M6 (`make test-m6-hl` / `make test-m6-lima`)**:
+  - Multi-library dynamic linking (`apk`, `scanelf`, `getconf`, `libcrypto.so.3`, `libssl.so.3`, `libz.so.1`).
+  - Relocatable shared-library `.so` AOT cache (`A32_AOT_VERSION = 6`) with `SHT_DYNSYM`/`SHT_SYMTAB` `STT_FUNC` symbol seeding and self-identifying `a64_emit_mov_pc32` base-address relocation.
+- **M7 (`make test-m7-hl` / `make test-m7-lima`)**:
+  - **`tests/test_m7_libc_math.c`** (compiled dynamically against `musl-dev` for both `-marm` A32 and `-mthumb` Thumb-2): IEEE-754 `libm` transcendentals, subnormal arithmetic, `NaN`/`Inf` propagation, hardware `fenv.h` rounding modes (`FE_TONEAREST`, `FE_TOWARDZERO`, `FE_UPWARD`, `FE_DOWNWARD`) mapped between ARM FPSCR bits `23:22` and AArch64 FPCR, `%a` hex float formatting/parsing, `qsort`/`bsearch`, nested `setjmp`/`longjmp` with VFP `d8`–`d15` preservation, POSIX `regex.h`, and `pthread` mutex/condvar/`__thread` TLS + `pipe`/`poll`.
+  - **`tests/test_m7_ecosystem.sh`** (20+ real-world Alpine v3.21 `armv7` packages provisioned via `tools/setup_m7_sysroot.py`):
+    - Shells & core utilities: `bash`, `dash`, `uutils-coreutils` (`sort`, `uniq`, `wc`, `tr`, `cmp`), `grep`, `sed`, `gawk`, `find`, `diff`, `tree`.
+    - Structured data & databases: `jq`, `sqlite3` (window functions + `PRAGMA integrity_check`).
+    - Scripting & dynamic JIT runtimes: `lua5.4` (coroutines), `luajit` (with ARM32 hardware JIT active, exercising dynamic RW→RX `mprotect` + `cacheflush` SMC), `python3.12` (`hashlib`, `json`, `zlib`, `math`, `re`).
+    - Cryptography, compression & VCS: `openssl` (`aes-256-cbc -pbkdf2`), `zstd`, `xz`, `git` (`init`, `config`, `add`, `commit`, `log`).
+    - Self-hosted `armv7` C toolchain: `gcc 14.2.0` (`cc1`) + GNU `binutils 2.43.1` (`as`, `collect2`, `ld` with `liblto_plugin.so`, `readelf`, `nm`, `strip`) compiling, linking, inspecting, stripping, and executing a 32-bit `armhf` PIE ELF binary inside `a32rt`.

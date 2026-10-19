@@ -12,6 +12,7 @@
         test-m4-hl test-m4-lima \
         test-m5-hl test-m5-lima \
         test-m6-hl test-m6-lima \
+        test-m7-hl test-m7-lima \
         test-all-hl test-all-lima \
         clean
 
@@ -66,7 +67,9 @@ TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
              $(BUILD_DIR)/test-m3-armhf \
              $(BUILD_DIR)/test-m4-armhf \
              $(BUILD_DIR)/test-m4-thumb \
-             $(BUILD_DIR)/test-m5-armhf
+             $(BUILD_DIR)/test-m5-armhf \
+             $(BUILD_DIR)/test-m7-armhf \
+             $(BUILD_DIR)/test-m7-thumb
 
 ARM32_FREESTANDING_CFLAGS := --target=armv7a-unknown-linux-eabihf -march=armv7ve -mfpu=neon-vfpv4 \
                              -mfloat-abi=hard -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
@@ -76,7 +79,7 @@ help: ## Show available build and verification targets
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} \
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-all: build tests ## Build a32rt and all arm32 M0-M5 test fixtures
+all: build tests ## Build a32rt and all arm32 M0-M7 test fixtures
 
 OBJ_DIR  := $(BUILD_DIR)/obj
 C_OBJS   := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
@@ -102,7 +105,7 @@ $(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
 	@ln -sf a32rt $(BUILD_DIR)/a32rt-binfmt-p
 
-tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M5
+tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M7
 
 define BUILD_ARM32_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) | $(BUILD_DIR)
@@ -131,6 +134,29 @@ $(BUILD_DIR)/sysroot-armv7/bin/busybox: | $(BUILD_DIR)
 	@mkdir -p $(BUILD_DIR)/sysroot-armv7
 	@curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armv7/alpine-minirootfs-3.21.8-armv7.tar.gz \
 		| tar -xz -C $(BUILD_DIR)/sysroot-armv7
+
+$(BUILD_DIR)/sysroot-armv7/usr/bin/gcc: $(BUILD_DIR)/sysroot-armv7/bin/busybox tools/setup_m7_sysroot.py
+	@printf "\033[32m▸ Populating Alpine armv7 M7 package sysroot\033[0m\n"
+	@python3 tools/setup_m7_sysroot.py $(BUILD_DIR)/apk-cache $(BUILD_DIR)/sysroot-armv7 --with-gcc
+	@touch $@
+
+define BUILD_ARM32_MUSL_FIXTURE
+$(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $$@ ($(3), musl dynamic)\n"
+	$(CLANG_RAW) --target=armv7a-unknown-linux-musleabihf -march=armv7ve -mfpu=neon-vfpv4 \
+		-mfloat-abi=hard $(3) -std=c11 -Werror=vla -Wall -Wextra -O2 -fPIE \
+		-isystem $(SYSROOT_ARMV7)/usr/include -c $$< -o $(BUILD_DIR)/$(1).o
+	$(LLD_RAW) -m armelf_linux_eabi -pie -dynamic-linker /lib/ld-musl-armhf.so.1 \
+		$(SYSROOT_ARMV7)/usr/lib/Scrt1.o $(SYSROOT_ARMV7)/usr/lib/crti.o \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/crtbeginS.o \
+		$(BUILD_DIR)/$(1).o -L$(SYSROOT_ARMV7)/usr/lib -L$(SYSROOT_ARMV7)/lib -lc \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/libgcc.a \
+		$(SYSROOT_ARMV7)/usr/lib/gcc/armv7-alpine-linux-musleabihf/14.2.0/crtendS.o \
+		$(SYSROOT_ARMV7)/usr/lib/crtn.o -o $$@
+endef
+
+$(eval $(call BUILD_ARM32_MUSL_FIXTURE,test-m7-armhf,test_m7_libc_math.c,-marm))
+$(eval $(call BUILD_ARM32_MUSL_FIXTURE,test-m7-thumb,test_m7_libc_math.c,-mthumb))
 
 check-headers: ## Verify include/a32host.h matches $(HL_DIR)/src/a32host.h
 	@cmp -s include/a32host.h $(HL_DIR)/src/a32host.h || (echo "ERROR: include/a32host.h out of sync with $(HL_DIR)/src/a32host.h" && exit 1)
@@ -227,13 +253,13 @@ test-m4-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m4-armhf $(BUILD_DIR)/test-m4-thumb
 test-m5-hl: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf $(BUILD_DIR)/hello-armhf-static ## Run M5 LTP syscall conformance and GDB RSP verification under hl
 	@printf "\033[32m▸ Verifying M5-hl (LTP syscall conformance + compat shims)\033[0m under $(HL_BIN)\n"
 	@$(TIMEOUT_RUN) $(HL_BIN) $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/test-m5-armhf)
-	@$(TIMEOUT_RUN) python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["$(HL_BIN)", "$(abspath $(A32RT_BIN))", "--gdb", "14322", "$(abspath $(BUILD_DIR)/hello-armhf-static)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); time.sleep(0.2); s = socket.create_connection(("127.0.0.1", 14322), timeout=3); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode("latin1"))(); send = lambda cmd: (s.sendall(b"$$" + cmd.encode("latin1") + b"#" + ("%02x" % (sum(cmd.encode("latin1")) & 0xff)).encode("latin1")), rpkt())[1]; r1 = send("?"); r2 = send("g"); r_sup = send("qSupported"); assert "qXfer:features:read+" in r_sup, r_sup; r_xml_part = send("qXfer:features:read:target.xml:0,40"); assert "$$m<?xml" in r_xml_part, r_xml_part; r_xml = send("qXfer:features:read:target.xml:0,fff"); assert "$$l" in r_xml and "org.gnu.gdb.arm.vfp" in r_xml, r_xml; r_xml_eof = send("qXfer:features:read:target.xml:ffff,40"); assert "$$l#" in r_xml_eof, r_xml_eof; assert "OK" in send("P1a=0123456789abcdef"); assert "0123456789abcdef" in send("p1a"); assert "OK" in send("P3a=12345678"); assert "12345678" in send("p3a"); r3 = send("s"); send("c"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5-hl GDB RSP Stub: PASS")'
+	@$(TIMEOUT_RUN) python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["$(HL_BIN)", "$(abspath $(A32RT_BIN))", "--gdb", "14322", "$(abspath $(BUILD_DIR)/hello-armhf-static)"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); exec("for _ in range(50):\n try:\n  s = socket.create_connection((\"127.0.0.1\", 14322), timeout=3); break\n except OSError:\n  time.sleep(0.05)"); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode("latin1"))(); send = lambda cmd: (s.sendall(b"$$" + cmd.encode("latin1") + b"#" + ("%02x" % (sum(cmd.encode("latin1")) & 0xff)).encode("latin1")), rpkt())[1]; r1 = send("?"); r2 = send("g"); r_sup = send("qSupported"); assert "qXfer:features:read+" in r_sup, r_sup; r_xml_part = send("qXfer:features:read:target.xml:0,40"); assert "$$m<?xml" in r_xml_part, r_xml_part; r_xml = send("qXfer:features:read:target.xml:0,fff"); assert "$$l" in r_xml and "org.gnu.gdb.arm.vfp" in r_xml, r_xml; r_xml_eof = send("qXfer:features:read:target.xml:ffff,40"); assert "$$l#" in r_xml_eof, r_xml_eof; assert "OK" in send("P1a=0123456789abcdef"); assert "0123456789abcdef" in send("p1a"); assert "OK" in send("P3a=12345678"); assert "12345678" in send("p3a"); r3 = send("s"); send("c"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5-hl GDB RSP Stub: PASS")'
 	@printf "\033[32mPASS\033[0m: M5-hl\n"
 
 test-m5-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m5-armhf $(BUILD_DIR)/hello-armhf-static ## Run M5 LTP syscall conformance and GDB RSP verification inside Lima VM
 	@printf "\033[32m▸ Verifying M5 (LTP syscall conformance + GDB RSP)\033[0m inside Lima VM ($(LIMA_VM))\n"
 	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) $(abspath $(BUILD_DIR)/test-m5-armhf)
-	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["./_build/a32rt", "--gdb", "14321", "./_build/hello-armhf-static"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); time.sleep(0.2); s = socket.create_connection(("127.0.0.1", 14321), timeout=3); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode("latin1"))(); send = lambda cmd: (s.sendall(b"$$" + cmd.encode("latin1") + b"#" + ("%02x" % (sum(cmd.encode("latin1")) & 0xff)).encode("latin1")), rpkt())[1]; r1 = send("?"); r2 = send("g"); r_sup = send("qSupported"); assert "qXfer:features:read+" in r_sup, r_sup; r_xml_part = send("qXfer:features:read:target.xml:0,40"); assert "$$m<?xml" in r_xml_part, r_xml_part; r_xml = send("qXfer:features:read:target.xml:0,fff"); assert "$$l" in r_xml and "org.gnu.gdb.arm.vfp" in r_xml, r_xml; r_xml_eof = send("qXfer:features:read:target.xml:ffff,40"); assert "$$l#" in r_xml_eof, r_xml_eof; assert "OK" in send("P1a=0123456789abcdef"); assert "0123456789abcdef" in send("p1a"); assert "OK" in send("P3a=12345678"); assert "12345678" in send("p3a"); r3 = send("s"); send("c"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5 GDB RSP Stub: PASS")'
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- python3 -c 'import socket, subprocess, time; p = subprocess.Popen(["./_build/a32rt", "--gdb", "14321", "./_build/hello-armhf-static"], stdout=subprocess.PIPE, stderr=subprocess.PIPE); exec("for _ in range(50):\n try:\n  s = socket.create_connection((\"127.0.0.1\", 14321), timeout=3); break\n except OSError:\n  time.sleep(0.05)"); rpkt = lambda: (lambda b=b"": [b := b + s.recv(1024) for _ in range(16) if b"#" not in b or len(b.split(b"#")[-1]) < 2] and b.decode("latin1"))(); send = lambda cmd: (s.sendall(b"$$" + cmd.encode("latin1") + b"#" + ("%02x" % (sum(cmd.encode("latin1")) & 0xff)).encode("latin1")), rpkt())[1]; r1 = send("?"); r2 = send("g"); r_sup = send("qSupported"); assert "qXfer:features:read+" in r_sup, r_sup; r_xml_part = send("qXfer:features:read:target.xml:0,40"); assert "$$m<?xml" in r_xml_part, r_xml_part; r_xml = send("qXfer:features:read:target.xml:0,fff"); assert "$$l" in r_xml and "org.gnu.gdb.arm.vfp" in r_xml, r_xml; r_xml_eof = send("qXfer:features:read:target.xml:ffff,40"); assert "$$l#" in r_xml_eof, r_xml_eof; assert "OK" in send("P1a=0123456789abcdef"); assert "0123456789abcdef" in send("p1a"); assert "OK" in send("P3a=12345678"); assert "12345678" in send("p3a"); r3 = send("s"); send("c"); out, _ = p.communicate(timeout=3); assert "S05" in r1 and len(r2) >= 128 and "S05" in r3 and out == b"hello\n", (r1, r2, r3, out); print("M5 GDB RSP Stub: PASS")'
 	@printf "\033[32mPASS\033[0m: M5 on Lima\n"
 
 test-m6-hl: $(A32RT_BIN) $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M6 real-world multi-library dynamic linking & relocatable .so AOT cache under hl
@@ -274,9 +300,27 @@ test-m6-lima: $(A32RT_BIN) $(BUILD_DIR)/sysroot-armv7/bin/busybox ## Run M6 real
 	@rm -f $(BUILD_DIR)/a32rt-*cache-*.bin
 	@printf "\033[32mPASS\033[0m: M6 on Lima\n"
 
-test-all-hl: check-headers test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl ## Run complete M0..M6 suite under hyper-linux
+test-m7-hl: $(A32RT_BIN) $(BUILD_DIR)/test-m7-armhf $(BUILD_DIR)/test-m7-thumb $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc tests/test_m7_ecosystem.sh ## Run M7 libc-math conformance & Alpine armv7 application ecosystem (incl. self-hosted gcc) under hl
+	@printf "\033[32m▸ Verifying M7-hl (libc/math conformance A32 + Thumb-2)\033[0m under $(HL_BIN)\n"
+	@$(TIMEOUT_RUN) env HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(abspath $(BUILD_DIR)/test-m7-armhf)
+	@$(TIMEOUT_RUN) env HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(abspath $(BUILD_DIR)/test-m7-thumb)
+	@printf "\033[32m▸ Verifying M7-hl (Alpine armv7 ecosystem + LuaJIT + Python 3.12 + self-hosted GCC)\033[0m under $(HL_BIN)\n"
+	@cp tests/test_m7_ecosystem.sh /tmp/test_m7_ecosystem.sh
+	@perl -e 'alarm 60; exec @ARGV' env HL_A32RT=$(abspath $(A32RT_BIN)) A32RT_SYSROOT=$(SYSROOT_ARMV7) $(HL_BIN) --a32rt $(abspath $(A32RT_BIN)) -- $(SYSROOT_ARMV7)/bin/bash /tmp/test_m7_ecosystem.sh
+	@rm -f /tmp/test_m7_ecosystem.sh
+	@printf "\033[32mPASS\033[0m: M7-hl\n"
 
-test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima test-m6-lima ## Run complete M0..M6 suite inside Lima VM
+test-m7-lima: $(A32RT_BIN) $(BUILD_DIR)/test-m7-armhf $(BUILD_DIR)/test-m7-thumb $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc tests/test_m7_ecosystem.sh ## Run M7 libc-math conformance & Alpine armv7 application ecosystem inside Lima VM
+	@printf "\033[32m▸ Verifying M7 (libc/math conformance A32 + Thumb-2)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m7-armhf)
+	@$(TIMEOUT_RUN) $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(abspath $(BUILD_DIR)/test-m7-thumb)
+	@printf "\033[32m▸ Verifying M7 (Alpine armv7 ecosystem + LuaJIT + Python 3.12 + self-hosted GCC)\033[0m inside Lima VM ($(LIMA_VM))\n"
+	@perl -e 'alarm 60; exec @ARGV' $(LIMACTL) shell --workdir $(abspath .) $(LIMA_VM) -- sh -c 'cp tests/test_m7_ecosystem.sh /tmp/test_m7_ecosystem.sh && $(abspath $(A32RT_BIN)) --sysroot $(SYSROOT_ARMV7) $(SYSROOT_ARMV7)/bin/bash /tmp/test_m7_ecosystem.sh && rm -f /tmp/test_m7_ecosystem.sh'
+	@printf "\033[32mPASS\033[0m: M7 on Lima\n"
+
+test-all-hl: check-headers test-hello-hl test-m1-hl test-m2-hl test-m3-hl test-m4-hl test-m5-hl test-m6-hl test-m7-hl ## Run complete M0..M7 suite under hyper-linux
+
+test-all-lima: test-hello-lima test-m1-lima test-m2-lima test-m3-lima test-m4-lima test-m5-lima test-m6-lima test-m7-lima ## Run complete M0..M7 suite inside Lima VM
 
 BENCH_BINS := $(BUILD_DIR)/bench-suite-armhf \
               $(BUILD_DIR)/bench-suite-thumb \

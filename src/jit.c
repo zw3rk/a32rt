@@ -19,9 +19,9 @@
 #include <string.h>
 #include <sys/mman.h>
 
-#define A32_CODE_CACHE_SIZE (16U * 1024U * 1024U)                 /* 16 MiB RX code cache */
-#define A32_CACHE_PAGES     (A32_CODE_CACHE_SIZE / A32_PAGE_SIZE) /* 4096 pages */
-#define A32_HT_SIZE         32768U                                /* Must be a power of 2 */
+#define A32_CODE_CACHE_SIZE (32U * 1024U * 1024U)                 /* 32 MiB RX code cache */
+#define A32_CACHE_PAGES     (A32_CODE_CACHE_SIZE / A32_PAGE_SIZE) /* 8192 pages */
+#define A32_HT_SIZE         131072U                               /* Must be a power of 2 */
 #define A32_HT_MASK         (A32_HT_SIZE - 1U)
 #define A32_SIDE_TABLE_SIZE 262144U
 #define MAX_STAGE_PC_MAP    256U
@@ -40,7 +40,8 @@ typedef struct a32_cache_entry {
     _Atomic uint32_t                 guest_end_pc;
     _Atomic uint32_t                 code_bytes;
     _Atomic bool                     is_call;
-    uint8_t                          pad_call[3];
+    bool                             in_active_list;
+    uint8_t                          pad_call[2];
     _Atomic uint32_t                 ret_key;
     _Atomic uint32_t                 ret_epoch;
     const void *_Atomic              ret_code;
@@ -92,10 +93,24 @@ static bool               g_page_is_rw[A32_CACHE_PAGES];
 static uintptr_t          g_batch_min  = UINTPTR_MAX;
 static uintptr_t          g_batch_max  = 0U;
 
-static a32_cache_entry_t  g_ht[A32_HT_SIZE];
-static a32_cache_entry_t  g_dummy_entry; /* Zeroed sentinel for x27 on uncached blocks */
+#define A32_PENDING_BUCKETS 4096U
+#define A32_PENDING_MASK    (A32_PENDING_BUCKETS - 1U)
+#define A32_PENDING_WAYS    4U
 
-static a32_side_entry_t   g_side_table[A32_SIDE_TABLE_SIZE];
+typedef struct a32_pending_bucket {
+    a32_cache_entry_t *callers[A32_PENDING_WAYS];
+    uint8_t            next_way;
+} a32_pending_bucket_t;
+
+static a32_cache_entry_t   *g_ht = NULL;
+static uint32_t             g_active_ht_idx[A32_HT_SIZE];
+static size_t               g_active_ht_count = 0U;
+static uint64_t             g_code_page_bitmap[16384]; /* 1 bit per 4 KiB guest page in 4 GiB */
+static a32_cache_entry_t    g_dummy_entry; /* Zeroed sentinel for x27 on uncached blocks */
+static a32_pending_bucket_t g_pending_slot_callers[A32_PENDING_BUCKETS];
+static a32_pending_bucket_t g_pending_ret_callers[A32_PENDING_BUCKETS];
+
+static a32_side_entry_t  *g_side_table = NULL;
 static size_t             g_side_table_count = 0U;
 
 static a32_pc_map_stage_t g_stage_pc_map[MAX_STAGE_PC_MAP];
@@ -119,6 +134,25 @@ static uint32_t hash_key(uint32_t key)
     key *= 0x846ca68bU;
     key ^= key >> 16;
     return key & A32_HT_MASK;
+}
+
+static inline void record_pending_caller_locked(a32_pending_bucket_t *table,
+                                                uint32_t target_key,
+                                                a32_cache_entry_t *caller)
+{
+    a32_pending_bucket_t *b = &table[hash_key(target_key) & A32_PENDING_MASK];
+    for (unsigned w = 0U; w < A32_PENDING_WAYS; w++) {
+        if (b->callers[w] == caller) {
+            return;
+        }
+        if (b->callers[w] == NULL) {
+            b->callers[w] = caller;
+            return;
+        }
+    }
+    unsigned victim = b->next_way & (A32_PENDING_WAYS - 1U);
+    b->next_way = (uint8_t)(victim + 1U);
+    b->callers[victim] = caller;
 }
 
 static inline void clear_ht_chain_slot_locked(a32_cache_entry_t *e, size_t c)
@@ -184,7 +218,7 @@ static a32_cache_entry_t *find_ht_slot_for_insert_locked(uint32_t key, uint32_t 
     }
     uint32_t slot          = hash_key(key);
     a32_cache_entry_t *res = NULL;
-    for (size_t probe = 0U; probe < 16U; probe++) {
+    for (size_t probe = 0U; probe < 32U; probe++) {
         uint32_t idx   = (slot + (uint32_t)probe) & A32_HT_MASK;
         uint32_t k     = atomic_load_explicit(&g_ht[idx].key, memory_order_relaxed);
         const void *hc = atomic_load_explicit(&g_ht[idx].host_code, memory_order_relaxed);
@@ -273,36 +307,40 @@ static void flush_icache_range(a32_ctx_t *ctx, const void *start, size_t len)
                      : "memory");
 }
 
+static size_t g_first_rw_page = 0U;
+
 static void reset_cache_locked(a32_ctx_t *ctx)
 {
     uint32_t old_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     atomic_store_explicit(&g_cache_epoch, 0U, memory_order_release);
-    for (size_t p = 0U; p < A32_CACHE_PAGES; p++) {
-        if (g_page_is_rw[p]) {
-            void *page_addr = g_code_cache + (p * A32_PAGE_SIZE);
-            if (mprotect(page_addr, A32_PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
-                fprintf(stderr, "a32rt: reset_cache mprotect(RX) failed: %s\n", strerror(errno));
-            }
-            g_page_is_rw[p] = false;
-        }
+    if (mprotect(g_code_cache, A32_CODE_CACHE_SIZE, PROT_READ | PROT_WRITE) != 0) {
+        fprintf(stderr, "a32rt: reset_cache mprotect(RW) failed: %s\n", strerror(errno));
     }
+    memset(g_page_is_rw, 1, sizeof(g_page_is_rw));
+    g_first_rw_page    = 0U;
     g_code_used        = 0U;
     g_batch_min        = UINTPTR_MAX;
     g_batch_max        = 0U;
-    for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+    for (size_t a = 0U; a < g_active_ht_count; a++) {
+        size_t i = g_active_ht_idx[a];
         clear_ht_entry_locked(&g_ht[i]);
         atomic_store_explicit(&g_ht[i].guest_pc, 0U, memory_order_relaxed);
         atomic_store_explicit(&g_ht[i].guest_end_pc, 0U, memory_order_relaxed);
         atomic_store_explicit(&g_ht[i].code_bytes, 0U, memory_order_relaxed);
         atomic_store_explicit(&g_ht[i].is_call, false, memory_order_relaxed);
-        g_ht[i].side_start = 0U;
-        g_ht[i].side_count = 0U;
+        g_ht[i].in_active_list = false;
+        g_ht[i].side_start     = 0U;
+        g_ht[i].side_count     = 0U;
     }
+    g_active_ht_count = 0U;
+    memset(g_code_page_bitmap, 0, sizeof(g_code_page_bitmap));
     if (ctx != NULL) {
         memset(ctx->ibtc, 0, sizeof(ctx->ibtc));
         memset(ctx->ras, 0, sizeof(ctx->ras));
         ctx->ras_top = 0U;
     }
+    memset(g_pending_slot_callers, 0, sizeof(g_pending_slot_callers));
+    memset(g_pending_ret_callers, 0, sizeof(g_pending_ret_callers));
     g_side_table_count = 0U;
     uint32_t new_epoch = old_epoch + 1U;
     if (new_epoch == 0U) {
@@ -313,14 +351,18 @@ static void reset_cache_locked(a32_ctx_t *ctx)
 
 static int flush_batch_locked(a32_ctx_t *ctx)
 {
-    size_t p = 0U;
-    while (p < A32_CACHE_PAGES) {
+    size_t used_pages = (g_code_used + A32_PAGE_SIZE - 1U) / A32_PAGE_SIZE;
+    if (used_pages > A32_CACHE_PAGES) {
+        used_pages = A32_CACHE_PAGES;
+    }
+    size_t p = g_first_rw_page;
+    while (p < used_pages) {
         if (!g_page_is_rw[p]) {
             p++;
             continue;
         }
         size_t start_p = p;
-        while (p < A32_CACHE_PAGES && g_page_is_rw[p]) {
+        while (p < used_pages && g_page_is_rw[p]) {
             p++;
         }
         void  *range_start = g_code_cache + (start_p * A32_PAGE_SIZE);
@@ -334,6 +376,7 @@ static int flush_batch_locked(a32_ctx_t *ctx)
         }
         ctx->wx_transitions++;
     }
+    g_first_rw_page = used_pages;
 
     if (g_batch_max > g_batch_min) {
         flush_icache_range(ctx, (const void *)g_batch_min, g_batch_max - g_batch_min);
@@ -379,6 +422,9 @@ static uint8_t *allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
             }
             g_page_is_rw[p] = true;
             ctx->wx_transitions++;
+        }
+        if (p < g_first_rw_page) {
+            g_first_rw_page = p;
         }
     }
 
@@ -503,43 +549,6 @@ int a32_jit_flush_batch(a32_ctx_t *ctx)
     }
     jit_lock_acquire();
     int ret = flush_batch_locked(ctx);
-    uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
-    if (ret == 0 && cur_epoch != 0U) {
-        for (size_t i = 0U; i < A32_HT_SIZE; i++) {
-            if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != cur_epoch) {
-                continue;
-            }
-            if (atomic_load_explicit(&g_ht[i].is_call, memory_order_relaxed) &&
-                atomic_load_explicit(&g_ht[i].ret_epoch, memory_order_relaxed) != cur_epoch) {
-                uint32_t k      = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
-                uint32_t end_pc = atomic_load_explicit(&g_ht[i].guest_end_pc, memory_order_relaxed);
-                uint32_t rk     = (end_pc & ~1U) | (k & 1U);
-                a32_cache_entry_t *re = find_ht_entry_locked(rk, cur_epoch);
-                if (re != NULL) {
-                    set_ht_ret_slot_locked(&g_ht[i], rk,
-                                           atomic_load_explicit(&re->host_code, memory_order_relaxed),
-                                           re, cur_epoch);
-                }
-            }
-            for (size_t s = 0U; s < A32_MAX_EXIT_SLOTS; s++) {
-                uint32_t s_key = atomic_load_explicit(&g_ht[i].slot_key[s], memory_order_relaxed);
-                if (s_key == 0U || atomic_load_explicit(&g_ht[i].slot_entry[s], memory_order_relaxed) != NULL) {
-                    continue;
-                }
-                a32_cache_entry_t *se = find_ht_entry_locked(s_key, cur_epoch);
-                if (se != NULL) {
-                    const void *target_code = atomic_load_explicit(&se->host_code, memory_order_relaxed);
-                    atomic_store_explicit(&g_ht[i].slot_entry[s], se, memory_order_release);
-                    if (atomic_load_explicit(&g_ht[i].chain_entry[0], memory_order_relaxed) == NULL) {
-                        set_ht_chain_slot_locked(&g_ht[i], 0U, s_key, target_code, se, cur_epoch);
-                    } else if (atomic_load_explicit(&g_ht[i].chain_entry[1], memory_order_relaxed) == NULL &&
-                               atomic_load_explicit(&g_ht[i].chain_key[0], memory_order_relaxed) != s_key) {
-                        set_ht_chain_slot_locked(&g_ht[i], 1U, s_key, target_code, se, cur_epoch);
-                    }
-                }
-            }
-        }
-    }
     jit_lock_release();
     return ret;
 }
@@ -565,18 +574,37 @@ int a32_jit_init(a32_ctx_t *ctx)
         jit_lock_release();
         return 0;
     }
-    void *mem = mmap(NULL, A32_CODE_CACHE_SIZE, PROT_READ | PROT_EXEC,
+    void *mem = mmap(NULL, A32_CODE_CACHE_SIZE, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
         fprintf(stderr, "a32rt: failed to allocate code cache: %s\n", strerror(errno));
         return -1;
     }
-    g_code_cache = (uint8_t *)mem;
-    g_code_used  = 0U;
-    memset(g_page_is_rw, 0, sizeof(g_page_is_rw));
-    g_batch_min  = UINTPTR_MAX;
-    g_batch_max  = 0U;
-    memset(g_ht, 0, sizeof(g_ht));
+    size_t ht_bytes = ((size_t)A32_HT_SIZE * sizeof(a32_cache_entry_t) + A32_PAGE_SIZE - 1U) &
+                      ~(size_t)(A32_PAGE_SIZE - 1U);
+    void *ht_mem = mmap(NULL, ht_bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ht_mem == MAP_FAILED) {
+        fprintf(stderr, "a32rt: failed to allocate JIT hash table: %s\n", strerror(errno));
+        return -1;
+    }
+    size_t st_bytes = ((size_t)A32_SIDE_TABLE_SIZE * sizeof(a32_side_entry_t) + A32_PAGE_SIZE - 1U) &
+                      ~(size_t)(A32_PAGE_SIZE - 1U);
+    void *st_mem = mmap(NULL, st_bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (st_mem == MAP_FAILED) {
+        fprintf(stderr, "a32rt: failed to allocate JIT side table: %s\n", strerror(errno));
+        return -1;
+    }
+    g_code_cache       = (uint8_t *)mem;
+    g_ht               = (a32_cache_entry_t *)ht_mem;
+    g_side_table       = (a32_side_entry_t *)st_mem;
+    g_code_used        = 0U;
+    memset(g_page_is_rw, 1, sizeof(g_page_is_rw));
+    g_first_rw_page    = 0U;
+    g_batch_min        = UINTPTR_MAX;
+    g_batch_max        = 0U;
+    g_active_ht_count  = 0U;
     g_side_table_count = 0U;
     return 0;
 }
@@ -589,9 +617,29 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
     }
 
     jit_lock_acquire();
+    if (g_ht == NULL || g_active_ht_count == 0U) {
+        jit_lock_release();
+        return 0;
+    }
+
+    uint32_t p_first = (start >= 512U ? (start - 512U) : 0U) >> 12U;
+    uint32_t p_last  = (end - 1U) >> 12U;
+    bool page_hit    = false;
+    for (uint32_t p = p_first; p <= p_last; p++) {
+        if ((g_code_page_bitmap[p >> 6U] & (1ULL << (p & 63U))) != 0ULL) {
+            page_hit = true;
+            break;
+        }
+    }
+    if (!page_hit) {
+        jit_lock_release();
+        return 0;
+    }
+
     uint32_t old_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     bool any_overlap   = false;
-    for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+    for (size_t a = 0U; a < g_active_ht_count; a++) {
+        size_t i       = g_active_ht_idx[a];
         uint32_t k     = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
         const void *hc = atomic_load_explicit(&g_ht[i].host_code, memory_order_relaxed);
         if (k != 0U && hc != NULL &&
@@ -620,7 +668,8 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
         new_epoch = 1U;
     }
     atomic_store_explicit(&g_cache_epoch, 0U, memory_order_release);
-    for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+    for (size_t a = 0U; a < g_active_ht_count; a++) {
+        size_t i       = g_active_ht_idx[a];
         uint32_t k     = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
         const void *hc = atomic_load_explicit(&g_ht[i].host_code, memory_order_relaxed);
         if (k != 0U && hc != NULL &&
@@ -635,7 +684,8 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
             }
         }
     }
-    for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+    for (size_t a = 0U; a < g_active_ht_count; a++) {
+        size_t i = g_active_ht_idx[a];
         if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != new_epoch) {
             continue;
         }
@@ -681,6 +731,18 @@ int a32_jit_invalidate_range(a32_ctx_t *ctx, uint32_t start, uint32_t end)
     return 0;
 }
 
+static inline void link_entry_chain_slot_locked(a32_cache_entry_t *caller, uint32_t s_key,
+                                                const void *target_code, a32_cache_entry_t *target,
+                                                uint32_t cur_epoch)
+{
+    if (atomic_load_explicit(&caller->chain_entry[0], memory_order_relaxed) == NULL) {
+        set_ht_chain_slot_locked(caller, 0U, s_key, target_code, target, cur_epoch);
+    } else if (atomic_load_explicit(&caller->chain_entry[1], memory_order_relaxed) == NULL &&
+               atomic_load_explicit(&caller->chain_key[0], memory_order_relaxed) != s_key) {
+        set_ht_chain_slot_locked(caller, 1U, s_key, target_code, target, cur_epoch);
+    }
+}
+
 static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, const void *dst,
                                      uint32_t guest_pc, uint32_t guest_end_pc, uint32_t code_bytes,
                                      bool is_call, size_t side_start, size_t side_count,
@@ -692,7 +754,8 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     uint32_t old_key = atomic_load_explicit(&entry->key, memory_order_relaxed);
     if (cur_epoch != 0U && old_ep == cur_epoch && old_key != 0U && old_key != key) {
         /* Evicting a live entry with a different key: unlink any incoming references */
-        for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+        for (size_t a = 0U; a < g_active_ht_count; a++) {
+            size_t i = g_active_ht_idx[a];
             if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != cur_epoch) {
                 continue;
             }
@@ -719,6 +782,17 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
     atomic_store_explicit(&entry->is_call, is_call, memory_order_relaxed);
     entry->side_start = side_start;
     entry->side_count = side_count;
+    if (cur_epoch != 0U && g_ht != NULL &&
+        entry >= g_ht && entry < g_ht + A32_HT_SIZE) {
+        if (!entry->in_active_list && g_active_ht_count < A32_HT_SIZE) {
+            entry->in_active_list = true;
+            g_active_ht_idx[g_active_ht_count++] = (uint32_t)(entry - g_ht);
+        }
+        uint32_t p0 = guest_pc >> 12U;
+        uint32_t p1 = ((guest_end_pc > guest_pc) ? (guest_end_pc - 1U) : guest_pc) >> 12U;
+        g_code_page_bitmap[p0 >> 6U] |= (1ULL << (p0 & 63U));
+        g_code_page_bitmap[p1 >> 6U] |= (1ULL << (p1 & 63U));
+    }
 
     if (words != NULL && word_count > 0U) {
         for (size_t i = 0U; i + 9U < word_count; i++) {
@@ -745,6 +819,11 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
                                 a32_cache_entry_t *se = find_ht_entry_locked(s_key, cur_epoch);
                                 if (se != NULL && se != entry) {
                                     atomic_store_explicit(&entry->slot_entry[s_idx_slot], se, memory_order_relaxed);
+                                    link_entry_chain_slot_locked(entry, s_key,
+                                                                 atomic_load_explicit(&se->host_code, memory_order_relaxed),
+                                                                 se, cur_epoch);
+                                } else {
+                                    record_pending_caller_locked(g_pending_slot_callers, s_key, entry);
                                 }
                             }
                         }
@@ -763,27 +842,41 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
             set_ht_ret_slot_locked(entry, r_key,
                                    atomic_load_explicit(&re->host_code, memory_order_relaxed),
                                    re, cur_epoch);
+        } else if (cur_epoch != 0U && r_key != 0U) {
+            record_pending_caller_locked(g_pending_ret_callers, r_key, entry);
         }
     }
 
-    if (link_reverse && cur_epoch != 0U) {
-        for (size_t i = 0U; i < A32_HT_SIZE; i++) {
-            if (&g_ht[i] == entry) {
-                continue;
-            }
-            if (atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed) != cur_epoch) {
+    (void)link_reverse;
+    if (cur_epoch != 0U && key != 0U) {
+        uint32_t p_idx = hash_key(key) & A32_PENDING_MASK;
+        a32_pending_bucket_t *sb = &g_pending_slot_callers[p_idx];
+        for (unsigned w = 0U; w < A32_PENDING_WAYS; w++) {
+            a32_cache_entry_t *ce = sb->callers[w];
+            if (ce == NULL || ce == entry ||
+                atomic_load_explicit(&ce->epoch, memory_order_relaxed) != cur_epoch) {
                 continue;
             }
             for (unsigned s = 0U; s < A32_MAX_EXIT_SLOTS; s++) {
-                if (atomic_load_explicit(&g_ht[i].slot_key[s], memory_order_relaxed) == key &&
-                    atomic_load_explicit(&g_ht[i].slot_entry[s], memory_order_relaxed) == NULL) {
-                    atomic_store_explicit(&g_ht[i].slot_entry[s], entry, memory_order_release);
+                if (atomic_load_explicit(&ce->slot_key[s], memory_order_relaxed) == key &&
+                    atomic_load_explicit(&ce->slot_entry[s], memory_order_relaxed) == NULL) {
+                    atomic_store_explicit(&ce->slot_entry[s], entry, memory_order_release);
+                    link_entry_chain_slot_locked(ce, key, dst, entry, cur_epoch);
                 }
             }
-            if (atomic_load_explicit(&g_ht[i].is_call, memory_order_relaxed) &&
-                atomic_load_explicit(&g_ht[i].ret_key, memory_order_relaxed) == key &&
-                atomic_load_explicit(&g_ht[i].ret_entry, memory_order_relaxed) == NULL) {
-                set_ht_ret_slot_locked(&g_ht[i], key, dst, entry, cur_epoch);
+        }
+        a32_pending_bucket_t *rb = &g_pending_ret_callers[p_idx];
+        for (unsigned w = 0U; w < A32_PENDING_WAYS; w++) {
+            a32_cache_entry_t *ce = rb->callers[w];
+            if (ce == NULL || ce == entry ||
+                atomic_load_explicit(&ce->epoch, memory_order_relaxed) != cur_epoch) {
+                continue;
+            }
+            if (atomic_load_explicit(&ce->is_call, memory_order_relaxed) &&
+                atomic_load_explicit(&ce->ret_key, memory_order_relaxed) == key &&
+                atomic_load_explicit(&ce->ret_entry, memory_order_relaxed) == NULL) {
+                set_ht_ret_slot_locked(ce, key, dst, entry, cur_epoch);
+                rb->callers[w] = NULL;
             }
         }
     }
@@ -907,6 +1000,28 @@ bool a32_jit_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
     return false;
 }
 
+static bool range_is_readonly_exec(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
+{
+    if (ctx == NULL || len == 0U || addr + len < addr) {
+        return false;
+    }
+    uint32_t end = addr + len;
+    uint32_t cur = addr;
+    for (size_t i = 0U; i < ctx->region_count && cur < end; i++) {
+        const a32_region_t *r = &ctx->regions[i];
+        if (r->end <= cur) {
+            continue;
+        }
+        if (r->start > cur || (r->prot & 0x4U) == 0U || (r->prot & 0x2U) != 0U) {
+            return false;
+        }
+        cur = (r->end < end) ? r->end : end;
+    }
+    return cur >= end;
+}
+
+#define A32_JIT_LOOKAHEAD_MAX 16U
+
 static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, bool is_thumb,
                                                   a32_cache_entry_t *oneshot_entry, bool flush_now,
                                                   a32_block_snap_t *out_snap)
@@ -945,101 +1060,175 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         return NULL;
     }
 
-    uint32_t entry_itstate = is_thumb ? ctx->itstate : 0U;
-    g_stage_pc_map_count   = 0U;
-    a32_jit_record_pc_map(0U, aligned_pc, entry_itstate);
+    uint32_t q_pcs[A32_JIT_LOOKAHEAD_MAX];
+    unsigned q_head    = 0U;
+    unsigned q_tail    = 1U;
+    q_pcs[0]           = aligned_pc;
+    unsigned max_batch = (!uncached && flush_now && range_is_readonly_exec(ctx, aligned_pc, is_thumb ? 2U : 4U))
+                             ? A32_JIT_LOOKAHEAD_MAX
+                             : 1U;
 
     uint32_t stage_words[A32_AOT_MAX_WORDS];
-    a64_buf_t buf;
-    a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
-    buf.guest_start_pc = aligned_pc;
-    if (uncached) {
-        buf.vfp_preheader_ineligible = true;
-    }
+    a32_cache_entry_t *first_entry = NULL;
 
-    if (is_thumb) {
-        a32_translate_t32_block(ctx, &buf, aligned_pc);
-    } else {
-        a32_translate_a32_block(ctx, &buf, aligned_pc);
-    }
+    for (q_head = 0U; q_head < q_tail; q_head++) {
+        uint32_t cur_b_pc  = q_pcs[q_head];
+        uint32_t cur_b_key = a32_make_key(cur_b_pc, is_thumb);
+        cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
 
-    if (!uncached && !buf.overflow && buf.has_self_loop &&
-        !buf.vfp_preheader_ineligible && buf.vfp_preheader_count > 0U) {
-        uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
-        uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
-        unsigned saved_count   = buf.vfp_preheader_count;
-        uint32_t saved_written = buf.vfp_preheader_written;
-        memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
-        memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
+        if (q_head > 0U) {
+            if (find_ht_entry_locked(cur_b_key, cur_epoch) != NULL) {
+                continue;
+            }
+            if (g_code_used + (A32_AOT_MAX_WORDS * sizeof(uint32_t)) > A32_CODE_CACHE_SIZE ||
+                g_side_table_count + MAX_STAGE_PC_MAP > A32_SIDE_TABLE_SIZE ||
+                find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
+                break;
+            }
+            if (!range_is_readonly_exec(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
+                continue;
+            }
+        } else if (!uncached && find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
+            reset_cache_locked(ctx);
+            cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
+        }
 
-        g_stage_pc_map_count = 0U;
-        a32_jit_record_pc_map(0U, aligned_pc, entry_itstate);
+        uint32_t entry_itstate = (q_head == 0U && is_thumb) ? ctx->itstate : 0U;
+        g_stage_pc_map_count   = 0U;
+        a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
+
+        a64_buf_t buf;
         a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
-        buf.guest_start_pc = aligned_pc;
-        a64_buf_start_self_loop(&buf, saved_kinds, saved_regs, saved_count, saved_written);
+        buf.guest_start_pc = cur_b_pc;
+        if (uncached) {
+            buf.vfp_preheader_ineligible = true;
+        }
+
         if (is_thumb) {
-            a32_translate_t32_block(ctx, &buf, aligned_pc);
+            a32_translate_t32_block(ctx, &buf, cur_b_pc);
         } else {
-            a32_translate_a32_block(ctx, &buf, aligned_pc);
+            a32_translate_a32_block(ctx, &buf, cur_b_pc);
+        }
+
+        if (!uncached && !buf.overflow && buf.has_self_loop &&
+            !buf.vfp_preheader_ineligible && buf.vfp_preheader_count > 0U) {
+            uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
+            uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
+            unsigned saved_count   = buf.vfp_preheader_count;
+            uint32_t saved_written = buf.vfp_preheader_written;
+            memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
+            memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
+
+            g_stage_pc_map_count = 0U;
+            a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
+            a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
+            buf.guest_start_pc = cur_b_pc;
+            a64_buf_start_self_loop(&buf, saved_kinds, saved_regs, saved_count, saved_written);
+            if (is_thumb) {
+                a32_translate_t32_block(ctx, &buf, cur_b_pc);
+            } else {
+                a32_translate_a32_block(ctx, &buf, cur_b_pc);
+            }
+        }
+
+        if (buf.overflow) {
+            if (q_head == 0U) {
+                fprintf(stderr, "a32rt: block buffer overflow at guest pc=0x%08x\n", pc);
+                jit_lock_release();
+                return NULL;
+            }
+            break;
+        }
+
+        size_t code_bytes = buf.count * sizeof(uint32_t);
+        uint8_t *dst = allocate_code_space_locked(ctx, code_bytes);
+        if (dst == NULL) {
+            if (q_head == 0U) {
+                jit_lock_release();
+                return NULL;
+            }
+            break;
+        }
+
+        memcpy(dst, stage_words, code_bytes);
+        size_t side_start = 0U;
+        size_t side_count = 0U;
+        commit_side_table_locked(dst, code_bytes, cur_b_pc, entry_itstate,
+                                 &side_start, &side_count);
+
+        uint32_t end_pc = (buf.guest_end_pc > cur_b_pc) ? buf.guest_end_pc : (cur_b_pc + 4U);
+        cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
+        a32_cache_entry_t *res_entry = NULL;
+
+        if (uncached && oneshot_entry != NULL) {
+            populate_ht_entry_locked(oneshot_entry, cur_b_key, dst, cur_b_pc, end_pc,
+                                     (uint32_t)code_bytes, buf.is_call, side_start, side_count,
+                                     0U, stage_words, buf.count, false);
+            res_entry = oneshot_entry;
+        } else {
+            res_entry = find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL);
+            if (res_entry == NULL) {
+                res_entry = &g_ht[hash_key(cur_b_key)];
+            }
+            populate_ht_entry_locked(res_entry, cur_b_key, dst, cur_b_pc, end_pc,
+                                     (uint32_t)code_bytes, buf.is_call, side_start, side_count,
+                                     cur_epoch, stage_words, buf.count, flush_now);
+        }
+
+        ctx->blocks_compiled++;
+
+        if (q_head == 0U) {
+            first_entry = res_entry;
+            if (out_snap != NULL) {
+                out_snap->code         = dst;
+                out_snap->is_call      = buf.is_call;
+                out_snap->guest_pc     = cur_b_pc;
+                out_snap->guest_end_pc = end_pc;
+                out_snap->code_bytes   = (uint32_t)code_bytes;
+                out_snap->epoch        = cur_epoch;
+            }
+        }
+
+        if (q_tail < max_batch) {
+            uint32_t cands[A64_MAX_EXIT_SLOTS + 1U];
+            unsigned n_cands = 0U;
+            for (unsigned s = 0U; s < buf.exit_slot_count && s < A64_MAX_EXIT_SLOTS; s++) {
+                cands[n_cands++] = buf.exit_slot_pcs[s];
+            }
+            if (buf.is_call && end_pc > cur_b_pc) {
+                cands[n_cands++] = end_pc;
+            }
+            for (unsigned c = 0U; c < n_cands && q_tail < max_batch; c++) {
+                uint32_t c_aligned = cands[c] & (is_thumb ? ~1U : ~3U);
+                if (c_aligned < 0x1000U || c_aligned >= 0xFFFF0000U) {
+                    continue;
+                }
+                bool seen = false;
+                for (unsigned q = 0U; q < q_tail; q++) {
+                    if (q_pcs[q] == c_aligned) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) {
+                    continue;
+                }
+                uint32_t c_key = a32_make_key(c_aligned, is_thumb);
+                if (find_ht_entry_locked(c_key, cur_epoch) == NULL &&
+                    range_is_readonly_exec(ctx, c_aligned, is_thumb ? 2U : 4U)) {
+                    q_pcs[q_tail++] = c_aligned;
+                }
+            }
         }
     }
 
-    if (buf.overflow) {
-        fprintf(stderr, "a32rt: block buffer overflow at guest pc=0x%08x\n", pc);
+    if (flush_now && g_batch_max > g_batch_min && flush_batch_locked(ctx) != 0) {
         jit_lock_release();
         return NULL;
     }
-
-    size_t code_bytes = buf.count * sizeof(uint32_t);
-    uint8_t *dst = allocate_code_space_locked(ctx, code_bytes);
-    if (dst == NULL) {
-        jit_lock_release();
-        return NULL;
-    }
-
-    memcpy(dst, stage_words, code_bytes);
-    size_t side_start = 0U;
-    size_t side_count = 0U;
-    commit_side_table_locked(dst, code_bytes, aligned_pc, entry_itstate,
-                             &side_start, &side_count);
-
-    if (flush_now && flush_batch_locked(ctx) != 0) {
-        jit_lock_release();
-        return NULL;
-    }
-
-    uint32_t end_pc = (buf.guest_end_pc > aligned_pc) ? buf.guest_end_pc : (aligned_pc + 4U);
-    cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
-    a32_cache_entry_t *res_entry = NULL;
-
-    if (uncached && oneshot_entry != NULL) {
-        populate_ht_entry_locked(oneshot_entry, key, dst, aligned_pc, end_pc,
-                                 (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                 0U, stage_words, buf.count, false);
-        res_entry = oneshot_entry;
-    } else {
-        res_entry = find_ht_slot_for_insert_locked(key, cur_epoch, NULL);
-        if (res_entry == NULL) {
-            res_entry = &g_ht[hash_key(key)];
-        }
-        populate_ht_entry_locked(res_entry, key, dst, aligned_pc, end_pc,
-                                 (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                 cur_epoch, stage_words, buf.count, flush_now);
-    }
-
-    if (out_snap != NULL) {
-        out_snap->code         = dst;
-        out_snap->is_call      = buf.is_call;
-        out_snap->guest_pc     = aligned_pc;
-        out_snap->guest_end_pc = end_pc;
-        out_snap->code_bytes   = (uint32_t)code_bytes;
-        out_snap->epoch        = cur_epoch;
-    }
-
-    ctx->blocks_compiled++;
 
     jit_lock_release();
-    return res_entry;
+    return first_entry;
 }
 
 static const void *compile_block_internal(a32_ctx_t *ctx, uint32_t guest_pc, bool is_thumb,
@@ -1074,7 +1263,8 @@ void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
     jit_lock_acquire();
     uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     a32_pc_map_stage_t pc_map[MAX_STAGE_PC_MAP];
-    for (size_t i = 0U; i < A32_HT_SIZE; i++) {
+    for (size_t a = 0U; a < g_active_ht_count; a++) {
+        size_t i              = g_active_ht_idx[a];
         uint32_t key          = atomic_load_explicit(&g_ht[i].key, memory_order_relaxed);
         const void *host_code = atomic_load_explicit(&g_ht[i].host_code, memory_order_relaxed);
         uint32_t ep           = atomic_load_explicit(&g_ht[i].epoch, memory_order_relaxed);
@@ -1398,6 +1588,7 @@ int a32_jit_run(a32_ctx_t *ctx)
         void    *run_entry      = uncached ? (void *)&g_dummy_entry : (void *)cur_entry;
         ctx->last_exec_entry    = run_entry;
         uint32_t reason         = a32_jit_run_block(ctx, code, run_entry, &g_cache_epoch);
+        is_thumb                = (ctx->cpsr & A32_CPSR_T) != 0U;
         bool     sync_sig_taken = ctx->sync_sig_delivered;
         if (sync_sig_taken) {
             prev_entry = NULL;
