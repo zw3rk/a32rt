@@ -11,6 +11,8 @@
  * syntax-clean under make check on macOS. Curated C11.
  */
 
+#define _GNU_SOURCE
+
 #include "os/backend.h"
 
 #include <errno.h>
