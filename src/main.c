@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "a32rt.h"
+#include "dbt/difftest.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -66,7 +67,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] -- <PATH> <ARGV0> [ARGS...]\n"
+            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] -- <PATH> <ARGV0> [ARGS...]\n"
             "  %s <PATH> [ARGS...]\n",
             prog, prog);
 }
@@ -81,6 +82,7 @@ int main(int argc, char **argv, char **envp)
     static a32_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.host_tid = (int)syscall(SYS_gettid);
+    a32_exec_mode_t exec_mode = A32_EXEC_DBT;
 
     uint64_t requested_window = UINT64_MAX;
     const char *env_sysroot = getenv("A32RT_SYSROOT");
@@ -170,6 +172,8 @@ int main(int argc, char **argv, char **envp)
             i++;
         } else if (strcmp(argv[i], "--trace") == 0) {
             ctx.trace_enabled = true;
+            i++;
+        } else if (a32_difftest_parse_arg(argv[i], &exec_mode)) {
             i++;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -269,6 +273,12 @@ int main(int argc, char **argv, char **envp)
     ctx.regs[13] = initial_sp;
     a32_set_pc_interwork(&ctx, ctx.elf_entry);
 
+    if (exec_mode == A32_EXEC_INTERP) {
+        return a32_difftest_run_interp(&ctx, 0ULL, NULL);
+    }
+    if (exec_mode == A32_EXEC_DIFFTEST) {
+        return a32_difftest_run_compare(&ctx, 0ULL, NULL);
+    }
     int rc = a32_jit_run(&ctx);
     if (ctx.auto_aot && !ctx.aot_loaded && ctx.blocks_compiled > 0U) {
         (void)a32_aot_save_cache(&ctx, exec_path);

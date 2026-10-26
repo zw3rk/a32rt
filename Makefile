@@ -56,9 +56,15 @@ SRCS := src/main.c \
         src/aot.c \
         src/syscalls.c \
         src/signals.c \
-        src/gdb.c
+        src/gdb.c \
+        src/interp/interp.c \
+        src/interp/interp_a32.c \
+        src/interp/interp_thumb.c \
+        src/interp/interp_vfp.c \
+        src/dbt/difftest.c
 ASM_SRCS := src/trampoline.S
-HDRS := include/a32host.h src/a32rt.h src/a64_emit.h
+HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
+        src/interp/interp.h src/interp/interp_priv.h src/dbt/difftest.h
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
 TEST_BINS := $(BUILD_DIR)/hello-armhf-static \

@@ -16,29 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../interp/interp.h"
-
-typedef enum a32_exec_mode {
-    A32_EXEC_DBT = 0,
-    A32_EXEC_INTERP = 1,
-    A32_EXEC_DIFFTEST = 2
-} a32_exec_mode_t;
-
-typedef struct a32_difftest_stats {
-    uint64_t steps;
-    uint64_t svc_count;
-    uint64_t undef_fallbacks;
-    uint64_t fault_count;
-    uint32_t first_undef_pc;
-    uint32_t first_diverge_pc;
-    uint64_t interp_hash;
-    uint64_t dbt_hash;
-    bool diverged;
-} a32_difftest_stats_t;
-
-/* Single DBT step hook, installed by the JIT lane once block single-step
- * is exposed. Defaults to NULL (coverage mode: interp only). */
-typedef uint32_t (*a32_dbt_step_fn)(a32_ctx_t *ctx);
+#include "difftest.h"
 
 static a32_dbt_step_fn g_dbt_step = NULL;
 
