@@ -98,7 +98,7 @@ static uint32_t a32_shift_op(uint32_t insn, uint32_t rm_val, uint32_t rs_val,
                 *carry = (amt == 32U) ? ((rm_val & 1U) != 0U) : false;
                 return 0U;
             case 1U:
-                *carry = ((rm_val >> 31) & 1U) != 0U;
+                *carry = (amt == 32U) ? (((rm_val >> 31) & 1U) != 0U) : false;
                 return 0U;
             case 2U:
                 *carry = ((rm_val >> 31) & 1U) != 0U;
@@ -117,7 +117,7 @@ static uint32_t a32_shift_op(uint32_t insn, uint32_t rm_val, uint32_t rs_val,
         }
     }
     switch (st) {
-    case 0U: *carry = ((rm_val >> (amt - 1U)) & 1U) != 0U; return rm_val << amt;
+    case 0U: *carry = ((rm_val >> (32U - amt)) & 1U) != 0U; return rm_val << amt;
     case 1U: *carry = ((rm_val >> (amt - 1U)) & 1U) != 0U; return rm_val >> amt;
     case 2U: {
         uint32_t r;

@@ -10,9 +10,12 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#if defined(__linux__)
 #include <sys/random.h>
+#endif
 #include <unistd.h>
 
 #define A32_STACK_TOP  0xE0000000U
@@ -120,11 +123,15 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     uint32_t sp = A32_STACK_TOP - 64U;
 
     uint8_t rand_bytes[16];
+#if defined(__linux__)
     if (getrandom(rand_bytes, sizeof(rand_bytes), 0) != (ssize_t)sizeof(rand_bytes)) {
         for (size_t i = 0; i < sizeof(rand_bytes); i++) {
             rand_bytes[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
         }
     }
+#else
+    arc4random_buf(rand_bytes, sizeof(rand_bytes));
+#endif
     uint32_t at_random_va   = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
     uint32_t at_platform_va = push_cstring(ctx, &sp, "v8l");
     const char *execfn_str  = (ctx->exec_path && ctx->exec_path[0]) ? ctx->exec_path : guest_argv[0];

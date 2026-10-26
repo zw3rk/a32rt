@@ -71,8 +71,14 @@ uintptr_t a32_vm32_arena_base(void);
 
 /* ---- 7-instruction Soft-TLB (UNIFICATION-PLAN section 4.3) ---- */
 
-#define A32_VM32_TLB_BITS 12U
-#define A32_VM32_TLB_SIZE (1U << A32_VM32_TLB_BITS) /* 4096 entries */
+/* Full-coverage table: one entry per 4 KiB guest page in the 4 GiB window
+ * (1M entries x 32 B = 32 MiB BSS, demand-zero). Direct-mapped aliasing is
+ * unacceptable for the A2 fast path: a miss exits the block with a guest
+ * fault, and an eviction-induced miss on a mapped page would deliver a
+ * bogus fault with no mid-block resume machinery. Full coverage makes
+ * every tag miss a genuine unmapped-or-wrong-permission fault. */
+#define A32_VM32_TLB_BITS 20U
+#define A32_VM32_TLB_SIZE (1U << A32_VM32_TLB_BITS) /* 1048576 entries */
 #define A32_VM32_TLB_INVALID_TAG (~UINT64_C(0))
 
 typedef struct {
@@ -108,10 +114,24 @@ void a32_vm32_tlb_invalidate_all(void);
 
 /* Mapping-layer hooks: publish translations for [start, end) after a
  * successful mmap/mprotect (host base == arena base + page in both
- * regimes), or drop them after munmap/mremap. Called by src/vm.c. */
+ * regimes), or drop them after munmap/mremap. Called by src/vm.c.
+ * The per-4 KiB guest permission record (R/W/X ground truth for the A2
+ * host-page union in a32_vm32_protect) is maintained alongside. */
 void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
-    bool readable, bool writable);
+    bool readable, bool writable, bool executable);
 void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva);
+
+/* Soft-TLB base address for the A2 emitter/trampoline (x21). Set by
+ * a32_vm32_init: &g_tlb[0] when regime == A2_SOFT_TLB, 0 (unused) in A1. */
+extern uintptr_t a32_vm32_tlb_base;
+
+/* Regime-aware mprotect. Outside A2 this forwards [addr, addr+len)
+ * directly; under A2 it computes the union of every 4 KiB sub-page
+ * permission (target sub-pages contribute guest_prot, neighbours their
+ * recorded permissions) within each host page and protects each host
+ * page once via a32_backend_protect. Returns 0, negative errno else. */
+int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
+    uint32_t guest_prot);
 
 /* ---- LDREX/STREX reservation + true atomic RMW (section 4.4) ----
  *
@@ -180,10 +200,18 @@ _Static_assert(sizeof(a32_vm32_mem_site_t) == 24,
 
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len);
+int a32_vmfile_populate_if_private(void *hva, int host_fd,
+    uint64_t file_offset, size_t len, int host_flags, int final_prot);
 void a32_vmfile_promote_cow(uint32_t gva_page, bool readable, bool writable);
 void a32_vmfile_promote_range(uint32_t start_gva, uint32_t end_gva,
     bool readable, bool writable);
 int a32_vmfile_on_truncate(uint64_t new_size);
 int a32_vmfile_hook_write(uint64_t end_offset);
+/* Syscall-hook entry points: refresh the tracked size/sequence for the
+ * file behind host_fd (ftruncate/write/pwrite) or host_path (truncate).
+ * Entries for other files are untouched. Return 0 (or negative errno
+ * when the file cannot be stated); unknown files are ignored. */
+int a32_vmfile_sync_fd(int host_fd);
+int a32_vmfile_sync_path(const char *host_path);
 
 #endif /* A32RT_VM_VM32_H */

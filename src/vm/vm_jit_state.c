@@ -6,8 +6,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "os/backend.h"
+
+/* Last guest PC handed to a32_jit_record_pc_map during block translation.
+ * Both translators record (count, cur_pc) immediately before emitting each
+ * guest instruction, so the DBT memory emitters can recover the faulting
+ * instruction PC (A2 Soft-TLB miss exit) and the per-block site base
+ * (AOT site tracking) without threading new parameters through the
+ * frozen emitter headers. Translation runs under the JIT lock. */
+static uint32_t g_last_record_pc = 0U;
+
+uint32_t a32_jit_last_record_pc(void)
+{
+    return g_last_record_pc;
+}
+
 void a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t itstate)
 {
+    g_last_record_pc = guest_pc;
     if (g_stage_pc_map_count > 0U &&
         g_stage_pc_map[g_stage_pc_map_count - 1U].host_word_idx == host_word_idx) {
         g_stage_pc_map[g_stage_pc_map_count - 1U].guest_pc = guest_pc;
@@ -93,9 +109,11 @@ int a32_jit_init(a32_ctx_t *ctx)
         jit_lock_release();
         return 0;
     }
-    void *mem = mmap(NULL, A32_CODE_CACHE_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) {
+    /* Route the executable code-cache allocation through the host
+     * backend so Darwin uses MAP_JIT/APRR publication while Linux keeps
+     * a plain RW mapping (sealed RX later by the W^X batch path). */
+    void *mem = a32_backend_jit_alloc(A32_CODE_CACHE_SIZE);
+    if (mem == NULL) {
         fprintf(stderr, "a32rt: failed to allocate code cache: %s\n", strerror(errno));
         return -1;
     }

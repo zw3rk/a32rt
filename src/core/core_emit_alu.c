@@ -13,6 +13,12 @@
  */
 
 #include "a64_emit.h"
+#include "dbt/aot/aot.h"
+
+/* Last-PC stash maintained by a32_jit_record_pc_map (src/vm/vm_jit_state.c):
+ * both translators record (count, cur_pc) immediately before emitting each
+ * guest instruction, so this is the faulting instruction PC at emission. */
+extern uint32_t a32_jit_last_record_pc(void);
 
 void a64_emit_movz_w(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
 {
@@ -600,10 +606,137 @@ void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *
     b->loop_body_offset = b->count;
 }
 
+/* ---- Per-block AOT site staging (P2 #7) ----
+ * The single-access memory emitters below append one 24-byte site record
+ * per access; the batch is handed to a32_aot_site_track() when the block
+ * changes or when a32_emit_sites_flush() runs (AOT save path). Records use
+ * the fault-recovery layout of section 4.3.3; insn_word stays 0 because
+ * the opcode word is not threaded to this layer, and npc_delta is the A32
+ * 4-byte step (Thumb variable-length NPC is approximated). */
+static a32_vm32_mem_site_t g_site_stage[A32_AOT_SITE_PER_BLOCK];
+static uint32_t g_site_stage_base = 0U;
+static uint32_t g_site_stage_count = 0U;
+static bool g_site_stage_valid = false;
+
+void a32_emit_sites_flush(void)
+{
+    if (g_site_stage_valid && g_site_stage_count > 0U) {
+        (void)a32_aot_site_track(g_site_stage_base, g_site_stage,
+            g_site_stage_count);
+    }
+    g_site_stage_valid = false;
+    g_site_stage_count = 0U;
+}
+
+static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
+    unsigned addr_w, uint32_t host_off)
+{
+    a32_vm32_mem_site_t rec;
+    uint32_t cur_pc;
+    if (g_site_stage_valid && b->guest_start_pc != g_site_stage_base) {
+        a32_emit_sites_flush();
+    }
+    if (g_site_stage_count >= A32_AOT_SITE_PER_BLOCK) {
+        return;
+    }
+    cur_pc = a32_jit_last_record_pc();
+    memset(&rec, 0, sizeof(rec));
+    rec.seq_start_offset = 0U;
+    rec.host_insn_offset = (uint16_t)(host_off & 0xFFFFU);
+    rec.cont_insn_offset = 0U;
+    rec.guest_pc_delta = cur_pc - b->guest_start_pc;
+    rec.npc_delta = 4;
+    rec.insn_word = 0U;
+    rec.sp_rollback_delta = 0;
+    rec.npc_mode = (uint8_t)A32_VM32_NPC_SEQUENTIAL;
+    rec.width = (uint8_t)(1U << ((opc >> 30U) & 3U));
+    rec.flags = (((opc & 0x400000U) == 0U) ? (uint8_t)A32_VM32_SITE_STORE : 0U);
+    if (rec.width <= 2U && (opc & 0x800000U) != 0U) {
+        rec.flags |= (uint8_t)A32_VM32_SITE_SIGNED;
+    }
+    rec.val_or_dst_reg = (uint8_t)(rt & 0xFFU);
+    rec.addr_base_reg = (uint8_t)(addr_w & 0xFFU);
+    rec.reserved = 0U;
+    g_site_stage[g_site_stage_count++] = rec;
+    g_site_stage_base = b->guest_start_pc;
+    g_site_stage_valid = true;
+}
+
+/* X-form MOVZ/MOVK for 64-bit immediates (TLB-base materialization). */
+static void emit_movz_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
+{
+    a64_emit(b, 0xD2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
+}
+
+static void emit_movk_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
+{
+    a64_emit(b, 0xF2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
+}
+
 static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned addr_w)
 {
     if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
-    a64_emit(b, opc | ((addr_w & 31U) << 16) | (A64_XG << 5) | (rt & 31U));
+    emit_site_record(b, opc, rt, addr_w, (uint32_t)b->count);
+    if (a32_vm32_current_regime() != A32_VM32_REGIME_A2_SOFT_TLB ||
+        a32_vm32_tlb_base == 0U) {
+        a64_emit(b, opc | ((addr_w & 31U) << 16) | (A64_XG << 5) | (rt & 31U));
+        return;
+    }
+    /* Regime A2: 7-instruction Soft-TLB lookup on x21 (section 4.3).
+     * x21 doubles as ALU scratch (TMP3), so the base is materialized per
+     * access; the 7 lookup instructions themselves never touch PSTATE or
+     * w0/w1, and a tag miss exits cleanly to the fault path below with
+     * (fault_addr, faulting PC, EXIT_FAULT) in (mem, w15, w16). Full TLB
+     * coverage (1M entries) makes every miss a genuine fault: no mid-block
+     * resume is required. Multi-word LDM/STM/LDRD/STRD keep direct
+     * addressing (correct but union-mapped); see the header notes. */
+    {
+        uint64_t base = (uint64_t)a32_vm32_tlb_base;
+        unsigned s0 = 15U;
+        unsigned s1 = 16U;
+        uint16_t h0 = (uint16_t)(base & 0xFFFFU);
+        uint16_t h1 = (uint16_t)((base >> 16) & 0xFFFFU);
+        uint16_t h2 = (uint16_t)((base >> 32) & 0xFFFFU);
+        uint16_t h3 = (uint16_t)((base >> 48) & 0xFFFFU);
+        uint32_t cur_pc = a32_jit_last_record_pc();
+        uint32_t tag_off = (((opc & 0x400000U) == 0U) ? 16U : 0U);
+        if (addr_w == 15U) {
+            s0 = 16U;
+            s1 = 17U;
+        } else if (addr_w == 16U) {
+            s0 = 15U;
+            s1 = 17U;
+        } else if (addr_w == 17U) {
+            s0 = 15U;
+            s1 = 16U;
+        }
+        emit_movz_x(b, 21U, h0, 0U);
+        if (h1 != 0U) {
+            emit_movk_x(b, 21U, h1, 1U);
+        }
+        if (h2 != 0U) {
+            emit_movk_x(b, 21U, h2, 2U);
+        }
+        if (h3 != 0U) {
+            emit_movk_x(b, 21U, h3, 3U);
+        }
+        a64_emit_ubfm_w(b, s0, addr_w, 12U, 19U);
+        a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 5U);
+        a64_emit_add_uxtw_x(b, s0, 21U, s0);
+        a64_emit_ldr_imm_w(b, s1, s0, tag_off);
+        a64_emit_ubfm_w(b, s1, s1, 12U, 19U);
+        a64_emit_eor_reg_w(b, s1, s1, s0, A64_SHIFT_LSL, 0U);
+        /* CBZ s1, +5 words: tag hit skips the 5-instruction miss stub. */
+        a64_emit(b, 0x34000000U | (5U << 5) | (s1 & 31U));
+        a64_emit_str_imm_w(b, addr_w, A64_XCTX,
+            (uint32_t)offsetof(a32_ctx_t, fault_addr));
+        a64_emit_mov_pc32(b, 15U, cur_pc);
+        a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
+        a64_emit(b, 0xD65F03C0U);
+        /* Hit: addend load plus the original single access via [addend, wA]. */
+        a64_emit(b, 0xF9400000U | (1U << 10) | ((s0 & 31U) << 5) | (s1 & 31U));
+        a64_emit(b, opc | ((addr_w & 31U) << 16) | ((s1 & 31U) << 5) | (rt & 31U));
+    }
 }

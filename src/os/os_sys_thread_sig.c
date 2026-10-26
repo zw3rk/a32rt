@@ -1,3 +1,4 @@
+#include "vm/vm32.h"
 /*
  * src/os/os_sys_thread_sig.c - split-TU part 4/7 of src/syscalls.c (lines 1610-2336).
  * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
@@ -248,7 +249,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
 
     case ARM_NR_write:
         FAIL_EFAULT_IF(a2 > 0U && a1 < 0x1000U);
-        ctx->regs[0] = host_ret(write((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2));
+        {
+            ssize_t wr = write((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2);
+            if (wr > 0) {
+                (void)a32_vmfile_sync_fd((int)a0);
+            }
+            ctx->regs[0] = host_ret(wr);
+        }
         break;
 
     case ARM_NR_readv:
@@ -275,6 +282,9 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         } else {
             r = (nr == ARM_NR_writev) ? writev((int)a0, iov_ptr, (int)a2)
                                       : readv((int)a0, iov_ptr, (int)a2);
+        }
+        if ((nr == ARM_NR_writev || nr == ARM_NR_pwritev) && r > 0) {
+            (void)a32_vmfile_sync_fd((int)a0);
         }
         if (iov_ptr != host_iov) {
             free(iov_ptr);

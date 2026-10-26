@@ -513,10 +513,14 @@ int a32_jit_run(a32_ctx_t *ctx)
     }
 }
 
-/* RC-U3: exactly one DBT block for the --difftest lockstep hook. Compiles
- * (or finds) the block at the current PC and runs it to its exit reason
- * without dispatching syscalls or signals; the difftest loop owns that
- * policy identically on both copies. */
+/* RC-U3-r2: exactly one DBT *instruction* for the --difftest lockstep
+ * hook. Forces single_step around compilation so both translators cap the
+ * block at max_insns = 1 (the same mechanism GDB single-stepping uses,
+ * hence production-tested), bypassing the block cache via the oneshot
+ * entry. Runs the block to its exit reason without dispatching syscalls
+ * or signals; the difftest loop owns that policy identically on both
+ * copies. The caller zeroes dut ibtc/ras once so the trampoline cannot
+ * chain into a second block inside one run_block call. */
 uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
 {
     bool is_thumb;
@@ -524,17 +528,33 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
     uint32_t code_bytes = 0U;
     const void *code;
     uint32_t reason;
+    bool saved_step;
+    int seal_rc;
     if (ctx == NULL) {
         return A32_EXIT_UNDEF;
     }
     is_thumb = (ctx->cpsr & A32_CPSR_T) != 0U;
     pc = ctx->regs[15] & (is_thumb ? ~1U : ~3U);
     ctx->exit_reason = A32_EXIT_NONE;
+    saved_step = ctx->single_step;
+    ctx->single_step = true;
     code = a32_jit_compile_block(ctx, pc, is_thumb, &code_bytes);
+    ctx->single_step = saved_step;
     if (code == NULL || code_bytes == 0U) {
         if (ctx->exit_reason == A32_EXIT_NONE) {
             ctx->exit_reason = A32_EXIT_UNDEF;
         }
+        return ctx->exit_reason;
+    }
+    /* W^X: fresh blocks live in RW staging pages until the batch seals
+     * them RX (plus icache flush). Normal dispatch seals via flush_now;
+     * this direct run_block path must seal explicitly. */
+    jit_lock_acquire();
+    seal_rc = flush_batch_locked(ctx);
+    jit_lock_release();
+    if (seal_rc != 0) {
+        ctx->fault_addr = pc;
+        ctx->exit_reason = A32_EXIT_FAULT;
         return ctx->exit_reason;
     }
     ctx->blocks_executed++;

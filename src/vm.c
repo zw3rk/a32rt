@@ -241,7 +241,7 @@ static int vm_record_region_locked(uint32_t start, uint32_t end,
      * record so Regime A2 stays coherent without a second walk. */
     if (rc == 0) {
         a32_vm32_sync_region(start, end, (prot & 0x1U) != 0U,
-            (prot & 0x2U) != 0U);
+            (prot & 0x2U) != 0U, (prot & 0x4U) != 0U);
     }
     return rc;
 }
@@ -294,7 +294,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
     /* Wave U3 A32-4: re-publish the Soft-TLB translation under the new
      * protections so Regime A2 faults match the guest view. */
     a32_vm32_sync_region(mp_start, mp_end, (prot & 0x1U) != 0U,
-        (prot & 0x2U) != 0U);
+        (prot & 0x2U) != 0U, (prot & 0x4U) != 0U);
 }
 
 static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
@@ -616,16 +616,16 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     off_t host_off    = (off_t)pgoffset * (off_t)A32_PAGE_SIZE;
     void *res = NULL;
     int map_rc = ((host_flags & MAP_ANONYMOUS) != 0)
-        ? a32_backend_map_anon(host_target, (size_t)aligned_len,
-            host_prot, 1, 1, &res)
-        : a32_backend_map_file(host_target, (size_t)aligned_len,
-            host_prot, (host_flags & MAP_SHARED) != 0, 1, 1, fd,
-            (uint64_t)host_off, &res);
+        ? a32_backend_map_anon(host_target, (size_t)aligned_len, host_prot, 1, 1, &res)
+        : a32_backend_map_file(host_target, (size_t)aligned_len, host_prot,
+            (host_flags & MAP_SHARED) != 0, 1, 1, fd, (uint64_t)host_off, &res);
     if (map_rc != 0) {
         return (uint32_t)map_rc;
     }
-    if ((host_flags & (MAP_ANONYMOUS | MAP_SHARED)) == 0) {
-        (void)a32_vmfile_populate_private(res, fd, (uint64_t)host_off, (size_t)aligned_len);
+    int pop_rc = a32_vmfile_populate_if_private(res, fd, (uint64_t)host_off,
+        (size_t)aligned_len, host_flags, host_prot);
+    if (pop_rc != 0) {
+        return (uint32_t)pop_rc;
     }
 
     if (update_cursor) {
@@ -683,8 +683,7 @@ static int vm_mprotect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint3
         return -ENOMEM;
     }
 
-    int prot_rc = a32_backend_protect(a32_guest_ptr(ctx, addr),
-        (size_t)aligned_len, a32_host_prot(ctx, prot));
+    int prot_rc = a32_vm32_protect(ctx, addr, (size_t)aligned_len, prot);
     if (prot_rc != 0) {
         return prot_rc;
     }

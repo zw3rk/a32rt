@@ -1,3 +1,4 @@
+#include "vm/vm32.h"
 /*
  * src/os/os_sys_sock.c - split-TU part 6/7 of src/syscalls.c (lines 3179-3697).
  * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
@@ -13,6 +14,9 @@
         ssize_t r = (nr == ARM_NR_pread64)
                     ? pread((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, pos)
                     : pwrite((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, pos);
+        if (nr == ARM_NR_pwrite64 && r > 0) {
+            (void)a32_vmfile_sync_fd((int)a0);
+        }
         ctx->regs[0] = host_ret(r);
         break;
     }
@@ -27,7 +31,13 @@
         off_t len = (nr == ARM_NR_truncate64)
                     ? (off_t)u64_from_u32(a2, a3)
                     : (off_t)(int32_t)a1;
-        ctx->regs[0] = host_ret(truncate(resolved, len));
+        {
+            int tr = truncate(resolved, len);
+            if (tr == 0) {
+                (void)a32_vmfile_sync_path(resolved);
+            }
+            ctx->regs[0] = host_ret(tr);
+        }
         break;
     }
 
@@ -39,7 +49,13 @@
         off_t len = (nr == ARM_NR_ftruncate64)
                     ? (off_t)u64_from_u32(a2, a3)
                     : (off_t)(int32_t)a1;
-        ctx->regs[0] = host_ret(ftruncate((int)a0, len));
+        {
+            int fr = ftruncate((int)a0, len);
+            if (fr == 0) {
+                (void)a32_vmfile_sync_fd((int)a0);
+            }
+            ctx->regs[0] = host_ret(fr);
+        }
         break;
     }
 
