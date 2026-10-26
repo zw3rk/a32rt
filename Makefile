@@ -43,8 +43,13 @@ CFLAGS := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
           -fno-stack-protector -Iinclude -Isrc
 LDFLAGS := -static-pie -Wl,-z,max-page-size=4096
 
-# Wave U3 A32-4: platform backend (dual-backend build).
-ifeq ($(shell uname -s),Darwin)
+# Wave U3 A32-4: platform backend (dual-backend build). Selected from the
+# compiler target triple so cross-builds (CC=aarch64-...-gcc) get the Linux
+# backend even when the build host is Darwin. Falls back to cc when the
+# Makefile leaves CC empty (no cross-compiler on PATH).
+A32_PROBE_CC := $(or $(CC),cc)
+A32_TARGET := $(shell $(A32_PROBE_CC) -dumpmachine 2>/dev/null)
+ifeq ($(findstring darwin,$(A32_TARGET)),darwin)
 A32_BACKEND_SRC := src/os/backend_darwin.c
 else
 A32_BACKEND_SRC := src/os/backend_linux.c
