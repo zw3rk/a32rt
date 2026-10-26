@@ -287,7 +287,9 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         return true;
     }
 
-    /* Branchless CSEL lowering for conditional MOV Rd, Rm (unshifted, S=0, Rd<15, Rm<15) */
+    /* Branchless CSEL lowering for conditional MOV Rd, Rm (unshifted, Rd<15, Rm<15).
+     * Mask 0x0FE00FF0 does not test bit 20, so S=1 (MOVS) also takes this path
+     * and CSEL does not write NZCV. */
     if (cond < 14U && (insn & 0x0FE00FF0U) == 0x01A00000U) {
         unsigned rd = (insn >> 12) & 0xFU;
         unsigned rm = insn & 0xFU;
