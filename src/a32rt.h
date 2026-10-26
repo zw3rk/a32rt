@@ -152,6 +152,9 @@ typedef struct a32_ctx {
     uint64_t    icache_flushes;
     uint64_t    wx_transitions;
     uint64_t    flags_elided;
+    /* Wave U3 A32-4: LDREX epoch snapshot for the shared vm32 LL table.
+     * Appended at the end so all pinned offsets above are unchanged. */
+    uint64_t    ll_epoch_snap;
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U

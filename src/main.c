@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "a32rt.h"
 #include "dbt/difftest.h"
+#include "vm/vm32.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -235,6 +236,12 @@ int main(int argc, char **argv, char **envp)
     a32_host_probe(&ctx);
 
     if (a32_vm_init(&ctx, requested_window) != 0) {
+        return 1;
+    }
+
+    /* Wave U3 A32-4: record the Two-Regime selection (A1 direct window on
+     * H == 4096, A2 Soft-TLB arena above) for the reserved window. */
+    if (a32_vm32_init(&ctx) != 0) {
         return 1;
     }
 

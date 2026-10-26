@@ -43,6 +43,12 @@ CFLAGS := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
           -fno-stack-protector -Iinclude -Isrc
 LDFLAGS := -static-pie -Wl,-z,max-page-size=4096
 
+# Wave U3 A32-4: platform backend (dual-backend build).
+ifeq ($(shell uname -s),Darwin)
+A32_BACKEND_SRC := src/os/backend_darwin.c
+else
+A32_BACKEND_SRC := src/os/backend_linux.c
+endif
 SRCS := src/main.c \
         src/host.c \
         src/vm.c \
@@ -61,10 +67,15 @@ SRCS := src/main.c \
         src/interp/interp_a32.c \
         src/interp/interp_thumb.c \
         src/interp/interp_vfp.c \
-        src/dbt/difftest.c
+        src/dbt/difftest.c \
+        src/vm/vm32.c \
+        src/vm/vm_file.c \
+        src/dbt/aot/aot_sites.c \
+        $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S
 HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
-        src/interp/interp.h src/interp/interp_priv.h src/dbt/difftest.h
+        src/interp/interp.h src/interp/interp_priv.h src/dbt/difftest.h \
+        src/vm/vm32.h src/os/backend.h src/dbt/aot/aot.h
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
 TEST_BINS := $(BUILD_DIR)/hello-armhf-static \

@@ -11,77 +11,55 @@
 #include <string.h>
 #include <sys/mman.h>
 
-static uint32_t g_excl_addr = 0U;
-static uint32_t g_excl_size = 0U;
-static bool g_excl_valid = false;
+#include "vm/vm32.h"
 
-static uint32_t do_ldrex(a32_ctx_t *ctx, uint32_t va, unsigned size)
+/* LDREX/STREX exclusives ride on the shared vm32 reservation table so
+ * the interpreter and the DBT slow path observe one atomic order
+ * (section 4.4). All RMWs are C11 __atomic SEQ_CST on HVA. Unaligned
+ * addresses cannot reserve: the caller raises UNDEF. */
+static bool g_excl_valid = false;
+static uint32_t g_excl_addr = 0U;
+static unsigned g_excl_size = 0U;
+
+static bool do_ldrex(a32_ctx_t *ctx, uint32_t va, unsigned size,
+    uint32_t *out)
 {
-    uint8_t *p = (uint8_t *)a32_guest_ptr(ctx, va);
+    void *hva;
     uint32_t v = 0U;
-    if (size == 1U) {
-        v = __atomic_load_n(p, __ATOMIC_ACQUIRE);
-    } else if (size == 2U) {
-        uint16_t w = 0U;
-        memcpy(&w, p, 2U);
-        v = __atomic_load_n((uint16_t *)(void *)p, __ATOMIC_ACQUIRE);
-        (void)w;
-    } else {
-        memcpy(&v, p, 4U);
-        v = __atomic_load_n((uint32_t *)(void *)p, __ATOMIC_ACQUIRE);
+    if (out == NULL || (size != 1U && size != 2U && size != 4U) ||
+        (va & (size - 1U)) != 0U) {
+        return false;
     }
-    g_excl_addr = va;
-    g_excl_size = (uint32_t)size;
+    hva = a32_vm32_hva(ctx, va);
+    if (size == 1U) {
+        v = __atomic_load_n((uint8_t *)hva, __ATOMIC_SEQ_CST);
+    } else if (size == 2U) {
+        v = __atomic_load_n((uint16_t *)(void *)hva, __ATOMIC_SEQ_CST);
+    } else {
+        v = __atomic_load_n((uint32_t *)(void *)hva, __ATOMIC_SEQ_CST);
+    }
+    a32_vm32_ll_record(ctx, va, size, v);
     g_excl_valid = true;
-    return v;
+    g_excl_addr = va;
+    g_excl_size = size;
+    *out = v;
+    return true;
 }
 
-
-static uint32_t do_strex(a32_ctx_t *ctx, uint32_t va, unsigned size, uint32_t val)
+static uint32_t do_strex(a32_ctx_t *ctx, uint32_t va, unsigned size,
+    uint32_t val)
 {
-    uint8_t *p = (uint8_t *)a32_guest_ptr(ctx, va);
-    uint32_t expected = 0U;
-    bool have = g_excl_valid && g_excl_addr == va && g_excl_size == (uint32_t)size;
-    if (have) {
-        if (size == 1U) {
-            uint8_t cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
-            uint8_t want = (uint8_t)val;
-            have = (cur == (uint8_t)expected) || true;
-            (void)expected;
-            uint8_t e = cur;
-            bool ok = __atomic_compare_exchange_n(p, &e, want, false,
-                __ATOMIC_RELEASE, __ATOMIC_RELAXED);
-            g_excl_valid = false;
-            return ok ? 0U : 1U;
-        }
-        if (size == 2U) {
-            uint16_t *pp = (uint16_t *)(void *)p;
-            uint16_t cur = __atomic_load_n(pp, __ATOMIC_ACQUIRE);
-            uint16_t e = cur;
-            bool ok = __atomic_compare_exchange_n(pp, &e,
-                (uint16_t)val, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
-            g_excl_valid = false;
-            return ok ? 0U : 1U;
-        }
-        {
-            uint32_t *pp = (uint32_t *)(void *)p;
-            uint32_t cur = __atomic_load_n(pp, __ATOMIC_ACQUIRE);
-            uint32_t e = cur;
-            bool ok = __atomic_compare_exchange_n(pp, &e, val, false,
-                __ATOMIC_RELEASE, __ATOMIC_RELAXED);
-            g_excl_valid = false;
-            return ok ? 0U : 1U;
-        }
+    bool have;
+    if (size != 1U && size != 2U && size != 4U) {
+        return 1U;
     }
-    if (size == 1U) {
-        __atomic_store_n(p, (uint8_t)val, __ATOMIC_RELEASE);
-    } else if (size == 2U) {
-        __atomic_store_n((uint16_t *)(void *)p, (uint16_t)val, __ATOMIC_RELEASE);
-    } else {
-        __atomic_store_n((uint32_t *)(void *)p, val, __ATOMIC_RELEASE);
+    if ((va & (size - 1U)) != 0U) {
+        return 1U;
     }
+    have = g_excl_valid && g_excl_addr == va && g_excl_size == size &&
+        a32_vm32_sc_attempt(ctx, va, size, val);
     g_excl_valid = false;
-    return have ? 0U : 0U;
+    return have ? 0U : 1U;
 }
 
 
@@ -383,12 +361,21 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
         unsigned rn = (insn >> 16) & 0xFU;
         unsigned rt = (insn >> 12) & 0xFU;
         uint32_t va = ctx->regs[rn];
+        uint32_t v = 0U;
+        if ((va & 3U) != 0U) {
+            i_undef(ctx);
+            return A32_EXIT_UNDEF;
+        }
         if (!i_mem_ok(ctx, va & ~3U, 4U, (uint32_t)PROT_READ)) {
             ctx->fault_addr = va;
             ctx->exit_reason = A32_EXIT_FAULT;
             return A32_EXIT_FAULT;
         }
-        ctx->regs[rt] = do_ldrex(ctx, va, 4U);
+        if (!do_ldrex(ctx, va, 4U, &v)) {
+            i_undef(ctx);
+            return A32_EXIT_UNDEF;
+        }
+        ctx->regs[rt] = v;
         ctx->regs[15] = pc + 4U;
         return A32_EXIT_NONE;
     }
@@ -397,6 +384,10 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
         unsigned rd = (insn >> 12) & 0xFU;
         unsigned rm = insn & 0xFU;
         uint32_t va = ctx->regs[rn];
+        if ((va & 3U) != 0U) {
+            i_undef(ctx);
+            return A32_EXIT_UNDEF;
+        }
         if (!i_mem_ok(ctx, va & ~3U, 4U, (uint32_t)PROT_WRITE)) {
             ctx->fault_addr = va;
             ctx->exit_reason = A32_EXIT_FAULT;
@@ -414,13 +405,22 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
         unsigned rn = (insn >> 16) & 0xFU;
         unsigned rt = (insn >> 12) & 0xFU;
         uint32_t va = ctx->regs[rn];
+        if ((va & (sz - 1U)) != 0U) {
+            i_undef(ctx);
+            return A32_EXIT_UNDEF;
+        }
         if (!i_mem_ok(ctx, va, sz, is_load ? (uint32_t)PROT_READ : (uint32_t)PROT_WRITE)) {
             ctx->fault_addr = va;
             ctx->exit_reason = A32_EXIT_FAULT;
             return A32_EXIT_FAULT;
         }
         if (is_load) {
-            ctx->regs[rt] = do_ldrex(ctx, va, sz);
+            uint32_t v = 0U;
+            if (!do_ldrex(ctx, va, sz, &v)) {
+                i_undef(ctx);
+                return A32_EXIT_UNDEF;
+            }
+            ctx->regs[rt] = v;
         } else {
             unsigned rm = insn & 0xFU;
             ctx->regs[rt] = do_strex(ctx, va, sz, ctx->regs[rm]);

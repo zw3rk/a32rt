@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "a32rt.h"
+#include "vm/vm32.h"
 
 #include <errno.h>
 #include <stdatomic.h>
@@ -214,6 +215,8 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
         }
         i++;
     }
+    /* Wave U3 A32-4: drop Soft-TLB translations for the unmapped span. */
+    a32_vm32_sync_unmap(unmap_start, unmap_end);
 }
 
 static int vm_record_region_locked(uint32_t start, uint32_t end,
@@ -236,6 +239,12 @@ static int vm_record_region_locked(uint32_t start, uint32_t end,
         rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
     }
     vm_coalesce_regions_locked();
+    /* Wave U3 A32-4: publish the Soft-TLB translation alongside the region
+     * record so Regime A2 stays coherent without a second walk. */
+    if (rc == 0) {
+        a32_vm32_sync_region(start, end, (prot & 0x1U) != 0U,
+            (prot & 0x2U) != 0U);
+    }
     return rc;
 }
 
@@ -284,6 +293,10 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
         }
     }
     vm_coalesce_regions_locked();
+    /* Wave U3 A32-4: re-publish the Soft-TLB translation under the new
+     * protections so Regime A2 faults match the guest view. */
+    a32_vm32_sync_region(mp_start, mp_end, (prot & 0x1U) != 0U,
+        (prot & 0x2U) != 0U);
 }
 
 static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
