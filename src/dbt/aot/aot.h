@@ -48,4 +48,17 @@ int a32_aot_site_save(const char *dir, uint32_t guest_pc_base,
 int a32_aot_site_load(const char *dir, uint32_t guest_pc_base,
     a32_vm32_mem_site_t *sites, uint32_t cap, uint32_t *out_count);
 
+/* In-memory per-block registry bridging the DBT emitters and the disk
+ * cache (src/dbt/dbt_aot_cache.c drains it on save, refills it on load).
+ * At most A32_AOT_SITE_TRACK_MAX blocks with A32_AOT_SITE_PER_BLOCK
+ * records each; track() copies, fetch() copies out. */
+#define A32_AOT_SITE_TRACK_MAX 256U
+#define A32_AOT_SITE_PER_BLOCK 64U
+
+int a32_aot_site_track(uint32_t guest_pc_base,
+    const a32_vm32_mem_site_t *sites, uint32_t count);
+int a32_aot_site_fetch(uint32_t guest_pc_base,
+    a32_vm32_mem_site_t *sites, uint32_t cap, uint32_t *out_count);
+void a32_aot_site_clear(void);
+
 #endif /* A32RT_DBT_AOT_H */

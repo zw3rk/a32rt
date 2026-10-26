@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "dbt/difftest.h"
+
 void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
 {
     if (!fn) {
@@ -457,6 +459,37 @@ int a32_jit_run(a32_ctx_t *ctx)
 
         case A32_EXIT_UNDEF: {
             prev_entry = NULL;
+            /* RC-U3: single-step the faulting insn through the reference
+             * interpreter before raising SIGILL, so encodings the DBT
+             * has not implemented yet still execute. */
+            {
+                uint32_t step_rc = a32_interp_step(ctx);
+                if (step_rc == A32_EXIT_NONE ||
+                    step_rc == A32_EXIT_BRANCH ||
+                    step_rc == A32_EXIT_INTERWORK) {
+                    break;
+                }
+                if (step_rc == A32_EXIT_SVC) {
+                    ctx->syscalls_executed++;
+                    uint32_t pre_step_pc = ctx->regs[15];
+                    bool pre_step_bkpt = (ctx->regs[7] == 0x0f0001U);
+                    if (a32_handle_syscall(ctx) != 0) {
+                        return (int)ctx->regs[0];
+                    }
+                    if (ctx->gdb_enabled && pre_step_bkpt) {
+                        gdb_stopped_at_pc = (ctx->regs[15] == pre_step_pc);
+                        gdb_stopped_pc = pre_step_pc;
+                    }
+                    break;
+                }
+                if (step_rc == A32_EXIT_FAULT) {
+                    int step_fault_rc = handle_guest_fault(ctx);
+                    if (step_fault_rc == 0) {
+                        continue;
+                    }
+                    return step_fault_rc;
+                }
+            }
             if (ctx->gdb_enabled) {
                 uint32_t pre_stop_pc = ctx->regs[15];
                 a32_gdb_handle_stop(ctx, SIGILL);
@@ -478,4 +511,36 @@ int a32_jit_run(a32_ctx_t *ctx)
             return 127;
         }
     }
+}
+
+/* RC-U3: exactly one DBT block for the --difftest lockstep hook. Compiles
+ * (or finds) the block at the current PC and runs it to its exit reason
+ * without dispatching syscalls or signals; the difftest loop owns that
+ * policy identically on both copies. */
+uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
+{
+    bool is_thumb;
+    uint32_t pc;
+    uint32_t code_bytes = 0U;
+    const void *code;
+    uint32_t reason;
+    if (ctx == NULL) {
+        return A32_EXIT_UNDEF;
+    }
+    is_thumb = (ctx->cpsr & A32_CPSR_T) != 0U;
+    pc = ctx->regs[15] & (is_thumb ? ~1U : ~3U);
+    ctx->exit_reason = A32_EXIT_NONE;
+    code = a32_jit_compile_block(ctx, pc, is_thumb, &code_bytes);
+    if (code == NULL || code_bytes == 0U) {
+        if (ctx->exit_reason == A32_EXIT_NONE) {
+            ctx->exit_reason = A32_EXIT_UNDEF;
+        }
+        return ctx->exit_reason;
+    }
+    ctx->blocks_executed++;
+    ctx->sync_sig_delivered = false;
+    reason = a32_jit_run_block(ctx, code, (void *)&g_dummy_entry,
+        &g_cache_epoch);
+    ctx->exit_reason = reason;
+    return reason;
 }

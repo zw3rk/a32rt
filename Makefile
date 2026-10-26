@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build tests check check-line-limits check-headers \
+.PHONY: help all build build-darwin tests check check-line-limits check-headers \
         test-hello-hl test-hello-lima \
         test-m1-hl test-m1-lima \
         test-m2-hl test-m2-lima \
@@ -132,6 +132,12 @@ $(OBJ_DIR)/%.o: src/%.S $(HDRS) | $(OBJ_DIR)
 	@$(CC) $(CFLAGS) -c $< -o $@
 
 build: $(A32RT_BIN) ## Build static-PIE aarch64-linux a32rt binary
+
+build-darwin: ## Build native darwin-arm64 binary (Backend 2) with host cc
+	@$(MAKE) $(BUILD_DIR)/a32rt-darwin CC=cc OBJ_DIR=$(BUILD_DIR)/darwin-obj \
+		A32RT_BIN=$(BUILD_DIR)/a32rt-darwin \
+		CFLAGS="-std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -Iinclude -Isrc" \
+		LDFLAGS=""
 
 $(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
 	@printf "\033[32m▸ Linking\033[0m $@\n"

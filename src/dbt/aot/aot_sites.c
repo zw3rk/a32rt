@@ -157,6 +157,76 @@ int a32_aot_site_save(const char *dir, uint32_t guest_pc_base,
     return rc;
 }
 
+/* ---- Per-block registry (emitters -> disk cache bridge) ---- */
+
+typedef struct {
+    bool used;
+    uint32_t base;
+    uint32_t count;
+    a32_vm32_mem_site_t sites[A32_AOT_SITE_PER_BLOCK];
+} a32_aot_site_slot_t;
+
+static a32_aot_site_slot_t g_site_slots[A32_AOT_SITE_TRACK_MAX];
+
+int a32_aot_site_track(uint32_t guest_pc_base,
+    const a32_vm32_mem_site_t *sites, uint32_t count)
+{
+    uint32_t i;
+    uint32_t free_slot = A32_AOT_SITE_TRACK_MAX;
+    if (sites == NULL || count == 0U || count > A32_AOT_SITE_PER_BLOCK) {
+        return -EINVAL;
+    }
+    for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
+        if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
+            memcpy(g_site_slots[i].sites, sites,
+                (size_t)count * sizeof(sites[0]));
+            g_site_slots[i].count = count;
+            return 0;
+        }
+        if (!g_site_slots[i].used && free_slot == A32_AOT_SITE_TRACK_MAX) {
+            free_slot = i;
+        }
+    }
+    if (free_slot == A32_AOT_SITE_TRACK_MAX) {
+        return -ENOSPC;
+    }
+    g_site_slots[free_slot].used = true;
+    g_site_slots[free_slot].base = guest_pc_base;
+    g_site_slots[free_slot].count = count;
+    memcpy(g_site_slots[free_slot].sites, sites,
+        (size_t)count * sizeof(sites[0]));
+    return 0;
+}
+
+int a32_aot_site_fetch(uint32_t guest_pc_base,
+    a32_vm32_mem_site_t *sites, uint32_t cap, uint32_t *out_count)
+{
+    uint32_t i;
+    if (out_count != NULL) {
+        *out_count = 0U;
+    }
+    if (sites == NULL || cap == 0U || out_count == NULL) {
+        return -EINVAL;
+    }
+    for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
+        if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
+            if (g_site_slots[i].count > cap) {
+                return -E2BIG;
+            }
+            memcpy(sites, g_site_slots[i].sites,
+                (size_t)g_site_slots[i].count * sizeof(sites[0]));
+            *out_count = g_site_slots[i].count;
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
+void a32_aot_site_clear(void)
+{
+    memset(g_site_slots, 0, sizeof(g_site_slots));
+}
+
 int a32_aot_site_load(const char *dir, uint32_t guest_pc_base,
     a32_vm32_mem_site_t *sites, uint32_t cap, uint32_t *out_count)
 {

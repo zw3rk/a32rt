@@ -21,10 +21,10 @@ static a32_vm32_tlb_entry_t g_tlb[A32_VM32_TLB_SIZE];
 
 typedef struct {
     _Atomic uint64_t epoch;
-    const a32_ctx_t *owner;
-    uint32_t addr;
-    uint32_t size;
-    uint32_t val;
+    _Atomic(const a32_ctx_t *) owner;
+    _Atomic uint32_t addr;
+    _Atomic uint32_t size;
+    _Atomic uint32_t val;
 } a32_ll_line_t;
 
 static a32_ll_line_t g_ll[A32_VM32_LL_LINES];
@@ -87,6 +87,13 @@ static inline uint32_t tlb_index(uint32_t gva)
     return (gva >> 12U) & (A32_VM32_TLB_SIZE - 1U);
 }
 
+/* Reservation-table slot: every 64-byte line hashed into 1024 entries.
+ * Never tlb_index() (4096 entries): that overruns g_ll whenever G != 0. */
+static inline uint32_t ll_index(uint32_t gva_aligned)
+{
+    return (gva_aligned >> A32_VM32_LL_LINE_SHIFT) & (A32_VM32_LL_LINES - 1U);
+}
+
 bool a32_vm32_tlb_probe(uint32_t gva, bool is_store, uint32_t width,
     uintptr_t *addend_out)
 {
@@ -127,7 +134,7 @@ void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     g_tlb[idx].write_tag = writable ? vpn : A32_VM32_TLB_INVALID_TAG;
     g_tlb[idx].flags_reserved = 0U;
     /* A remap breaks any LDREX reservation on this page. */
-    atomic_fetch_add(&g_ll[tlb_index(gva_page)].epoch, 1ULL);
+    atomic_fetch_add(&g_ll[ll_index(gva_page & ~0xFFFU)].epoch, 1ULL);
 }
 
 void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
@@ -203,19 +210,14 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
 
 /* ---- Shared LDREX/STREX reservation table ---- */
 
-static inline uint32_t ll_index(uint32_t gva_aligned)
-{
-    return (gva_aligned >> A32_VM32_LL_LINE_SHIFT) & (A32_VM32_LL_LINES - 1U);
-}
-
 void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     uint32_t val)
 {
     uint32_t h = ll_index(gva & ~3U);
-    g_ll[h].owner = ctx;
-    g_ll[h].addr = gva;
-    g_ll[h].size = (uint32_t)size;
-    g_ll[h].val = val;
+    atomic_store(&g_ll[h].owner, ctx);
+    atomic_store(&g_ll[h].addr, gva);
+    atomic_store(&g_ll[h].size, (uint32_t)size);
+    atomic_store(&g_ll[h].val, val);
     if (ctx != NULL) {
         ctx->ll_epoch_snap = atomic_load(&g_ll[h].epoch);
     }
@@ -225,7 +227,7 @@ void a32_vm32_reservation_bump(uint32_t gva_aligned)
 {
     uint32_t h = ll_index(gva_aligned);
     atomic_fetch_add(&g_ll[h].epoch, 1ULL);
-    g_ll[h].owner = NULL;
+    atomic_store(&g_ll[h].owner, NULL);
 }
 
 bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
@@ -245,7 +247,9 @@ bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     if ((gva & (size - 1U)) != 0U) {
         return false;
     }
-    if (g_ll[h].owner != ctx || g_ll[h].addr != gva || g_ll[h].size != size) {
+    if (atomic_load(&g_ll[h].owner) != ctx ||
+        atomic_load(&g_ll[h].addr) != gva ||
+        atomic_load(&g_ll[h].size) != size) {
         goto consume;
     }
     snap = atomic_load(&g_ll[h].epoch);
@@ -260,7 +264,7 @@ bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     } else {
         cur = __atomic_load_n((uint32_t *)(void *)hva, __ATOMIC_SEQ_CST);
     }
-    if (cur != g_ll[h].val ||
+    if (cur != atomic_load(&g_ll[h].val) ||
         snap != atomic_load(&g_ll[h].epoch)) {
         goto consume;
     }
@@ -279,6 +283,6 @@ bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     }
 consume:
     atomic_fetch_add(&g_ll[h].epoch, 1ULL);
-    g_ll[h].owner = NULL;
+    atomic_store(&g_ll[h].owner, NULL);
     return ok;
 }

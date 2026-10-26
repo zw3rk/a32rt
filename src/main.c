@@ -15,7 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
 #include <sys/auxv.h>
+#endif
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -82,7 +84,11 @@ int main(int argc, char **argv, char **envp)
 
     static a32_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
+#if defined(__linux__)
     ctx.host_tid = (int)syscall(SYS_gettid);
+#else
+    ctx.host_tid = (int)getpid();
+#endif
     a32_exec_mode_t exec_mode = A32_EXEC_DBT;
 
     uint64_t requested_window = UINT64_MAX;
@@ -201,10 +207,14 @@ int main(int argc, char **argv, char **envp)
     }
 
     int exec_fd = -1;
-    unsigned long aux_execfd = getauxval(AT_EXECFD);
-    if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
-        exec_fd = (int)aux_execfd;
+#if defined(__linux__)
+    {
+        unsigned long aux_execfd = getauxval(AT_EXECFD);
+        if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
+            exec_fd = (int)aux_execfd;
+        }
     }
+#endif
 
     exec_path = argv[i];
     if (is_binfmt_p || (explicit_sep && exec_fd < 0 && i + 1 < argc)) {
@@ -279,6 +289,9 @@ int main(int argc, char **argv, char **envp)
 
     ctx.regs[13] = initial_sp;
     a32_set_pc_interwork(&ctx, ctx.elf_entry);
+
+    /* RC-U3: --difftest always runs DBT against the reference interpreter. */
+    a32_difftest_set_dbt_step(a32_dbt_single_step);
 
     if (exec_mode == A32_EXEC_INTERP) {
         return a32_difftest_run_interp(&ctx, 0ULL, NULL);

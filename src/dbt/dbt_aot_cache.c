@@ -15,6 +15,8 @@
 #define _GNU_SOURCE
 #include "a32rt.h"
 
+#include "dbt/aot/aot.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -74,7 +76,11 @@ static uint64_t hash_fd_contents(uint64_t h, int fd)
     }
     uint64_t sz  = (uint64_t)st.st_size;
     uint64_t mt  = (uint64_t)st.st_mtime;
+#if defined(__APPLE__)
+    uint64_t mtn = (uint64_t)st.st_mtimespec.tv_nsec;
+#else
     uint64_t mtn = (uint64_t)st.st_mtim.tv_nsec;
+#endif
     h = fnv1a_64_step(h, &sz, sizeof(sz));
     h = fnv1a_64_step(h, &mt, sizeof(mt));
     h = fnv1a_64_step(h, &mtn, sizeof(mtn));
@@ -221,6 +227,23 @@ typedef struct aot_save_state {
     bool             error;
 } aot_save_state_t;
 
+/* Cache directory for per-block 24-byte site payloads: same precedence
+ * as format_cache_path (ctx dir, A32RT_CACHE, XDG_CACHE_HOME, /tmp). */
+static const char *aot_site_dir(const a32_ctx_t *ctx)
+{
+    const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
+    if (dir == NULL || dir[0] == '\0') {
+        dir = getenv("A32RT_CACHE");
+    }
+    if (dir == NULL || dir[0] == '\0') {
+        dir = getenv("XDG_CACHE_HOME");
+    }
+    if (dir == NULL || dir[0] == '\0') {
+        dir = "/tmp";
+    }
+    return dir;
+}
+
 static bool aot_block_valid(const a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
                             bool is_thumb, const uint32_t *words, size_t word_count,
                             const a32_pc_map_stage_t *pc_map, size_t pc_map_count)
@@ -282,6 +305,18 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
         return;
     }
     st->count++;
+    /* Persist this block's 24-byte site records (when the emitters
+     * tracked any) next to the block cache; site failures never fail
+     * the block save itself. */
+    {
+        a32_vm32_mem_site_t site_buf[A32_AOT_SITE_PER_BLOCK];
+        uint32_t n_sites = 0U;
+        if (a32_aot_site_fetch(guest_pc, site_buf, A32_AOT_SITE_PER_BLOCK,
+                &n_sites) == 0) {
+            (void)a32_aot_site_save(aot_site_dir(st->ctx), guest_pc,
+                site_buf, n_sites);
+        }
+    }
 }
 
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
@@ -446,6 +481,17 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
                                       bh.pc_map_count > 0U ? pc_map_buf : NULL,
                                       (size_t)bh.pc_map_count) != 0) {
             break;
+        }
+        /* Restore this block's 24-byte site records into the registry
+         * for the fault-recovery path; a missing payload just means the
+         * block was saved before its emitters tracked sites. */
+        {
+            a32_vm32_mem_site_t site_buf[A32_AOT_SITE_PER_BLOCK];
+            uint32_t n_sites = 0U;
+            if (a32_aot_site_load(aot_site_dir(ctx), bh.guest_pc, site_buf,
+                    A32_AOT_SITE_PER_BLOCK, &n_sites) == 0) {
+                (void)a32_aot_site_track(bh.guest_pc, site_buf, n_sites);
+            }
         }
     }
 

@@ -65,14 +65,16 @@ static int host_prot(int linux_prot)
 }
 
 int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
-    int fixed, void **out_host_addr)
+    int fixed, int replace, void **out_host_addr)
 {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     void *res;
     if (len == 0U || out_host_addr == NULL) {
         return -EINVAL;
     }
-    if (fixed) {
+    if (replace) {
+        flags |= MAP_FIXED;
+    } else if (fixed) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #else
@@ -88,15 +90,17 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
 }
 
 int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
-    int shared, int fixed, int host_fd, uint64_t aligned_file_offset,
-    void **out_host_addr)
+    int shared, int fixed, int replace, int host_fd,
+    uint64_t aligned_file_offset, void **out_host_addr)
 {
     int flags = shared ? MAP_SHARED : MAP_PRIVATE;
     void *res;
     if (len == 0U || host_fd < 0 || out_host_addr == NULL) {
         return -EINVAL;
     }
-    if (fixed) {
+    if (replace) {
+        flags |= MAP_FIXED;
+    } else if (fixed) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #else
