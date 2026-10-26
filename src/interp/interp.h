@@ -5,8 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Single-step reference model for the JIT (src/jit.c) and the difftest
- * harness (src/dbt/difftest.c). No assembly, no x18, no host syscalls
- * here: memory is accessed through the [G, G+4GiB) window only.
+ * harness (src/dbt/difftest.c). No assembly, no platform-register use,
+ * no host syscalls here: memory is accessed through the [G, G+4GiB) window only.
  */
 
 #ifndef A32_INTERP_H
