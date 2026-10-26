@@ -585,12 +585,14 @@ int a32_kuser_setup(a32_ctx_t *ctx)
                kuser_entries[i].data, kuser_entries[i].sz);
     }
 
-    if (mprotect(host_page, 4096U, PROT_READ | PROT_EXEC) != 0) {
+    /* W^X: the kuser helpers are A32 data translated by the JIT, never host
+     * code executed in place; the host mapping must never be PROT_EXEC. */
+    if (mprotect(host_page, 4096U, PROT_READ) != 0) {
         fprintf(stderr, "a32rt: failed to mprotect kuser page: %s\n", strerror(errno));
         return -1;
     }
 
     a32_vm_record_region(ctx, kuser_va, kuser_va + 4096U,
-                         (uint32_t)(PROT_READ | PROT_EXEC), 0x12U, "[vectors]");
+                         (uint32_t)PROT_READ, 0x12U, "[vectors]");
     return 0;
 }
