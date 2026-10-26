@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build tests check-headers \
+.PHONY: help all build tests check check-line-limits check-headers \
         test-hello-hl test-hello-lima \
         test-m1-hl test-m1-lima \
         test-m2-hl test-m2-lima \
@@ -229,6 +229,25 @@ endef
 
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-armhf,test_m8_cpp_ehabi.cpp,-marm))
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-thumb,test_m8_cpp_ehabi.cpp,-mthumb))
+
+check: check-line-limits ## Host-runnable structural checks (line limits, x18/push/VLA bans)
+	@bad=$$(grep -rnE '(^|[^0-9A-Za-z_])x18([^0-9A-Za-z_]|$$)' src --include='*.c' --include='*.h' --include='*.S' || true); \
+	if [ -n "$$bad" ]; then echo "ERROR: x18 platform register used:"; echo "$$bad"; exit 1; fi
+	@bad=$$(grep -rniE '^[[:space:]]*(push|pop)([[:space:]]|$$)' src --include='*.S' || true); \
+	if [ -n "$$bad" ]; then echo "ERROR: push/pop mnemonic in .S:"; echo "$$bad"; exit 1; fi
+	@bad=$$(grep -rnE '(^|[^_A-Za-z])_?_Generic([^_A-Za-z]|$$)|<threads\.h>' src --include='*.c' --include='*.h' || true); \
+	if [ -n "$$bad" ]; then echo "ERROR: banned C construct:"; echo "$$bad"; exit 1; fi
+	@echo "=== check: PASS ==="
+
+check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
+	@over=$$(for f in $$(find src -name '*.c' -o -name '*.h' -o -name '*.S'); do \
+		n=$$(wc -l < "$$f"); \
+		if [ "$$n" -gt 900 ]; then echo "$$f: $$n lines"; fi; \
+	done); \
+	if [ -n "$$over" ]; then \
+		echo "files over the 900-line limit:"; echo "$$over"; exit 1; \
+	fi; \
+	echo "line limits OK (all src .c/.h/.S <= 900 lines)"
 
 check-headers: ## Verify include/a32host.h matches $(HL_DIR)/src/a32host.h
 	@cmp -s include/a32host.h $(HL_DIR)/src/a32host.h || (echo "ERROR: include/a32host.h out of sync with $(HL_DIR)/src/a32host.h" && exit 1)
