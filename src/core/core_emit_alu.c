@@ -722,19 +722,29 @@ static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned add
         if (h3 != 0U) {
             emit_movk_x(b, 21U, h3, 3U);
         }
-        a64_emit_ubfm_w(b, s0, addr_w, 12U, 19U);
+        /* 12-bit Soft-TLB index: (gva >> 12) & 0xfff. */
+        a64_emit_ubfm_w(b, s0, addr_w, 12U, 23U);
         a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 5U);
         a64_emit_add_uxtw_x(b, s0, 21U, s0);
         a64_emit_ldr_imm_w(b, s1, s0, tag_off);
-        a64_emit_ubfm_w(b, s1, s1, 12U, 19U);
+        /* Full 20-bit guest-page compare: (tag ^ (gva >> 12)) == 0.
+         * An INVALID (~0) tag can never alias a valid page this way.
+         * s0 is reused as scratch; the entry address is recomputed on
+         * the hit path below. */
+        a64_emit_ubfm_w(b, s0, addr_w, 12U, 31U);
         a64_emit_eor_reg_w(b, s1, s1, s0, A64_SHIFT_LSL, 0U);
-        /* CBZ s1, +5 words: tag hit skips the 5-instruction miss stub. */
-        a64_emit(b, 0x34000000U | (5U << 5) | (s1 & 31U));
-        a64_emit_str_imm_w(b, addr_w, A64_XCTX,
-            (uint32_t)offsetof(a32_ctx_t, fault_addr));
-        a64_emit_mov_pc32(b, 15U, cur_pc);
-        a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
-        a64_emit(b, 0xD65F03C0U);
+        {
+            size_t cbz = a64_emit_cbz_w_placeholder(b, false, s1);
+            a64_emit_str_imm_w(b, addr_w, A64_XCTX,
+                (uint32_t)offsetof(a32_ctx_t, fault_addr));
+            a64_emit_mov_pc32(b, 15U, cur_pc);
+            a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
+            a64_emit(b, 0xD65F03C0U);
+            a64_patch_cbz_w(b, cbz, b->count);
+        }
+        a64_emit_ubfm_w(b, s0, addr_w, 12U, 23U);
+        a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 5U);
+        a64_emit_add_uxtw_x(b, s0, 21U, s0);
         /* Hit: addend load plus the original single access via [addend, wA]. */
         a64_emit(b, 0xF9400000U | (1U << 10) | ((s0 & 31U) << 5) | (s1 & 31U));
         a64_emit(b, opc | ((addr_w & 31U) << 16) | ((s1 & 31U) << 5) | (rt & 31U));

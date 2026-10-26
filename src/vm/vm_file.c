@@ -107,6 +107,61 @@ int a32_vmfile_populate_if_private(void *hva, int host_fd,
     return rc;
 }
 
+/* A2 staged mapping (RC-U3-r3 #5): reserve anonymous RW memory for a
+ * private file range. The caller preads the file bytes over it (see
+ * a32_vmfile_populate_private) and flips to the committed protection
+ * afterward, so no file-backed page can SIGBUS on a beyond-EOF touch. */
+int a32_vmfile_map_staged(void *hint_addr, size_t len, int host_fd,
+    uint64_t file_offset, void **out)
+{
+    (void)host_fd;
+    (void)file_offset;
+    if (hint_addr == NULL || len == 0U || out == NULL) {
+        return -EINVAL;
+    }
+    return a32_backend_map_anon(hint_addr, len, PROT_READ | PROT_WRITE,
+        1, 1, out);
+}
+
+/* Reserve the host mapping for one guest range and pread-populate it.
+ * When a2_stage is set the range is an A2 private file mapping: stage
+ * it in anonymous memory instead of a native file-backed mmap so no
+ * file-backed page can SIGBUS on a beyond-EOF touch. The staged range
+ * then flows through the same populate + final-protection path. */
+int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
+    int host_fd, uint64_t file_offset, int host_flags, bool a2_stage,
+    void **out)
+{
+    int map_rc;
+    int pop_rc;
+    void *res = NULL;
+
+    if (host_target == NULL || len == 0U || out == NULL) {
+        return -EINVAL;
+    }
+    if (a2_stage) {
+        map_rc = a32_vmfile_map_staged(host_target, len, host_fd,
+            file_offset, &res);
+    } else if ((host_flags & MAP_ANONYMOUS) != 0) {
+        map_rc = a32_backend_map_anon(host_target, len, host_prot,
+            1, 1, &res);
+    } else {
+        map_rc = a32_backend_map_file(host_target, len, host_prot,
+            (host_flags & MAP_SHARED) != 0, 1, 1, host_fd, file_offset,
+            &res);
+    }
+    if (map_rc != 0) {
+        return map_rc;
+    }
+    pop_rc = a32_vmfile_populate_if_private(res, host_fd, file_offset,
+        len, host_flags, host_prot);
+    if (pop_rc != 0) {
+        return pop_rc;
+    }
+    *out = res;
+    return 0;
+}
+
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len)
 {
@@ -137,7 +192,23 @@ int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
             return -errno;
         }
         if (r == 0) {
-            memset((char *)hva + done, 0, len - done);
+            /* RC-U3-r3 #5: zero-fill only the partial page tail up to
+             * align_up(eof, 4096). Pages wholly beyond EOF stay
+             * untouched: on A2 a file-backed touch there can raise
+             * SIGBUS, and anonymous staging is already zeroed. */
+            if (st.st_size >= 0) {
+                uint64_t fill_start = file_offset + (uint64_t)done;
+                uint64_t fill_cap = file_offset + (uint64_t)len;
+                uint64_t fill_end =
+                    (((uint64_t)st.st_size + 4095ULL) & ~4095ULL);
+                if (fill_end > fill_cap) {
+                    fill_end = fill_cap;
+                }
+                if (fill_end > fill_start) {
+                    memset((char *)hva + done, 0,
+                        (size_t)(fill_end - fill_start));
+                }
+            }
             break;
         }
         done += (size_t)r;

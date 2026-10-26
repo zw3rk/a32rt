@@ -198,6 +198,11 @@ _Static_assert(sizeof(a32_vm32_mem_site_t) == 24,
 
 /* ---- Provider A file backing (section 5.1, src/vm/vm_file.c) ---- */
 
+int a32_vmfile_map_staged(void *hint_addr, size_t len, int host_fd,
+    uint64_t file_offset, void **out);
+int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
+    int host_fd, uint64_t file_offset, int host_flags, bool a2_stage,
+    void **out);
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len);
 int a32_vmfile_populate_if_private(void *hva, int host_fd,

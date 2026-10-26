@@ -10,11 +10,20 @@
 
     .text
     .align 4
-    .globl a32_jit_run_block
-#ifndef __APPLE__
-    .type a32_jit_run_block, %function
+/* Mach-O C symbols carry a leading underscore; alias the ELF names so
+ * both object formats link (RC-U3-r3 #6). */
+#ifdef __APPLE__
+#define JIT_RUN_BLOCK _a32_jit_run_block
+#define VM32_TLB_BASE _a32_vm32_tlb_base
+#else
+#define JIT_RUN_BLOCK a32_jit_run_block
+#define VM32_TLB_BASE a32_vm32_tlb_base
 #endif
-a32_jit_run_block:
+    .globl JIT_RUN_BLOCK
+#ifndef __APPLE__
+    .type JIT_RUN_BLOCK, %function
+#endif
+JIT_RUN_BLOCK:
     stp     x29, x30, [sp, #-160]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
@@ -34,11 +43,11 @@ a32_jit_run_block:
      * A2 memory sequences materialize it per access (x21 doubles as TMP3);
      * this entry load keeps the documented register meaning on block entry. */
 #if defined(__APPLE__)
-    adrp    x21, a32_vm32_tlb_base@PAGE
-    ldr     x21, [x21, a32_vm32_tlb_base@PAGEOFF]
+    adrp    x21, VM32_TLB_BASE@PAGE
+    ldr     x21, [x21, VM32_TLB_BASE@PAGEOFF]
 #else
-    adrp    x21, a32_vm32_tlb_base
-    ldr     x21, [x21, :lo12:a32_vm32_tlb_base]
+    adrp    x21, VM32_TLB_BASE
+    ldr     x21, [x21, :lo12:VM32_TLB_BASE]
 #endif
     mov     x27, x2                 /* x27 = cur_entry (a32_cache_entry_t *) */
     mov     x28, x3                 /* x28 = &g_cache_epoch */
@@ -236,5 +245,5 @@ a32_jit_run_block:
     ldp     x29, x30, [sp], #160
     ret
 #ifndef __APPLE__
-    .size a32_jit_run_block, .-a32_jit_run_block
+    .size JIT_RUN_BLOCK, .-JIT_RUN_BLOCK
 #endif

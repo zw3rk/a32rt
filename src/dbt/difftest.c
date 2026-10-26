@@ -120,13 +120,11 @@ static int difftest_done(a32_ctx_t *ctx, const a32_ctx_t *ref,
  * inside one run_block call. One interp step is compared against exactly
  * one DBT instruction; mismatched exit reasons diverge.
  *
- * On the A1 direct regime the dut runs in a private 4 GiB window that is
- * remirrored from ref after every syscall, with a memory hash compared
- * before each sync. Syscalls execute exactly once (on ref) and the result
- * is mirrored, so host-side effects cannot diverge. On A2 (arena-global
- * Soft-TLB addends) both copies share the window and only the
- * single-execution/mirror applies. Zero compared instructions or any
- * divergence fails. */
+ * The dut always runs in a private 4 GiB shadow window (A1 and A2
+ * alike) that is remirrored from ref after every syscall, with a memory
+ * hash compared before each sync. Syscalls execute exactly once (on
+ * ref) and the result is mirrored, so host-side effects cannot
+ * diverge. Zero compared instructions or any divergence fails. */
 
 #define DIFFTEST_WINDOW_SIZE 0x100000000ULL
 
@@ -236,8 +234,8 @@ static int difftest_sync_dut(const a32_ctx_t *ref, a32_ctx_t *dut)
     return 0;
 }
 
-/* Register-state mirror for the shared-window path: copy everything except
- * the window base, and keep ibtc/ras zeroed so single-step cannot chain. */
+/* Register-state mirror: copy everything except the window base, and
+ * keep ibtc/ras zeroed so single-step cannot chain. */
 static void difftest_mirror_regs(const a32_ctx_t *ref, a32_ctx_t *dut)
 {
     uint64_t dut_base = dut->guest_base;
@@ -318,17 +316,17 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
     void *win_out = NULL;
     memcpy(&ref, ctx, sizeof(ref));
     memcpy(&dut, ctx, sizeof(dut));
-    /* A1 runs dut in a private window; A2 (and reserve failure) shares the
-     * window with single-execution syscall mirroring (see header notes). */
-    separate = (a32_vm32_current_regime() != A32_VM32_REGIME_A2_SOFT_TLB);
-    if (separate) {
-        if (a32_backend_map_anon(NULL, (size_t)DIFFTEST_WINDOW_SIZE, 0,
-                0, 0, &win_out) != 0 || win_out == NULL) {
-            separate = false;
-        } else {
-            dut.guest_base = (uint64_t)(uintptr_t)win_out;
-        }
+    /* RC-U3-r3 #2: the DUT always runs in a private shadow window so the
+     * two engines never share memory, on A1 and A2 alike. Allocation
+     * failure is fatal: falling back to a shared window would compare
+     * an engine against itself. */
+    separate = true;
+    if (a32_backend_map_anon(NULL, (size_t)DIFFTEST_WINDOW_SIZE, 0,
+            0, 0, &win_out) != 0 || win_out == NULL) {
+        fprintf(stderr, "[difftest] shadow window allocation failed\n");
+        return difftest_done(ctx, &ref, &dut, &s, stats, 1);
     }
+    dut.guest_base = (uint64_t)(uintptr_t)win_out;
     if (separate) {
         if (difftest_sync_dut(&ref, &dut) != 0) {
             fprintf(stderr, "[difftest] initial window mirror failed\n");
@@ -377,6 +375,18 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
         if (r_rc == A32_EXIT_SVC) {
             int ex;
             s.svc_count++;
+            /* RC-U3-r3 #2: compare registers BEFORE the syscall handler
+             * and the DUT sync below overwrite DUT state; comparing
+             * after would compare ref against itself. */
+            if (!a32_interp_state_equal(&ref, &dut)) {
+                s.diverged = true;
+                s.first_diverge_pc = pc;
+                fprintf(stderr,
+                    "[difftest] DIVERGENCE in registers before syscall at pc=0x%08x step=%llu\n",
+                    pc, (unsigned long long)s.steps);
+                final_rc = 1;
+                goto difftest_out;
+            }
             if (separate &&
                 difftest_mem_hash(&ref) != difftest_mem_hash(&dut)) {
                 s.diverged = true;
@@ -401,7 +411,10 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
                 difftest_mirror_regs(&ref, &dut);
             }
             if (ex != 0) {
-                if (!a32_interp_state_equal(&ref, &dut) ||
+                /* RC-U3-r3 #2: a guest exit with zero compared
+                 * instructions proves nothing; fail it. */
+                if (compared == 0U ||
+                    !a32_interp_state_equal(&ref, &dut) ||
                     (separate &&
                      difftest_mem_hash(&ref) != difftest_mem_hash(&dut))) {
                     s.diverged = true;

@@ -615,17 +615,17 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     void *host_target = a32_guest_ptr(ctx, target_va);
     off_t host_off    = (off_t)pgoffset * (off_t)A32_PAGE_SIZE;
     void *res = NULL;
-    int map_rc = ((host_flags & MAP_ANONYMOUS) != 0)
-        ? a32_backend_map_anon(host_target, (size_t)aligned_len, host_prot, 1, 1, &res)
-        : a32_backend_map_file(host_target, (size_t)aligned_len, host_prot,
-            (host_flags & MAP_SHARED) != 0, 1, 1, fd, (uint64_t)host_off, &res);
+    /* RC-U3-r3 #5: on A2, private file mappings are staged in anonymous
+     * memory (see a32_vmfile_map_commit); A1 keeps the native mapping. */
+    bool a2_stage = a32_vm32_current_regime() ==
+            A32_VM32_REGIME_A2_SOFT_TLB &&
+        (host_flags & MAP_ANONYMOUS) == 0 &&
+        (host_flags & MAP_SHARED) == 0;
+    int map_rc = a32_vmfile_map_commit(host_target,
+        (size_t)aligned_len, host_prot, fd, (uint64_t)host_off,
+        host_flags, a2_stage, &res);
     if (map_rc != 0) {
         return (uint32_t)map_rc;
-    }
-    int pop_rc = a32_vmfile_populate_if_private(res, fd, (uint64_t)host_off,
-        (size_t)aligned_len, host_flags, host_prot);
-    if (pop_rc != 0) {
-        return (uint32_t)pop_rc;
     }
 
     if (update_cursor) {
