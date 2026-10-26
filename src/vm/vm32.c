@@ -92,6 +92,30 @@ uintptr_t a32_vm32_arena_base(void)
     return g_arena_base;
 }
 
+/* Rebase the arena (RC-U3-r4 #2): point the global window at a new base
+ * and shift every valid TLB addend by the same delta so warm entries
+ * stay canonical. Entries with both tags invalid are left alone; the
+ * next miss refills them. A no-op when base is unchanged. */
+void a32_vm32_set_arena_base(uintptr_t base)
+{
+    uintptr_t old = g_arena_base;
+    intptr_t delta;
+    uint32_t i;
+
+    if (base == old) {
+        return;
+    }
+    delta = (intptr_t)(base - old);
+    for (i = 0u; i < A32_VM32_TLB_SIZE; i++) {
+        if (g_tlb[i].read_tag != A32_VM32_TLB_INVALID_TAG ||
+            g_tlb[i].write_tag != A32_VM32_TLB_INVALID_TAG) {
+            g_tlb[i].addend =
+                (uintptr_t)((intptr_t)g_tlb[i].addend + delta);
+        }
+    }
+    g_arena_base = base;
+}
+
 /* ---- Soft-TLB data side ---- */
 
 static inline uint32_t tlb_index(uint32_t gva)

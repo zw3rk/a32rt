@@ -65,6 +65,7 @@ int a32_vm32_init(a32_ctx_t *ctx);
  * HVA, so sibling CLONE_VM threads and futex keys stay coherent. Both
  * regimes share one coherent address: HVA = G + gva. */
 void *a32_vm32_hva(const a32_ctx_t *ctx, uint32_t gva);
+void a32_vm32_set_arena_base(uintptr_t base);
 
 /* Arena base backing [G, G + 4 GiB) (== G in both regimes). */
 uintptr_t a32_vm32_arena_base(void);

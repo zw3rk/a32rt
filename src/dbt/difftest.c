@@ -105,6 +105,9 @@ static int difftest_done(a32_ctx_t *ctx, const a32_ctx_t *ref,
     const a32_ctx_t *dut, a32_difftest_stats_t *s,
     a32_difftest_stats_t *stats, int rc)
 {
+    /* RC-U3-r4 #2: restore the arena to the reference window. A no-op
+     * on paths that never switched (coverage mode, alloc failure). */
+    a32_vm32_set_arena_base((uintptr_t)(uintptr_t)ref->guest_base);
     s->interp_hash = a32_interp_state_hash(ref);
     s->dbt_hash = a32_interp_state_hash(dut);
     memcpy(ctx, ref, sizeof(*ctx));
@@ -327,6 +330,10 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
         return difftest_done(ctx, &ref, &dut, &s, stats, 1);
     }
     dut.guest_base = (uint64_t)(uintptr_t)win_out;
+    /* RC-U3-r4 #2: the A2 Soft-TLB addends are arena-global (loaded by
+     * the trampoline from a32_vm32_tlb_base), so point the arena at the
+     * shadow window while the DUT runs there. Restored in difftest_done. */
+    a32_vm32_set_arena_base((uintptr_t)win_out);
     if (separate) {
         if (difftest_sync_dut(&ref, &dut) != 0) {
             fprintf(stderr, "[difftest] initial window mirror failed\n");

@@ -727,11 +727,14 @@ static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned add
         a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 5U);
         a64_emit_add_uxtw_x(b, s0, 21U, s0);
         a64_emit_ldr_imm_w(b, s1, s0, tag_off);
-        /* Full 20-bit guest-page compare: (tag ^ (gva >> 12)) == 0.
-         * An INVALID (~0) tag can never alias a valid page this way.
-         * s0 is reused as scratch; the entry address is recomputed on
-         * the hit path below. */
+        /* Guest-page compare in tag units (RC-U3-r4 #2): the table
+         * stores read_tag/write_tag unshifted (gva_page & ~0xFFFU), so
+         * shift the extracted index back left by 12 and compare
+         * (gva & ~0xFFFU) against the tag. An INVALID (~0) tag can
+         * never alias a valid page this way. s0 is reused as scratch;
+         * the entry address is recomputed on the hit path below. */
         a64_emit_ubfm_w(b, s0, addr_w, 12U, 31U);
+        a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 12U);
         a64_emit_eor_reg_w(b, s1, s1, s0, A64_SHIFT_LSL, 0U);
         {
             size_t cbz = a64_emit_cbz_w_placeholder(b, false, s1);
