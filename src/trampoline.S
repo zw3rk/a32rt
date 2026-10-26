@@ -11,7 +11,9 @@
     .text
     .align 4
     .globl a32_jit_run_block
+#ifndef __APPLE__
     .type a32_jit_run_block, %function
+#endif
 a32_jit_run_block:
     stp     x29, x30, [sp, #-160]!
     mov     x29, sp
@@ -28,6 +30,16 @@ a32_jit_run_block:
 
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
+    /* x21 = Soft-TLB base for Regime A2 (0 in A1, where x21 stays scratch).
+     * A2 memory sequences materialize it per access (x21 doubles as TMP3);
+     * this entry load keeps the documented register meaning on block entry. */
+#if defined(__APPLE__)
+    adrp    x21, a32_vm32_tlb_base@PAGE
+    ldr     x21, [x21, a32_vm32_tlb_base@PAGEOFF]
+#else
+    adrp    x21, a32_vm32_tlb_base
+    ldr     x21, [x21, :lo12:a32_vm32_tlb_base]
+#endif
     mov     x27, x2                 /* x27 = cur_entry (a32_cache_entry_t *) */
     mov     x28, x3                 /* x28 = &g_cache_epoch */
 
@@ -223,4 +235,6 @@ a32_jit_run_block:
     ldp     x27, x28, [sp, #80]
     ldp     x29, x30, [sp], #160
     ret
+#ifndef __APPLE__
     .size a32_jit_run_block, .-a32_jit_run_block
+#endif

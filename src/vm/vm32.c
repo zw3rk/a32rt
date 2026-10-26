@@ -11,6 +11,7 @@
  */
 
 #include "vm/vm32.h"
+#include "os/backend.h"
 
 #include <errno.h>
 #include <string.h>
@@ -18,6 +19,14 @@
 #include <unistd.h>
 
 static a32_vm32_tlb_entry_t g_tlb[A32_VM32_TLB_SIZE];
+
+/* Per-4 KiB guest permission ground truth (bit0=R, bit1=W, bit2=X),
+ * maintained by the sync hooks alongside the TLB. The A2 union mprotect
+ * reads neighbour permissions from here. */
+static uint8_t g_prot[A32_VM32_TLB_SIZE];
+
+/* Soft-TLB base for the A2 emitter/trampoline x21 (see vm32.h). */
+uintptr_t a32_vm32_tlb_base = 0U;
 
 typedef struct {
     _Atomic uint64_t epoch;
@@ -60,7 +69,10 @@ int a32_vm32_init(a32_ctx_t *ctx)
     g_regime = a32_vm32_select_regime((size_t)h);
     g_arena_base = (uintptr_t)ctx->guest_base;
     a32_vm32_tlb_invalidate_all();
+    memset(g_prot, 0, sizeof(g_prot));
     memset(g_ll, 0, sizeof(g_ll));
+    a32_vm32_tlb_base = (g_regime == A32_VM32_REGIME_A2_SOFT_TLB)
+        ? (uintptr_t)&g_tlb[0] : 0U;
     return 0;
 }
 
@@ -187,15 +199,19 @@ int a32_vm32_tlb_miss(a32_ctx_t *ctx, uint32_t gva, bool is_store,
 /* Publish translations for [start_gva, end_gva) after a successful
  * mmap/mprotect (host base == arena base + page in both regimes). */
 void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
-    bool readable, bool writable)
+    bool readable, bool writable, bool executable)
 {
     uint32_t page;
+    uint8_t bits;
     if (g_arena_base == 0U) {
         return;
     }
+    bits = (uint8_t)(((readable ? 1U : 0U) | (writable ? 2U : 0U)) |
+        (executable ? 4U : 0U));
     for (page = start_gva & ~0xFFFU; page < end_gva; page += 0x1000U) {
         a32_vm32_tlb_fill(page, g_arena_base + (uintptr_t)page,
             readable, writable);
+        g_prot[page >> 12U] = bits;
         if (page + 0x1000U < page) {
             break;
         }
@@ -205,7 +221,71 @@ void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
 /* Drop translations for [start_gva, end_gva) after munmap/mremap. */
 void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
 {
+    uint32_t start = start_gva & ~0xFFFU;
+    uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
     a32_vm32_tlb_invalidate_range(start_gva, end_gva);
+    for (; start < end; start += 0x1000U) {
+        g_prot[start >> 12U] = 0U;
+        if (start + 0x1000U < start) {
+            break;
+        }
+    }
+}
+
+/* Regime-aware mprotect (see vm32.h). A1 forwards guest-sized ranges
+ * directly; A2 (>4 KiB host pages) protects each covering host page with
+ * the union of its 4 KiB sub-pages. Target sub-pages use guest_prot;
+ * neighbours keep their recorded g_prot permissions so a 4 KiB guest
+ * mprotect never silently widens or narrows its host page siblings. X is
+ * unioned faithfully like R/W (A1 maps guest-X with host PROT_EXEC;
+ * never invent or drop it here). */
+int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
+    uint32_t guest_prot)
+{
+    size_t host_page;
+    uint32_t hp_start;
+    uint32_t hp_end;
+    if (ctx == NULL || len == 0U) {
+        return -EINVAL;
+    }
+    if (g_regime != A32_VM32_REGIME_A2_SOFT_TLB) {
+        return a32_backend_protect(a32_vm32_hva(ctx, addr), len,
+            a32_host_prot(ctx, guest_prot));
+    }
+    host_page = a32_backend_page_size();
+    if (host_page != 16384U && host_page != 65536U) {
+        host_page = 16384U;
+    }
+    hp_start = (uint32_t)((uint64_t)addr & ~(uint64_t)(host_page - 1U));
+    hp_end = (uint32_t)(((uint64_t)addr + (uint64_t)len +
+        (uint64_t)(host_page - 1U)) & ~(uint64_t)(host_page - 1U));
+    for (uint32_t hp = hp_start; hp < hp_end; hp += (uint32_t)host_page) {
+        uint32_t union_prot = 0U;
+        uint32_t hp_page_end = hp + (uint32_t)host_page;
+        if (hp_page_end < hp) {
+            hp_page_end = 0xFFFFFFFFU;
+        }
+        for (uint32_t sp = hp; sp < hp_page_end; sp += 0x1000U) {
+            if (sp >= addr && (uint64_t)sp - (uint64_t)addr < (uint64_t)len) {
+                union_prot |= guest_prot & 0x7U;
+            } else {
+                union_prot |= g_prot[sp >> 12U];
+            }
+            if (sp + 0x1000U < sp) {
+                break;
+            }
+        }
+        void *hp_addr = (void *)((uintptr_t)ctx->guest_base + (uintptr_t)hp);
+        int rc = a32_backend_protect(hp_addr, host_page,
+            a32_host_prot(ctx, union_prot));
+        if (rc != 0) {
+            return rc;
+        }
+        if (hp + (uint32_t)host_page < hp) {
+            break;
+        }
+    }
+    return 0;
 }
 
 /* ---- Shared LDREX/STREX reservation table ---- */

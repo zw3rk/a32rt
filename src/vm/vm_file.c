@@ -19,6 +19,7 @@
  */
 
 #include "vm/vm32.h"
+#include "os/backend.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -70,6 +71,40 @@ static a32_vmfile_inode_t *inode_intern_locked(uint64_t dev, uint64_t ino)
     g_inodes[free_slot].resize_seq = 0U;
     g_inodes[free_slot].code_generation = g_code_generation;
     return &g_inodes[free_slot];
+}
+
+/* Populate a fresh MAP_PRIVATE file mapping: pread the file bytes while
+ * the range is temporarily RW, propagate errors, zero-fill the EOF tail
+ * only inside the mapped range, then apply the final guest prot. On
+ * failure the range is left PROT_NONE. Non-private mappings return 0. */
+int a32_vmfile_populate_if_private(void *hva, int host_fd,
+    uint64_t file_offset, size_t len, int host_flags, int final_prot)
+{
+    bool rw_stage;
+    int rc;
+    if ((host_flags & (MAP_ANONYMOUS | MAP_SHARED)) != 0) {
+        return 0;
+    }
+    if (hva == NULL || host_fd < 0 || len == 0U) {
+        return -EINVAL;
+    }
+    rw_stage = ((final_prot & (PROT_READ | PROT_WRITE)) !=
+        (PROT_READ | PROT_WRITE));
+    if (rw_stage) {
+        rc = a32_backend_protect(hva, len, PROT_READ | PROT_WRITE);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    rc = a32_vmfile_populate_private(hva, host_fd, file_offset, len);
+    if (rc == 0 && rw_stage) {
+        rc = a32_backend_protect(hva, len, final_prot);
+    }
+    if (rc != 0) {
+        void *out = NULL;
+        (void)a32_backend_map_anon(hva, len, 0, 1, 1, &out);
+    }
+    return rc;
 }
 
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
@@ -132,6 +167,66 @@ void a32_vmfile_promote_range(uint32_t start_gva, uint32_t end_gva,
     for (; p < end; p += 0x1000U) {
         a32_vmfile_promote_cow((uint32_t)p, readable, writable);
     }
+}
+
+/* Identity-aware resize sync shared by the ftruncate/truncate/write
+ * hooks below. Only the interned (dev, ino) entry matching the file is
+ * touched; unrelated mappings keep their size/sequence. On shrink, pages
+ * beyond the new EOF are dropped from the Soft-TLB so a later regrow
+ * observes file bytes instead of stale dirty pages. */
+static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
+{
+    uint32_t cut;
+    unsigned i;
+    bool shrink = false;
+    pthread_mutex_lock(&g_vmfile_lock);
+    g_code_generation++;
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (!g_inodes[i].used || g_inodes[i].dev != dev ||
+            g_inodes[i].ino != ino) {
+            continue;
+        }
+        g_inodes[i].resize_seq++;
+        g_inodes[i].code_generation = g_code_generation;
+        if (new_size < g_inodes[i].file_size) {
+            shrink = true;
+            g_inodes[i].file_size = new_size;
+        } else if (new_size > g_inodes[i].file_size) {
+            g_inodes[i].file_size = new_size;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    if (shrink) {
+        cut = (uint32_t)(((new_size + 0xFFFU) & ~0xFFFU) & 0xFFFFFFFFU);
+        a32_vm32_tlb_invalidate_range(cut, 0U);
+    }
+    return 0;
+}
+
+int a32_vmfile_sync_fd(int host_fd)
+{
+    struct stat st;
+    if (host_fd < 0) {
+        return -EINVAL;
+    }
+    if (fstat(host_fd, &st) != 0) {
+        return -errno;
+    }
+    return vmfile_sync_size((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+        (uint64_t)st.st_size);
+}
+
+int a32_vmfile_sync_path(const char *host_path)
+{
+    struct stat st;
+    if (host_path == NULL || host_path[0] == '\0') {
+        return -EINVAL;
+    }
+    if (stat(host_path, &st) != 0) {
+        return -errno;
+    }
+    return vmfile_sync_size((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+        (uint64_t)st.st_size);
 }
 
 int a32_vmfile_on_truncate(uint64_t new_size)

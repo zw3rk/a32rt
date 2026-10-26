@@ -38,7 +38,11 @@ void a32_host_probe(a32_ctx_t *ctx)
     }
 
     a32h_info_t info = {0};
+#if defined(__linux__)
     if (syscall(SYS_ioctl, fd, (unsigned long)A32H_GET_INFO, &info) == 0 &&
+#else
+    if (ioctl(fd, (unsigned long)A32H_GET_INFO, &info) == 0 &&
+#endif
         info.abi_major == A32H_ABI_MAJOR) {
         ctx->host_info = info;
         ctx->has_host_info = true;

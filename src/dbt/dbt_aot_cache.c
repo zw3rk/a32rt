@@ -319,11 +319,23 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
     }
 }
 
+/* Staged per-block site records from the DBT emitters (src/core/). */
+extern void a32_emit_sites_flush(void);
+
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
 {
     if (elf_path == NULL) {
         return -1;
     }
+    /* Regime A2 code words embed the process-local Soft-TLB base, so a
+     * cache written here would fault on reload after ASLR slides it.
+     * Skip persisting (JIT stays correct); site payloads remain valid. */
+    if (a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
+        return -1;
+    }
+    /* Drain the emitter-staged site batch for the final block first, so
+     * the per-block fetch below observes every translated block. */
+    a32_emit_sites_flush();
     if (ctx != NULL) {
         a32_vm_sync_ctx(ctx);
     }
@@ -545,6 +557,9 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
     if (ctx == NULL || elf_path == NULL) {
         return -1;
     }
+    if (a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
+        return -1;
+    }
     char cache_path[PATH_MAX];
     if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), false, NULL) != 0) {
         return -1;
@@ -555,6 +570,9 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
 int a32_aot_load_fd(a32_ctx_t *ctx, int fd, uint32_t load_bias)
 {
     if (ctx == NULL || fd < 0) {
+        return -1;
+    }
+    if (a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
         return -1;
     }
     uint64_t fd_hash = compute_fd_hash(fd);
