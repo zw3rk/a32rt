@@ -55,10 +55,11 @@ int a32_aot_site_encode(const a32_vm32_mem_site_t *sites, uint32_t count,
     if (sites == NULL || count == 0U || out_buf == NULL || out_len == NULL) {
         return -EINVAL;
     }
-    if ((uint64_t)count > (uint64_t)SIZE_MAX / 24U - A32_AOT_SITE_HDR_LEN) {
+    len = (size_t)A32_AOT_SITE_HDR_LEN + (size_t)count * 24U;
+    if (len < (size_t)A32_AOT_SITE_HDR_LEN ||
+        (len - (size_t)A32_AOT_SITE_HDR_LEN) / 24U != (size_t)count) {
         return -E2BIG;
     }
-    len = (size_t)A32_AOT_SITE_HDR_LEN + (size_t)count * 24U;
     buf = (uint8_t *)malloc(len);
     if (buf == NULL) {
         return -ENOMEM;
