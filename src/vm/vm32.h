@@ -181,6 +181,8 @@ _Static_assert(sizeof(a32_vm32_mem_site_t) == 24,
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len);
 void a32_vmfile_promote_cow(uint32_t gva_page, bool readable, bool writable);
+void a32_vmfile_promote_range(uint32_t start_gva, uint32_t end_gva,
+    bool readable, bool writable);
 int a32_vmfile_on_truncate(uint64_t new_size);
 int a32_vmfile_hook_write(uint64_t end_offset);
 

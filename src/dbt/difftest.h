@@ -35,11 +35,15 @@ typedef struct a32_difftest_stats {
     bool diverged;
 } a32_difftest_stats_t;
 
-/* Single DBT step hook, installed by the JIT lane once block single-step
- * is exposed. Defaults to NULL (coverage mode: interp only). */
+/* Single DBT step hook, installed by src/main.c at startup.
+ * Defaults to NULL (coverage mode: interp only). */
 typedef uint32_t (*a32_dbt_step_fn)(a32_ctx_t *ctx);
 
 void a32_difftest_set_dbt_step(a32_dbt_step_fn fn);
+
+/* Execute exactly one DBT block at ctx->regs[15] (src/dbt/dbt_jit_run.c).
+ * Returns the block exit reason; never dispatches syscalls or signals. */
+uint32_t a32_dbt_single_step(a32_ctx_t *ctx);
 bool a32_difftest_parse_arg(const char *arg, a32_exec_mode_t *out);
 const char *a32_difftest_mode_name(a32_exec_mode_t mode);
 int a32_difftest_run_interp(a32_ctx_t *ctx, uint64_t max_steps,

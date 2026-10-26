@@ -4,10 +4,10 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Wiring note (for the coordinator merging U3-A32-1): this file adds only
- * new symbols. Enabling the flags in src/main.c is a 3-line patch:
- * parse with a32_difftest_parse_arg, then dispatch to a32_difftest_run_*
- * instead of a32_jit_run. No existing file is modified by this lane.
+ * Wiring note (RC-U3): src/main.c installs a32_dbt_single_step() via
+ * a32_difftest_set_dbt_step() at startup and dispatches --interp / --dbt /
+ * --difftest to a32_difftest_run_* instead of a32_jit_run, so --difftest
+ * always executes DBT against the reference interpreter lockstep.
  */
 
 #include <stdbool.h>
@@ -85,14 +85,28 @@ int a32_difftest_run_dbt(a32_ctx_t *ctx, a32_difftest_stats_t *stats)
  *
  * Both contexts start as copies of *ctx. Each iteration single-steps the
  * interpreter on the ref copy and the DBT hook on the dut copy, then
- * compares guest-visible state. The first divergence (PC included) is
- * reported; the function returns 0 when no divergence was observed, 1 on
- * divergence, or the guest exit code when both sides exit cleanly.
+ * compares guest-visible state (GPRs, CPSR, FPSCR, VFP). The first
+ * divergence (PC included) is reported. Returns the guest exit code when
+ * both sides exit cleanly, 1 on any register/PC divergence or any
+ * unexpected UNDEF/fault on either side.
  *
  * Without an installed DBT hook this degrades to interp coverage mode:
  * it runs the reference stepper and counts EXIT_UNDEF fallbacks, which
  * is exactly the metric U3 needs before JIT lockstep lands.
  */
+
+static int difftest_done(a32_ctx_t *ctx, const a32_ctx_t *ref,
+    const a32_ctx_t *dut, a32_difftest_stats_t *s,
+    a32_difftest_stats_t *stats, int rc)
+{
+    s->interp_hash = a32_interp_state_hash(ref);
+    s->dbt_hash = a32_interp_state_hash(dut);
+    memcpy(ctx, ref, sizeof(*ctx));
+    if (stats != NULL) {
+        *stats = *s;
+    }
+    return rc;
+}
 int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
     a32_difftest_stats_t *stats)
 {
@@ -140,18 +154,20 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
             break;
         }
         s.interp_hash = a32_interp_state_hash(&ref);
+        s.dbt_hash = s.interp_hash;
         memcpy(ctx, &ref, sizeof(*ctx));
         if (stats != NULL) {
             *stats = s;
         }
-        if (s.undef_fallbacks > 0U) {
+        if (s.undef_fallbacks > 0U || s.fault_count > 0U) {
             fprintf(stderr,
-                "[difftest] coverage: steps=%llu svc=%llu undef=%llu first_undef=0x%08x hash=0x%llx\n",
+                "[difftest] coverage: steps=%llu svc=%llu undef=%llu fault=%llu first_undef=0x%08x hash=0x%llx\n",
                 (unsigned long long)s.steps, (unsigned long long)s.svc_count,
-                (unsigned long long)s.undef_fallbacks, s.first_undef_pc,
+                (unsigned long long)s.undef_fallbacks,
+                (unsigned long long)s.fault_count, s.first_undef_pc,
                 (unsigned long long)s.interp_hash);
         }
-        return 0;
+        return (s.undef_fallbacks > 0U || s.fault_count > 0U) ? 1 : 0;
     }
     static a32_ctx_t ref;
     static a32_ctx_t dut;
@@ -162,24 +178,73 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
         uint32_t r_rc = a32_interp_step(&ref);
         uint32_t d_rc = g_dbt_step(&dut);
         s.steps++;
-        if (r_rc == A32_EXIT_SVC) {
-            s.svc_count++;
-        }
-        if (r_rc == A32_EXIT_UNDEF) {
-            s.undef_fallbacks++;
-            if (s.first_undef_pc == 0U) {
-                s.first_undef_pc = pc;
+        if (r_rc == A32_EXIT_SVC || d_rc == A32_EXIT_SVC) {
+            int r_ex = 0;
+            int d_ex = 0;
+            bool r_out = false;
+            bool d_out = false;
+            if (r_rc == A32_EXIT_SVC) {
+                s.svc_count++;
+                ref.syscalls_executed++;
+                if (a32_handle_syscall(&ref) != 0) {
+                    r_out = true;
+                    r_ex = (int)ref.regs[0];
+                }
             }
+            if (d_rc == A32_EXIT_SVC) {
+                dut.syscalls_executed++;
+                if (a32_handle_syscall(&dut) != 0) {
+                    d_out = true;
+                    d_ex = (int)dut.regs[0];
+                }
+            }
+            if (r_out || d_out) {
+                if (!r_out || !d_out || r_ex != d_ex ||
+                    !a32_interp_state_equal(&ref, &dut)) {
+                    s.diverged = true;
+                    s.first_diverge_pc = pc;
+                    fprintf(stderr,
+                        "[difftest] DIVERGENCE on guest exit at pc=0x%08x step=%llu\n",
+                        pc, (unsigned long long)s.steps);
+                    return difftest_done(ctx, &ref, &dut, &s, stats, 1);
+                }
+                return difftest_done(ctx, &ref, &dut, &s, stats, r_ex);
+            }
+            if (!a32_interp_state_equal(&ref, &dut)) {
+                s.diverged = true;
+                s.first_diverge_pc = pc;
+                fprintf(stderr,
+                    "[difftest] DIVERGENCE after syscall at pc=0x%08x step=%llu rc_interp=%u rc_dbt=%u\n",
+                    pc, (unsigned long long)s.steps, r_rc, d_rc);
+                return difftest_done(ctx, &ref, &dut, &s, stats, 1);
+            }
+            continue;
         }
         if (!a32_interp_state_equal(&ref, &dut)) {
             s.diverged = true;
             s.first_diverge_pc = pc;
-            s.interp_hash = a32_interp_state_hash(&ref);
-            s.dbt_hash = a32_interp_state_hash(&dut);
             fprintf(stderr,
                 "[difftest] DIVERGENCE at pc=0x%08x step=%llu rc_interp=%u rc_dbt=%u\n",
                 pc, (unsigned long long)s.steps, r_rc, d_rc);
-            break;
+            return difftest_done(ctx, &ref, &dut, &s, stats, 1);
+        }
+        if (r_rc == A32_EXIT_UNDEF || d_rc == A32_EXIT_UNDEF ||
+            r_rc == A32_EXIT_FAULT || d_rc == A32_EXIT_FAULT) {
+            if (r_rc == A32_EXIT_UNDEF || d_rc == A32_EXIT_UNDEF) {
+                s.undef_fallbacks++;
+                if (s.first_undef_pc == 0U) {
+                    s.first_undef_pc = pc;
+                }
+            }
+            if (r_rc == A32_EXIT_FAULT || d_rc == A32_EXIT_FAULT) {
+                s.fault_count++;
+            }
+            fprintf(stderr,
+                "[difftest] unexpected %s at pc=0x%08x step=%llu rc_interp=%u rc_dbt=%u\n",
+                (r_rc == A32_EXIT_FAULT || d_rc == A32_EXIT_FAULT) ?
+                    "fault" : "UNDEF",
+                pc, (unsigned long long)s.steps, r_rc, d_rc);
+            return difftest_done(ctx, &ref, &dut, &s, stats, 1);
         }
         if (r_rc != A32_EXIT_NONE && r_rc != A32_EXIT_BRANCH &&
             r_rc != A32_EXIT_INTERWORK) {
@@ -190,9 +255,5 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
             break;
         }
     }
-    memcpy(ctx, &ref, sizeof(*ctx));
-    if (stats != NULL) {
-        *stats = s;
-    }
-    return s.diverged ? 1 : 0;
+    return difftest_done(ctx, &ref, &dut, &s, stats, s.diverged ? 1 : 0);
 }

@@ -122,6 +122,18 @@ void a32_vmfile_promote_cow(uint32_t gva_page, bool readable, bool writable)
     a32_vm32_tlb_fill(page, base + (uintptr_t)page, readable, writable);
 }
 
+/* Promote every 4 KiB page in [start_gva, end_gva) after the host
+ * mapping gains PROT_WRITE (called by src/vm.c mprotect wiring). */
+void a32_vmfile_promote_range(uint32_t start_gva, uint32_t end_gva,
+    bool readable, bool writable)
+{
+    uint64_t end = ((uint64_t)end_gva + 0xFFFU) & ~0xFFFU;
+    uint64_t p = (uint64_t)(start_gva & ~0xFFFU);
+    for (; p < end; p += 0x1000U) {
+        a32_vmfile_promote_cow((uint32_t)p, readable, writable);
+    }
+}
+
 int a32_vmfile_on_truncate(uint64_t new_size)
 {
     uint32_t cut = (uint32_t)(((new_size + 0xFFFU) & ~0xFFFU) & 0xFFFFFFFFU);

@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "a32rt.h"
+#include "os/backend.h"
 #include "vm/vm32.h"
 
 #include <errno.h>
@@ -58,12 +59,9 @@ static uint64_t page_align_up(uint64_t v)
 
 static int vm_reserve_prot_none(a32_ctx_t *ctx, uint32_t start, uint32_t len)
 {
-    void *res = mmap(a32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
-        return -errno;
-    }
-    return 0;
+    void *out = NULL;
+    return a32_backend_map_anon(a32_guest_ptr(ctx, start), (size_t)len,
+        0, 1, 1, &out);
 }
 
 static inline void vm_invalidate_jit(a32_ctx_t *ctx, uint32_t start, uint32_t end)
@@ -401,17 +399,13 @@ static int try_reserve_window(uint64_t base)
     uint64_t map_len   = (base == 0ULL) ? (A32_WINDOW_SIZE - (uint64_t)A32_LOW_GUARD_SIZE)
                                         : A32_WINDOW_SIZE;
 
-    void *res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (res == MAP_FAILED && (errno == EINVAL || errno == EOPNOTSUPP)) {
-        res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    }
-    if (res == MAP_FAILED) {
-        return -1;
-    }
-    if ((uint64_t)(uintptr_t)res != map_start) {
-        munmap(res, (size_t)map_len);
+    void *out = NULL;
+    if (a32_backend_map_anon((void *)(uintptr_t)map_start,
+            (size_t)map_len, 0, 1, 0, &out) != 0 ||
+        (uint64_t)(uintptr_t)out != map_start) {
+        if (out != NULL && (uint64_t)(uintptr_t)out != map_start) {
+            (void)a32_backend_unmap(out, (size_t)map_len);
+        }
         return -1;
     }
     return 0;
@@ -535,9 +529,9 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
         }
         uint32_t len = new_page - old_page;
         void *host_addr = a32_guest_ptr(ctx, old_page);
-        void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (res == MAP_FAILED) {
+        void *res = NULL;
+        if (a32_backend_map_anon(host_addr, len, PROT_READ | PROT_WRITE,
+                1, 1, &res) != 0 || res != host_addr) {
             uint32_t curr = g_vm_brk_curr;
             vm_sync_brk_to_ctx(ctx);
             vm_lock_release();
@@ -620,11 +614,18 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     int   host_prot   = a32_host_prot(ctx, prot);
     void *host_target = a32_guest_ptr(ctx, target_va);
     off_t host_off    = (off_t)pgoffset * (off_t)A32_PAGE_SIZE;
-    void *res = mmap(host_target, (size_t)aligned_len, host_prot,
-                     host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
-                     (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
-    if (res == MAP_FAILED) {
-        return (uint32_t)(-errno);
+    void *res = NULL;
+    int map_rc = ((host_flags & MAP_ANONYMOUS) != 0)
+        ? a32_backend_map_anon(host_target, (size_t)aligned_len,
+            host_prot, 1, 1, &res)
+        : a32_backend_map_file(host_target, (size_t)aligned_len,
+            host_prot, (host_flags & MAP_SHARED) != 0, 1, 1, fd,
+            (uint64_t)host_off, &res);
+    if (map_rc != 0) {
+        return (uint32_t)map_rc;
+    }
+    if ((host_flags & (MAP_ANONYMOUS | MAP_SHARED)) == 0) {
+        (void)a32_vmfile_populate_private(res, fd, (uint64_t)host_off, (size_t)aligned_len);
     }
 
     if (update_cursor) {
@@ -682,8 +683,13 @@ static int vm_mprotect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint3
         return -ENOMEM;
     }
 
-    if (mprotect(a32_guest_ptr(ctx, addr), (size_t)aligned_len, a32_host_prot(ctx, prot)) != 0) {
-        return -errno;
+    int prot_rc = a32_backend_protect(a32_guest_ptr(ctx, addr),
+        (size_t)aligned_len, a32_host_prot(ctx, prot));
+    if (prot_rc != 0) {
+        return prot_rc;
+    }
+    if ((prot & (uint32_t)PROT_WRITE) != 0U) {
+        a32_vmfile_promote_range(addr, (uint32_t)end64, (prot & 0x1U) != 0U, true);
     }
 
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
@@ -861,7 +867,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
 
     if ((prot & 0x1U) == 0U) {
-        (void)mprotect(a32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+        (void)a32_backend_protect(a32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
     }
     size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
     memcpy(a32_guest_ptr(ctx, new_va), a32_guest_ptr(ctx, old_addr), copy_bytes);

@@ -82,16 +82,39 @@ static uint32_t a32_shift_op(uint32_t insn, uint32_t rm_val, uint32_t rs_val,
             *carry = (rm_val >> 31) & 1U;
             return ((rm_val & 0x80000000U) != 0U) ? 0xFFFFFFFFU : 0U;
         }
-        *carry = cin;
-        return (cin ? 0xFFFFFFFFU : 0U) | (rm_val << 1);
+        *carry = (rm_val & 1U) != 0U;
+        return (rm_val >> 1U) | (cin ? 0x80000000U : 0U);
     }
-    if (amt >= 32U && (st == 0U || st == 1U)) {
-        if (st == 0U) {
-            *carry = (amt == 32U) ? ((rm_val & 1U) != 0U) : false;
-            return (amt == 32U) ? (rm_val & 1U ? 0x80000000U : 0U) : 0U;
+    if (rs_shift) {
+        if (amt == 0U) {
+            /* Register-controlled zero shift: result and carry pass
+             * through unchanged (and no UB shift count executes). */
+            *carry = cin;
+            return rm_val;
         }
-        *carry = (rm_val >> 31) & 1U;
-        return 0U;
+        if (amt >= 32U) {
+            switch (st) {
+            case 0U:
+                *carry = (amt == 32U) ? ((rm_val & 1U) != 0U) : false;
+                return 0U;
+            case 1U:
+                *carry = ((rm_val >> 31) & 1U) != 0U;
+                return 0U;
+            case 2U:
+                *carry = ((rm_val >> 31) & 1U) != 0U;
+                return ((rm_val & 0x80000000U) != 0U) ? 0xFFFFFFFFU : 0U;
+            default: {
+                /* ROR by register rotates by amt mod 32. */
+                unsigned r = amt & 31U;
+                if (r == 0U) {
+                    *carry = ((rm_val >> 31) & 1U) != 0U;
+                    return rm_val;
+                }
+                *carry = ((rm_val >> (r - 1U)) & 1U) != 0U;
+                return i_ror32(rm_val, r);
+            }
+            }
+        }
     }
     switch (st) {
     case 0U: *carry = ((rm_val >> (amt - 1U)) & 1U) != 0U; return rm_val << amt;
@@ -537,6 +560,18 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
             addr = p ? base + 4U : base;
         } else {
             addr = p ? base - 4U * n : base - 4U * n + 4U;
+        }
+        /* Validate the full word span before touching any register or
+         * memory so a mid-list fault leaves no partial update behind. */
+        {
+            uint64_t span_end = (uint64_t)addr + (uint64_t)n * 4U;
+            if (span_end > 0x100000000ULL ||
+                !i_mem_ok(ctx, addr, n * 4U,
+                    l ? (uint32_t)PROT_READ : (uint32_t)PROT_WRITE)) {
+                ctx->fault_addr = addr;
+                ctx->exit_reason = A32_EXIT_FAULT;
+                return A32_EXIT_FAULT;
+            }
         }
         uint32_t cur = addr;
         bool pc_in = (list & 0x8000U) != 0U;

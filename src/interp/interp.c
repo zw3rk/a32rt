@@ -13,6 +13,8 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include "vm/vm32.h"
+
 bool a32_interp_cond_passes(uint32_t cpsr, unsigned cond)
 {
     bool n = (cpsr & A32_CPSR_N) != 0U;
@@ -123,6 +125,15 @@ bool i_store_bytes(a32_ctx_t *ctx, uint32_t va, const void *in, uint32_t len)
         return false;
     }
     memcpy(a32_guest_ptr(ctx, va), in, len);
+    /* An ordinary store breaks LDREX reservations on every 64-byte line
+     * it touches, so a stale STREX fails instead of silently winning. */
+    {
+        uint64_t end = (uint64_t)va + (uint64_t)len;
+        uint64_t a = (uint64_t)(va & ~3U);
+        for (; a < end; a += 4U) {
+            a32_vm32_reservation_bump((uint32_t)a);
+        }
+    }
     return true;
 }
 
