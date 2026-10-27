@@ -28,8 +28,13 @@
             break;
         }
         struct pollfd *fds = (a1 > 0U) ? (struct pollfd *)a32_guest_ptr(ctx, a0) : NULL;
+#if defined(__linux__)
         long r = syscall(SYS_ppoll, fds, (nfds_t)a1, ts_ptr,
                          has_temp_mask ? &temp_mask : NULL, (size_t)8);
+#else
+        int t_ms = ts_ptr ? (int)(ts_ptr->tv_sec * 1000 + ts_ptr->tv_nsec / 1000000) : -1;
+        long r = poll(fds, (nfds_t)a1, t_ms);
+#endif
         int saved_errno = errno;
         if (a2 != 0U && (r >= 0 || saved_errno == EINTR)) {
             uint32_t ts_sz = time64 ? (uint32_t)sizeof(arm_timespec64_t)
@@ -46,82 +51,78 @@
     }
 
     case ARM_NR_epoll_create:
-        ctx->regs[0] = host_ret(epoll_create((int)a0));
-        break;
-
     case ARM_NR_epoll_create1:
-        ctx->regs[0] = host_ret(epoll_create1((int)a0));
-        break;
-
     case ARM_NR_epoll_ctl:
-        FAIL_EFAULT_IF(a3 != 0U && !a32_guest_range_ok(ctx, a3, (uint32_t)sizeof(struct epoll_event), PROT_READ));
-        ctx->regs[0] = host_ret(epoll_ctl((int)a0, (int)a1, (int)a2,
-                                          a3 ? (struct epoll_event *)a32_guest_ptr(ctx, a3) : NULL));
-        break;
-
     case ARM_NR_epoll_wait:
-        FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(struct epoll_event), PROT_WRITE));
-        ctx->regs[0] = host_ret(epoll_wait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
-                                           (int)a2, (int)a3));
-        break;
-
-    case ARM_NR_epoll_pwait: {
-        FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(struct epoll_event), PROT_WRITE));
-        bool     has_temp_mask  = false;
-        uint64_t saved_sig_mask = ctx->sig_mask;
-        uint64_t temp_mask      = 0ULL;
-        int sm_rc = pwait_sigmask_enter(ctx, a4, a5, &has_temp_mask, &saved_sig_mask, &temp_mask);
-        if (sm_rc != 0) {
-            if (sm_rc < 0) {
-                ctx->regs[0] = (uint32_t)sm_rc;
-            }
-            break;
-        }
-        long r = syscall(SYS_epoll_pwait, (int)a0,
-                         (struct epoll_event *)a32_guest_ptr(ctx, a1), (int)a2, (int)a3,
-                         has_temp_mask ? &temp_mask : NULL, (size_t)8);
-        ctx->regs[0] = host_ret(r);
-        pwait_sigmask_leave(ctx, has_temp_mask, saved_sig_mask, temp_mask);
-        break;
-    }
-
+    case ARM_NR_epoll_pwait:
     case ARM_NR_eventfd:
     case ARM_NR_eventfd2:
-        ctx->regs[0] = host_ret(eventfd((unsigned int)a0, (nr == ARM_NR_eventfd2) ? (int)a1 : 0));
-        break;
-
     case ARM_NR_timerfd_create:
-        ctx->regs[0] = host_ret(timerfd_create((int)a0, (int)a1));
-        break;
-
     case ARM_NR_timerfd_settime:
-    case ARM_NR_timerfd_settime64: {
-        bool time64 = (nr == ARM_NR_timerfd_settime64);
-        uint32_t it_sz = time64 ? 32U : 16U;
-        struct itimerspec h_in, h_out = { 0 };
-        FAIL_EFAULT_IF(!read_guest_itimerspec(ctx, a2, time64, &h_in) ||
-                       (a3 != 0U && !a32_guest_range_ok(ctx, a3, it_sz, PROT_WRITE)));
-        int r = timerfd_settime((int)a0, (int)a1, &h_in, (a3 != 0U) ? &h_out : NULL);
-        if (r == 0 && a3 != 0U) {
-            (void)write_guest_itimerspec(ctx, a3, time64, &h_out);
-        }
-        ctx->regs[0] = host_ret(r);
-        break;
-    }
-
+    case ARM_NR_timerfd_settime64:
     case ARM_NR_timerfd_gettime:
     case ARM_NR_timerfd_gettime64: {
-        bool time64 = (nr == ARM_NR_timerfd_gettime64);
-        uint32_t it_sz = time64 ? 32U : 16U;
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, it_sz, PROT_WRITE));
-        struct itimerspec h_out = { 0 };
-        int r = timerfd_gettime((int)a0, &h_out);
-        if (r == 0) {
-            (void)write_guest_itimerspec(ctx, a1, time64, &h_out);
+#if defined(__linux__)
+        if (nr == ARM_NR_epoll_create) {
+            ctx->regs[0] = host_ret(epoll_create((int)a0));
+        } else if (nr == ARM_NR_epoll_create1) {
+            ctx->regs[0] = host_ret(epoll_create1((int)a0));
+        } else if (nr == ARM_NR_epoll_ctl) {
+            FAIL_EFAULT_IF(a3 != 0U && !a32_guest_range_ok(ctx, a3, (uint32_t)sizeof(struct epoll_event), PROT_READ));
+            ctx->regs[0] = host_ret(epoll_ctl((int)a0, (int)a1, (int)a2,
+                                              a3 ? (struct epoll_event *)a32_guest_ptr(ctx, a3) : NULL));
+        } else if (nr == ARM_NR_epoll_wait) {
+            FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(struct epoll_event), PROT_WRITE));
+            ctx->regs[0] = host_ret(epoll_wait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
+                                               (int)a2, (int)a3));
+        } else if (nr == ARM_NR_epoll_pwait) {
+            FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(struct epoll_event), PROT_WRITE));
+            bool     has_temp_mask  = false;
+            uint64_t saved_sig_mask = ctx->sig_mask;
+            uint64_t temp_mask      = 0ULL;
+            int sm_rc = pwait_sigmask_enter(ctx, a4, a5, &has_temp_mask, &saved_sig_mask, &temp_mask);
+            if (sm_rc != 0) {
+                if (sm_rc < 0) {
+                    ctx->regs[0] = (uint32_t)sm_rc;
+                }
+                break;
+            }
+            long r = syscall(SYS_epoll_pwait, (int)a0,
+                             (struct epoll_event *)a32_guest_ptr(ctx, a1), (int)a2, (int)a3,
+                             has_temp_mask ? &temp_mask : NULL, (size_t)8);
+            ctx->regs[0] = host_ret(r);
+            pwait_sigmask_leave(ctx, has_temp_mask, saved_sig_mask, temp_mask);
+        } else if (nr == ARM_NR_eventfd || nr == ARM_NR_eventfd2) {
+            ctx->regs[0] = host_ret(eventfd((unsigned int)a0, (nr == ARM_NR_eventfd2) ? (int)a1 : 0));
+        } else if (nr == ARM_NR_timerfd_create) {
+            ctx->regs[0] = host_ret(timerfd_create((int)a0, (int)a1));
+        } else if (nr == ARM_NR_timerfd_settime || nr == ARM_NR_timerfd_settime64) {
+            bool time64 = (nr == ARM_NR_timerfd_settime64);
+            uint32_t it_sz = time64 ? 32U : 16U;
+            struct itimerspec h_in, h_out = { 0 };
+            FAIL_EFAULT_IF(!read_guest_itimerspec(ctx, a2, time64, &h_in) ||
+                           (a3 != 0U && !a32_guest_range_ok(ctx, a3, it_sz, PROT_WRITE)));
+            int r = timerfd_settime((int)a0, (int)a1, &h_in, (a3 != 0U) ? &h_out : NULL);
+            if (r == 0 && a3 != 0U) {
+                (void)write_guest_itimerspec(ctx, a3, time64, &h_out);
+            }
+            ctx->regs[0] = host_ret(r);
+        } else {
+            bool time64 = (nr == ARM_NR_timerfd_gettime64);
+            uint32_t it_sz = time64 ? 32U : 16U;
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, it_sz, PROT_WRITE));
+            struct itimerspec h_out = { 0 };
+            int r = timerfd_gettime((int)a0, &h_out);
+            if (r == 0) {
+                (void)write_guest_itimerspec(ctx, a1, time64, &h_out);
+            }
+            ctx->regs[0] = host_ret(r);
         }
-        ctx->regs[0] = host_ret(r);
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
@@ -135,14 +136,25 @@
         break;
 
     case ARM_NR_dup3:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(dup3((int)a0, (int)a1, (int)a2));
+#else
+        if (a0 == a1) {
+            FAIL_ERR(EINVAL);
+        }
+        ctx->regs[0] = host_ret(dup2((int)a0, (int)a1));
+#endif
         break;
 
     case ARM_NR_pipe:
     case ARM_NR_pipe2: {
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 8U, PROT_WRITE));
         int fds[2];
+#if defined(__linux__)
         int r = (nr == ARM_NR_pipe2) ? pipe2(fds, (int)a1) : pipe(fds);
+#else
+        int r = pipe(fds);
+#endif
         if (r < 0) {
             FAIL_ERR(errno);
         }
@@ -179,7 +191,7 @@
         char resolved[PATH_MAX];
         int dirfd     = (nr == ARM_NR_unlinkat) ? translate_at_fd(a0) : AT_FDCWD;
         uint32_t p_va = (nr == ARM_NR_unlinkat) ? a1 : a0;
-        int u_flags   = (nr == ARM_NR_unlinkat) ? (int)a2
+        int u_flags   = (nr == ARM_NR_unlinkat) ? ((a2 & 0x200U) ? AT_REMOVEDIR : 0)
                       : (nr == ARM_NR_rmdir)    ? AT_REMOVEDIR : 0;
         RESOLVE_AT(dirfd, p_va, resolved, false);
         ctx->regs[0] = host_ret(unlinkat(dirfd, resolved, u_flags));
@@ -198,7 +210,12 @@
         unsigned int fl = (nr == ARM_NR_renameat2) ? (unsigned int)a4 : 0U;
         RESOLVE_AT(oldfd, old_va, r_old, false);
         RESOLVE_AT(newfd, new_va, r_new, false);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_renameat2, oldfd, r_old, newfd, r_new, fl));
+#else
+        (void)fl;
+        ctx->regs[0] = host_ret(renameat(oldfd, r_old, newfd, r_new));
+#endif
         break;
     }
 
@@ -210,7 +227,7 @@
         uint32_t old_va = is_at ? a1 : a0;
         int newfd       = is_at ? translate_at_fd(a2) : AT_FDCWD;
         uint32_t new_va = is_at ? a3 : a1;
-        int l_flags     = is_at ? (int)a4 : 0;
+        int l_flags     = (is_at && (a4 & 0x400U)) ? AT_SYMLINK_FOLLOW : 0;
         bool follow_old = ((l_flags & AT_SYMLINK_FOLLOW) != 0);
         RESOLVE_AT(oldfd, old_va, r_old, follow_old);
         RESOLVE_AT(newfd, new_va, r_new, false);
@@ -286,8 +303,9 @@
         uint32_t va = is_at ? a1 : a0;
         uid_t uid   = is_at ? (uid_t)a2 : (uid_t)(is_16 ? id16_to_32(a1) : a1);
         gid_t gid   = is_at ? (gid_t)a3 : (gid_t)(is_16 ? id16_to_32(a2) : a2);
-        int c_flags = is_at ? (int)a4
-                    : (nr == ARM_NR_lchown || nr == ARM_NR_lchown32) ? AT_SYMLINK_NOFOLLOW : 0;
+        int c_flags = (is_at ? ((a4 & 0x100U) != 0U)
+                             : (nr == ARM_NR_lchown || nr == ARM_NR_lchown32))
+                      ? AT_SYMLINK_NOFOLLOW : 0;
         bool follow = ((c_flags & AT_SYMLINK_NOFOLLOW) == 0);
         RESOLVE_AT(dirfd, va, resolved, follow);
         ctx->regs[0] = host_ret(fchownat(dirfd, resolved, uid, gid, c_flags));
@@ -312,7 +330,11 @@
         break;
 
     case ARM_NR_fdatasync:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(fdatasync((int)a0));
+#else
+        ctx->regs[0] = host_ret(fsync((int)a0));
+#endif
         break;
 
     case ARM_NR_utimensat:
@@ -322,7 +344,7 @@
         const char *path = NULL;
         int dirfd = translate_at_fd(a0);
         if (a1 != 0U) {
-            bool follow = ((a3 & AT_SYMLINK_NOFOLLOW) == 0U);
+            bool follow = ((a3 & 0x100U) == 0U);
             RESOLVE_AT(dirfd, a1, resolved, follow);
             path = resolved;
         }
@@ -334,7 +356,12 @@
                            !read_guest_timespec(ctx, a2 + ts_sz, time64, &host_ts[1]));
             ts_ptr = host_ts;
         }
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_utimensat, dirfd, path, ts_ptr, (int)a3));
+#else
+        ctx->regs[0] = host_ret((path == NULL) ? futimens(dirfd, ts_ptr)
+                                               : utimensat(dirfd, path, ts_ptr, (a3 & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0));
+#endif
         break;
     }
 
@@ -347,18 +374,23 @@
         int flags     = is_clock ? (int)a1 : 0;
         uint32_t req_va = is_clock ? a2 : a0;
         uint32_t rem_va = is_clock ? a3 : a1;
-        bool abstime  = ((flags & TIMER_ABSTIME) != 0);
+        bool abstime  = ((flags & 1) != 0);
         uint32_t ts_sz = time64 ? 16U : 8U;
         struct timespec host_req, host_rem = { 0, 0 };
         FAIL_EFAULT_IF(!read_guest_timespec(ctx, req_va, time64, &host_req) ||
                        (!abstime && rem_va != 0U && !a32_guest_range_ok(ctx, rem_va, ts_sz, PROT_WRITE)));
         int err;
+#if defined(__linux__)
         if (is_clock) {
             err = clock_nanosleep(clk, flags, &host_req,
                                   (!abstime && rem_va != 0U) ? &host_rem : NULL);
         } else {
             err = (nanosleep(&host_req, (rem_va != 0U) ? &host_rem : NULL) < 0) ? errno : 0;
         }
+#else
+        (void)clk;
+        err = (nanosleep(&host_req, (!abstime && rem_va != 0U) ? &host_rem : NULL) < 0) ? errno : 0;
+#endif
         if (err != 0) {
             ctx->regs[0] = (uint32_t)(-err);
             if (err == EINTR && !abstime && rem_va != 0U) {
@@ -375,6 +407,7 @@
         break;
 
     case ARM_NR_prctl: {
+#if defined(__linux__)
         static _Thread_local char tls_comm[16] = "a32rt";
         unsigned long arg2 = (unsigned long)a1;
         if (a0 == PR_SET_NAME) {
@@ -393,6 +426,9 @@
         }
         ctx->regs[0] = host_ret(prctl((int)a0, arg2, (unsigned long)a2,
                                       (unsigned long)a3, (unsigned long)a4));
+#else
+        ctx->regs[0] = 0U;
+#endif
         break;
     }
 
@@ -401,6 +437,7 @@
         FAIL_EINVAL_IF((a0 & 0xFFFU) != 0U || a0 < 0x1000U ||
                        (uint64_t)a0 + (uint64_t)a1 > 0xFFFF0000ULL ||
                        (uint64_t)a0 + aligned_len > 0xFFFF0000ULL);
+#if defined(__linux__)
         if (a1 > 0U) {
             if (madvise(a32_guest_ptr(ctx, a0), 0U, (int)a2) != 0) {
                 FAIL_ERR(errno);
@@ -414,6 +451,9 @@
             }
         }
         ctx->regs[0] = host_ret(madvise(a32_guest_ptr(ctx, a0), (size_t)a1, (int)a2));
+#else
+        ctx->regs[0] = 0U;
+#endif
         break;
     }
 
@@ -422,11 +462,19 @@
         break;
 
     case ARM_NR_tkill:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_tkill, (pid_t)a0, (int)a1));
+#else
+        ctx->regs[0] = host_ret(kill(getpid(), (int)a1));
+#endif
         break;
 
     case ARM_NR_tgkill:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_tgkill, (pid_t)a0, (pid_t)a1, (int)a2));
+#else
+        ctx->regs[0] = host_ret(kill((pid_t)a0, (int)a2));
+#endif
         break;
 
     case ARM_NR_setpgid:
@@ -446,36 +494,52 @@
         break;
 
     case ARM_NR_arm_fadvise64_64: {
+#if defined(__linux__)
         int64_t offset = (int64_t)u64_from_u32(a2, a3);
         int64_t len    = (int64_t)u64_from_u32(a4, a5);
         long r = syscall(SYS_fadvise64, (int)a0, offset, len, (int)a1);
         ctx->regs[0] = (r < 0 && errno == ENOSYS) ? 0U : host_ret(r);
+#else
+        ctx->regs[0] = 0U;
+#endif
         break;
     }
 
     case ARM_NR_membarrier: {
+#if defined(__linux__)
         long r = syscall(SYS_membarrier, (int)a0, (unsigned int)a1, (int)a2);
         if (r < 0 && errno == ENOSYS && a0 == 0U /* MEMBARRIER_CMD_QUERY */) {
             ctx->regs[0] = 0U;
         } else {
             ctx->regs[0] = host_ret(r);
         }
+#else
+        ctx->regs[0] = 0U;
+#endif
         break;
     }
 
     case ARM_NR_flock:
-        ctx->regs[0] = host_ret(syscall(SYS_flock, (int)a0, (int)a1));
+        ctx->regs[0] = host_ret(flock((int)a0, (int)a1));
         break;
 
     case ARM_NR_inotify_add_watch: {
+#if defined(__linux__)
         char resolved[PATH_MAX];
         RESOLVE_AT(AT_FDCWD, a1, resolved, true);
         ctx->regs[0] = host_ret(syscall(SYS_inotify_add_watch, (int)a0, resolved, a2));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
     case ARM_NR_inotify_rm_watch:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_inotify_rm_watch, (int)a0, (int)a1));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_mlock:
@@ -490,106 +554,116 @@
 
     case ARM_NR_mlock2:
         FAIL_EFAULT_IF(a1 > 0U && !a32_guest_range_ok(ctx, a0, a1, PROT_NONE));
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_mlock2, a32_guest_ptr(ctx, a0), (size_t)a1, (unsigned int)a2));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_getpriority:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_getpriority, (int)a0, (id_t)a1));
+#else
+        {
+            errno = 0;
+            int p = getpriority((int)a0, (id_t)a1);
+            ctx->regs[0] = (p == -1 && errno != 0) ? (uint32_t)(-errno) : (uint32_t)(20 - p);
+        }
+#endif
         break;
 
     case ARM_NR_setpriority:
-        ctx->regs[0] = host_ret(syscall(SYS_setpriority, (int)a0, (id_t)a1, (int)a2));
+        ctx->regs[0] = host_ret(setpriority((int)a0, (id_t)a1, (int)a2));
         break;
 
     case ARM_NR_personality:
         ctx->regs[0] = (a0 == 0xFFFFFFFFU || a0 == 0U) ? 0U : (uint32_t)(-EINVAL);
         break;
 
-    case ARM_NR_times: {
-        if (a0 != 0U) {
-            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 16U, PROT_WRITE));
-            int64_t h_tms[4] = { 0, 0, 0, 0 };
-            long r = syscall(SYS_times, h_tms);
-            if (r < 0) {
-                FAIL_ERR(errno);
-            }
-            uint32_t g_tms[4] = {
-                (uint32_t)h_tms[0], (uint32_t)h_tms[1],
-                (uint32_t)h_tms[2], (uint32_t)h_tms[3],
-            };
-            (void)guest_write(ctx, a0, g_tms, sizeof(g_tms));
-            ctx->regs[0] = (uint32_t)r;
-        } else {
-            ctx->regs[0] = host_ret(syscall(SYS_times, NULL));
-        }
-        break;
-    }
-
+    case ARM_NR_times:
     case ARM_NR_setxattr:
     case ARM_NR_lsetxattr:
-    case ARM_NR_fsetxattr: {
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ) ||
-                       (a3 > 0U && !a32_guest_range_ok(ctx, a2, a3, PROT_READ)));
-        const char *name = (const char *)a32_guest_ptr(ctx, a1);
-        const void *val  = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
-        if (nr == ARM_NR_fsetxattr) {
-            ctx->regs[0] = host_ret(syscall(SYS_fsetxattr, (int)a0, name, val, (size_t)a3, (int)a4));
-        } else {
-            char resolved[PATH_MAX];
-            RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_setxattr);
-            long sysno = (nr == ARM_NR_setxattr) ? SYS_setxattr : SYS_lsetxattr;
-            ctx->regs[0] = host_ret(syscall(sysno, resolved, name, val, (size_t)a3, (int)a4));
-        }
-        break;
-    }
-
+    case ARM_NR_fsetxattr:
     case ARM_NR_getxattr:
     case ARM_NR_lgetxattr:
-    case ARM_NR_fgetxattr: {
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ) ||
-                       (a3 > 0U && !a32_guest_range_ok(ctx, a2, a3, PROT_WRITE)));
-        const char *name = (const char *)a32_guest_ptr(ctx, a1);
-        void       *val  = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
-        if (nr == ARM_NR_fgetxattr) {
-            ctx->regs[0] = host_ret(syscall(SYS_fgetxattr, (int)a0, name, val, (size_t)a3));
-        } else {
-            char resolved[PATH_MAX];
-            RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_getxattr);
-            long sysno = (nr == ARM_NR_getxattr) ? SYS_getxattr : SYS_lgetxattr;
-            ctx->regs[0] = host_ret(syscall(sysno, resolved, name, val, (size_t)a3));
-        }
-        break;
-    }
-
+    case ARM_NR_fgetxattr:
     case ARM_NR_listxattr:
     case ARM_NR_llistxattr:
-    case ARM_NR_flistxattr: {
-        FAIL_EFAULT_IF(a2 > 0U && !a32_guest_range_ok(ctx, a1, a2, PROT_WRITE));
-        void *list = (a1 != 0U) ? a32_guest_ptr(ctx, a1) : NULL;
-        if (nr == ARM_NR_flistxattr) {
-            ctx->regs[0] = host_ret(syscall(SYS_flistxattr, (int)a0, list, (size_t)a2));
-        } else {
-            char resolved[PATH_MAX];
-            RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_listxattr);
-            long sysno = (nr == ARM_NR_listxattr) ? SYS_listxattr : SYS_llistxattr;
-            ctx->regs[0] = host_ret(syscall(sysno, resolved, list, (size_t)a2));
-        }
-        break;
-    }
-
+    case ARM_NR_flistxattr:
     case ARM_NR_removexattr:
     case ARM_NR_lremovexattr:
     case ARM_NR_fremovexattr: {
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ));
-        const char *name = (const char *)a32_guest_ptr(ctx, a1);
-        if (nr == ARM_NR_fremovexattr) {
-            ctx->regs[0] = host_ret(syscall(SYS_fremovexattr, (int)a0, name));
+#if defined(__linux__)
+        if (nr == ARM_NR_times) {
+            if (a0 != 0U) {
+                FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 16U, PROT_WRITE));
+                int64_t h_tms[4] = { 0, 0, 0, 0 };
+                long r = syscall(SYS_times, h_tms);
+                if (r < 0) {
+                    FAIL_ERR(errno);
+                }
+                uint32_t g_tms[4] = {
+                    (uint32_t)h_tms[0], (uint32_t)h_tms[1],
+                    (uint32_t)h_tms[2], (uint32_t)h_tms[3],
+                };
+                (void)guest_write(ctx, a0, g_tms, sizeof(g_tms));
+                ctx->regs[0] = (uint32_t)r;
+            } else {
+                ctx->regs[0] = host_ret(syscall(SYS_times, NULL));
+            }
+        } else if (nr == ARM_NR_setxattr || nr == ARM_NR_lsetxattr || nr == ARM_NR_fsetxattr) {
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ) ||
+                           (a3 > 0U && !a32_guest_range_ok(ctx, a2, a3, PROT_READ)));
+            const char *name = (const char *)a32_guest_ptr(ctx, a1);
+            const void *val  = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
+            if (nr == ARM_NR_fsetxattr) {
+                ctx->regs[0] = host_ret(syscall(SYS_fsetxattr, (int)a0, name, val, (size_t)a3, (int)a4));
+            } else {
+                char resolved[PATH_MAX];
+                RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_setxattr);
+                long sysno = (nr == ARM_NR_setxattr) ? SYS_setxattr : SYS_lsetxattr;
+                ctx->regs[0] = host_ret(syscall(sysno, resolved, name, val, (size_t)a3, (int)a4));
+            }
+        } else if (nr == ARM_NR_getxattr || nr == ARM_NR_lgetxattr || nr == ARM_NR_fgetxattr) {
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ) ||
+                           (a3 > 0U && !a32_guest_range_ok(ctx, a2, a3, PROT_WRITE)));
+            const char *name = (const char *)a32_guest_ptr(ctx, a1);
+            void       *val  = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
+            if (nr == ARM_NR_fgetxattr) {
+                ctx->regs[0] = host_ret(syscall(SYS_fgetxattr, (int)a0, name, val, (size_t)a3));
+            } else {
+                char resolved[PATH_MAX];
+                RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_getxattr);
+                long sysno = (nr == ARM_NR_getxattr) ? SYS_getxattr : SYS_lgetxattr;
+                ctx->regs[0] = host_ret(syscall(sysno, resolved, name, val, (size_t)a3));
+            }
+        } else if (nr == ARM_NR_listxattr || nr == ARM_NR_llistxattr || nr == ARM_NR_flistxattr) {
+            FAIL_EFAULT_IF(a2 > 0U && !a32_guest_range_ok(ctx, a1, a2, PROT_WRITE));
+            void *list = (a1 != 0U) ? a32_guest_ptr(ctx, a1) : NULL;
+            if (nr == ARM_NR_flistxattr) {
+                ctx->regs[0] = host_ret(syscall(SYS_flistxattr, (int)a0, list, (size_t)a2));
+            } else {
+                char resolved[PATH_MAX];
+                RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_listxattr);
+                long sysno = (nr == ARM_NR_listxattr) ? SYS_listxattr : SYS_llistxattr;
+                ctx->regs[0] = host_ret(syscall(sysno, resolved, list, (size_t)a2));
+            }
         } else {
-            char resolved[PATH_MAX];
-            RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_removexattr);
-            long sysno = (nr == ARM_NR_removexattr) ? SYS_removexattr : SYS_lremovexattr;
-            ctx->regs[0] = host_ret(syscall(sysno, resolved, name));
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ));
+            const char *name = (const char *)a32_guest_ptr(ctx, a1);
+            if (nr == ARM_NR_fremovexattr) {
+                ctx->regs[0] = host_ret(syscall(SYS_fremovexattr, (int)a0, name));
+            } else {
+                char resolved[PATH_MAX];
+                RESOLVE_AT(AT_FDCWD, a0, resolved, nr == ARM_NR_removexattr);
+                long sysno = (nr == ARM_NR_removexattr) ? SYS_removexattr : SYS_lremovexattr;
+                ctx->regs[0] = host_ret(syscall(sysno, resolved, name));
+            }
         }
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 

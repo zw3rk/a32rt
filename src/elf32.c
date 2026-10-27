@@ -7,6 +7,8 @@
 
 #define _GNU_SOURCE
 #include "a32rt.h"
+#include "os/backend.h"
+#include "vm/vm32.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -100,12 +102,12 @@ static int pread_full(int fd, void *buf, size_t count, off_t offset)
 static int protect_and_record_seg(a32_ctx_t *ctx, uint32_t start, uint32_t end,
                                   uint32_t guest_prot, const char *label)
 {
-    if (mprotect(a32_guest_ptr(ctx, start), end - start, a32_host_prot(ctx, guest_prot)) != 0) {
+    a32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
+    if (a32_vm32_protect(ctx, start, (size_t)(end - start), guest_prot) != 0) {
         fprintf(stderr, "a32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
                 label, start, end, strerror(errno));
         return -1;
     }
-    a32_vm_record_region(ctx, start, end, guest_prot, 0x12U, label);
     return 0;
 }
 
@@ -281,8 +283,8 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         uint32_t shared_end  = (map_end < map_start) ? map_end : map_start;
         uint32_t merged_prot = highest_mapped_prot | guest_prot;
         if (page_start < map_start) {
-            if (mprotect(a32_guest_ptr(ctx, page_start), shared_end - page_start,
-                         PROT_READ | PROT_WRITE) != 0) {
+            if (a32_backend_protect(a32_guest_ptr(ctx, page_start), shared_end - page_start,
+                                    PROT_READ | PROT_WRITE) != 0) {
                 fprintf(stderr, "a32rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
                         label, page_start, shared_end, strerror(errno));
                 return -1;
@@ -290,10 +292,9 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         }
 
         if (map_end > map_start) {
-            void *res = mmap(a32_guest_ptr(ctx, map_start), map_end - map_start,
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (res == MAP_FAILED) {
+            void *res = NULL;
+            if (a32_backend_map_anon(a32_guest_ptr(ctx, map_start), map_end - map_start,
+                                     PROT_READ | PROT_WRITE, 1, 1, &res) != 0) {
                 fprintf(stderr, "a32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
                         label, map_start, map_end, strerror(errno));
                 return -1;
@@ -466,9 +467,8 @@ int a32_kuser_setup(a32_ctx_t *ctx)
 
     const uint32_t kuser_va = 0xFFFF0000U;
     void *host_page = a32_guest_ptr(ctx, kuser_va);
-    void *res = mmap(host_page, 4096U, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
+    void *res = NULL;
+    if (a32_backend_map_anon(host_page, 4096U, PROT_READ | PROT_WRITE, 1, 1, &res) != 0) {
         fprintf(stderr, "a32rt: failed to map kuser page at 0xffff0000: %s\n",
                 strerror(errno));
         return -1;
@@ -587,12 +587,11 @@ int a32_kuser_setup(a32_ctx_t *ctx)
 
     /* W^X: the kuser helpers are A32 data translated by the JIT, never host
      * code executed in place; the host mapping must never be PROT_EXEC. */
-    if (mprotect(host_page, 4096U, PROT_READ) != 0) {
+    a32_vm_record_region(ctx, kuser_va, kuser_va + 4096U,
+                         (uint32_t)PROT_READ, 0x12U, "[vectors]");
+    if (a32_vm32_protect(ctx, kuser_va, 4096U, (uint32_t)PROT_READ) != 0) {
         fprintf(stderr, "a32rt: failed to mprotect kuser page: %s\n", strerror(errno));
         return -1;
     }
-
-    a32_vm_record_region(ctx, kuser_va, kuser_va + 4096U,
-                         (uint32_t)PROT_READ, 0x12U, "[vectors]");
     return 0;
 }

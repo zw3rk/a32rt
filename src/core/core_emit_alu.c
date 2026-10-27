@@ -694,24 +694,12 @@ static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned add
      * addressing (correct but union-mapped); see the header notes. */
     {
         uint64_t base = (uint64_t)a32_vm32_tlb_base;
-        unsigned s0 = 15U;
-        unsigned s1 = 16U;
         uint16_t h0 = (uint16_t)(base & 0xFFFFU);
         uint16_t h1 = (uint16_t)((base >> 16) & 0xFFFFU);
         uint16_t h2 = (uint16_t)((base >> 32) & 0xFFFFU);
         uint16_t h3 = (uint16_t)((base >> 48) & 0xFFFFU);
         uint32_t cur_pc = a32_jit_last_record_pc();
         uint32_t tag_off = (((opc & 0x400000U) == 0U) ? 16U : 0U);
-        if (addr_w == 15U) {
-            s0 = 16U;
-            s1 = 17U;
-        } else if (addr_w == 16U) {
-            s0 = 15U;
-            s1 = 17U;
-        } else if (addr_w == 17U) {
-            s0 = 15U;
-            s1 = 16U;
-        }
         emit_movz_x(b, 21U, h0, 0U);
         if (h1 != 0U) {
             emit_movk_x(b, 21U, h1, 1U);
@@ -722,34 +710,25 @@ static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned add
         if (h3 != 0U) {
             emit_movk_x(b, 21U, h3, 3U);
         }
-        /* 12-bit Soft-TLB index: (gva >> 12) & 0xfff. */
-        a64_emit_ubfm_w(b, s0, addr_w, 12U, 23U);
-        a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 5U);
-        a64_emit_add_uxtw_x(b, s0, 21U, s0);
-        a64_emit_ldr_imm_w(b, s1, s0, tag_off);
-        /* Guest-page compare in tag units (RC-U3-r4 #2): the table
-         * stores read_tag/write_tag unshifted (gva_page & ~0xFFFU), so
-         * shift the extracted index back left by 12 and compare
-         * (gva & ~0xFFFU) against the tag. An INVALID (~0) tag can
-         * never alias a valid page this way. s0 is reused as scratch;
-         * the entry address is recomputed on the hit path below. */
-        a64_emit_ubfm_w(b, s0, addr_w, 12U, 31U);
-        a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 12U);
-        a64_emit_eor_reg_w(b, s1, s1, s0, A64_SHIFT_LSL, 0U);
+        /* 20-bit Soft-TLB index: gva >> 12 (into x21 = &g_tlb[idx]). */
+        a64_emit_ubfm_w(b, 23U, addr_w, 12U, 31U);
+        a64_emit_orr_reg_w(b, 23U, A64_ZR, 23U, A64_SHIFT_LSL, 5U);
+        a64_emit_add_uxtw_x(b, 21U, 21U, 23U);
+        /* 64-bit tag load: ldr x23, [x21, #tag_off]; lsr x23, x23, #12 */
+        a64_emit(b, 0xF9400000U | ((tag_off / 8U) << 10) | (21U << 5) | 23U);
+        a64_emit(b, 0xD34CFC00U | (23U << 5) | 23U);
+        a64_emit_eor_reg_w(b, 23U, 23U, addr_w, A64_SHIFT_LSR, 12U);
         {
-            size_t cbz = a64_emit_cbz_w_placeholder(b, false, s1);
+            size_t cbz = a64_emit_cbz_w_placeholder(b, false, 23U);
             a64_emit_str_imm_w(b, addr_w, A64_XCTX,
                 (uint32_t)offsetof(a32_ctx_t, fault_addr));
             a64_emit_mov_pc32(b, 15U, cur_pc);
             a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
-            a64_emit(b, 0xD65F03C0U);
+            a64_emit_ret(b);
             a64_patch_cbz_w(b, cbz, b->count);
         }
-        a64_emit_ubfm_w(b, s0, addr_w, 12U, 23U);
-        a64_emit_orr_reg_w(b, s0, A64_ZR, s0, A64_SHIFT_LSL, 5U);
-        a64_emit_add_uxtw_x(b, s0, 21U, s0);
-        /* Hit: addend load plus the original single access via [addend, wA]. */
-        a64_emit(b, 0xF9400000U | (1U << 10) | ((s0 & 31U) << 5) | (s1 & 31U));
-        a64_emit(b, opc | ((addr_w & 31U) << 16) | ((s1 & 31U) << 5) | (rt & 31U));
+        /* Hit: ldr x23, [x21, #8] (addend) and [x23, wA, uxtw] access. */
+        a64_emit(b, 0xF9400000U | (1U << 10) | (21U << 5) | 23U);
+        a64_emit(b, opc | ((addr_w & 31U) << 16) | (23U << 5) | (rt & 31U));
     }
 }

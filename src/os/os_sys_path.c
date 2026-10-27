@@ -55,10 +55,30 @@ static inline uint64_t u64_from_u32(uint32_t lo, uint32_t hi)
 
 static int translate_at_fd(uint32_t guest_dfd)
 {
-    if (guest_dfd == (uint32_t)AT_FDCWD) {
+    if (guest_dfd == 0xFFFFFF9CU || guest_dfd == (uint32_t)AT_FDCWD) {
         return AT_FDCWD;
     }
     return (int)(int32_t)guest_dfd;
+}
+
+static int translate_open_flags(uint32_t guest_flags)
+{
+#if defined(__APPLE__)
+    int f = (int)(guest_flags & 3U);
+    if (guest_flags & 0x00000040U) f |= O_CREAT;
+    if (guest_flags & 0x00000080U) f |= O_EXCL;
+    if (guest_flags & 0x00000100U) f |= O_NOCTTY;
+    if (guest_flags & 0x00000200U) f |= O_TRUNC;
+    if (guest_flags & 0x00000400U) f |= O_APPEND;
+    if (guest_flags & 0x00000800U) f |= O_NONBLOCK;
+    if (guest_flags & 0x00001000U) f |= O_DSYNC;
+    if (guest_flags & (0x00004000U | 0x00010000U)) f |= O_DIRECTORY;
+    if (guest_flags & (0x00008000U | 0x00020000U)) f |= O_NOFOLLOW;
+    if (guest_flags & 0x00080000U) f |= O_CLOEXEC;
+    return f;
+#else
+    return (int)guest_flags;
+#endif
 }
 
 static inline uint32_t id16_to_32(uint32_t id)
@@ -69,7 +89,15 @@ static inline uint32_t id16_to_32(uint32_t id)
 static inline int get_host_tid(a32_ctx_t *ctx)
 {
     if (ctx->host_tid == 0) {
+#if defined(__linux__)
         ctx->host_tid = (int)syscall(SYS_gettid);
+#elif defined(__APPLE__)
+        uint64_t tid64 = 0ULL;
+        (void)pthread_threadid_np(NULL, &tid64);
+        ctx->host_tid = (tid64 != 0ULL) ? (int)(tid64 & 0x3FFFFFFFULL) : (int)getpid();
+#else
+        ctx->host_tid = (int)getpid();
+#endif
     }
     return ctx->host_tid;
 }
@@ -173,7 +201,7 @@ static int resolve_guest_path_str_at(const a32_ctx_t *ctx, int dirfd, const char
         char base_dir[PATH_MAX];
         base_dir[0] = '\0';
         if (dirfd == AT_FDCWD) {
-            if (syscall(SYS_getcwd, base_dir, sizeof(base_dir)) < 0) {
+            if (getcwd(base_dir, sizeof(base_dir)) == NULL) {
                 base_dir[0] = '\0';
             }
         } else if (dirfd >= 0) {
@@ -404,7 +432,12 @@ static int resolve_guest_path_at(const a32_ctx_t *ctx, int dirfd, uint32_t guest
 
 static int create_anon_file(const char *name, const void *data, size_t len)
 {
-    int fd = (int)syscall(SYS_memfd_create, name, 0x0001U /* MFD_CLOEXEC */);
+    int fd = -1;
+#if defined(__linux__)
+    fd = (int)syscall(SYS_memfd_create, name, 0x0001U /* MFD_CLOEXEC */);
+#else
+    (void)name;
+#endif
     if (fd < 0) {
         char tmpl[] = "/tmp/a32rt_proc_XXXXXX";
         fd = mkstemp(tmpl);

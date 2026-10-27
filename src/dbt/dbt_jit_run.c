@@ -341,6 +341,9 @@ int a32_jit_run(a32_ctx_t *ctx)
         ctx->sync_sig_delivered = false;
         void    *run_entry      = uncached ? (void *)&g_dummy_entry : (void *)cur_entry;
         ctx->last_exec_entry    = run_entry;
+#if defined(__APPLE__)
+        pthread_jit_write_protect_np(1);
+#endif
         uint32_t reason         = a32_jit_run_block(ctx, code, run_entry, &g_cache_epoch);
         is_thumb                = (ctx->cpsr & A32_CPSR_T) != 0U;
         bool     sync_sig_taken = ctx->sync_sig_delivered;

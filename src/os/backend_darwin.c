@@ -57,7 +57,7 @@ static int host_prot(int linux_prot)
         p |= PROT_WRITE;
     }
     if ((linux_prot & 0x4) != 0) {
-        p |= PROT_EXEC;
+        p |= PROT_READ;
     }
     return p;
 }
@@ -70,18 +70,35 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
     if (len == 0U || out_host_addr == NULL) {
         return -EINVAL;
     }
+    if (replace && hint_addr != NULL) {
+        if (linux_prot != 0) {
+            size_t hp = a32_backend_page_size();
+            uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
+            uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
+                ~(uintptr_t)(hp - 1U);
+            if (mprotect((void *)start, end - start,
+                    PROT_READ | PROT_WRITE) != 0) {
+                return -errno;
+            }
+            memset(hint_addr, 0, len);
+        }
+        *out_host_addr = hint_addr;
+        return 0;
+    }
     if (replace) {
         flags |= MAP_FIXED;
     } else if (fixed) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
-#else
-        flags |= MAP_FIXED;
 #endif
     }
     res = mmap(hint_addr, len, host_prot(linux_prot), flags, -1, 0);
     if (res == MAP_FAILED) {
         return -errno;
+    }
+    if (!replace && fixed && hint_addr != NULL && res != hint_addr) {
+        munmap(res, len);
+        return -EEXIST;
     }
     *out_host_addr = res;
     return 0;
@@ -101,8 +118,6 @@ int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
     } else if (fixed) {
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
-#else
-        flags |= MAP_FIXED;
 #endif
     }
     res = mmap(hint_addr, len, host_prot(linux_prot), flags, host_fd,
@@ -110,16 +125,26 @@ int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
     if (res == MAP_FAILED) {
         return -errno;
     }
+    if (!replace && fixed && hint_addr != NULL && res != hint_addr) {
+        munmap(res, len);
+        return -EEXIST;
+    }
     *out_host_addr = res;
     return 0;
 }
 
 int a32_backend_protect(void *host_addr, size_t len, int linux_prot)
 {
+    size_t hp;
+    uintptr_t start;
+    uintptr_t end;
     if (host_addr == NULL || len == 0U) {
         return -EINVAL;
     }
-    if (mprotect(host_addr, len, host_prot(linux_prot)) != 0) {
+    hp = a32_backend_page_size();
+    start = (uintptr_t)host_addr & ~(uintptr_t)(hp - 1U);
+    end = ((uintptr_t)host_addr + len + hp - 1U) & ~(uintptr_t)(hp - 1U);
+    if (mprotect((void *)start, end - start, host_prot(linux_prot)) != 0) {
         return -errno;
     }
     return 0;
@@ -154,7 +179,7 @@ void *a32_backend_jit_alloc(size_t size)
         return NULL;
     }
 #if defined(__APPLE__)
-    res = mmap(NULL, size, PROT_READ | PROT_WRITE,
+    res = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
         MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
 #else
     res = mmap(NULL, size, PROT_READ | PROT_WRITE,
@@ -193,9 +218,6 @@ int a32_backend_jit_seal_rx(void *buf, size_t size)
     }
 #if defined(__APPLE__)
     pthread_jit_write_protect_np(1);
-    if (mprotect(buf, size, PROT_READ | PROT_EXEC) != 0) {
-        return -errno;
-    }
     sys_icache_invalidate(buf, size);
 #else
     if (mprotect(buf, size, PROT_READ | PROT_EXEC) != 0) {

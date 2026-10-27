@@ -61,13 +61,18 @@
 
     case ARM_NR_sched_setaffinity:
         FAIL_EFAULT_IF(a2 < 0x1000U);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_sched_setaffinity, (pid_t)a0,
                                         (unsigned int)a1, a32_guest_ptr(ctx, a2)));
+#else
+        ctx->regs[0] = 0U;
+#endif
         break;
 
     case ARM_NR_sched_getaffinity: {
         FAIL_EFAULT_IF(a2 < 0x1000U);
         FAIL_EINVAL_IF((a1 & 3U) != 0U || a1 == 0U);
+#if defined(__linux__)
         if ((a1 & 7U) == 4U && a1 <= 1020U) {
             uint64_t kbuf[128] = { 0 };
             long r = syscall(SYS_sched_getaffinity, (pid_t)a0,
@@ -82,17 +87,27 @@
         }
         ctx->regs[0] = host_ret(syscall(SYS_sched_getaffinity, (pid_t)a0,
                                         (unsigned int)a1, a32_guest_ptr(ctx, a2)));
+#else
+        uint32_t mask = 1U;
+        memcpy(a32_guest_ptr(ctx, a2), &mask, 4U);
+        ctx->regs[0] = 4U;
+#endif
         break;
     }
 
     case ARM_NR_sendfile64:
         FAIL_EFAULT_IF(a2 != 0U && a2 < 0x1000U);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(sendfile((int)a0, (int)a1,
                                          a2 ? (off_t *)a32_guest_ptr(ctx, a2) : NULL,
                                          (size_t)a3));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_statx: {
+#if defined(__linux__)
         char resolved[PATH_MAX];
         bool follow = ((a2 & AT_SYMLINK_NOFOLLOW) == 0U);
         int dirfd = translate_at_fd(a0);
@@ -108,15 +123,26 @@
             }
         }
         ctx->regs[0] = host_ret(r);
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
     case ARM_NR_unshare:
+#if defined(__linux__)
         ctx->regs[0] = (a0 == 0U) ? 0U : host_ret(syscall(SYS_unshare, (int)a0));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_setns:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_setns, (int)a0, (int)a1));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_seccomp:
@@ -125,34 +151,51 @@
 
     case ARM_NR_close_range:
         FAIL_EINVAL_IF(a0 > a1 || (a2 & ~6U /* CLOSE_RANGE_UNSHARE(2) | CLOSE_RANGE_CLOEXEC(4) */) != 0U);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_close_range, (unsigned int)a0, (unsigned int)a1, (unsigned int)a2));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_memfd_create: {
+#if defined(__linux__)
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 1U, PROT_READ));
         FAIL_EINVAL_IF((a1 & ~0xFC00001FU) != 0U || ((a1 & 4U) == 0U && (a1 & ~0x1FU) != 0U));
         const char *uname_str = (const char *)a32_guest_ptr(ctx, a0);
         FAIL_EINVAL_IF(strnlen(uname_str, 250U) >= 250U);
         ctx->regs[0] = host_ret(syscall(SYS_memfd_create, uname_str, (unsigned int)a1));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
     case ARM_NR_inotify_init1:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_inotify_init1, (int)a0));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_signalfd4: {
+#if defined(__linux__)
         uint64_t gmask = 0ULL;
         FAIL_EFAULT_IF(a2 != 8U || !guest_read(ctx, &gmask, a1, sizeof(gmask)));
         sigset_t hmask;
         memset(&hmask, 0, sizeof(hmask));
         memcpy(&hmask, &gmask, sizeof(uint64_t));
         ctx->regs[0] = host_ret(syscall(SYS_signalfd4, (int)a0, &hmask, sizeof(hmask), (int)a3));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
     case ARM_NR_splice:
     case ARM_NR_copy_file_range: {
+#if defined(__linux__)
         FAIL_EFAULT_IF((a1 != 0U && !a32_guest_range_ok(ctx, a1, 8U, PROT_READ | PROT_WRITE)) ||
                        (a3 != 0U && !a32_guest_range_ok(ctx, a3, 8U, PROT_READ | PROT_WRITE)));
         loff_t *p_off_in  = a1 ? (loff_t *)a32_guest_ptr(ctx, a1) : NULL;
@@ -160,24 +203,39 @@
         long h_nr = (nr == ARM_NR_splice) ? SYS_splice : SYS_copy_file_range;
         ctx->regs[0] = host_ret(syscall(h_nr, (int)a0, p_off_in,
                                         (int)a2, p_off_out, (size_t)a4, (unsigned int)a5));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
     case ARM_NR_sync_file_range2: {
+#if defined(__linux__)
         off_t offset = (off_t)u64_from_u32(a2, a3);
         off_t nbytes = (off_t)u64_from_u32(a4, a5);
         ctx->regs[0] = host_ret(syscall(SYS_sync_file_range, (int)a0, offset, nbytes, (unsigned int)a1));
+#else
+        ctx->regs[0] = 0U;
+#endif
         break;
     }
 
     case ARM_NR_tee:
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_tee, (int)a0, (int)a1, (size_t)a2, (unsigned int)a3));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_fallocate: {
+#if defined(__linux__)
         off_t offset = (off_t)u64_from_u32(a2, a3);
         off_t len    = (off_t)u64_from_u32(a4, a5);
         ctx->regs[0] = host_ret(syscall(SYS_fallocate, (int)a0, (int)a1, offset, len));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
@@ -202,8 +260,12 @@
     case ARM_NR_accept4: {
         struct sockaddr *sa = a1 ? a32_guest_ptr(ctx, a1) : NULL;
         socklen_t *salen    = a2 ? (socklen_t *)a32_guest_ptr(ctx, a2) : NULL;
+#if defined(__linux__)
         int r = (nr == ARM_NR_accept4) ? accept4((int)a0, sa, salen, (int)a3)
                                        : accept((int)a0, sa, salen);
+#else
+        int r = accept((int)a0, sa, salen);
+#endif
         ctx->regs[0] = host_ret(r);
         break;
     }
@@ -501,7 +563,12 @@
             e_ptr = (a3 != 0U) ? a32_guest_ptr(ctx, a3) : NULL;
         }
 
+#if defined(__linux__)
         long r = syscall(SYS_pselect6, nfds, r_ptr, w_ptr, e_ptr, ts_ptr, sig_arg);
+#else
+        (void)sig_arg;
+        long r = pselect(nfds, (fd_set *)r_ptr, (fd_set *)w_ptr, (fd_set *)e_ptr, ts_ptr, NULL);
+#endif
         int saved_errno = errno;
         if (r >= 0 && nfds <= 1024) {
             if (a1 != 0U) {

@@ -24,12 +24,21 @@ static void fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struc
     dst->st_size       = (int64_t)src->st_size;
     dst->st_blksize    = (uint32_t)src->st_blksize;
     dst->st_blocks     = (uint64_t)src->st_blocks;
+#if defined(__APPLE__)
+    dst->st_atime_sec  = (uint32_t)src->st_atimespec.tv_sec;
+    dst->st_atime_nsec = (uint32_t)src->st_atimespec.tv_nsec;
+    dst->st_mtime_sec  = (uint32_t)src->st_mtimespec.tv_sec;
+    dst->st_mtime_nsec = (uint32_t)src->st_mtimespec.tv_nsec;
+    dst->st_ctime_sec  = (uint32_t)src->st_ctimespec.tv_sec;
+    dst->st_ctime_nsec = (uint32_t)src->st_ctimespec.tv_nsec;
+#else
     dst->st_atime_sec  = (uint32_t)src->st_atim.tv_sec;
     dst->st_atime_nsec = (uint32_t)src->st_atim.tv_nsec;
     dst->st_mtime_sec  = (uint32_t)src->st_mtim.tv_sec;
     dst->st_mtime_nsec = (uint32_t)src->st_mtim.tv_nsec;
     dst->st_ctime_sec  = (uint32_t)src->st_ctim.tv_sec;
     dst->st_ctime_nsec = (uint32_t)src->st_ctim.tv_nsec;
+#endif
     dst->st_ino        = (uint64_t)src->st_ino;
 }
 
@@ -216,10 +225,17 @@ static void fill_arm_statfs64(arm_statfs64_t *dst, const struct statfs *src)
     dst->f_bavail    = (uint64_t)src->f_bavail;
     dst->f_files     = (uint64_t)src->f_files;
     dst->f_ffree     = (uint64_t)src->f_ffree;
+#if defined(__APPLE__)
+    dst->f_fsid.val[0] = (int32_t)src->f_fsid.val[0];
+    dst->f_fsid.val[1] = (int32_t)src->f_fsid.val[1];
+    dst->f_namelen   = 255U;
+    dst->f_frsize    = (uint32_t)src->f_bsize;
+#else
     dst->f_fsid.val[0] = (int32_t)src->f_fsid.__val[0];
     dst->f_fsid.val[1] = (int32_t)src->f_fsid.__val[1];
     dst->f_namelen   = (uint32_t)src->f_namelen;
     dst->f_frsize    = (uint32_t)src->f_frsize;
+#endif
     dst->f_flags     = (uint32_t)src->f_flags;
 }
 
@@ -313,6 +329,23 @@ static inline bool guest_write(a32_ctx_t *ctx, uint32_t va, const void *src, uin
     return true;
 }
 
+static int translate_linux_clockid(uint32_t linux_clk, clockid_t *out_clk)
+{
+#if defined(__APPLE__)
+    switch (linux_clk) {
+    case 0U: case 5U: *out_clk = CLOCK_REALTIME; return 0;
+    case 1U: case 6U: case 7U: *out_clk = CLOCK_MONOTONIC; return 0;
+    case 2U: *out_clk = CLOCK_PROCESS_CPUTIME_ID; return 0;
+    case 3U: *out_clk = CLOCK_THREAD_CPUTIME_ID; return 0;
+    case 4U: *out_clk = CLOCK_MONOTONIC_RAW; return 0;
+    default: errno = EINVAL; return -1;
+    }
+#else
+    *out_clk = (clockid_t)linux_clk;
+    return 0;
+#endif
+}
+
 static bool read_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, struct timespec *out)
 {
     if (time64) {
@@ -343,6 +376,7 @@ static bool write_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, const
     return guest_write(ctx, va, &ts32, sizeof(ts32));
 }
 
+#if defined(__linux__)
 static bool read_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, struct itimerspec *out)
 {
     uint32_t step = time64 ? 16U : 8U;
@@ -356,6 +390,7 @@ static bool write_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, con
     return write_guest_timespec(ctx, va, time64, &in->it_interval) &&
            write_guest_timespec(ctx, va + step, time64, &in->it_value);
 }
+#endif
 
 static bool read_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, struct timeval *out)
 {
@@ -466,7 +501,9 @@ static void wake_robust_futex(a32_ctx_t *ctx, uint32_t node_va, int32_t futex_of
         uint32_t new_val = (val & 0x80000000U) | 0x40000000U /* FUTEX_OWNER_DIED */;
         if (__atomic_compare_exchange_n(futex_ptr, &val, new_val, false,
                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+#if defined(__linux__)
             syscall(SYS_futex, futex_ptr, 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+#endif
             break;
         }
     }

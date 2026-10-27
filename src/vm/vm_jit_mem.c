@@ -25,6 +25,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
 
 #define A32_CODE_CACHE_SIZE (32U * 1024U * 1024U)                 /* 32 MiB RX code cache */
 #define A32_CACHE_PAGES     (A32_CODE_CACHE_SIZE / A32_PAGE_SIZE) /* 8192 pages */
@@ -286,6 +290,10 @@ static inline bool validate_cache_candidate(a32_cache_entry_t *cand, const void 
 static void flush_icache_range(a32_ctx_t *ctx, const void *start, size_t len)
 {
     ctx->icache_flushes++;
+#if defined(__APPLE__)
+    sys_icache_invalidate((void *)(uintptr_t)start, len);
+    return;
+#else
     uintptr_t addr = (uintptr_t)start & ~(uintptr_t)63U;
     uintptr_t end  = (uintptr_t)start + len;
 
@@ -312,6 +320,7 @@ static void flush_icache_range(a32_ctx_t *ctx, const void *start, size_t len)
                      :
                      :
                      : "memory");
+#endif
 }
 
 static size_t g_first_rw_page = 0U;
@@ -320,9 +329,13 @@ static void reset_cache_locked(a32_ctx_t *ctx)
 {
     uint32_t old_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     atomic_store_explicit(&g_cache_epoch, 0U, memory_order_release);
+#if defined(__APPLE__)
+    pthread_jit_write_protect_np(0);
+#else
     if (mprotect(g_code_cache, A32_CODE_CACHE_SIZE, PROT_READ | PROT_WRITE) != 0) {
         fprintf(stderr, "a32rt: reset_cache mprotect(RW) failed: %s\n", strerror(errno));
     }
+#endif
     memset(g_page_is_rw, 1, sizeof(g_page_is_rw));
     g_first_rw_page    = 0U;
     g_code_used        = 0U;
@@ -374,16 +387,24 @@ static int flush_batch_locked(a32_ctx_t *ctx)
         }
         void  *range_start = g_code_cache + (start_p * A32_PAGE_SIZE);
         size_t range_len   = (p - start_p) * A32_PAGE_SIZE;
+#if defined(__APPLE__)
+        (void)range_start;
+        (void)range_len;
+#else
         if (mprotect(range_start, range_len, PROT_READ | PROT_EXEC) != 0) {
             fprintf(stderr, "a32rt: code cache mprotect(RX) failed: %s\n", strerror(errno));
             return -1;
         }
+#endif
         for (size_t q = start_p; q < p; q++) {
             g_page_is_rw[q] = false;
         }
         ctx->wx_transitions++;
     }
     g_first_rw_page = used_pages;
+#if defined(__APPLE__)
+    pthread_jit_write_protect_np(1);
+#endif
 
     if (g_batch_max > g_batch_min) {
         flush_icache_range(ctx, (const void *)g_batch_min, g_batch_max - g_batch_min);
@@ -421,6 +442,13 @@ static uint8_t *allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
     }
 
     for (size_t p = p_start; p < p_end; p++) {
+#if defined(__APPLE__)
+        pthread_jit_write_protect_np(0);
+        if (!g_page_is_rw[p]) {
+            g_page_is_rw[p] = true;
+            ctx->wx_transitions++;
+        }
+#else
         if (!g_page_is_rw[p]) {
             void *page_addr = g_code_cache + (p * A32_PAGE_SIZE);
             if (mprotect(page_addr, A32_PAGE_SIZE, PROT_READ | PROT_WRITE) != 0) {
@@ -430,6 +458,7 @@ static uint8_t *allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
             g_page_is_rw[p] = true;
             ctx->wx_transitions++;
         }
+#endif
         if (p < g_first_rw_page) {
             g_first_rw_page = p;
         }

@@ -12,8 +12,10 @@ static void thread_exit_cleanup(a32_ctx_t *ctx)
     a32_cleanup_robust_list(ctx);
     uint32_t zero = 0U;
     if (guest_write(ctx, ctx->clear_child_tid, &zero, 4U)) {
+#if defined(__linux__)
         syscall(SYS_futex, a32_guest_ptr(ctx, ctx->clear_child_tid),
                 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+#endif
     }
 }
 
@@ -35,7 +37,7 @@ static void *guest_thread_start(void *arg)
     uint32_t ctid_va  = args->ctid_va;
 
     a32_signals_set_thread_ctx(ctx);
-    ctx->host_tid        = (int)syscall(SYS_gettid);
+    ctx->host_tid        = get_host_tid(ctx);
     ctx->is_thread_clone = true;
     args->child_tid      = ctx->host_tid;
 
@@ -239,7 +241,11 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             (void)a32_aot_save_cache(ctx, ctx->exec_path);
         }
         print_stats_if_enabled(ctx);
+#if defined(__linux__)
         syscall(SYS_exit_group, (int)a0);
+#else
+        _exit((int)a0);
+#endif
         return 1;
 
     case ARM_NR_read:
@@ -308,7 +314,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)vfd;
             break;
         }
-        ctx->regs[0] = host_ret(openat(dirfd, resolved, (int)flags, mode));
+        ctx->regs[0] = host_ret(openat(dirfd, resolved, translate_open_flags(flags), mode));
         break;
     }
 
@@ -561,7 +567,8 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         int dirfd        = is_at ? translate_at_fd(a0) : AT_FDCWD;
         uint32_t path_va = is_at ? a1 : a0;
         uint32_t buf_va  = is_at ? a2 : a1;
-        int flags        = is_at ? (int)a3 : ((nr == ARM_NR_lstat64) ? AT_SYMLINK_NOFOLLOW : 0);
+        uint32_t gflags  = is_at ? a3 : ((nr == ARM_NR_lstat64) ? 0x100U : 0U);
+        int flags        = (gflags & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0;
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, buf_va, sizeof(arm_stat64_t), PROT_WRITE));
         char resolved[PATH_MAX];
         RESOLVE_AT(dirfd, path_va, resolved, (flags & AT_SYMLINK_NOFOLLOW) == 0);
@@ -584,16 +591,22 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         int dirfd        = is_at ? translate_at_fd(a0) : AT_FDCWD;
         uint32_t path_va = is_at ? a1 : a0;
         uint32_t mode    = is_at ? a2 : a1;
-        uint32_t flags   = (nr == ARM_NR_faccessat2) ? a3 : 0U;
+        uint32_t gflags  = (nr == ARM_NR_faccessat2) ? a3 : 0U;
         FAIL_EINVAL_IF((is_at && (mode & ~7U) != 0U) ||
-                       (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH)) != 0U);
+                       (gflags & ~(0x100U | 0x200U | 0x1000U)) != 0U);
+        int hflags       = ((gflags & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0) |
+                           ((gflags & 0x200U) ? AT_EACCESS : 0);
         char resolved[PATH_MAX];
-        RESOLVE_AT(dirfd, path_va, resolved, (flags & AT_SYMLINK_NOFOLLOW) == 0U);
+        RESOLVE_AT(dirfd, path_va, resolved, (hflags & AT_SYMLINK_NOFOLLOW) == 0);
         if (nr == ARM_NR_faccessat2) {
-            long rc = syscall(SYS_faccessat2, dirfd, resolved, (int)mode, (int)flags);
+#if defined(__linux__)
+            long rc = syscall(SYS_faccessat2, dirfd, resolved, (int)mode, (int)gflags);
             if (rc < 0 && errno == ENOSYS) {
-                rc = faccessat(dirfd, resolved, (int)mode, (int)(flags & (AT_SYMLINK_NOFOLLOW | AT_EACCESS)));
+                rc = faccessat(dirfd, resolved, (int)mode, hflags);
             }
+#else
+            long rc = faccessat(dirfd, resolved, (int)mode, hflags);
+#endif
             ctx->regs[0] = host_ret(rc);
         } else {
             ctx->regs[0] = host_ret(faccessat(dirfd, resolved, (int)mode, 0));
@@ -605,12 +618,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         FAIL_EFAULT_IF(a0 < 0x1000U);
         char *buf = (char *)a32_guest_ptr(ctx, a0);
         size_t sr_len = sysroot_prefix_len(ctx);
+        char host_cwd[PATH_MAX];
+        if (getcwd(host_cwd, sizeof(host_cwd)) == NULL) {
+            FAIL_ERR(errno);
+        }
+        const char *guest_cwd = host_cwd;
         if (sr_len > 0U) {
-            char host_cwd[PATH_MAX];
-            if (syscall(SYS_getcwd, host_cwd, sizeof(host_cwd)) < 0) {
-                FAIL_ERR(errno);
-            }
-            const char *guest_cwd = host_cwd;
             if (strncmp(host_cwd, ctx->sysroot, sr_len) == 0 &&
                 (host_cwd[sr_len] == '/' || host_cwd[sr_len] == '\0')) {
                 guest_cwd = (host_cwd[sr_len] == '\0') ? "/" : (host_cwd + sr_len);
@@ -618,16 +631,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                        strncmp(host_cwd, "/private/tmp/", 13) == 0) {
                 guest_cwd = host_cwd + 8;
             }
-            size_t len = strlen(guest_cwd);
-            if ((size_t)a1 < len + 1U) {
-                FAIL_ERR(ERANGE);
-            }
-            memcpy(buf, guest_cwd, len + 1U);
-            ctx->regs[0] = (uint32_t)(len + 1U);
-            break;
         }
-        long r = syscall(SYS_getcwd, buf, (size_t)a1);
-        ctx->regs[0] = (r < 0) ? (uint32_t)(-errno) : (uint32_t)r;
+        size_t len = strlen(guest_cwd);
+        if ((size_t)a1 < len + 1U) {
+            FAIL_ERR(ERANGE);
+        }
+        memcpy(buf, guest_cwd, len + 1U);
+        ctx->regs[0] = (uint32_t)(len + 1U);
         break;
     }
 
@@ -664,19 +674,19 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_setuid32:
-        ctx->regs[0] = host_ret(syscall(SYS_setuid, (uid_t)a0));
+        ctx->regs[0] = host_ret(setuid((uid_t)a0));
         break;
 
     case ARM_NR_setgid32:
-        ctx->regs[0] = host_ret(syscall(SYS_setgid, (gid_t)a0));
+        ctx->regs[0] = host_ret(setgid((gid_t)a0));
         break;
 
     case ARM_NR_setreuid32:
-        ctx->regs[0] = host_ret(syscall(SYS_setreuid, (uid_t)a0, (uid_t)a1));
+        ctx->regs[0] = host_ret(setreuid((uid_t)a0, (uid_t)a1));
         break;
 
     case ARM_NR_setregid32:
-        ctx->regs[0] = host_ret(syscall(SYS_setregid, (gid_t)a0, (gid_t)a1));
+        ctx->regs[0] = host_ret(setregid((gid_t)a0, (gid_t)a1));
         break;
 
     case ARM_NR_setresuid:
@@ -685,7 +695,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         uid_t r = (uid_t)(is16 ? id16_to_32(a0) : a0);
         uid_t e = (uid_t)(is16 ? id16_to_32(a1) : a1);
         uid_t s = (uid_t)(is16 ? id16_to_32(a2) : a2);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_setresuid, r, e, s));
+#else
+        (void)s;
+        ctx->regs[0] = host_ret(setreuid(r, e));
+#endif
         break;
     }
 
@@ -695,7 +710,12 @@ int a32_handle_syscall(a32_ctx_t *ctx)
         gid_t r = (gid_t)(is16 ? id16_to_32(a0) : a0);
         gid_t e = (gid_t)(is16 ? id16_to_32(a1) : a1);
         gid_t s = (gid_t)(is16 ? id16_to_32(a2) : a2);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_setresgid, r, e, s));
+#else
+        (void)s;
+        ctx->regs[0] = host_ret(setregid(r, e));
+#endif
         break;
     }
 
@@ -705,12 +725,18 @@ int a32_handle_syscall(a32_ctx_t *ctx)
                        (a1 != 0U && !a32_guest_range_ok(ctx, a1, 4U, PROT_WRITE)) ||
                        (a2 != 0U && !a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)));
         uint32_t r = 0U, e = 0U, s = 0U;
+#if defined(__linux__)
         int rc = (nr == ARM_NR_getresuid32)
                  ? getresuid((uid_t *)&r, (uid_t *)&e, (uid_t *)&s)
                  : getresgid((gid_t *)&r, (gid_t *)&e, (gid_t *)&s);
         if (rc != 0) {
             FAIL_ERR(errno);
         }
+#else
+        r = (nr == ARM_NR_getresuid32) ? (uint32_t)getuid() : (uint32_t)getgid();
+        e = (nr == ARM_NR_getresuid32) ? (uint32_t)geteuid() : (uint32_t)getegid();
+        s = e;
+#endif
         if (a0) *(uint32_t *)a32_guest_ptr(ctx, a0) = r;
         if (a1) *(uint32_t *)a32_guest_ptr(ctx, a1) = e;
         if (a2) *(uint32_t *)a32_guest_ptr(ctx, a2) = s;
@@ -721,13 +747,13 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     case ARM_NR_getgroups32:
         FAIL_EINVAL_IF((int32_t)a0 < 0);
         FAIL_EFAULT_IF(a0 > 0U && a1 < 0x1000U);
-        ctx->regs[0] = host_ret(syscall(SYS_getgroups, (int)a0, a0 > 0U ? (gid_t *)a32_guest_ptr(ctx, a1) : NULL));
+        ctx->regs[0] = host_ret(getgroups((int)a0, a0 > 0U ? (gid_t *)a32_guest_ptr(ctx, a1) : NULL));
         break;
 
     case ARM_NR_setgroups32:
         FAIL_EINVAL_IF((int32_t)a0 < 0 || a0 > 65536U);
         FAIL_EFAULT_IF(a0 > 0U && a1 < 0x1000U);
-        ctx->regs[0] = host_ret(syscall(SYS_setgroups, (size_t)a0, a0 > 0U ? (const gid_t *)a32_guest_ptr(ctx, a1) : NULL));
+        ctx->regs[0] = host_ret(setgroups((int)a0, a0 > 0U ? (const gid_t *)a32_guest_ptr(ctx, a1) : NULL));
         break;
 
     case ARM_NR_set_tid_address:

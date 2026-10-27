@@ -13,6 +13,9 @@
  */
 
 #define _GNU_SOURCE
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #include "a32rt.h"
 
 #include <errno.h>
@@ -28,27 +31,57 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
-#include <sys/random.h>
 #include <sys/resource.h>
-#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/statfs.h>
 #include <sys/syscall.h>
-#include <sys/sysinfo.h>
 #include <sys/time.h>
-#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/prctl.h>
+#include <sys/random.h>
+#include <sys/sendfile.h>
+#include <sys/statfs.h>
+#include <sys/sysinfo.h>
+#include <sys/timerfd.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#include <sys/param.h>
+#undef ifc_buf
+#endif
+
+#ifndef CMSG_ALIGN
+#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1U) & ~(sizeof(size_t) - 1U))
+#endif
+
+#ifndef CLONE_VM
+#define CLONE_VM             0x00000100U
+#define CLONE_FS             0x00000200U
+#define CLONE_FILES          0x00000400U
+#define CLONE_SIGHAND        0x00000800U
+#define CLONE_VFORK          0x00004000U
+#define CLONE_PARENT         0x00008000U
+#define CLONE_THREAD         0x00010000U
+#define CLONE_SYSVSEM        0x00040000U
+#define CLONE_SETTLS         0x00080000U
+#define CLONE_PARENT_SETTID  0x00100000U
+#define CLONE_CHILD_CLEARTID 0x00200000U
+#define CLONE_DETACHED       0x00400000U
+#define CLONE_CHILD_SETTID   0x01000000U
+#endif
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
 
 extern char **environ;
 

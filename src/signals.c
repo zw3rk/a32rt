@@ -6,6 +6,10 @@
  */
 
 #define _GNU_SOURCE
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#define _XOPEN_SOURCE 600
+#endif
 #include "a32rt.h"
 
 #include <errno.h>
@@ -20,6 +24,13 @@
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
+
+#ifndef SI_TKILL
+#define SI_TKILL (-6)
+#endif
+#ifndef SI_KERNEL
+#define SI_KERNEL 0x80
+#endif
 
 #define A32_SIGFRAME_MAGIC 0x53494746U /* "SIGF" */
 #define A32_VFP_MAGIC      0x56465001U /* VFP coprocessor sigframe magic */
@@ -377,7 +388,11 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     }
 
     ucontext_t *uc = (ucontext_t *)ucontext;
+#if defined(__APPLE__)
+    uintptr_t host_pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+#else
     uintptr_t host_pc = (uintptr_t)uc->uc_mcontext.pc;
+#endif
 
     uint32_t guest_pc = 0U;
     uint32_t itstate  = 0U;
@@ -385,12 +400,20 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 
     if (in_block) {
         for (int i = 0; i < 15; i++) {
+#if defined(__APPLE__)
+            ctx->regs[i] = (uint32_t)uc->uc_mcontext->__ss.__x[i];
+#else
             ctx->regs[i] = (uint32_t)uc->uc_mcontext.regs[i];
+#endif
         }
         ctx->regs[15] = guest_pc;
         ctx->itstate  = itstate;
 
+#if defined(__APPLE__)
+        uint32_t pstate = (uint32_t)uc->uc_mcontext->__ss.__cpsr;
+#else
         uint32_t pstate = (uint32_t)uc->uc_mcontext.pstate;
+#endif
         ctx->cpsr = (ctx->cpsr & ~A32_CPSR_NZCV_MASK) | (pstate & A32_CPSR_NZCV_MASK);
 
         if ((sig == SIGSEGV || sig == SIGBUS) && info != NULL) {
@@ -415,11 +438,21 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         deliver_guest_signal(ctx, sig, act, info);
 
         for (int i = 0; i < 15; i++) {
+#if defined(__APPLE__)
+            uc->uc_mcontext->__ss.__x[i] = (uint64_t)ctx->regs[i];
+#else
             uc->uc_mcontext.regs[i] = (uint64_t)ctx->regs[i];
+#endif
         }
+#if defined(__APPLE__)
+        uc->uc_mcontext->__ss.__x[15] = (uint64_t)(ctx->regs[15] | ((ctx->cpsr & A32_CPSR_T) ? 1U : 0U));
+        uc->uc_mcontext->__ss.__x[16] = (uint64_t)A32_EXIT_INTERWORK;
+        uc->uc_mcontext->__ss.__pc    = uc->uc_mcontext->__ss.__lr;
+#else
         uc->uc_mcontext.regs[15] = (uint64_t)(ctx->regs[15] | ((ctx->cpsr & A32_CPSR_T) ? 1U : 0U));
         uc->uc_mcontext.regs[16] = (uint64_t)A32_EXIT_INTERWORK;
         uc->uc_mcontext.pc       = uc->uc_mcontext.regs[30];
+#endif
         return;
     }
 
@@ -449,6 +482,7 @@ static int install_host_sigaction(int signum, unsigned long flags)
         g_host_handler_installed_mask |= (1ULL << (signum - 1));
         return 0;
     }
+#if defined(__linux__)
     if (signum >= 32 && signum <= 34) {
         struct a64_kernel_sigaction ksa;
         memset(&ksa, 0, sizeof(ksa));
@@ -462,6 +496,7 @@ static int install_host_sigaction(int signum, unsigned long flags)
             }
         }
     }
+#endif
     return -1;
 }
 

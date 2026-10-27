@@ -99,7 +99,11 @@
                 break;
             }
             struct timespec poll_ts = { 0, 1000000L };
+#if defined(__linux__)
             (void)syscall(SYS_ppoll, NULL, 0, &poll_ts, &temp_mask, (size_t)8);
+#else
+            (void)nanosleep(&poll_ts, NULL);
+#endif
         }
         restore_pwait_sigmask(ctx, saved_sig_mask);
         break;
@@ -120,6 +124,7 @@
         si.si_pid             = (pid_t)gsi[3];
         si.si_uid             = (uid_t)gsi[4];
         si.si_value.sival_int = (int)gsi[5];
+#if defined(__linux__)
         long rc = is_tg ? syscall(SYS_rt_tgsigqueueinfo, (pid_t)a0, (pid_t)a1, sig, &si)
                         : syscall(SYS_rt_sigqueueinfo, (pid_t)a0, sig, &si);
         if (rc < 0 && errno == ENOSYS) {
@@ -132,6 +137,10 @@
             rc = is_tg ? syscall(SYS_tgkill, (pid_t)a0, (pid_t)a1, sig)
                        : syscall(SYS_kill, (pid_t)a0, sig);
         }
+#else
+        a32_signals_preset_siginfo(sig, &si);
+        long rc = kill((pid_t)a0, sig);
+#endif
         ctx->regs[0] = host_ret(rc);
         break;
     }
@@ -178,9 +187,13 @@
 
     case ARM_NR_prlimit64:
         FAIL_EFAULT_IF((a2 != 0U && a2 < 0x1000U) || (a3 != 0U && a3 < 0x1000U));
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_prlimit64, (pid_t)a0, (int)a1,
                                         a2 ? a32_guest_ptr(ctx, a2) : NULL,
                                         a3 ? a32_guest_ptr(ctx, a3) : NULL));
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
 
     case ARM_NR_getrusage: {
@@ -196,6 +209,9 @@
 
     case ARM_NR_sysinfo: {
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, sizeof(arm_sysinfo32_t), PROT_WRITE));
+        arm_sysinfo32_t si32;
+        memset(&si32, 0, sizeof(si32));
+#if defined(__linux__)
         struct sysinfo si;
         if (sysinfo(&si) != 0) {
             FAIL_ERR(errno);
@@ -204,31 +220,23 @@
         while ((((uint64_t)si.totalram | (uint64_t)si.totalswap) >> 32) != 0ULL &&
                (mem_unit << 1) <= 0xFFFFFFFFULL) {
             mem_unit <<= 1;
-            si.totalram  >>= 1;
-            si.freeram   >>= 1;
-            si.sharedram >>= 1;
-            si.bufferram >>= 1;
-            si.totalswap >>= 1;
-            si.freeswap  >>= 1;
-            si.totalhigh >>= 1;
-            si.freehigh  >>= 1;
+            si.totalram >>= 1; si.freeram >>= 1; si.sharedram >>= 1; si.bufferram >>= 1;
+            si.totalswap >>= 1; si.freeswap >>= 1; si.totalhigh >>= 1; si.freehigh >>= 1;
         }
-        arm_sysinfo32_t si32;
-        memset(&si32, 0, sizeof(si32));
         si32.uptime    = (int32_t)si.uptime;
         si32.loads[0]  = (uint32_t)si.loads[0];
         si32.loads[1]  = (uint32_t)si.loads[1];
         si32.loads[2]  = (uint32_t)si.loads[2];
-        si32.totalram  = (uint32_t)si.totalram;
-        si32.freeram   = (uint32_t)si.freeram;
-        si32.sharedram = (uint32_t)si.sharedram;
-        si32.bufferram = (uint32_t)si.bufferram;
-        si32.totalswap = (uint32_t)si.totalswap;
-        si32.freeswap  = (uint32_t)si.freeswap;
+        si32.totalram  = (uint32_t)si.totalram;  si32.freeram   = (uint32_t)si.freeram;
+        si32.sharedram = (uint32_t)si.sharedram; si32.bufferram = (uint32_t)si.bufferram;
+        si32.totalswap = (uint32_t)si.totalswap; si32.freeswap  = (uint32_t)si.freeswap;
         si32.procs     = (uint16_t)si.procs;
-        si32.totalhigh = (uint32_t)si.totalhigh;
-        si32.freehigh  = (uint32_t)si.freehigh;
+        si32.totalhigh = (uint32_t)si.totalhigh; si32.freehigh  = (uint32_t)si.freehigh;
         si32.mem_unit  = (uint32_t)mem_unit;
+#else
+        si32.uptime = 1000; si32.totalram = 262144U; si32.freeram = 131072U;
+        si32.procs  = 64U;  si32.mem_unit = 4096U;
+#endif
         memcpy(a32_guest_ptr(ctx, a0), &si32, sizeof(si32));
         ctx->regs[0] = 0U;
         break;
@@ -257,7 +265,13 @@
 
     case ARM_NR_getrandom:
         FAIL_EFAULT_IF(a1 > 0U && a0 < 0x1000U);
+#if defined(__linux__)
         ctx->regs[0] = host_ret(getrandom(a32_guest_ptr(ctx, a0), (size_t)a1, (unsigned int)a2));
+#else
+        (void)a2;
+        arc4random_buf(a32_guest_ptr(ctx, a0), (size_t)a1);
+        ctx->regs[0] = a1;
+#endif
         break;
 
     case ARM_NR_clock_gettime32:
@@ -265,7 +279,8 @@
         bool time64 = (nr == ARM_NR_clock_gettime64);
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, time64 ? 16U : 8U, PROT_WRITE));
         struct timespec ts;
-        if (syscall(SYS_clock_gettime, (long)a0, &ts) != 0) {
+        clockid_t clk = CLOCK_REALTIME;
+        if (translate_linux_clockid(a0, &clk) != 0 || clock_gettime(clk, &ts) != 0) {
             FAIL_ERR(errno);
         }
         (void)write_guest_timespec(ctx, a1, time64, &ts);
@@ -278,7 +293,8 @@
         bool time64 = (nr == ARM_NR_clock_getres64);
         FAIL_EFAULT_IF(a1 != 0U && !a32_guest_range_ok(ctx, a1, time64 ? 16U : 8U, PROT_WRITE));
         struct timespec ts;
-        if (clock_getres((clockid_t)a0, &ts) != 0) {
+        clockid_t clk = CLOCK_REALTIME;
+        if (translate_linux_clockid(a0, &clk) != 0 || clock_getres(clk, &ts) != 0) {
             FAIL_ERR(errno);
         }
         if (a1 != 0U) {
@@ -293,8 +309,7 @@
                        (a1 != 0U && !a32_guest_range_ok(ctx, a1, 8U, PROT_WRITE)));
         struct timeval tv;
         struct timezone tz = { 0, 0 };
-        int r = (a1 == 0U) ? gettimeofday(&tv, NULL)
-                           : (int)syscall(SYS_gettimeofday, &tv, &tz);
+        int r = gettimeofday(&tv, (a1 != 0U) ? &tz : NULL);
         if (r != 0) {
             FAIL_ERR(errno);
         }
@@ -348,6 +363,7 @@
 
     case ARM_NR_getdents64: {
         FAIL_EFAULT_IF(a1 < 0x1000U);
+#if defined(__linux__)
         long r = syscall(SYS_getdents64, (int)a0, a32_guest_ptr(ctx, a1), (size_t)a2);
         if (r < 0) {
             FAIL_ERR(errno);
@@ -365,11 +381,15 @@
             }
         }
         ctx->regs[0] = (uint32_t)r;
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
     case ARM_NR_getdents: {
         FAIL_EFAULT_IF(a1 < 0x1000U);
+#if defined(__linux__)
         size_t host_buf_size = (a2 > 32768U) ? 65536U : (size_t)a2 * 2U;
         if (host_buf_size < 1024U) {
             host_buf_size = 1024U;
@@ -414,6 +434,9 @@
         }
         free(host_buf);
         ctx->regs[0] = too_small ? (uint32_t)(-EINVAL) : (uint32_t)out_pos;
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
@@ -423,7 +446,8 @@
         if (pid < 0) {
             FAIL_ERR(errno);
         } else if (pid == 0) {
-            ctx->host_tid = (int)syscall(SYS_gettid);
+            ctx->host_tid = 0;
+            ctx->host_tid = get_host_tid(ctx);
             ctx->is_thread_clone = false;
             ctx->clear_child_tid = 0U;
             ctx->robust_list_head = 0U;
@@ -508,7 +532,8 @@
         if (pid < 0) {
             FAIL_ERR(errno);
         } else if (pid == 0) {
-            ctx->host_tid         = (int)syscall(SYS_gettid);
+            ctx->host_tid         = 0;
+            ctx->host_tid         = get_host_tid(ctx);
             ctx->is_thread_clone  = false;
             ctx->robust_list_head = 0U;
             ctx->robust_list_len  = 0U;
@@ -761,6 +786,7 @@
     case ARM_NR_waitid: {
         FAIL_EFAULT_IF((a2 != 0U && !a32_guest_range_ok(ctx, a2, 128U, PROT_WRITE)) ||
                        (a4 != 0U && !a32_guest_range_ok(ctx, a4, (uint32_t)sizeof(arm_rusage32_t), PROT_WRITE)));
+#if defined(__linux__)
         siginfo_t si = { 0 };
         struct rusage ru = { 0 };
         long r = syscall(SYS_waitid, (int)a0, (id_t)a1,
@@ -783,6 +809,9 @@
             fill_arm_rusage32((arm_rusage32_t *)a32_guest_ptr(ctx, a4), &ru);
         }
         ctx->regs[0] = 0U;
+#else
+        FAIL_ERR(ENOSYS);
+#endif
         break;
     }
 
@@ -820,8 +849,17 @@
         } else {
             uaddr2 = (void *)(uintptr_t)a4;
         }
+#if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_futex, a32_guest_ptr(ctx, a0),
                                         (int)a1, a2, arg4, uaddr2, a5));
+#else
+        (void)arg4; (void)uaddr2; (void)a5;
+        if ((basic_op == 0U || basic_op == 9U) &&
+            __atomic_load_n((uint32_t *)a32_guest_ptr(ctx, a0), __ATOMIC_SEQ_CST) != a2) {
+            FAIL_ERR(EAGAIN);
+        }
+        ctx->regs[0] = 0U;
+#endif
         break;
     }
 

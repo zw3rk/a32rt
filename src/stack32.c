@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "a32rt.h"
+#include "os/backend.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -109,9 +110,9 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
 
     uint32_t stack_base = A32_STACK_TOP - A32_STACK_SIZE;
     void *host_stack = a32_guest_ptr(ctx, stack_base);
-    void *res = mmap(host_stack, A32_STACK_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
+    void *res = NULL;
+    if (a32_backend_map_anon(host_stack, A32_STACK_SIZE, PROT_READ | PROT_WRITE,
+                             1, 1, &res) != 0) {
         fprintf(stderr, "a32rt: failed to map guest stack: %s\n", strerror(errno));
         return -1;
     }

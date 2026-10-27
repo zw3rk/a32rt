@@ -220,6 +220,42 @@ int a32_vm32_tlb_miss(a32_ctx_t *ctx, uint32_t gva, bool is_store,
     return 0;
 }
 
+static void vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
+{
+    size_t host_page;
+    uint32_t hp_start;
+    uint32_t hp_end;
+    if (g_regime != A32_VM32_REGIME_A2_SOFT_TLB || g_arena_base == 0U ||
+        end_gva <= start_gva) {
+        return;
+    }
+    host_page = a32_backend_page_size();
+    if (host_page != 16384U && host_page != 65536U) {
+        host_page = 16384U;
+    }
+    hp_start = (uint32_t)((uint64_t)start_gva & ~(uint64_t)(host_page - 1U));
+    hp_end = (uint32_t)(((uint64_t)end_gva + (uint64_t)(host_page - 1U)) &
+        ~(uint64_t)(host_page - 1U));
+    for (uint32_t hp = hp_start; hp < hp_end; hp += (uint32_t)host_page) {
+        uint32_t union_prot = 0U;
+        uint32_t hp_page_end = hp + (uint32_t)host_page;
+        if (hp_page_end < hp) {
+            hp_page_end = 0xFFFFFFFFU;
+        }
+        for (uint32_t sp = hp; sp < hp_page_end; sp += 0x1000U) {
+            union_prot |= g_prot[sp >> 12U];
+            if (sp + 0x1000U < sp) {
+                break;
+            }
+        }
+        (void)a32_backend_protect((void *)(g_arena_base + (uintptr_t)hp),
+            host_page, (int)(union_prot & 0x7U));
+        if (hp + (uint32_t)host_page < hp) {
+            break;
+        }
+    }
+}
+
 /* Publish translations for [start_gva, end_gva) after a successful
  * mmap/mprotect (host base == arena base + page in both regimes). */
 void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
@@ -240,6 +276,7 @@ void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
             break;
         }
     }
+    vm32_sync_host_pages_a2(start_gva & ~0xFFFU, (end_gva + 0xFFFU) & ~0xFFFU);
 }
 
 /* Drop translations for [start_gva, end_gva) after munmap/mremap. */
@@ -247,13 +284,17 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
 {
     uint32_t start = start_gva & ~0xFFFU;
     uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
-    a32_vm32_tlb_invalidate_range(start_gva, end_gva);
-    for (; start < end; start += 0x1000U) {
-        g_prot[start >> 12U] = 0U;
-        if (start + 0x1000U < start) {
+    for (uint32_t p = start; p < end; p += 0x1000U) {
+        uint32_t idx = tlb_index(p);
+        g_tlb[idx].read_tag = A32_VM32_TLB_INVALID_TAG;
+        g_tlb[idx].write_tag = A32_VM32_TLB_INVALID_TAG;
+        g_tlb[idx].flags_reserved = 0U;
+        g_prot[idx] = 0U;
+        if (p + 0x1000U < p) {
             break;
         }
     }
+    vm32_sync_host_pages_a2(start, end);
 }
 
 /* Regime-aware mprotect (see vm32.h). A1 forwards guest-sized ranges

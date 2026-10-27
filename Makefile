@@ -80,7 +80,8 @@ SRCS := src/main.c \
 ASM_SRCS := src/trampoline.S
 HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
         src/interp/interp.h src/interp/interp_priv.h src/dbt/difftest.h \
-        src/vm/vm32.h src/os/backend.h src/dbt/aot/aot.h
+        src/vm/vm32.h src/os/backend.h src/dbt/aot/aot.h \
+        $(wildcard src/core/*.c src/dbt/*.c src/vm/*.c src/os/*.c src/interp/*.c)
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
 TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
