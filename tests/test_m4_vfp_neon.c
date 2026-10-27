@@ -427,7 +427,7 @@ static int run_vfp_neon_tests(void)
         return 21;
     }
 
-    /* Also test odd single-precision pair (s1, s2 where M=1) vs high D register (d17 where M=1) */
+    /* Also test the odd single-precision pair s1, s2 (encoding M=1). The asm does not use d17. */
     uint32_t odd_s1_in = 0x40400000U; /* 3.0f */
     uint32_t odd_s2_in = 0x40800000U; /* 4.0f */
     uint32_t odd_r0_out = 0U, odd_r1_out = 0U;
@@ -1390,7 +1390,7 @@ static int run_vfp_neon_tests(void)
         }
 
         /*
-         * 26b: Polynomial multiply over GF(2)[x]: VMUL.P8 (64-bit & 128-bit)
+         * 26b: Polynomial multiply over GF(2)[x]: VMUL.P8 (64-bit D form)
          *      and widening VMULL.P8 Qd, Dn, Dm
          *      - 0x03 (x + 1) * 0x03 (x + 1) = x^2 + 1 = 0x05
          *      - 0x07 (x^2 + x + 1) * 0x03 (x + 1) = x^3 + 1 = 0x09
@@ -1580,7 +1580,7 @@ static int run_vfp_neon_tests(void)
      *            (sign bit == 0), whereas -(d + n*m) = -(+0.0) = -0.0 would
      *            produce sign bit == 1!
      *     - 28b: NEON VMLA.F32 and VMLS.F32 (64-bit D and 128-bit Q vector forms,
-     *            plus by-scalar d0, d1, d2[0] / d2[1] and q0, q1, d2[0]).
+     *            plus by-scalar d0, d1, d2[0] / d2[1] and q0, q2, d2[0]).
      */
     {
         /* 28a-1: VNMLA.F32 signed-zero check (d = +1.0f, n = -1.0f, m = +1.0f -> +0.0f) */
@@ -1723,7 +1723,7 @@ static int run_vfp_neon_tests(void)
 
         /*
          * 28b-3: NEON by-scalar VMLA.F32 d0, d1, d2[0], VMLS.F32 d0, d1, d2[0],
-         *        VMLS.F32 d0, d1, d2[1], and VMLS.F32 q0, q1, d2[0]
+         *        VMLS.F32 d0, d1, d2[1], and VMLS.F32 q0, q2, d2[0]
          */
         float sc_d2[2]      = { 3.0f, -2.0f };
         float sc_d0_mla[2]  = { 0.0f, 0.0f };

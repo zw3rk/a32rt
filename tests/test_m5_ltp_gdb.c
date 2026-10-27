@@ -2190,7 +2190,8 @@ static int test22_r9_mmap_flags_enametoolong_epoll_pwait(void)
  *        munmap) across open (5), openat (322), rt_sigaction (174),
  *        rt_sigprocmask (175), sigaltstack (186), uname (122), pipe (42),
  *        and stat64 (195)
- *   23b: Positive regression test for setresuid32 (164) and setresgid32 (170)
+ *   23b: Positive regression test for setresuid (164), setresgid (170),
+ *        setresuid32 (208), and setresgid32 (210)
  *        with (-1, -1, -1) succeeding (0) even after registering a custom
  *        handler on signal 34 (SIGRTMIN)
  * -------------------------------------------------------------------------- */
@@ -2289,7 +2290,8 @@ static int test23_r10_efault_high_unmapped_and_setresuid_rt34(void)
     }
 
     /*
-     * 23b: Positive regression test for setresuid32 (164) and setresgid32 (170)
+     * 23b: Positive regression test for setresuid (164), setresgid (170),
+     *      setresuid32 (208), and setresgid32 (210)
      *      with (-1, -1, -1) succeeding (0) even after registering a handler on
      *      signal 34 (SIGRTMIN).
      */

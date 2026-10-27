@@ -1222,7 +1222,7 @@ __asm__(
     ".type thumb_it_udf_helper, %function\n"
     "thumb_it_udf_helper:\n"
     "    .short 0x4280\n"             /* +0:  cmp r0, r0 (Z=1, C=1, N=0, V=0) */
-    "    .short 0xbf01\n"             /* +2:  ittt eq */
+    "    .short 0xbf01\n"             /* +2:  itttt eq (mask 0001: four following insns) */
     "    .short 0x200a\n"             /* +4:  moveq r0, #10 */
     "    .short 0xde00\n"             /* +6:  udf #0 (2-byte T16 undefined) */
     "    .short 0x2014\n"             /* +8:  moveq r0, #20 */
@@ -1290,7 +1290,7 @@ static int test15_thumb_it_udf_sigill(void)
         return 130;
     }
     /*
-     * Verify the remaining two instructions in `ittt eq` (`moveq r0, #20` and
+     * Verify the remaining two instructions in `itttt eq` (`moveq r0, #20` and
      * `addeq r0, r0, #5`) executed to produce r0 == 25, AND that ITSTATE was
      * preserved across rt_sigreturn (16-bit moveq/addeq inside an IT block do
      * not modify NZCV, so Z=1 / C=1 == 0x60000000U remains intact).
@@ -2937,8 +2937,8 @@ static int test23_m6_adversarial_regressions(void)
     }
 
     /* 2. Adversarial Finding 3.1 & M6 Decoder SIGILL negative checks:
-     *    - VDUP.32 D0, D16[0] (m=16 > 15: 0xf3b40c20)
-     *    - VDUP.32 Q0 (odd d=1: 0xf3f41c00)
+     *    - invalid VDUP scalar, imm4=8 (0xf3b80c00)
+     *    - invalid VDUP.32 Q, is_q=1 and odd Qd d=17 (0xf3f41c40)
      *    - CRC32 with sz=3 (0xe1600040)
      *    - AESE.8 with odd Qd (d=1: 0xf3b01300)
      */
@@ -3023,8 +3023,8 @@ static int test23_m6_adversarial_regressions(void)
      * callee at code[5..12]:
      *   [5] cmp r0, #0         (0xe3500000)
      *   [6] bxeq lr            (0x012fff1e)  <-- warmup call returns without patching so RAS/ret_entry is linked!
-     *   [7] mov r1, #77        (0xe3a0104d)
-     *   [8] orr r1, r1, #0xe3a00000 (movw/movt or ldr literal: let's load 0xe3a0004d from code[14]!)
+     *   [7] ldr r1, [pc, #24]  (0xe59f1018) loads the literal at code[15] (mov r0, #77)
+     *   [8] str r1, [lr]       (0xe58e1000) overwrites code[2] with that mov
      */
     code[0]  = 0xE92D4010U; /* push {r4, lr} */
     code[1]  = 0xEB000002U; /* bl code[5] */

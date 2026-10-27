@@ -214,7 +214,14 @@ int a32_vm32_tlb_miss(a32_ctx_t *ctx, uint32_t gva, bool is_store,
     idx = tlb_index(gva);
     tag = is_store ? g_tlb[idx].write_tag : g_tlb[idx].read_tag;
     if (tag != (uint64_t)(gva & ~0xFFFU)) {
-        return -EFAULT;
+        uint8_t bits = g_prot[gva >> 12U];
+        bool ok = is_store ? ((bits & 2U) != 0U) : ((bits & 1U) != 0U);
+        if (!ok || g_arena_base == 0U) {
+            return -EFAULT;
+        }
+        a32_vm32_tlb_fill(gva & ~0xFFFU,
+            g_arena_base + (uintptr_t)(gva & ~0xFFFU),
+            (bits & 1U) != 0U, (bits & 2U) != 0U);
     }
     *hva_out = (void *)(g_tlb[idx].addend + (uintptr_t)gva);
     return 0;
@@ -286,10 +293,13 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
     uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
     for (uint32_t p = start; p < end; p += 0x1000U) {
         uint32_t idx = tlb_index(p);
-        g_tlb[idx].read_tag = A32_VM32_TLB_INVALID_TAG;
-        g_tlb[idx].write_tag = A32_VM32_TLB_INVALID_TAG;
-        g_tlb[idx].flags_reserved = 0U;
-        g_prot[idx] = 0U;
+        if (g_tlb[idx].read_tag == (uint64_t)p ||
+            g_tlb[idx].write_tag == (uint64_t)p) {
+            g_tlb[idx].read_tag = A32_VM32_TLB_INVALID_TAG;
+            g_tlb[idx].write_tag = A32_VM32_TLB_INVALID_TAG;
+            g_tlb[idx].flags_reserved = 0U;
+        }
+        g_prot[p >> 12U] = 0U;
         if (p + 0x1000U < p) {
             break;
         }

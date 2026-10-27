@@ -113,6 +113,34 @@ int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
     if (len == 0U || host_fd < 0 || out_host_addr == NULL) {
         return -EINVAL;
     }
+    if (replace && hint_addr != NULL) {
+        size_t hp = a32_backend_page_size();
+        uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
+        uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
+            ~(uintptr_t)(hp - 1U);
+        if (mprotect((void *)start, end - start,
+                PROT_READ | PROT_WRITE) != 0) {
+            return -errno;
+        }
+        memset(hint_addr, 0, len);
+        size_t done = 0U;
+        while (done < len) {
+            ssize_t r = pread(host_fd, (uint8_t *)hint_addr + done,
+                len - done, (off_t)(aligned_file_offset + done));
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -errno;
+            }
+            if (r == 0) {
+                break;
+            }
+            done += (size_t)r;
+        }
+        *out_host_addr = hint_addr;
+        return 0;
+    }
     if (replace) {
         flags |= MAP_FIXED;
     } else if (fixed) {
@@ -144,6 +172,17 @@ int a32_backend_protect(void *host_addr, size_t len, int linux_prot)
     hp = a32_backend_page_size();
     start = (uintptr_t)host_addr & ~(uintptr_t)(hp - 1U);
     end = ((uintptr_t)host_addr + len + hp - 1U) & ~(uintptr_t)(hp - 1U);
+    if (hp > 4096U) {
+        /* On 16 KiB Darwin hosts, 4 KiB guest page permissions are enforced
+         * by the Soft-TLB (vm32); keep shared 16 KiB host pages RW so a
+         * sub-page mprotect never faults sibling 4 KiB guest pages. */
+        (void)linux_prot;
+        if (mprotect((void *)start, end - start,
+                PROT_READ | PROT_WRITE) != 0) {
+            return -errno;
+        }
+        return 0;
+    }
     if (mprotect((void *)start, end - start, host_prot(linux_prot)) != 0) {
         return -errno;
     }
@@ -152,8 +191,14 @@ int a32_backend_protect(void *host_addr, size_t len, int linux_prot)
 
 int a32_backend_unmap(void *host_addr, size_t len)
 {
+    size_t hp;
     if (host_addr == NULL || len == 0U) {
         return -EINVAL;
+    }
+    hp = a32_backend_page_size();
+    if (hp > 4096U &&
+        (((uintptr_t)host_addr & (hp - 1U)) != 0U || (len & (hp - 1U)) != 0U)) {
+        return 0;
     }
     if (munmap(host_addr, len) != 0) {
         return -errno;

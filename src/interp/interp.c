@@ -214,7 +214,7 @@ int a32_interp_run(a32_ctx_t *ctx, uint64_t max_steps)
         return 127;
     }
     if (max_steps == 0U) {
-        max_steps = 100000000ULL;
+        max_steps = ~0ULL;
     }
     for (uint64_t i = 0ULL; i < max_steps; i++) {
         if ((ctx->pending_signals & ~ctx->sig_mask) != 0ULL) {
