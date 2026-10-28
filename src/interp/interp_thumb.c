@@ -165,40 +165,65 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 bool o = false;
                 bool w = true;
                 switch (op) {
-                case 0x0U: r = a & b; c = false; break;
-                case 0x1U: r = a ^ b; c = false; break;
-                case 0x2U: r = a << (b & 31U); c = (b != 0U) ? ((a >> (32U - (b & 31U))) & 1U) != 0U : c; break;
-                case 0x3U: r = a >> (b & 31U); c = (b != 0U) ? ((a >> ((b & 31U) - 1U)) & 1U) != 0U : c; break;
-                case 0x4U: r = (uint32_t)((int32_t)a >> (b & 31U)); break;
-                case 0x5U: r = a + b; r = i_add_carry(a, b, 0U, &c, &o); break;
-                case 0x6U: r = i_add_carry(a, ~b, 1U, &c, &o); break;
-                case 0x7U: r = (uint32_t)((int32_t)a >> 31) >> (b & 31U); break;
+                case 0x0U: r = a & b; break;
+                case 0x1U: r = a ^ b; break;
+                case 0x2U: {
+                    unsigned sh = b & 0xFFU;
+                    if (sh != 0U) {
+                        c = (sh <= 32U) ? (((a >> (32U - sh)) & 1U) != 0U) : false;
+                        r = (sh < 32U) ? (a << sh) : 0U;
+                    }
+                    break;
+                }
+                case 0x3U: {
+                    unsigned sh = b & 0xFFU;
+                    if (sh != 0U) {
+                        c = (sh <= 32U) ? (((a >> (sh - 1U)) & 1U) != 0U) : false;
+                        r = (sh < 32U) ? (a >> sh) : 0U;
+                    }
+                    break;
+                }
+                case 0x4U: {
+                    unsigned sh = b & 0xFFU;
+                    if (sh != 0U) {
+                        c = (sh < 32U) ? (((a >> (sh - 1U)) & 1U) != 0U) : ((a & 0x80000000U) != 0U);
+                        r = (sh < 32U) ? (uint32_t)((int32_t)a >> sh) : ((a & 0x80000000U) ? 0xFFFFFFFFU : 0U);
+                    }
+                    break;
+                }
+                case 0x5U: r = i_add_carry(a, b, c ? 1U : 0U, &c, &o); break;
+                case 0x6U: r = i_add_carry(a, ~b, c ? 1U : 0U, &c, &o); break;
+                case 0x7U: {
+                    unsigned sh = b & 0xFFU;
+                    if (sh != 0U) {
+                        unsigned rot = sh & 31U;
+                        r = (rot != 0U) ? ((a >> rot) | (a << (32U - rot))) : a;
+                        c = (r & 0x80000000U) != 0U;
+                    }
+                    break;
+                }
                 case 0x8U: r = a & b; w = false; break;
-                case 0x9U: r = a ^ b; w = false; break;
-                case 0xAU: r = a * b; c = false; break;
-                case 0xBU: r = a & ~b; c = false; break;
-                case 0xCU: r = ~b; c = false; break;
-                case 0xDU: r = a + b; r = i_add_carry(a, b, 0U, &c, &o); break;
-                case 0xEU: r = i_add_carry(a, ~b, 1U, &c, &o); break;
-                default: r = ~b; c = false; break;
+                case 0x9U: r = i_add_carry(0U, ~b, 1U, &c, &o); break;
+                case 0xAU: r = i_add_carry(a, ~b, 1U, &c, &o); w = false; break;
+                case 0xBU: r = i_add_carry(a, b, 0U, &c, &o); w = false; break;
+                case 0xCU: r = a | b; break;
+                case 0xDU: r = a * b; break;
+                case 0xEU: r = a & ~b; break;
+                default:   r = ~b; break;
                 }
                 if (w) {
                     ctx->regs[rd] = r;
                 }
-                if (op == 0x2U || op == 0x3U) {
-                    if ((b & 31U) == 0U) {
+                if (op == 0x2U || op == 0x3U || op == 0x4U || op == 0x7U) {
+                    if ((b & 0xFFU) == 0U) {
                         i_set_nz(&ctx->cpsr, r);
                     } else {
-                        i_set_nzcv(&ctx->cpsr, r, c, false);
+                        i_set_nzcv(&ctx->cpsr, r, c, (ctx->cpsr & A32_CPSR_V) != 0U);
                     }
-                } else if (op == 0x5U || op == 0x6U || op == 0xDU || op == 0xEU) {
+                } else if (op == 0x5U || op == 0x6U || op == 0x9U || op == 0xAU || op == 0xBU) {
                     i_set_nzcv(&ctx->cpsr, r, c, o);
                 } else {
-                    bool cc = (op == 0x8U || op == 0x9U) ? ((ctx->cpsr & A32_CPSR_C) != 0U) : c;
-                    i_set_nzcv(&ctx->cpsr, r, cc, false);
-                    if (op == 0x8U || op == 0x9U) {
-                        ctx->cpsr &= ~A32_CPSR_V;
-                    }
+                    i_set_nz(&ctx->cpsr, r);
                 }
             } else {
                 /* Hi-reg ops / BX / BLX. */

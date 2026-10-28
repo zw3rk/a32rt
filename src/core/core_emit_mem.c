@@ -470,10 +470,15 @@ void a64_patch_b_cond(a64_buf_t *b, size_t patch_idx, size_t target_idx)
     if (b->cond_branch_depth > 0U) {
         b->cond_branch_depth--;
     }
-    if (patch_idx >= b->count) {
+    if (patch_idx >= b->count || patch_idx >= b->cap) {
+        b->overflow = true;
         return;
     }
     int32_t disp = (int32_t)target_idx - (int32_t)patch_idx;
+    if (disp < -(1 << 18) || disp >= (1 << 18)) {
+        b->overflow = true;
+        return;
+    }
     uint32_t cond = b->words[patch_idx] & 15U;
     b->words[patch_idx] = 0x54000000U | (((uint32_t)disp & 0x7FFFFU) << 5) | cond;
 }
@@ -498,10 +503,15 @@ void a64_patch_cbz_w(a64_buf_t *b, size_t patch_idx, size_t target_idx)
     if (b->cond_branch_depth > 0U) {
         b->cond_branch_depth--;
     }
-    if (patch_idx >= b->count) {
+    if (patch_idx >= b->count || patch_idx >= b->cap) {
+        b->overflow = true;
         return;
     }
     int32_t disp = (int32_t)target_idx - (int32_t)patch_idx;
+    if (disp < -(1 << 18) || disp >= (1 << 18)) {
+        b->overflow = true;
+        return;
+    }
     uint32_t op_rt = b->words[patch_idx] & 0xFF00001FU;
     b->words[patch_idx] = op_rt | (((uint32_t)disp & 0x7FFFFU) << 5);
 }
