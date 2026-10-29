@@ -199,12 +199,18 @@ uint32_t a32_interp_step(a32_ctx_t *ctx)
     ctx->exit_reason = A32_EXIT_NONE;
     uint32_t pc = ctx->regs[15];
     bool is_thumb = (ctx->cpsr & A32_CPSR_T) != 0U;
+    uint32_t rc;
     if (is_thumb) {
         pc &= ~1U;
-        return i_thumb_step(ctx, pc);
+        rc = i_thumb_step(ctx, pc);
+    } else {
+        pc &= ~3U;
+        rc = i_a32_step(ctx, pc);
     }
-    pc &= ~3U;
-    return i_a32_step(ctx, pc);
+    if (rc == A32_EXIT_UNDEF) {
+        ctx->regs[15] = pc;
+    }
+    return rc;
 }
 
 

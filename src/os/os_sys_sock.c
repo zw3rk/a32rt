@@ -182,11 +182,12 @@
     case ARM_NR_signalfd4: {
 #if defined(__linux__)
         uint64_t gmask = 0ULL;
-        FAIL_EFAULT_IF(a2 != 8U || !guest_read(ctx, &gmask, a1, sizeof(gmask)));
+        FAIL_EINVAL_IF(a2 != 8U);
+        FAIL_EFAULT_IF(!guest_read(ctx, &gmask, a1, sizeof(gmask)));
         sigset_t hmask;
         memset(&hmask, 0, sizeof(hmask));
         memcpy(&hmask, &gmask, sizeof(uint64_t));
-        ctx->regs[0] = host_ret(syscall(SYS_signalfd4, (int)a0, &hmask, sizeof(hmask), (int)a3));
+        ctx->regs[0] = host_ret(syscall(SYS_signalfd4, (int)a0, &hmask, (size_t)8, (int)a3));
 #else
         FAIL_ERR(ENOSYS);
 #endif
@@ -451,6 +452,18 @@
                         break;
                     }
                     size_t payload_len = cm64->cmsg_len - sizeof(struct cmsghdr);
+                    int32_t tv32[2];
+                    const void *payload_src = CMSG_DATA(cm64);
+                    if (cm64->cmsg_level == SOL_SOCKET &&
+                        cm64->cmsg_type == 29 /* SCM_TIMESTAMP (time32) */ &&
+                        payload_len == 16U) {
+                        int64_t tv64[2];
+                        memcpy(tv64, CMSG_DATA(cm64), 16U);
+                        tv32[0] = (int32_t)tv64[0];
+                        tv32[1] = (int32_t)tv64[1];
+                        payload_src = tv32;
+                        payload_len = 8U;
+                    }
                     uint32_t len32 = 12U + (uint32_t)payload_len;
                     uint32_t space32 = (len32 + 3U) & ~3U;
                     if (!ctrunc && off32 + len32 <= gm->msg_controllen) {
@@ -459,7 +472,7 @@
                         memcpy(gctl_out + off32, &len32, 4);
                         memcpy(gctl_out + off32 + 4U, &level32, 4);
                         memcpy(gctl_out + off32 + 8U, &type32, 4);
-                        memcpy(gctl_out + off32 + 12U, CMSG_DATA(cm64), payload_len);
+                        memcpy(gctl_out + off32 + 12U, payload_src, payload_len);
                         off32 += (off32 + space32 <= gm->msg_controllen) ? space32 : len32;
                     } else {
                         ctrunc = true;

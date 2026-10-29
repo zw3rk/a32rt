@@ -315,7 +315,7 @@ extern char **environ;
 #define ARM_NR_breakpoint        0x0F0001U
 #define ARM_NR_cacheflush        0x0F0002U
 #define ARM_NR_set_tls           0x0F0005U
-#define ARM_NR_get_tls           0x0F0800U
+#define ARM_NR_get_tls           0x0F0006U
 
 /* ARM32-specific open flag */
 #define ARM_O_NOFOLLOW           0100000U

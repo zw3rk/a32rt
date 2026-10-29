@@ -93,7 +93,7 @@ static void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask)
         uint32_t oldmask32 = (uint32_t)saved_sig_mask;
         memcpy(fp + 156U, &oldmask32, sizeof(oldmask32));
         memcpy(fp + 232U, &saved_sig_mask, sizeof(saved_sig_mask));
-        memcpy(fp + 856U, &saved_sig_mask, sizeof(saved_sig_mask));
+        memcpy(fp + 968U, &saved_sig_mask, sizeof(saved_sig_mask));
     } else {
         ctx->sig_mask = saved_sig_mask;
     }

@@ -63,16 +63,19 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
     if (prev_entry == NULL || prev_key == 0U || cur_entry == NULL || code == NULL) {
         return;
     }
+    bool need_slot_update = false;
     for (size_t s = 0U; s < A32_MAX_EXIT_SLOTS; s++) {
-        if (atomic_load_explicit(&prev_entry->slot_key[s], memory_order_relaxed) == key) {
-            atomic_store_explicit(&prev_entry->slot_entry[s], cur_entry, memory_order_release);
+        if (atomic_load_explicit(&prev_entry->slot_key[s], memory_order_relaxed) == key &&
+            atomic_load_explicit(&prev_entry->slot_entry[s], memory_order_relaxed) != cur_entry) {
+            need_slot_update = true;
+            break;
         }
     }
     uint32_t           e0  = atomic_load_explicit(&prev_entry->chain_epoch[0], memory_order_acquire);
     const void        *c0  = atomic_load_explicit(&prev_entry->chain_code[0], memory_order_relaxed);
     uint32_t           k0  = atomic_load_explicit(&prev_entry->chain_key[0], memory_order_relaxed);
     a32_cache_entry_t *ce0 = atomic_load_explicit(&prev_entry->chain_entry[0], memory_order_relaxed);
-    bool slot0_live = (e0 == epoch && c0 != NULL && ce0 != NULL &&
+    bool slot0_live = (!need_slot_update && e0 == epoch && c0 != NULL && ce0 != NULL &&
                        atomic_load_explicit(&ce0->epoch, memory_order_acquire) == epoch &&
                        atomic_load_explicit(&ce0->key, memory_order_relaxed) == k0 &&
                        atomic_load_explicit(&ce0->host_code, memory_order_relaxed) == c0);
@@ -165,10 +168,14 @@ int a32_jit_run(a32_ctx_t *ctx)
             g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
         }
     }
+    int init_flush_rc = 0;
     if (g_batch_max > g_batch_min) {
-        (void)flush_batch_locked(ctx);
+        init_flush_rc = flush_batch_locked(ctx);
     }
     jit_lock_release();
+    if (init_flush_rc != 0) {
+        return -1;
+    }
 
     a32_cache_entry_t *prev_entry        = NULL;
     uint32_t           prev_key          = 0U;
@@ -466,7 +473,10 @@ int a32_jit_run(a32_ctx_t *ctx)
              * interpreter before raising SIGILL, so encodings the DBT
              * has not implemented yet still execute. */
             {
-                uint32_t step_rc = a32_interp_step(ctx);
+                uint32_t saved_pc      = ctx->regs[15];
+                uint32_t saved_cpsr    = ctx->cpsr;
+                uint32_t saved_itstate = ctx->itstate;
+                uint32_t step_rc       = a32_interp_step(ctx);
                 if (step_rc == A32_EXIT_NONE ||
                     step_rc == A32_EXIT_BRANCH ||
                     step_rc == A32_EXIT_INTERWORK) {
@@ -492,6 +502,9 @@ int a32_jit_run(a32_ctx_t *ctx)
                     }
                     return step_fault_rc;
                 }
+                ctx->regs[15] = saved_pc;
+                ctx->cpsr     = saved_cpsr;
+                ctx->itstate  = saved_itstate;
             }
             if (ctx->gdb_enabled) {
                 uint32_t pre_stop_pc = ctx->regs[15];

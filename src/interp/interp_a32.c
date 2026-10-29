@@ -246,6 +246,10 @@ static uint32_t a32_dp_step(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
 
     uint32_t rnv = reg_rd_pc_adjust(ctx, rn, pc);
     bool is_test = (opc == 8U || opc == 9U || opc == 10U || opc == 11U);
+    if (is_test && !s) {
+        i_undef(ctx);
+        return A32_EXIT_UNDEF;
+    }
     bool want_w = s || is_test;
     uint32_t res = 0U;
     bool carry = sh_carry;

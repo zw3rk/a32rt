@@ -136,14 +136,14 @@ typedef struct a32_ucontext {
     a32_stack_t      uc_stack;
     a32_sigcontext_t uc_mcontext;
     uint64_t         uc_sigmask;
-    uint32_t         _pad[2];
+    uint32_t         _unused[30];
     _Alignas(8) uint32_t uc_regspace[128];
 } a32_ucontext_t;
 
 _Static_assert(offsetof(a32_ucontext_t, uc_mcontext.arm_r0) == 32,
                "arm_r0 must be at offset 32 from start of ucontext");
-_Static_assert(offsetof(a32_ucontext_t, uc_regspace) == 120,
-               "uc_regspace must be at offset 120 from start of ucontext");
+_Static_assert(offsetof(a32_ucontext_t, uc_regspace) == 232,
+               "uc_regspace must be at offset 232 from start of ucontext");
 
 typedef struct a32_siginfo {
     int32_t  si_signo;
@@ -175,8 +175,8 @@ _Static_assert(offsetof(a32_rt_sigframe_t, info) == 0,
                "rt_sigframe info must be at offset 0");
 _Static_assert(offsetof(a32_rt_sigframe_t, uc) == 128,
                "rt_sigframe uc must be at offset 128");
-_Static_assert(offsetof(a32_rt_sigframe_t, saved_mask) == 856,
-               "rt_sigframe saved_mask must be at offset 856");
+_Static_assert(offsetof(a32_rt_sigframe_t, saved_mask) == 968,
+               "rt_sigframe saved_mask must be at offset 968");
 
 static _Thread_local a32_ctx_t *g_tls_ctx = NULL;
 static guest_sigaction_t        g_guest_sigactions[65];

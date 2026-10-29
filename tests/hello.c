@@ -8,7 +8,7 @@
  *   - 32-bit initial stack layout (argc, argv, envp, auxv: AT_PAGESZ=4096)
  *   - ARM private syscall __ARM_NR_set_tls (0x0f0005) & CP15 TPIDRURO read
  *   - Kernel kuser helper page at 0xffff0000 (__kuser_helper_version,
- *     __kuser_get_tls, __kuser_memory_barrier, __kuser_cmpxchg)
+ *     __kuser_get_tls, __kuser_cmpxchg)
  *   - Emulated guest brk() and mmap2()/mprotect()/munmap() inside [G, G+4GiB)
  *   - ARM EABI writev() / write() and exit_group(0)
  */

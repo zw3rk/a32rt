@@ -9,10 +9,10 @@
  *
  * Workloads:
  *   1. coremark   : 2,000 iters of 4x4 matmul, 16-node list sort, state machine, CRC-16
- *   2. chacha20   : 8,000 blocks (512 KiB) of 20-round ChaCha20 ARX stream cipher
+ *   2. chacha20   : 8,000 blocks (500 KiB) of 20-round ChaCha20 ARX stream cipher
  *   3. vfp_simd   : 40,000 iters of 4x4 FP32 matmul + FP64 Mandelbrot kernel
  *   4. calls_ibtc : Recursive fib(28) + 200,000 indirect vtable calls
- *   5. syscalls   : 20,000 getpid() syscalls measuring raw SVC/syscall shim latency
+ *   5. syscalls   : 4,000 getpid() syscalls measuring raw SVC/syscall shim latency
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0

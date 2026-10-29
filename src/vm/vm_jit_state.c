@@ -96,18 +96,19 @@ int a32_jit_init(a32_ctx_t *ctx)
         ctx->ras_top = 0U;
     }
     if (g_code_cache != NULL) {
+        int rc = 0;
         jit_lock_acquire();
         if (!atomic_load_explicit(&g_multithreaded, memory_order_relaxed)) {
             atomic_store_explicit(&g_multithreaded, true, memory_order_release);
             if (ctx != NULL && g_batch_max > g_batch_min) {
-                (void)flush_batch_locked(ctx);
+                rc = flush_batch_locked(ctx);
             }
             g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
         } else if (ctx != NULL && g_batch_max > g_batch_min) {
-            (void)flush_batch_locked(ctx);
+            rc = flush_batch_locked(ctx);
         }
         jit_lock_release();
-        return 0;
+        return rc;
     }
     /* Route the executable code-cache allocation through the host
      * backend so Darwin uses MAP_JIT/APRR publication while Linux keeps
@@ -518,6 +519,9 @@ bool a32_jit_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         return false;
     }
     uint32_t end = addr + len;
+    if (addr >= A32_KUSER_BASE_32 && end <= A32_KUSER_BASE_32 + 0x1000U) {
+        return true;
+    }
     for (unsigned attempt = 0U; attempt < 2U; attempt++) {
         uint32_t cur = addr;
         for (size_t i = 0U; i < ctx->region_count && cur < end; i++) {

@@ -2806,13 +2806,13 @@ static void vfp_uc_sigusr1_handler(int sig, void *info, void *ucontext)
         return;
     }
     uint8_t *uc = (uint8_t *)ucontext;
-    /* uc_regspace starts at byte offset 120 of arm32 struct ucontext */
-    uint32_t magic = *(uint32_t *)(void *)(uc + 120U);
-    uint32_t size  = *(uint32_t *)(void *)(uc + 124U);
-    uint64_t d0_in  = *(uint64_t *)(void *)(uc + 128U + 0U * 8U);
-    uint64_t d16_in = *(uint64_t *)(void *)(uc + 128U + 16U * 8U);
-    uint32_t fpexc  = *(uint32_t *)(void *)(uc + 128U + 32U * 8U + 4U);
-    uint32_t end_magic = *(uint32_t *)(void *)(uc + 120U + 0x120U);
+    /* uc_regspace starts at byte offset 232 of arm32 struct ucontext */
+    uint32_t magic = *(uint32_t *)(void *)(uc + 232U);
+    uint32_t size  = *(uint32_t *)(void *)(uc + 236U);
+    uint64_t d0_in  = *(uint64_t *)(void *)(uc + 240U + 0U * 8U);
+    uint64_t d16_in = *(uint64_t *)(void *)(uc + 240U + 16U * 8U);
+    uint32_t fpexc  = *(uint32_t *)(void *)(uc + 240U + 32U * 8U + 4U);
+    uint32_t end_magic = *(uint32_t *)(void *)(uc + 232U + 0x120U);
 
     /* 123.5 == 0x405EE00000000000ULL, -456.25 == 0xC07C840000000000ULL */
     if (magic == 0x56465001U && size == 0x120U &&
@@ -2822,8 +2822,8 @@ static void vfp_uc_sigusr1_handler(int sig, void *info, void *ucontext)
         end_magic == 0U) {
         /* Mutate fpregs[0] = 789.125 (0x4088A90000000000ULL) and
          * fpregs[16] = 1024.5 (0x4090020000000000ULL) */
-        *(uint64_t *)(void *)(uc + 128U + 0U * 8U)  = 0x4088A90000000000ULL;
-        *(uint64_t *)(void *)(uc + 128U + 16U * 8U) = 0x4090020000000000ULL;
+        *(uint64_t *)(void *)(uc + 240U + 0U * 8U)  = 0x4088A90000000000ULL;
+        *(uint64_t *)(void *)(uc + 240U + 16U * 8U) = 0x4090020000000000ULL;
         g_vfp_sigframe_ok = 1U;
     }
 }
@@ -2913,8 +2913,8 @@ static void m6_corrupt_vfp_uc_handler(int sig, void *info, void *ucontext)
     }
     uint8_t *uc = (uint8_t *)ucontext;
     /* Corrupt VFP_MAGIC and fpregs[0] so rt_sigreturn must reject the corrupted frame */
-    *(uint32_t *)(void *)(uc + 120U) = 0xDEADBEEFU;
-    *(uint64_t *)(void *)(uc + 128U) = 0x409999999999999AULL;
+    *(uint32_t *)(void *)(uc + 232U) = 0xDEADBEEFU;
+    *(uint64_t *)(void *)(uc + 240U) = 0x409999999999999AULL;
 }
 
 static int test23_m6_adversarial_regressions(void)

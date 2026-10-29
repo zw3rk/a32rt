@@ -407,20 +407,43 @@
         break;
 
     case ARM_NR_prctl: {
-#if defined(__linux__)
         static _Thread_local char tls_comm[16] = "a32rt";
-        unsigned long arg2 = (unsigned long)a1;
-        if (a0 == PR_SET_NAME) {
+        if (a0 == 15U /* PR_SET_NAME */) {
             FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ));
             const char *src = (const char *)a32_guest_ptr(ctx, a1);
             size_t n = strnlen(src, 15U);
             memcpy(tls_comm, src, n);
             memset(tls_comm + n, 0, 16U - n);
-            arg2 = (unsigned long)(uintptr_t)src;
-        } else if (a0 == PR_GET_NAME) {
+#if defined(__linux__)
+            ctx->regs[0] = host_ret(prctl(PR_SET_NAME, (unsigned long)(uintptr_t)src,
+                                          (unsigned long)a2, (unsigned long)a3,
+                                          (unsigned long)a4));
+#else
+            ctx->regs[0] = 0U;
+#endif
+            break;
+        }
+        if (a0 == 16U /* PR_GET_NAME */) {
             FAIL_EFAULT_IF(!guest_write(ctx, a1, tls_comm, 16U));
-            arg2 = (unsigned long)(uintptr_t)a32_guest_ptr(ctx, a1);
-        } else if (a0 == PR_GET_PDEATHSIG) {
+#if defined(__linux__)
+            ctx->regs[0] = host_ret(prctl(PR_GET_NAME,
+                                          (unsigned long)(uintptr_t)a32_guest_ptr(ctx, a1),
+                                          (unsigned long)a2, (unsigned long)a3,
+                                          (unsigned long)a4));
+#else
+            ctx->regs[0] = 0U;
+#endif
+            break;
+        }
+        if (a0 == 40U /* PR_GET_TID_ADDRESS */) {
+            FAIL_EINVAL_IF(a2 != 0U || a3 != 0U || a4 != 0U);
+            FAIL_EFAULT_IF(!guest_write(ctx, a1, &ctx->clear_child_tid, 4U));
+            ctx->regs[0] = 0U;
+            break;
+        }
+#if defined(__linux__)
+        unsigned long arg2 = (unsigned long)a1;
+        if (a0 == PR_GET_PDEATHSIG) {
             FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 4U, PROT_WRITE));
             arg2 = (unsigned long)(uintptr_t)a32_guest_ptr(ctx, a1);
         }
