@@ -371,7 +371,7 @@
                 b->lr_written_from_pc = true;
             }
             if (handled && rd == 15U && (opc < 0x8U || opc >= 0xCU)) {
-                a64_emit_exit_branch_reg(b, A64_TMP0, false);
+                a64_emit_exit_branch_reg(b, A64_TMP0, true);
                 if (cond == A64_COND_AL) {
                     *out_ends_block = true;
                 }

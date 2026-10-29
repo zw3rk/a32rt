@@ -219,5 +219,10 @@ int a32_vmfile_hook_write(uint64_t end_offset);
  * when the file cannot be stated); unknown files are ignored. */
 int a32_vmfile_sync_fd(int host_fd);
 int a32_vmfile_sync_path(const char *host_path);
+void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
+    uint32_t pgoffset);
+bool a32_vmfile_lookup_shared(uint32_t start_gva, int *out_fd,
+    uint32_t *out_pgoffset);
+void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end);
 
 #endif /* A32RT_VM_VM32_H */

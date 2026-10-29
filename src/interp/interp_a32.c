@@ -285,7 +285,7 @@ static uint32_t a32_dp_step(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
     }
     if (write) {
         if (rd == 15U) {
-            i_set_pc_branch(ctx, res, false);
+            i_set_pc_branch(ctx, res, !s);
             return A32_EXIT_NONE;
         }
         ctx->regs[rd] = res;

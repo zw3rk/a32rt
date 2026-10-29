@@ -353,11 +353,9 @@ static bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
 
 static int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
 {
-    if (aligned_len == 0ULL ||
-        aligned_len > (uint64_t)(A32_MMAP_TOP_32 - A32_MMAP_BASE_32)) {
+    if (aligned_len == 0ULL || aligned_len > (uint64_t)(A32_MMAP_TOP_32 - A32_MMAP_BASE_32)) {
         return -1;
     }
-
     uint64_t cursor_cand = page_align_up((uint64_t)g_vm_mmap_cursor);
     if (cursor_cand < (uint64_t)A32_MMAP_BASE_32) {
         cursor_cand = (uint64_t)A32_MMAP_BASE_32;
@@ -367,7 +365,6 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
         *out_va = (uint32_t)cursor_cand;
         return 0;
     }
-
     uint64_t cand = (uint64_t)A32_MMAP_BASE_32;
     for (size_t i = 0U; i < g_vm_region_count; i++) {
         uint64_t r_start = (uint64_t)g_vm_regions[i].start;
@@ -380,11 +377,9 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
         }
         cand = r_end;
     }
-
     if (cand + aligned_len > (uint64_t)A32_MMAP_TOP_32) {
         return -1;
     }
-
     *out_va = (uint32_t)cand;
     return 0;
 }
@@ -394,14 +389,10 @@ static int try_reserve_window(uint64_t base)
     if ((base & (A32_PAGE_SIZE - 1ULL)) != 0ULL || base > UINT64_MAX - A32_WINDOW_SIZE) {
         return -1;
     }
-
     uint64_t map_start = (base == 0ULL) ? (uint64_t)A32_LOW_GUARD_SIZE : base;
-    uint64_t map_len   = (base == 0ULL) ? (A32_WINDOW_SIZE - (uint64_t)A32_LOW_GUARD_SIZE)
-                                        : A32_WINDOW_SIZE;
-
+    uint64_t map_len   = (base == 0ULL) ? (A32_WINDOW_SIZE - (uint64_t)A32_LOW_GUARD_SIZE) : A32_WINDOW_SIZE;
     void *out = NULL;
-    if (a32_backend_map_anon((void *)(uintptr_t)map_start,
-            (size_t)map_len, 0, 1, 0, &out) != 0 ||
+    if (a32_backend_map_anon((void *)(uintptr_t)map_start, (size_t)map_len, 0, 1, 0, &out) != 0 ||
         (uint64_t)(uintptr_t)out != map_start) {
         if (out != NULL && (uint64_t)(uintptr_t)out != map_start) {
             (void)a32_backend_unmap(out, (size_t)map_len);
@@ -416,10 +407,8 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
     if (!ctx) {
         return -1;
     }
-
     uint64_t base = requested_window;
     bool     has_explicit = (requested_window != UINT64_MAX);
-
     if (!has_explicit) {
         const char *env_win = getenv("A32RT_WINDOW");
         if (env_win && env_win[0] != '\0') {
@@ -435,37 +424,31 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
             has_explicit = true;
         }
     }
-
     if (has_explicit) {
         if (try_reserve_window(base) != 0) {
-            fprintf(stderr, "a32rt: failed to reserve guest window at 0x%llx\n",
-                    (unsigned long long)base);
+            fprintf(stderr, "a32rt: failed to reserve guest window at 0x%llx\n", (unsigned long long)base);
             return -1;
         }
         ctx->guest_base = base;
     } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
                try_reserve_window(ctx->host_info.window_hint) == 0) {
         ctx->guest_base = ctx->host_info.window_hint;
+    } else if (try_reserve_window(0ULL) == 0) {
+        ctx->guest_base = 0ULL;
     } else {
-        /* Try G = 0 first; if occupied, scan 4 GiB-aligned windows [4G, 64G). */
-        if (try_reserve_window(0ULL) == 0) {
-            ctx->guest_base = 0ULL;
-        } else {
-            bool found = false;
-            for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
-                if (try_reserve_window(cand) == 0) {
-                    ctx->guest_base = cand;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                fprintf(stderr, "a32rt: unable to find free 4 GiB guest window\n");
-                return -1;
+        bool found = false;
+        for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
+            if (try_reserve_window(cand) == 0) {
+                ctx->guest_base = cand;
+                found = true;
+                break;
             }
         }
+        if (!found) {
+            fprintf(stderr, "a32rt: unable to find free 4 GiB guest window\n");
+            return -1;
+        }
     }
-
     vm_lock_acquire();
     g_vm_root_ctx     = ctx;
     g_vm_brk_base     = 0U;
@@ -631,6 +614,9 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
     if (update_cursor) {
         g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
     }
+    if ((flags & (0x01U | A32_MAP_ANONYMOUS)) == 0x01U && fd >= 0) {
+        a32_vmfile_record_shared(target_va, (uint32_t)((uint64_t)target_va + aligned_len), fd, pgoffset);
+    }
     (void)vm_record_region_locked(target_va, (uint32_t)((uint64_t)target_va + aligned_len),
                                   prot & 0x7U, flags, "[mmap]");
     return target_va;
@@ -794,6 +780,10 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
     uint32_t    keep_flags  = orig_flags & 0x23U;
     uint32_t    map_flags   = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) | A32_MAP_ANONYMOUS;
+    int         sh_fd       = -1;
+    uint32_t    sh_pgoff    = 0U;
+    bool        is_sh_file  = ((keep_flags & (0x01U | A32_MAP_ANONYMOUS)) == 0x01U) &&
+                              a32_vmfile_lookup_shared(old_addr, &sh_fd, &sh_pgoff);
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
 
     if ((flags & A32_MREMAP_FIXED) == 0U) {
@@ -819,14 +809,17 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         uint64_t new_end = (uint64_t)old_addr + new_aligned;
         if (new_end <= (uint64_t)A32_KUSER_BASE_32 &&
             !vm_range_overlaps_locked(old_end, (uint32_t)new_end)) {
+            uint32_t ext_flags = (is_sh_file ? keep_flags : map_flags) | A32_MAP_FIXED;
+            uint32_t ext_pgoff = is_sh_file ? (sh_pgoff + (uint32_t)(old_aligned / A32_PAGE_SIZE)) : 0U;
             uint32_t ext = vm_mmap2_locked(ctx, old_end, (uint32_t)(new_aligned - old_aligned),
-                                           prot, map_flags | A32_MAP_FIXED, -1, 0U);
+                                           prot, ext_flags, is_sh_file ? sh_fd : -1, ext_pgoff);
             if (ext <= 0xFFFFF000U) {
-                (void)vm_record_region_locked(old_end, (uint32_t)new_end,
-                                              prot, keep_flags, region_name);
+                if (is_sh_file) {
+                    a32_vmfile_record_shared(old_addr, (uint32_t)new_end, sh_fd, sh_pgoff);
+                }
+                (void)vm_record_region_locked(old_end, (uint32_t)new_end, prot, keep_flags, region_name);
                 uint32_t ext_end = (uint32_t)new_end;
-                if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end &&
-                    ext_end <= A32_MMAP_TOP_32) {
+                if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end && ext_end <= A32_MMAP_TOP_32) {
                     g_vm_mmap_cursor = ext_end;
                 }
                 vm_sync_to_ctx(ctx);
@@ -855,27 +848,31 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
 
     bool     is_fixed = (flags & A32_MREMAP_FIXED) != 0U;
-    uint32_t rw_prot  = (prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE);
+    uint32_t rw_prot  = is_sh_file ? prot : ((prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE));
+    uint32_t mv_flags = (is_sh_file ? keep_flags : map_flags) | (is_fixed ? A32_MAP_FIXED : 0U);
     uint32_t new_va   = vm_mmap2_locked(ctx, is_fixed ? new_addr : 0U, (uint32_t)new_aligned,
-                                        rw_prot, map_flags | (is_fixed ? A32_MAP_FIXED : 0U),
-                                        -1, 0U);
+                                        rw_prot, mv_flags, is_sh_file ? sh_fd : -1, is_sh_file ? sh_pgoff : 0U);
     if (new_va > 0xFFFFF000U) {
         vm_sync_to_ctx(ctx);
         vm_lock_release();
         return new_va;
     }
 
-    if ((prot & 0x1U) == 0U) {
-        (void)a32_backend_protect(a32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+    if (!is_sh_file) {
+        if ((prot & 0x1U) == 0U) {
+            (void)a32_backend_protect(a32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+        }
+        size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
+        memcpy(a32_guest_ptr(ctx, new_va), a32_guest_ptr(ctx, old_addr), copy_bytes);
+        if (prot != 0x3U) {
+            (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+        }
     }
-    size_t copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
-    memcpy(a32_guest_ptr(ctx, new_va), a32_guest_ptr(ctx, old_addr), copy_bytes);
-    if (prot != 0x3U) {
-        (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
-    }
-    (void)vm_record_region_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned),
-                                  prot, keep_flags, region_name);
+    (void)vm_record_region_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned), prot, keep_flags, region_name);
     (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+    if (is_sh_file) {
+        a32_vmfile_unmap_shared(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
+    }
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 

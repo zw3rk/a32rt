@@ -70,7 +70,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] -- <PATH> <ARGV0> [ARGS...]\n"
+            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--execfn <path>] [--image-fd <fd>] [--no-host] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] -- <PATH> [<ARGV0> [ARGS...]]\n"
             "  %s <PATH> [ARGS...]\n",
             prog, prog);
 }
@@ -129,6 +129,8 @@ int main(int argc, char **argv, char **envp)
 
     int i = 1;
     bool explicit_sep = false;
+    const char *execfn_cli = NULL;
+    int image_fd_cli = -1;
     while (i < argc && argv[i][0] == '-') {
         if (strcmp(argv[i], "--") == 0) {
             explicit_sep = true;
@@ -148,13 +150,38 @@ int main(int argc, char **argv, char **envp)
                 return 1;
             }
             i += 2;
-        } else if (strcmp(argv[i], "--sysroot") == 0) {
+        } else if (strcmp(argv[i], "--sysroot") == 0 || strcmp(argv[i], "--rootfs") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '\0') {
                 usage(argv[0]);
                 return 1;
             }
             ctx.sysroot = argv[i + 1];
             i += 2;
+        } else if (strcmp(argv[i], "--execfn") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                usage(argv[0]);
+                return 1;
+            }
+            execfn_cli = argv[i + 1];
+            i += 2;
+        } else if (strcmp(argv[i], "--image-fd") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0' || strchr(argv[i + 1], '-') != NULL) {
+                usage(argv[0]);
+                return 1;
+            }
+            char *endp = NULL;
+            errno = 0;
+            unsigned long fd_val = strtoul(argv[i + 1], &endp, 10);
+            if (errno != 0 || !endp || endp == argv[i + 1] || *endp != '\0' ||
+                fd_val > (unsigned long)INT_MAX) {
+                usage(argv[0]);
+                return 1;
+            }
+            image_fd_cli = (int)fd_val;
+            i += 2;
+        } else if (strcmp(argv[i], "--no-host") == 0) {
+            setenv("A32RT_HOST", "none", 1);
+            i++;
         } else if (strcmp(argv[i], "--cache") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '\0') {
                 usage(argv[0]);
@@ -201,28 +228,35 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
-    if (i >= argc || (is_binfmt_p && i + 1 >= argc)) {
+    if ((execfn_cli == NULL && i >= argc) || (is_binfmt_p && i + 1 >= argc)) {
         usage(argv[0]);
         return 1;
     }
 
-    int exec_fd = -1;
+    int exec_fd = image_fd_cli;
 #if defined(__linux__)
-    {
+    if (exec_fd < 0) {
+        errno = 0;
         unsigned long aux_execfd = getauxval(AT_EXECFD);
-        if (aux_execfd != 0UL && aux_execfd <= (unsigned long)INT_MAX) {
+        if (errno == 0 && aux_execfd <= (unsigned long)INT_MAX) {
             exec_fd = (int)aux_execfd;
         }
     }
 #endif
 
-    exec_path = argv[i];
-    if (is_binfmt_p || (explicit_sep && exec_fd < 0 && i + 1 < argc)) {
-        guest_argc = argc - (i + 1);
-        guest_argv = &argv[i + 1];
-    } else {
+    if (execfn_cli != NULL) {
+        exec_path = execfn_cli;
         guest_argc = argc - i;
         guest_argv = &argv[i];
+    } else {
+        exec_path = argv[i];
+        if (is_binfmt_p || (explicit_sep && exec_fd < 0 && i + 1 < argc)) {
+            guest_argc = argc - (i + 1);
+            guest_argv = &argv[i + 1];
+        } else {
+            guest_argc = argc - i;
+            guest_argv = &argv[i];
+        }
     }
 
     if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {

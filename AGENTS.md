@@ -14,7 +14,7 @@ This repository follows:
 - Sibling boundary rules in `../hyper-linux/AGENTS.md` and `../hyper-linux/docs/SIBLING-REPOS.md`.
 
 ### Key Invariants
-1. **Language & Toolchain**: **Curated C11** (`-std=c11 -Werror=vla -pedantic -Wall -Wextra`) + minimal AArch64 `.S` assembly (`trampoline.S`, `start.S`).
+1. **Language & Toolchain**: **Curated C11** (`-std=c11 -Werror=vla -pedantic -Wall -Wextra`) + minimal AArch64 `.S` assembly (`src/trampoline.S`).
    - Fixed-width integers (`uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`, `size_t`, `uintptr_t`) everywhere; `unsigned` for bitwise/shifts.
    - Forbidden: VLAs, Annex K (`*_s`), `<threads.h>`, `_Generic`, `gets`/`sprintf`/`strcpy`/`strcat`/`atoi` (use `snprintf` and `strtol`/`strtoul`).
 2. **Zero External Dependencies**: No Dynarmic, no oaknut, no C++, no CMake. `a32rt` uses its own bespoke A32/T32 decoder, 32-bit AArch64 instruction encoder (`a64_emit`), runtime code cache, and EABI syscall/signal layer from `M0`.
@@ -53,7 +53,7 @@ a32rt/
 │   ├── decode_t32.c     # T32 (Thumb-1 / Thumb-2) decoder & A64 lowering
 │   ├── vfp_neon.c       # VFPv4-D32 & NEON (ASIMD) decoder & A64 lowering
 │   ├── jit.c            # Code cache, RW chain slots, IBTC, W^X batch mprotect, dispatcher
-│   ├── aot.c            # Persistent disk-backed AOT cache (.a32cache, SHA-256 keyed)
+│   ├── aot.c            # Persistent disk-backed AOT cache (.a32cache, FNV-1a keyed)
 │   ├── trampoline.S     # Host <-> guest context switch, GPR + VFP d0-d31 save/restore
 │   ├── syscalls.c       # ARM EABI (r7, r0-r5) -> aarch64-linux syscall & struct shim
 │   ├── signals.c        # 3-class signal routing, side-table recovery & arm32 rt_sigframe

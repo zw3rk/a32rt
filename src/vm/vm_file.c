@@ -339,3 +339,83 @@ int a32_vmfile_hook_write(uint64_t end_offset)
     pthread_mutex_unlock(&g_vmfile_lock);
     return 0;
 }
+
+typedef struct {
+    bool used;
+    uint32_t start_gva;
+    uint32_t end_gva;
+    int dup_fd;
+    uint32_t pgoffset;
+} a32_vmfile_shared_t;
+
+static a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
+
+void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
+    uint32_t pgoffset)
+{
+    if (fd < 0 || start_gva >= end_gva) {
+        return;
+    }
+    int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    if (dup_fd < 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_vmfile_lock);
+    unsigned slot = A32_VMFILE_SLOTS;
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used && g_shared[i].start_gva == start_gva) {
+            close(g_shared[i].dup_fd);
+            slot = i;
+            break;
+        }
+        if (!g_shared[i].used && slot == A32_VMFILE_SLOTS) {
+            slot = i;
+        }
+    }
+    if (slot < A32_VMFILE_SLOTS) {
+        g_shared[slot].used = true;
+        g_shared[slot].start_gva = start_gva;
+        g_shared[slot].end_gva = end_gva;
+        g_shared[slot].dup_fd = dup_fd;
+        g_shared[slot].pgoffset = pgoffset;
+    } else {
+        close(dup_fd);
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+}
+
+bool a32_vmfile_lookup_shared(uint32_t start_gva, int *out_fd,
+    uint32_t *out_pgoffset)
+{
+    bool found = false;
+    pthread_mutex_lock(&g_vmfile_lock);
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used && start_gva >= g_shared[i].start_gva &&
+            start_gva < g_shared[i].end_gva) {
+            uint32_t delta = (start_gva - g_shared[i].start_gva) / 4096U;
+            if (out_fd) {
+                *out_fd = g_shared[i].dup_fd;
+            }
+            if (out_pgoffset) {
+                *out_pgoffset = g_shared[i].pgoffset + delta;
+            }
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    return found;
+}
+
+void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
+{
+    pthread_mutex_lock(&g_vmfile_lock);
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used && g_shared[i].start_gva >= unmap_start &&
+            g_shared[i].end_gva <= unmap_end) {
+            close(g_shared[i].dup_fd);
+            g_shared[i].used = false;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+}

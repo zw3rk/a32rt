@@ -621,14 +621,6 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
         if (!guest_read(ctx, &new_act, act_va, sizeof(new_act))) {
             return -EFAULT;
         }
-        g_guest_sigactions[signum] = new_act;
-        g_guest_sigactions[signum].mask &= ~A32_UNMASKABLE_SIGNALS;
-        ctx->sig_mask &= ~A32_UNMASKABLE_SIGNALS;
-
-        if (sig_is_ignored(signum, g_guest_sigactions[signum].handler)) {
-            __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (signum - 1)), __ATOMIC_SEQ_CST);
-        }
-
         unsigned long sa_flags = (unsigned long)(SA_SIGINFO | SA_NODEFER);
         if (new_act.handler <= 1U || (new_act.flags & A32_SA_RESTART) != 0U) {
             sa_flags |= (unsigned long)SA_RESTART;
@@ -641,7 +633,22 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
                 sa_flags |= (unsigned long)SA_NOCLDWAIT;
             }
         }
-        (void)install_host_sigaction(signum, sa_flags);
+#if defined(__linux__)
+        if (install_host_sigaction(signum, sa_flags) != 0) {
+            return -EINVAL;
+        }
+#else
+        if (signum < NSIG && install_host_sigaction(signum, sa_flags) != 0) {
+            return -EINVAL;
+        }
+#endif
+        g_guest_sigactions[signum] = new_act;
+        g_guest_sigactions[signum].mask &= ~A32_UNMASKABLE_SIGNALS;
+        ctx->sig_mask &= ~A32_UNMASKABLE_SIGNALS;
+
+        if (sig_is_ignored(signum, g_guest_sigactions[signum].handler)) {
+            __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (signum - 1)), __ATOMIC_SEQ_CST);
+        }
     }
 
     if (oldact_va != 0U) {
