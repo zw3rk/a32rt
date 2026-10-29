@@ -1,0 +1,3 @@
+M4 VFPv4-D32 & NEON: PASS
+M4 ARMv8-A Directed-Rounding VFP: PASS
+M6 NEON Q-D-S Cross-Width Aliasing: PASS
