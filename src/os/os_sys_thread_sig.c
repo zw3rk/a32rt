@@ -200,6 +200,60 @@ static bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max
     return true;
 }
 
+/* Darwin futex WAIT emulation (no kernel futex waits on macOS).  Returns
+ * true when the op is fully handled (regs[0] set); false falls through
+ * to regs[0] = 0.  Guest (Linux) errnos throughout: EAGAIN 11 (Darwin
+ * host 35), ETIMEDOUT 110, EINVAL 22 (same both sides).  No wait queue
+ * yet: matched waits with a timeout sleep it out, then time out. */
+#if !defined(__linux__)
+static bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
+                              uint32_t a2, uint32_t a3, uint32_t a5, bool time64)
+{
+    uint32_t *uaddr = (uint32_t *)a32_guest_ptr(ctx, a0);
+    if (basic_op == 9U && a5 == 0U) {
+        ctx->regs[0] = (uint32_t)-EINVAL;
+        return true;
+    }
+    if (basic_op == 4U && __atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != a5) {
+        ctx->regs[0] = (uint32_t)-11;
+        return true;
+    }
+    if (basic_op != 0U && basic_op != 9U) {
+        return false;
+    }
+    if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != a2) {
+        ctx->regs[0] = (uint32_t)-11;
+        return true;
+    }
+    if (a3 == 0U) {
+        return false;
+    }
+    {
+        struct timespec end_m;
+        struct timespec now_m;
+        long ds;
+        long dn;
+        if (read_guest_timespec(ctx, a3, time64, &end_m)) {
+            struct timespec rem;
+            (void)clock_gettime(CLOCK_MONOTONIC, &now_m);
+            ds = (long)(end_m.tv_sec - now_m.tv_sec);
+            dn = (long)(end_m.tv_nsec - now_m.tv_nsec);
+            if (dn < 0L) {
+                ds -= 1L;
+                dn += 1000000000L;
+            }
+            if (ds >= 0L) {
+                rem.tv_sec = (time_t)ds;
+                rem.tv_nsec = dn;
+                (void)nanosleep(&rem, NULL);
+            }
+        }
+    }
+    ctx->regs[0] = (uint32_t)-110;
+    return true;
+}
+#endif /* !defined(__linux__) */
+
 #define FAIL_ERR(err)        do { ctx->regs[0] = (uint32_t)(-(err)); goto out; } while (0)
 #define FAIL_EFAULT_IF(cond) do { if (cond) FAIL_ERR(EFAULT); } while (0)
 #define FAIL_EINVAL_IF(cond) do { if (cond) FAIL_ERR(EINVAL); } while (0)

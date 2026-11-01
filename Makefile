@@ -88,6 +88,8 @@ TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
              $(BUILD_DIR)/hello-thumb-static \
              $(BUILD_DIR)/test-m1-armhf \
              $(BUILD_DIR)/test-m1-thumb \
+             $(BUILD_DIR)/hello-armel-static \
+             $(BUILD_DIR)/test-m1-armel \
              $(BUILD_DIR)/bench-coremark-armhf \
              $(BUILD_DIR)/bench-coremark-thumb \
              $(BUILD_DIR)/test-m3-armhf \
@@ -105,6 +107,12 @@ TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
 
 ARM32_FREESTANDING_CFLAGS := --target=armv7a-unknown-linux-eabihf -march=armv7ve -mfpu=neon-vfpv4 \
                              -mfloat-abi=hard -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+                             -ffreestanding -fno-stack-protector -nostdlib -DA32RT_FREESTANDING_TEST
+# armel (soft-float ABI) variant: same freestanding recipe, gnueabi target.
+# Integer-only fixtures (hello, m1) build here; the VFP/NEON fixture (m4)
+# needs compiler-emitted __aeabi_fp helpers, so it stays hard-float-only.
+ARM32_FREESTANDING_CFLAGS_SOFT := --target=armv7a-unknown-linux-gnueabi -march=armv7ve -mfpu=neon-vfpv4 \
+                             -mfloat-abi=soft -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
                              -ffreestanding -fno-stack-protector -nostdlib -DA32RT_FREESTANDING_TEST
 
 help: ## Show available build and verification targets
@@ -155,8 +163,18 @@ $(BUILD_DIR)/$(1): tests/$(2) | $(BUILD_DIR)
 		--image-base=0x00010000 -e _start $(BUILD_DIR)/$(1).o -o $$@
 endef
 
+define BUILD_ARM32_FIXTURE_SOFT
+$(BUILD_DIR)/$(1): tests/$(2) | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $$@ ($(3) soft)\n"
+	$(CLANG_RAW) $(ARM32_FREESTANDING_CFLAGS_SOFT) $(3) -c $$< -o $(BUILD_DIR)/$(1).o
+	$(LLD_RAW) -m armelf_linux_eabi -Bstatic --no-dynamic-linker \
+		--image-base=0x00010000 -e _start $(BUILD_DIR)/$(1).o -o $$@
+endef
+
 $(eval $(call BUILD_ARM32_FIXTURE,hello-armhf-static,hello.c,-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,hello-thumb-static,hello.c,-mthumb))
+$(eval $(call BUILD_ARM32_FIXTURE_SOFT,hello-armel-static,hello.c,-marm))
+$(eval $(call BUILD_ARM32_FIXTURE_SOFT,test-m1-armel,test_m1_isa_fs.c,-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,test-m1-armhf,test_m1_isa_fs.c,-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,test-m1-thumb,test_m1_isa_fs.c,-mthumb))
 $(eval $(call BUILD_ARM32_FIXTURE,bench-coremark-armhf,bench_coremark.c,-marm))
@@ -165,6 +183,21 @@ $(eval $(call BUILD_ARM32_FIXTURE,test-m3-armhf,test_m3_threads_signals.c,-marm)
 $(eval $(call BUILD_ARM32_FIXTURE,test-m4-armhf,test_m4_vfp_neon.c,-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,test-m4-thumb,test_m4_vfp_neon.c,-mthumb))
 $(eval $(call BUILD_ARM32_FIXTURE,test-m5-armhf,test_m5_ltp_gdb.c,-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,test-h1-armhf,test_h1_smc.c,-marm))
+
+# Uniform libc guests (p3_torture, tcg smoke): static musl A32 builds of the
+# shared rt-series sources.  Thumb libc variants are an open gap (T32
+# data-processing + kuser-sigreturn); A32 carries the category rows.
+RT_SERIES_TESTS := $(abspath ../rt-series/tests)
+guests-libc: | $(BUILD_DIR) ## Build static musl A32 p3/tcg guests (needs docker+network)
+	@printf "\033[32m▸ Building\033[0m A32 libc guests\n"
+	docker run --rm --platform linux/arm/v7 \
+		-v $(RT_SERIES_TESTS):/src:ro -v $(abspath $(BUILD_DIR)):/out \
+		alpine:3.21 sh -c "apk add -q musl-dev gcc >/dev/null 2>&1; \
+		gcc -std=c11 -Wall -Wextra -O1 -marm -pthread -static \
+			/src/p3_torture.c -o /out/p3-torture-a32 && \
+		gcc -std=c11 -Wall -Wextra -O1 -marm -pthread -static \
+			/src/tcg/smoke_tcg.c -o /out/tcg-smoke-a32 -lm"
 
 TIMEOUT_RUN ?= perl -e 'alarm 15; exec @ARGV'
 SYSROOT_ARMV7 := $(abspath $(BUILD_DIR)/sysroot-armv7)

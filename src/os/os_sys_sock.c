@@ -124,7 +124,71 @@
         }
         ctx->regs[0] = host_ret(r);
 #else
-        FAIL_ERR(ENOSYS);
+        /* Darwin has no statx: emulate basic stats via fstatat.  glibc
+         * ld.so treats -ENOSYS from statx as fatal ("cannot stat shared
+         * object"), so a faithful fallback unblocks dynamic linking. */
+        char resolved[PATH_MAX];
+        bool follow = ((a2 & AT_SYMLINK_NOFOLLOW) == 0U);
+        int dirfd = translate_at_fd(a0);
+        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a4, 256U, PROT_WRITE));
+        struct stat st;
+        if ((((uint32_t)a2) & 0x1000U) != 0U) {
+            /* AT_EMPTY_PATH: stat the fd itself (glibc fstat-via-statx). */
+            if (fstat(dirfd, &st) != 0) {
+                FAIL_ERR(errno);
+            }
+        } else {
+            RESOLVE_AT(dirfd, a1, resolved, follow);
+            int stflags = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+            if (fstatat(dirfd, resolved, &st, stflags) != 0) {
+                FAIL_ERR(errno);
+            }
+        }
+        uint8_t *stxb = (uint8_t *)a32_guest_ptr(ctx, a4);
+        memset(stxb, 0, 256U);
+        /* Linux struct statx (LE): mask@0 blksize@4 attr@8 nlink@16
+         * uid@20 gid@24 mode@28 ino@32 size@40 blocks@48 attrmask@56
+         * atime@64 mtime@80 ctime@96 btime@112 rdev@128 dev@136. */
+        uint32_t stx_mask = ((uint32_t)a3) & 0xFFFU; /* BASIC_STATS|BTIME */
+        uint32_t stx_uid = (uint32_t)st.st_uid;
+        uint32_t stx_gid = (uint32_t)st.st_gid;
+        if (ctx->has_host_info) {
+            stx_uid = (uint32_t)geteuid();
+            stx_gid = (uint32_t)getegid();
+        }
+        uint16_t stx_mode = (uint16_t)st.st_mode;
+        uint64_t stx_ino = (uint64_t)st.st_ino;
+        uint64_t stx_size = (uint64_t)st.st_size;
+        uint64_t stx_blocks = (uint64_t)st.st_blocks;
+        uint32_t stx_blksize = (uint32_t)st.st_blksize;
+        uint32_t stx_nlink = (uint32_t)st.st_nlink;
+        memcpy(stxb + 0, &stx_mask, 4U);
+        memcpy(stxb + 4, &stx_blksize, 4U);
+        memcpy(stxb + 16, &stx_nlink, 4U);
+        memcpy(stxb + 20, &stx_uid, 4U);
+        memcpy(stxb + 24, &stx_gid, 4U);
+        memcpy(stxb + 28, &stx_mode, 2U);
+        memcpy(stxb + 32, &stx_ino, 8U);
+        memcpy(stxb + 40, &stx_size, 8U);
+        memcpy(stxb + 48, &stx_blocks, 8U);
+        int64_t secs[4] = { (int64_t)st.st_atimespec.tv_sec, (int64_t)st.st_mtimespec.tv_sec,
+                            (int64_t)st.st_ctimespec.tv_sec, (int64_t)st.st_birthtimespec.tv_sec };
+        uint32_t nsecs[4] = { (uint32_t)st.st_atimespec.tv_nsec, (uint32_t)st.st_mtimespec.tv_nsec,
+                              (uint32_t)st.st_ctimespec.tv_nsec, (uint32_t)st.st_birthtimespec.tv_nsec };
+        for (unsigned ti = 0U; ti < 4U; ti++) {
+            memcpy(stxb + 64 + ti * 16, &secs[ti], 8U);
+            memcpy(stxb + 72 + ti * 16, &nsecs[ti], 4U);
+        }
+        /* Darwin dev_t: major bits[31:24], minor bits[23:0]. */
+        uint32_t rdev_major = (uint32_t)(((uint32_t)st.st_rdev >> 24) & 0xFFU);
+        uint32_t rdev_minor = (uint32_t)((uint32_t)st.st_rdev & 0xFFFFFFU);
+        uint32_t dev_major = (uint32_t)(((uint32_t)st.st_dev >> 24) & 0xFFU);
+        uint32_t dev_minor = (uint32_t)((uint32_t)st.st_dev & 0xFFFFFFU);
+        memcpy(stxb + 128, &rdev_major, 4U);
+        memcpy(stxb + 132, &rdev_minor, 4U);
+        memcpy(stxb + 136, &dev_major, 4U);
+        memcpy(stxb + 140, &dev_minor, 4U);
+        ctx->regs[0] = 0U;
 #endif
         break;
     }

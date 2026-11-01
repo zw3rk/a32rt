@@ -853,12 +853,10 @@
         ctx->regs[0] = host_ret(syscall(SYS_futex, a32_guest_ptr(ctx, a0),
                                         (int)a1, a2, arg4, uaddr2, a5));
 #else
-        (void)arg4; (void)uaddr2; (void)a5;
-        if ((basic_op == 0U || basic_op == 9U) &&
-            __atomic_load_n((uint32_t *)a32_guest_ptr(ctx, a0), __ATOMIC_SEQ_CST) != a2) {
-            FAIL_ERR(EAGAIN);
+        (void)arg4; (void)uaddr2;
+        if (!futex_darwin_wait(ctx, a0, basic_op, a2, a3, a5, time64)) {
+            ctx->regs[0] = 0U;
         }
-        ctx->regs[0] = 0U;
 #endif
         break;
     }

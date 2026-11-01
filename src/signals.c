@@ -370,6 +370,25 @@ static void enqueue_async_signal(a32_ctx_t *ctx, int sig, const siginfo_t *info)
     __atomic_fetch_or(&ctx->pending_signals, 1ULL << (sig - 1), __ATOMIC_SEQ_CST);
 }
 
+/* User-sent vs kernel-fault discriminator for si_code.  Linux reports
+ * user sources as <= 0 (SI_USER 0, QUEUE/TIMER/... negative) and faults
+ * as small-positive; Darwin reports user sources as >= SI_USER 0x10001
+ * (QUEUE/TIMER/... above) and faults as small-positive.  A sync trap
+ * (SEGV/BUS/ILL/FPE/TRAP) is a genuine fault only for kernel codes;
+ * user-sent instances (kill/tkill/tgkill/sigqueue) must enqueue for
+ * guest delivery on both platforms. */
+static bool sig_code_is_user_sent(const siginfo_t *info)
+{
+    if (info == NULL) {
+        return false;
+    }
+#ifdef __APPLE__
+    return info->si_code >= SI_USER;
+#else
+    return info->si_code <= 0;
+#endif
+}
+
 static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 {
     a32_ctx_t *ctx = g_tls_ctx;
@@ -382,7 +401,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 
     bool is_sync_trap = (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL ||
                          sig == SIGFPE  || sig == SIGTRAP);
-    if (!is_sync_trap || (info != NULL && info->si_code <= 0)) {
+    if (!is_sync_trap || sig_code_is_user_sent(info)) {
         enqueue_async_signal(ctx, sig, info);
         return;
     }
@@ -398,7 +417,19 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     uint32_t itstate  = 0U;
     bool in_block = a32_jit_lookup_host_pc(host_pc, &guest_pc, &itstate);
 
-    if (in_block) {
+    if (!in_block) {
+        /* Not guest code: the thread was parked in host code (a syscall
+         * like kill/tkill, a host helper) when the trap arrived, so no
+         * guest PC can be attributed.  Kill-sent sync numbers land here
+         * on platforms whose kill() uses small-positive codes (verified:
+         * Darwin kill() reports si_code 1, colliding with BUS_ADRALN),
+         * and they must still reach the guest.  Enqueue for async guest
+         * delivery instead of escalating. */
+        enqueue_async_signal(ctx, sig, info);
+        return;
+    }
+
+    {
         for (int i = 0; i < 15; i++) {
 #if defined(__APPLE__)
             ctx->regs[i] = (uint32_t)uc->uc_mcontext->__ss.__x[i];
@@ -457,7 +488,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     }
 
     if ((sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) &&
-        info != NULL && info->si_code > 0) {
+        info != NULL && !sig_code_is_user_sent(info)) {
         _exit(128 + sig);
     }
 

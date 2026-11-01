@@ -603,8 +603,13 @@ static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2
         i_undef(ctx);
         return A32_EXIT_UNDEF;
     }
-    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
-        /* B.W / BL: F0 9x / F0 Dx / F7 Fx. */
+    /* B.W T3/T4 only: every 32-bit Thumb branch fixes hw2[15:14]=10
+     * (BL/BLX use 11 and never reach here).  Data-processing
+     * modified-immediate (mov.w/bic.w: f04f/f020 with hw2 bit15=0)
+     * must NOT match: without the bit14 test they mis-decode as a
+     * wild branch instead of falling through to UNDEF. */
+    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xC000U) == 0x8000U) {
+        /* B.W: F0 9x / F0 Dx / F7 Fx with hw2[15:14]=10. */
         int32_t s = (int32_t)((hw1 >> 10) & 1U);
         int32_t j1 = (hw2 >> 13) & 1;
         int32_t j2 = (hw2 >> 11) & 1;

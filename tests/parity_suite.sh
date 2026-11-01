@@ -150,6 +150,15 @@ parity_row "host" "darwin" "make-check" "check" "$_st" "$_ms" "$_det"
 # test_m4_vfp_neon -> test-m4-armhf (A32) + test-m4-thumb (Thumb-2).
 GUESTS_ARMHF="hello-armhf-static test-m1-armhf test-m4-armhf"
 GUESTS_THUMB="hello-thumb-static test-m4-thumb"
+# armel (soft-float ABI): integer-only fixtures; VFP/NEON (m4) stays
+# hard-float-only (needs compiler __aeabi_fp helpers — see Makefile).
+GUESTS_ARMEL="hello-armel-static test-m1-armel"
+# Thumb interp pins: every Thumb guest starts with bic.w in _start, which
+# the T32 data-processing unit does not implement yet, so interp UNDEFs
+# (132, A32_EXIT_UNDEF=4 in difftest lines) at step 2 while dbt — whose
+# own T32 DP lowering handles bic.w — proceeds.  Before the
+# hw2[15:14]==10 branch-guard fix these rows pinned 139 wild-branch
+# faults at the same PCs; the goldens now pin the clean UNDEF instead.
 # test-m1-thumb is a second Thumb-2 row for the m1 ISA suite.
 if [ -x "$ROOT/_build/test-m1-thumb" ]; then
     GUESTS_THUMB="$GUESTS_THUMB test-m1-thumb"
@@ -165,6 +174,118 @@ for _g in $GUESTS_ARMHF; do
         run_guest "armhf" "darwin" "$_g" "$_flag" "$_name" "$ROOT/_build/$_g" "$_g"
     done
 done
+# test-m3-armhf (p4 threads/signals): interp+dbt goldens only.  The
+# lockstep difftest cannot gate it (threads + async signals do not
+# compose with 1:1 lockstep: signal delivery races the stepper), so no
+# difftest row — cf. the catalogue's "where single-thread/supported".
+for _g in test-m3-armhf; do
+    if [ ! -x "$ROOT/_build/$_g" ]; then
+        parity_row "armhf" "darwin" "$_g" "dbt" "GAP" "0" "missing guest $_g"
+        continue
+    fi
+    for _e in "--dbt:dbt" "--interp:interp"; do
+        _flag="${_e%%:*}"; _name="${_e##*:}"
+        run_guest "armhf" "darwin" "$_g" "$_flag" "$_name" "$ROOT/_build/$_g" "$_g"
+    done
+done
+# Uniform libc guests (A32 static musl, `make guests-libc`): p3_torture +
+# tcg smoke from ../rt-series/tests.  Interp dies in musl startup (A32
+# startup-code gap, silent UNDEF/132).  DBT survives startup but faults in
+# signal test 1 (wild PC into rodata — open signal-path gap, native
+# ALL_OK).  tcg-smoke hangs past the banner under dbt (bounded below with
+# a 10 s alarm; native finishes in 0.01 s).  No difftest rows:
+# threaded+signals do not compose with lockstep (same rationale as m3).
+if [ -x "$ROOT/_build/p3-torture-a32" ]; then
+    run_guest "armhf" "darwin" "p3-torture-a32" "--dbt" "dbt" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
+    run_guest "armhf" "darwin" "p3-torture-a32" "--interp" "interp" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
+else
+    parity_row "armhf" "darwin" "p3-torture-a32" "dbt" "GAP" "0" "missing guest (make guests-libc)"
+fi
+# run_alarm_guest: run_guest shape for guests that hang under an engine.
+# Bounds the run with a perl alarm; the golden pins the partial output
+# and the alarm rc (142).  Args: abi host case secs path golden [args...].
+run_alarm_guest() {
+    _abi="$1"; _host="$2"; _case="$3"; _secs="$4"; _path="$5"; _gold="$6"
+    shift 6
+    _t0=$(parity_now_ms)
+    _tmp_out=$(mktemp /tmp/a32alm.XXXXXX); _tmp_err=$(mktemp /tmp/a32alm.XXXXXX); _tmp_code=$(mktemp /tmp/a32alm.XXXXXX)
+    perl -e 'alarm $ARGV[0]; exec @ARGV[1..$#ARGV]' "$_secs" "$RT_DARWIN" --dbt -- "$_path" "$@" >"$_tmp_out" 2>"$_tmp_err"; _rc=$?
+    printf '%s' "$_rc" > "$_tmp_code"
+    _t1=$(parity_now_ms)
+    _ms=0
+    if [ "$_t0" != "0" ] && [ "$_t1" != "0" ]; then
+        _ms=$((_t1 - _t0))
+    fi
+    _st="PASS"; _det=""
+    parity_check_golden "$GOLDEN_DIR/$_gold.dbt.out" "$_tmp_out"; _rc_cmp=$?
+    if [ "$_rc_cmp" -eq 2 ]; then
+        _st="GAP"; _det="missing golden $_gold.dbt.out"
+    elif [ "$_rc_cmp" -ne 0 ]; then
+        _st="FAIL"; _det="stdout differs"
+    fi
+    if [ "$_st" = "PASS" ]; then
+        parity_check_golden "$GOLDEN_DIR/$_gold.dbt.code" "$_tmp_code"; _rc_cmp=$?
+        if [ "$_rc_cmp" -eq 2 ]; then
+            _st="GAP"; _det="missing golden $_gold.dbt.code"
+        elif [ "$_rc_cmp" -ne 0 ]; then
+            _st="FAIL"; _det="exit $_rc differs"
+        fi
+    fi
+    if [ "$_st" = "PASS" ]; then
+        parity_check_golden "$GOLDEN_DIR/$_gold.dbt.err" "$_tmp_err"; _rc_cmp=$?
+        if [ "$_rc_cmp" -eq 2 ]; then
+            _st="GAP"; _det="missing golden $_gold.dbt.err"
+        elif [ "$_rc_cmp" -ne 0 ]; then
+            _st="FAIL"; _det="stderr differs"
+        fi
+    fi
+    parity_row "$_abi" "$_host" "$_case" "dbt" "$_st" "$_ms" "$_det"
+    rm -f "$_tmp_out" "$_tmp_err" "$_tmp_code"
+}
+if [ -x "$ROOT/_build/tcg-smoke-a32" ]; then
+    run_guest "armhf" "darwin" "tcg-smoke-a32" "--interp" "interp" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
+    # tcg-smoke dbt hangs: bound with a 10 s alarm, golden pins the
+    # partial (banner-only) output + alarm rc.
+    run_alarm_guest "armhf" "darwin" "tcg-smoke-a32" "10" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
+else
+    parity_row "armhf" "darwin" "tcg-smoke-a32" "dbt" "GAP" "0" "missing guest (make guests-libc)"
+fi
+# h1_smc: freestanding SMC (mprotect + patch + cacheflush + exec).  All
+# engines agree, so the lockstep difftest row is included.
+if [ -x "$ROOT/_build/test-h1-armhf" ]; then
+    for _e in "--dbt:dbt" "--interp:interp" "--difftest:difftest"; do
+        _flag="${_e%%:*}"; _name="${_e##*:}"
+        run_guest "armhf" "darwin" "h1_smc" "$_flag" "$_name" "$ROOT/_build/test-h1-armhf" "h1_smc"
+    done
+else
+    parity_row "armhf" "darwin" "h1_smc" "dbt" "GAP" "0" "missing guest test-h1-armhf"
+fi
+# p2_libc dynamic leg (m7, musl) via A32RT_SYSROOT: interp golden pins the
+# ldso-startup UNDEF (132); dbt hangs after 4 musl-thread-startup faults
+# (open thread-startup gap) — 10 s alarm row.  No difftest (threads).
+if [ -x "$ROOT/_build/test-m7-armhf" ]; then
+    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m7-armhf" "--interp" "interp" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
+    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_alarm_guest "armhf" "darwin" "test-m7-armhf" "10" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
+else
+    parity_row "armhf" "darwin" "test-m7-armhf" "dbt" "GAP" "0" "missing guest test-m7-armhf"
+fi
+# p5_dyn (m8 glibc 2.36): dbt PASS via the sysroot; interp 132
+# (ldso-startup gap).  No difftest (NPTL threads + dlopen).
+if [ -x "$ROOT/_build/test-m8-glibc-armhf" ]; then
+    A32RT_SYSROOT="$ROOT/_build/sysroot-glibc-armhf" run_guest "armhf" "darwin" "test-m8-glibc-armhf" "--dbt" "dbt" "$ROOT/_build/test-m8-glibc-armhf" "test-m8-glibc-armhf"
+    A32RT_SYSROOT="$ROOT/_build/sysroot-glibc-armhf" run_guest "armhf" "darwin" "test-m8-glibc-armhf" "--interp" "interp" "$ROOT/_build/test-m8-glibc-armhf" "test-m8-glibc-armhf"
+else
+    parity_row "armhf" "darwin" "test-m8-glibc-armhf" "dbt" "GAP" "0" "missing guest test-m8-glibc-armhf"
+fi
+# h4_cxx (m8 C++17 ARM EHABI, musl): dbt faults in runtime init (open
+# libstdc++-init gap, native PASS); interp 132 (ldso-startup gap).
+# No difftest (std::thread).
+if [ -x "$ROOT/_build/test-m8-cpp-armhf" ]; then
+    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m8-cpp-armhf" "--dbt" "dbt" "$ROOT/_build/test-m8-cpp-armhf" "test-m8-cpp-armhf"
+    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m8-cpp-armhf" "--interp" "interp" "$ROOT/_build/test-m8-cpp-armhf" "test-m8-cpp-armhf"
+else
+    parity_row "armhf" "darwin" "test-m8-cpp-armhf" "dbt" "GAP" "0" "missing guest test-m8-cpp-armhf"
+fi
 for _g in $GUESTS_THUMB; do
     if [ ! -x "$ROOT/_build/$_g" ]; then
         parity_row "thumb" "darwin" "$_g" "dbt" "GAP" "0" "missing guest $_g"
@@ -173,6 +294,16 @@ for _g in $GUESTS_THUMB; do
     for _e in "--dbt:dbt" "--interp:interp" "--difftest:difftest"; do
         _flag="${_e%%:*}"; _name="${_e##*:}"
         run_guest "thumb" "darwin" "$_g" "$_flag" "$_name" "$ROOT/_build/$_g" "$_g"
+    done
+done
+for _g in $GUESTS_ARMEL; do
+    if [ ! -x "$ROOT/_build/$_g" ]; then
+        parity_row "armel" "darwin" "$_g" "dbt" "GAP" "0" "missing guest $_g"
+        continue
+    fi
+    for _e in "--dbt:dbt" "--interp:interp" "--difftest:difftest"; do
+        _flag="${_e%%:*}"; _name="${_e##*:}"
+        run_guest "armel" "darwin" "$_g" "$_flag" "$_name" "$ROOT/_build/$_g" "$_g"
     done
 done
 if [ -x "$BENCH_ARMHF" ]; then
@@ -230,8 +361,11 @@ rm -rf "$_AOTDIR" "$_AOT1" "$_AOT2"
 
 # --- P3 cached-GPR/FPR signal-frame check ---
 # Structural: side-table recovery (saved_regs/saved_vfp_d) plus VFP
-# sigframe (fpregs/fpscr) in src/signals.c; execution: test-m3-armhf runs
-# identically on both engines (signal delivery coherence).
+# sigframe (fpregs/fpscr) in src/signals.c.  Behavioral parity lives in
+# the test-m3-armhf run_engine interp/dbt rows below (dbt currently
+# outruns interp: open futex wait-queues + NEON interp gaps; the lockstep
+# difftest cannot gate threaded+signalled guests, so m3 has goldens but
+# no difftest row — cf. the catalogue's "where single-thread/supported").
 _t0=$(parity_now_ms)
 _P3DET=""
 if ! grep -q "saved_regs" "$ROOT/src/signals.c"; then
@@ -240,17 +374,6 @@ elif ! grep -q "saved_vfp_d" "$ROOT/src/signals.c"; then
     _P3DET="signals.c lacks saved_vfp_d"
 elif ! grep -q "fpregs" "$ROOT/src/signals.c"; then
     _P3DET="signals.c lacks VFP fpregs"
-fi
-if [ -z "$_P3DET" ] && [ -x "$ROOT/_build/test-m3-armhf" ]; then
-    _m3a=$(mktemp /tmp/a32m3a.XXXXXX); _m3b=$(mktemp /tmp/a32m3b.XXXXXX)
-    perl -e 'alarm 15; exec @ARGV' "$RT_DARWIN" --dbt -- "$ROOT/_build/test-m3-armhf" >"$_m3a" 2>&1; _rca=$?
-    perl -e 'alarm 15; exec @ARGV' "$RT_DARWIN" --interp -- "$ROOT/_build/test-m3-armhf" >"$_m3b" 2>&1; _rcb=$?
-    if [ "$_rca" -ne "$_rcb" ]; then
-        _P3DET="m3 dbt rc=$_rca vs interp rc=$_rcb"
-    elif ! cmp -s "$_m3a" "$_m3b"; then
-        _P3DET="m3 dbt/interp output differs"
-    fi
-    rm -f "$_m3a" "$_m3b"
 fi
 _t1=$(parity_now_ms)
 _ms=0

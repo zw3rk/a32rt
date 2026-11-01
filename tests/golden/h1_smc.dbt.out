@@ -1,0 +1,4 @@
+H1_SMC exec-before-patch ok
+H1_SMC mprotect-rwx ok
+H1_SMC exec-after-patch ok
+H1_SMC ALL_OK

@@ -330,6 +330,15 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
             a32_interp_vfp_step(ctx, insn)) {
             return (ctx->exit_reason == A32_EXIT_FAULT) ? A32_EXIT_FAULT : A32_EXIT_NONE;
         }
+        /* Unconditional hints (mask set mirrors the DBT contract in
+         * interp_a32_ctl.c decode_a32_insn exactly): barriers and
+         * CLREX/PLD are NOPs under the interpreter. */
+        if ((insn & 0xFFF000F0U) == 0xF5700050U || (insn & 0xFFF000F0U) == 0xF5700040U ||
+            (insn & 0xFFF000F0U) == 0xF5700060U || insn == 0xF57FF01FU ||
+            (insn & 0xFD70F000U) == 0xF450F000U || (insn & 0xFD30F000U) == 0xF510F000U) {
+            ctx->regs[15] = pc + 4U;
+            return A32_EXIT_NONE;
+        }
         if ((insn & 0x0FFFFFF0U) == 0x07F000F0U) {
             ctx->regs[15] = pc + 4U;
             i_undef(ctx);
@@ -829,6 +838,29 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
     /* Data processing / misc. */
     if (((insn >> 25) & 7U) <= 1U) {
         return a32_dp_step(ctx, pc, insn);
+    }
+    /* MRC / MCR p15 (TPIDRURO/RW + barriers).  Mask set mirrors the
+     * DBT contract in core_emit_shared.c a64_emit_cp15 exactly (the
+     * 0x0FFF0FFF mask drops cond + Rt; Rt is decoded separately).
+     * Conditional execution already passed at function entry. */
+    {
+        uint32_t masked = insn & 0x0FFF0FFFU;
+        unsigned rt = (insn >> 12) & 0xFU;
+        if (masked == 0x0E1D0F70U || masked == 0x0E1D0F50U) {
+            ctx->regs[rt] = ctx->tls_tp; /* TPIDRURO / TPIDRURW read */
+            ctx->regs[15] = pc + 4U;
+            return A32_EXIT_NONE;
+        }
+        if (masked == 0x0E0D0F50U) {
+            ctx->tls_tp = ctx->regs[rt]; /* TPIDRURW write */
+            ctx->regs[15] = pc + 4U;
+            return A32_EXIT_NONE;
+        }
+        if (masked == 0x0E070FBAU || masked == 0x0E070F9AU ||
+            masked == 0x0E070F95U) {
+            ctx->regs[15] = pc + 4U; /* DMB / DSB / ISB: nop */
+            return A32_EXIT_NONE;
+        }
     }
     ctx->regs[15] = pc + 4U;
     i_undef(ctx);
