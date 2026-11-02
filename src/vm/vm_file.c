@@ -166,7 +166,31 @@ int a32_vmfile_map_staged(void *hint_addr, size_t len, int host_fd,
 
 static int vmfile_create_shared_anon_fd(size_t len)
 {
-    char tmpl[] = "/tmp/a32-shanon-XXXXXX";
+#if defined(__linux__)
+    int mfd = memfd_create("a32-shanon", MFD_CLOEXEC);
+    if (mfd >= 0) {
+        size_t mhp = a32_backend_page_size();
+        size_t mfsize = (len + mhp - 1U) & ~(mhp - 1U);
+        if (ftruncate(mfd, (off_t)mfsize) != 0) {
+            int merr = errno;
+            close(mfd);
+            return -merr;
+        }
+        return mfd;
+    }
+#endif
+    const char *dir = getenv("TMPDIR");
+    if (dir == NULL || dir[0] == '\0') {
+        dir = getenv("A32RT_CACHE");
+    }
+    if (dir == NULL || dir[0] == '\0') {
+        dir = "/tmp";
+    }
+    char tmpl[256];
+    int tlen = snprintf(tmpl, sizeof(tmpl), "%s/a32-shanon-XXXXXX", dir);
+    if (tlen <= 0 || (size_t)tlen >= sizeof(tmpl)) {
+        return -ENAMETOOLONG;
+    }
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         return -errno;

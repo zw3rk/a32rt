@@ -301,10 +301,11 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
 
 static bool vm_range_overlaps_locked(uint32_t start, uint32_t end)
 {
+    size_t hp = a32_backend_page_size();
     for (size_t i = 0U; i < g_vm_region_count && g_vm_regions[i].start < end; i++) {
-        if (g_vm_regions[i].end > start) {
-            return true;
-        }
+        uint64_t re = (uint64_t)g_vm_regions[i].end;
+        if (hp > 4096U && (g_vm_regions[i].flags & 0x01U) != 0U) { re = (re + hp - 1U) & ~(hp - 1U); }
+        if (re > (uint64_t)start) { return true; }
     }
     return false;
 }

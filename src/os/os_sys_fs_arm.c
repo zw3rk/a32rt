@@ -426,7 +426,7 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
             char kbuf[16];
             size_t n = 0U;
             bool ok = false;
-            for (; n < 16U; n++) {
+            for (; n < 15U; n++) {
                 if (!guest_read(ctx, &kbuf[n], a1 + (uint32_t)n, 1U)) {
                     break;
                 }
@@ -434,10 +434,11 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
                     ok = true;
                     break;
                 }
-                if (n == 15U) {
-                    kbuf[15] = '\0';
-                    ok = true;
-                }
+            }
+            if (!ok && n == 15U) {
+                kbuf[15] = '\0';
+                n = 16U;
+                ok = true;
             }
             FAIL_EFAULT_IF(!ok);
             memcpy(tls_comm, kbuf, n);
