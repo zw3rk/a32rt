@@ -1,12 +1,5 @@
 /*
- * src/dbt/dbt_aot_cache.c - split-TU part 1/2 of src/aot.c (lines 1-525).
- * Compiled only via the src/aot.c wrapper; do not add to Makefile SRCS.
- *
- * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
- * SPDX-License-Identifier: Apache-2.0
- */
-/*
- * src/aot.c — Ahead-Of-Time (AOT) pre-translator and disk cache
+ * src/dbt/dbt_aot_cache.c — Ahead-Of-Time (AOT) disk cache serialization and loading
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
@@ -30,9 +23,8 @@
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
 #define A32_AOT_VERSION    8U
-#define A32_MAX_AOT_SCAN   4096U
 #define A32_AOT_MAX_BLOCKS 16384U
-#define A32_AOT_MAX_WORDS  2048U
+#define A32_AOT_MAX_WORDS  4096U
 #define A32_AOT_MAX_PC_MAP 256U
 
 typedef struct a32_aot_header {
@@ -41,11 +33,6 @@ typedef struct a32_aot_header {
     uint32_t num_blocks;
     uint32_t load_bias;
 } a32_aot_header_t;
-
-static inline int32_t sign_extend_24(uint32_t v)
-{
-    return (v & 0x00800000U) ? (int32_t)(v | 0xFF000000U) : (int32_t)(v & 0x00FFFFFFU);
-}
 
 typedef struct a32_aot_block_header {
     uint32_t guest_pc;
@@ -585,12 +572,3 @@ int a32_aot_load_fd(a32_ctx_t *ctx, int fd, uint32_t load_bias)
     }
     return load_cache_from_path(ctx, cache_path, load_bias, true);
 }
-
-typedef struct aot_scan_buf {
-    const a32_ctx_t *ctx;
-    uint32_t        *pcs;
-    bool            *thumbs;
-    uint32_t        *seen_keys;
-    size_t           count;
-    size_t           limit;
-} aot_scan_buf_t;

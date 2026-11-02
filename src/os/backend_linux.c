@@ -65,9 +65,9 @@ static int host_prot(int linux_prot)
 }
 
 int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
-    int fixed, int replace, void **out_host_addr)
+    int fixed, int replace, int shared, void **out_host_addr)
 {
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int flags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_ANONYMOUS;
     void *res;
     if (len == 0U || out_host_addr == NULL) {
         return -EINVAL;

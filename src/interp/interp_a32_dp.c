@@ -1,17 +1,116 @@
 /*
- * src/interp/interp_a32_dp.c - split-TU part 2/2 of src/decode_a32.c (lines 646-1116).
- * Compiled only via the src/decode_a32.c wrapper; do not add to Makefile SRCS.
+ * src/interp/interp_a32_dp.c — A32 data-processing, multiply, exclusive, and extra L/S lowering
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "interp/decode_priv.h"
+
+unsigned emit_a32_shifted_reg(a64_buf_t *b, uint32_t insn, uint32_t pc_val,
+                              unsigned out_reg, bool want_carry, unsigned *out_carry_reg)
+{
+    unsigned rm = insn & 0xFU;
+    unsigned shift_type = (insn >> 5) & 3U;
+    bool by_reg = ((insn >> 4) & 1U) != 0U;
+    unsigned src_m = a32_load_reg(b, rm, pc_val, out_reg);
+
+    if (!by_reg) {
+        a64_emit_shift_imm_w(b, out_reg, src_m, shift_type, (insn >> 7) & 31U,
+                             want_carry, out_carry_reg);
+        return out_reg;
+    }
+
+    if (out_carry_reg) {
+        *out_carry_reg = A64_ZR;
+    }
+    unsigned rs = (insn >> 8) & 0xFU;
+    unsigned src_s = a32_load_reg(b, rs, pc_val, A64_TMP2);
+    bool calc_carry = want_carry && (out_carry_reg != NULL);
+    a64_emit_arm_shift_reg_w(b, out_reg, src_m, src_s, shift_type, calc_carry);
+    if (calc_carry) {
+        *out_carry_reg = A64_TMP2;
+    }
+    return out_reg;
+}
+
+bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_val,
+                        uint32_t insn, unsigned cond, unsigned op1, bool flags_live,
+                        bool *out_ends_block)
+{
+    bool handled = false;
+    {
+        if (op1 == 0U && (insn & 0x0FFFFFF0U) == 0x012FFF10U) {
+            /* BX Rm */
+            unsigned rm = insn & 0xFU;
+            unsigned target = a32_load_reg(b, rm, pc_val, A64_TMP0);
+            a64_emit_exit_branch_reg(b, target, true);
+            if (cond == A64_COND_AL) {
+                *out_ends_block = true;
+            }
+            handled = true;
+        } else if (op1 == 0U && (insn & 0x0FFFFFF0U) == 0x012FFF30U) {
+            /* BLX Rm */
+            unsigned rm = insn & 0xFU;
+            unsigned target = a32_load_reg(b, rm, pc_val, A64_TMP0);
+            if (rm == 14U) {
+                a64_emit_mov_w(b, A64_TMP0, target);
+                target = A64_TMP0;
+            }
+            a64_emit_mov_pc32(b, 14U, pc + 4U);
+            if (cond == A64_COND_AL) {
+                b->is_call = true;
+                *out_ends_block = true;
+            }
+            a64_emit_exit_branch_reg(b, target, true);
+            handled = true;
+        } else if (op1 == 0U && (insn & 0x0FFF0FF0U) == 0x016F0F10U) {
+            /* CLZ Rd, Rm */
+            a64_emit_clz_w(b, (insn >> 12) & 0xFU, insn & 0xFU);
+            handled = true;
+        } else if (op1 == 1U && ((insn & 0x0FB00000U) == 0x03000000U)) {
+            /* MOVW (bit 22 == 0) / MOVT (bit 22 == 1) */
+            bool is_movt = ((insn >> 22) & 1U) != 0U;
+            unsigned rd = (insn >> 12) & 0xFU;
+            uint16_t imm16 = (uint16_t)(((insn >> 4) & 0xF000U) | (insn & 0xFFFU));
+            if (is_movt) {
+                a64_emit_movk_w(b, rd, imm16, 1U);
+            } else {
+                a64_emit_movz_w(b, rd, imm16, 0U);
+            }
+            handled = true;
+        } else if (op1 == 1U && ((insn & 0x0FFFFFF0U) == 0x0320F000U)) {
+            /* NOP / YIELD / WFE / WFI hints */
+            handled = true;
+        } else if (op1 == 0U && ((insn & 0x0FBF0FFFU) == 0x010F0000U)) {
+            /* MRS Rd, CPSR */
+            a64_emit_mrs_cpsr(b, (insn >> 12) & 0xFU);
+            handled = true;
+        } else if (op1 == 0U && (insn & 0x0FF0FFF0U) == 0x0120F000U &&
+                   ((insn >> 16) & 0xFU) != 0U) {
+            /* MSR APSR/CPSR_<fields>, Rm */
+            unsigned src = a32_load_reg(b, insn & 0xFU, pc_val, A64_TMP0);
+            a64_emit_msr_cpsr_reg(b, src, (insn >> 16) & 0xFU);
+            handled = true;
+        } else if (op1 == 1U && (insn & 0x0FF0F000U) == 0x0320F000U &&
+                   ((insn >> 16) & 0xFU) != 0U) {
+            /* MSR APSR/CPSR_<fields>, #imm */
+            uint32_t imm32 = a32_ror32(insn & 0xFFU, ((insn >> 8) & 0xFU) * 2U);
+            a64_emit_mov_imm32(b, A64_TMP0, imm32);
+            a64_emit_msr_cpsr_reg(b, A64_TMP0, (insn >> 16) & 0xFU);
+            handled = true;
+        } else if (op1 == 0U && ((insn & 0x0FB00FF0U) == 0x01000090U)) {
+            /* SWP / SWPB */
+            bool b_bit = ((insn >> 22) & 1U) != 0U;
+            unsigned rn = (insn >> 16) & 0xFU;
+            unsigned rd = (insn >> 12) & 0xFU;
+            unsigned rm = insn & 0xFU;
             unsigned src_raw = a32_load_reg(b, rm, pc_val, A64_TMP1);
             a64_emit_mov_w(b, A64_TMP1, src_raw);
             unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
 
             /* Compute 64-bit host address in x22 = xG + uxtw(wRn) */
-            a64_emit_add_uxtw_x(b, A64_ADDR, A64_XG, rn);
+            a64_emit_guest_addr_x(b, A64_ADDR, rn, b_bit ? 1U : 4U, true);
 
             size_t loop_top = b->count;
             if (b_bit) {
@@ -31,8 +130,9 @@
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rt = insn & 0xFU;
+            uint32_t ex_span = (ex_op < 2U) ? 4U : (ex_op < 4U) ? 8U : (ex_op < 6U) ? 1U : 2U;
 
-            a64_emit_add_uxtw_x(b, A64_ADDR, A64_XG, rn);
+            a64_emit_guest_addr_x(b, A64_ADDR, rn, ex_span, (ex_op & 1U) == 0U);
 
             switch (ex_op) {
             case 0U: /* STREX Rd, Rt, [Rn] */
@@ -378,101 +478,5 @@
             }
         }
     }
-
-    if (!handled) {
-        if (ctx->trace_enabled) {
-            fprintf(stderr, "a32rt: unhandled A32 instruction 0x%08x at pc=0x%08x\n", insn, pc);
-        }
-        a64_emit_exit_undef(b, pc);
-        if (cond == A64_COND_AL) {
-            *out_ends_block = true;
-        }
-    }
-    if (cond != A64_COND_AL) {
-        a64_patch_b_cond(b, cond_skip, b->count);
-    }
-    return true;
-}
-
-bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
-{
-    uint32_t pc = start_pc & ~3U;
-    uint32_t block_insns[A32_MAX_BLOCK_INSNS];
-    bool     flags_live[A32_MAX_BLOCK_INSNS];
-    unsigned num_insns = 0U;
-    unsigned max_insns = ctx->single_step ? 1U : A32_MAX_BLOCK_INSNS;
-
-    /* Pre-pass: scan guest instructions in the basic block */
-    for (unsigned i = 0U; i < max_insns; i++) {
-        uint32_t insn_pc = pc + (i * 4U);
-        if (i > 0U && (insn_pc & 0xFFFU) == 0U && !a32_jit_range_executable(ctx, insn_pc, 4U)) {
-            break;
-        }
-        if (ctx->gdb_enabled && i > 0U && a32_gdb_has_breakpoint(insn_pc)) {
-            break;
-        }
-        const uint32_t *guest_code = (const uint32_t *)a32_guest_ptr(ctx, insn_pc);
-        uint32_t insn = *guest_code;
-        block_insns[i] = insn;
-        num_insns++;
-        if (a32_insn_uncond_ends_block(insn)) {
-            break;
-        }
-        if (((insn >> 28) & 0xFU) < 14U && ((insn >> 25) & 7U) == 5U && ((insn >> 24) & 1U) == 0U) {
-            int32_t imm24 = (int32_t)(insn & 0x00FFFFFFU);
-            if (imm24 & 0x00800000) {
-                imm24 |= (int32_t)0xFF000000U;
-            }
-            uint32_t target = insn_pc + 8U + (uint32_t)(imm24 << 2);
-            if (target == pc) {
-                break;
-            }
-        }
-    }
-
-    /* Liveness analysis: determine for each instruction whether NZCV flags output is live */
-    bool live = true;
-    for (int i = (int)num_insns - 1; i >= 0; i--) {
-        uint32_t insn = block_insns[i];
-        flags_live[i] = live;
-        if (a32_insn_overwrites_all_flags(insn)) {
-            live = false;
-        }
-        if (a32_insn_reads_flags(insn)) {
-            live = true;
-        }
-    }
-
-    /* Translation & emission loop */
-    for (unsigned i = 0U; i < num_insns; i++) {
-        uint32_t cur_pc = pc + (i * 4U);
-        if (i > 0U && b->cap > b->count && b->cap - b->count < 128U) {
-            b->guest_end_pc = cur_pc;
-            a64_emit_exit_branch_imm(b, cur_pc, false);
-            return true;
-        }
-        uint32_t insn = block_insns[i];
-
-        /* Side-Table PC Recording */
-        a32_jit_record_pc_map((uint32_t)b->count, cur_pc, 0U);
-
-        bool ends_block = false;
-        if (!decode_a32_insn(ctx, b, cur_pc, insn, flags_live[i], &ends_block)) {
-            if (ctx->trace_enabled) {
-                fprintf(stderr, "a32rt: unhandled A32 instruction 0x%08x at pc=0x%08x\n", insn, cur_pc);
-            }
-            a64_emit_exit_undef(b, cur_pc);
-            b->guest_end_pc = cur_pc + 4U;
-            return true;
-        }
-        if (ends_block) {
-            b->guest_end_pc = cur_pc + 4U;
-            return true;
-        }
-    }
-
-    uint32_t end_pc = pc + (num_insns * 4U);
-    b->guest_end_pc = end_pc;
-    a64_emit_exit_branch_imm(b, end_pc, false);
-    return true;
+    return handled;
 }

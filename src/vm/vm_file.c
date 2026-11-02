@@ -44,9 +44,42 @@ typedef struct {
     uint64_t code_generation;
 } a32_vmfile_inode_t;
 
+typedef struct {
+    bool used;
+    uint64_t dev;
+    uint64_t ino;
+    uint32_t start_gva;
+    uint32_t end_gva;
+    uint64_t file_offset;
+} a32_vmfile_map_t;
+
 static a32_vmfile_inode_t g_inodes[A32_VMFILE_SLOTS];
+static a32_vmfile_map_t g_fmaps[A32_VMFILE_SLOTS];
 static pthread_mutex_t g_vmfile_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_code_generation = 1U;
+
+static void fmap_record_locked(uint64_t dev, uint64_t ino, uint32_t start_gva,
+    uint32_t end_gva, uint64_t file_offset)
+{
+    unsigned slot = A32_VMFILE_SLOTS;
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_fmaps[i].used && g_fmaps[i].start_gva == start_gva) {
+            slot = i;
+            break;
+        }
+        if (!g_fmaps[i].used && slot == A32_VMFILE_SLOTS) {
+            slot = i;
+        }
+    }
+    if (slot < A32_VMFILE_SLOTS) {
+        g_fmaps[slot].used = true;
+        g_fmaps[slot].dev = dev;
+        g_fmaps[slot].ino = ino;
+        g_fmaps[slot].start_gva = start_gva;
+        g_fmaps[slot].end_gva = end_gva;
+        g_fmaps[slot].file_offset = file_offset;
+    }
+}
 
 static a32_vmfile_inode_t *inode_intern_locked(uint64_t dev, uint64_t ino)
 {
@@ -102,7 +135,7 @@ int a32_vmfile_populate_if_private(void *hva, int host_fd,
     }
     if (rc != 0) {
         void *out = NULL;
-        (void)a32_backend_map_anon(hva, len, 0, 1, 1, &out);
+        (void)a32_backend_map_anon(hva, len, 0, 1, 1, 0, &out);
     }
     return rc;
 }
@@ -120,7 +153,7 @@ int a32_vmfile_map_staged(void *hint_addr, size_t len, int host_fd,
         return -EINVAL;
     }
     return a32_backend_map_anon(hint_addr, len, PROT_READ | PROT_WRITE,
-        1, 1, out);
+        1, 1, 0, out);
 }
 
 /* Reserve the host mapping for one guest range and pread-populate it.
@@ -144,7 +177,7 @@ int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
             file_offset, &res);
     } else if ((host_flags & MAP_ANONYMOUS) != 0) {
         map_rc = a32_backend_map_anon(host_target, len, host_prot,
-            1, 1, &res);
+            1, 1, (host_flags & MAP_SHARED) != 0, &res);
     } else {
         map_rc = a32_backend_map_file(host_target, len, host_prot,
             (host_flags & MAP_SHARED) != 0, 1, 1, host_fd, file_offset,
@@ -170,7 +203,11 @@ int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
     if (hva == NULL || host_fd < 0 || len == 0U) {
         return -EINVAL;
     }
-    if (fstat(host_fd, &st) == 0) {
+    if (fstat(host_fd, &st) != 0) {
+        return -errno;
+    }
+    {
+        uintptr_t arena = a32_vm32_arena_base();
         pthread_mutex_lock(&g_vmfile_lock);
         a32_vmfile_inode_t *e =
             inode_intern_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
@@ -179,6 +216,15 @@ int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
             if (end > e->file_size) {
                 e->file_size = end;
             }
+            if ((uint64_t)st.st_size > e->file_size) {
+                e->file_size = (uint64_t)st.st_size;
+            }
+        }
+        if ((uintptr_t)hva >= arena &&
+            ((uintptr_t)hva - arena) + len <= A32_VM32_WINDOW_SIZE) {
+            uint32_t sgva = (uint32_t)((uintptr_t)hva - arena);
+            fmap_record_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+                sgva, sgva + (uint32_t)len, file_offset);
         }
         pthread_mutex_unlock(&g_vmfile_lock);
     }
@@ -247,7 +293,7 @@ void a32_vmfile_promote_range(uint32_t start_gva, uint32_t end_gva,
  * observes file bytes instead of stale dirty pages. */
 static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
 {
-    uint32_t cut;
+    uint64_t cut_off = (new_size + 0xFFFULL) & ~0xFFFULL;
     unsigned i;
     bool shrink = false;
     pthread_mutex_lock(&g_vmfile_lock);
@@ -266,11 +312,25 @@ static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
             g_inodes[i].file_size = new_size;
         }
     }
-    pthread_mutex_unlock(&g_vmfile_lock);
     if (shrink) {
-        cut = (uint32_t)(((new_size + 0xFFFU) & ~0xFFFU) & 0xFFFFFFFFU);
-        a32_vm32_tlb_invalidate_range(cut, 0U);
+        for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+            if (!g_fmaps[i].used || g_fmaps[i].dev != dev ||
+                g_fmaps[i].ino != ino) {
+                continue;
+            }
+            uint64_t map_len = (uint64_t)(g_fmaps[i].end_gva - g_fmaps[i].start_gva);
+            uint64_t map_end_off = g_fmaps[i].file_offset + map_len;
+            if (map_end_off > cut_off) {
+                uint64_t inv_off = (cut_off > g_fmaps[i].file_offset)
+                    ? (cut_off - g_fmaps[i].file_offset) : 0ULL;
+                uint32_t inv_start = g_fmaps[i].start_gva + (uint32_t)inv_off;
+                if (g_fmaps[i].end_gva > inv_start) {
+                    a32_vm32_tlb_invalidate_range(inv_start, g_fmaps[i].end_gva);
+                }
+            }
+        }
     }
+    pthread_mutex_unlock(&g_vmfile_lock);
     return 0;
 }
 
@@ -300,46 +360,6 @@ int a32_vmfile_sync_path(const char *host_path)
         (uint64_t)st.st_size);
 }
 
-int a32_vmfile_on_truncate(uint64_t new_size)
-{
-    uint32_t cut = (uint32_t)(((new_size + 0xFFFU) & ~0xFFFU) & 0xFFFFFFFFU);
-    unsigned i;
-    pthread_mutex_lock(&g_vmfile_lock);
-    g_code_generation++;
-    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (!g_inodes[i].used) {
-            continue;
-        }
-        g_inodes[i].resize_seq++;
-        g_inodes[i].code_generation = g_code_generation;
-        if ((uint64_t)cut < g_inodes[i].file_size) {
-            /* Discard wholly-removed MAP_PRIVATE tails so a later regrow
-             * observes clean file bytes, not stale dirty pages. */
-            a32_vm32_tlb_invalidate_range(cut, 0U);
-            g_inodes[i].file_size = (uint64_t)cut;
-        }
-    }
-    pthread_mutex_unlock(&g_vmfile_lock);
-    return 0;
-}
-
-int a32_vmfile_hook_write(uint64_t end_offset)
-{
-    unsigned i;
-    pthread_mutex_lock(&g_vmfile_lock);
-    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (!g_inodes[i].used) {
-            continue;
-        }
-        if (end_offset > g_inodes[i].file_size) {
-            g_inodes[i].file_size = end_offset;
-            g_inodes[i].resize_seq++;
-        }
-    }
-    pthread_mutex_unlock(&g_vmfile_lock);
-    return 0;
-}
-
 typedef struct {
     bool used;
     uint32_t start_gva;
@@ -353,6 +373,7 @@ static a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
 void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
     uint32_t pgoffset)
 {
+    struct stat st;
     if (fd < 0 || start_gva >= end_gva) {
         return;
     }
@@ -360,7 +381,17 @@ void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
     if (dup_fd < 0) {
         return;
     }
+    bool have_st = (fstat(dup_fd, &st) == 0);
     pthread_mutex_lock(&g_vmfile_lock);
+    if (have_st) {
+        a32_vmfile_inode_t *e =
+            inode_intern_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
+        if (e != NULL && (uint64_t)st.st_size > e->file_size) {
+            e->file_size = (uint64_t)st.st_size;
+        }
+        fmap_record_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+            start_gva, end_gva, (uint64_t)pgoffset * 4096ULL);
+    }
     unsigned slot = A32_VMFILE_SLOTS;
     for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
         if (g_shared[i].used && g_shared[i].start_gva == start_gva) {
@@ -415,6 +446,10 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
             g_shared[i].end_gva <= unmap_end) {
             close(g_shared[i].dup_fd);
             g_shared[i].used = false;
+        }
+        if (g_fmaps[i].used && g_fmaps[i].start_gva >= unmap_start &&
+            g_fmaps[i].end_gva <= unmap_end) {
+            g_fmaps[i].used = false;
         }
     }
     pthread_mutex_unlock(&g_vmfile_lock);

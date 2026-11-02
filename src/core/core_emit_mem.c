@@ -1,10 +1,187 @@
 /*
- * src/core/core_emit_mem.c - split-TU part 2/3 of src/a64_emit.c (lines 603-1367).
- * Compiled only via the src/a64_emit.c wrapper; do not add to Makefile SRCS.
+ * src/core/core_emit_mem.c — Direct 32-bit AArch64 memory, VFP & branch encoder
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#include "a64_emit.h"
+#include "dbt/aot/aot.h"
+
+extern uint32_t a32_jit_last_record_pc(void);
+
+/* ---- Per-block AOT site staging (P2 #7) ---- */
+static a32_vm32_mem_site_t g_site_stage[A32_AOT_SITE_PER_BLOCK];
+static uint32_t g_site_stage_base = 0U;
+static uint32_t g_site_stage_count = 0U;
+static bool g_site_stage_valid = false;
+
+void a32_emit_sites_flush(void)
+{
+    if (g_site_stage_valid && g_site_stage_count > 0U) {
+        (void)a32_aot_site_track(g_site_stage_base, g_site_stage,
+            g_site_stage_count);
+    }
+    g_site_stage_valid = false;
+    g_site_stage_count = 0U;
+}
+
+static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
+    unsigned addr_w, uint32_t host_off)
+{
+    a32_vm32_mem_site_t rec;
+    uint32_t cur_pc;
+    if (g_site_stage_valid && b->guest_start_pc != g_site_stage_base) {
+        a32_emit_sites_flush();
+    }
+    if (g_site_stage_count >= A32_AOT_SITE_PER_BLOCK) {
+        return;
+    }
+    cur_pc = a32_jit_last_record_pc();
+    memset(&rec, 0, sizeof(rec));
+    rec.seq_start_offset = 0U;
+    rec.host_insn_offset = (uint16_t)(host_off & 0xFFFFU);
+    rec.cont_insn_offset = 0U;
+    rec.guest_pc_delta = cur_pc - b->guest_start_pc;
+    rec.npc_delta = 4;
+    rec.insn_word = 0U;
+    rec.sp_rollback_delta = 0;
+    rec.npc_mode = (uint8_t)A32_VM32_NPC_SEQUENTIAL;
+    rec.width = (uint8_t)(1U << ((opc >> 30U) & 3U));
+    rec.flags = (((opc & 0x400000U) == 0U) ? (uint8_t)A32_VM32_SITE_STORE : 0U);
+    if (rec.width <= 2U && (opc & 0x800000U) != 0U) {
+        rec.flags |= (uint8_t)A32_VM32_SITE_SIGNED;
+    }
+    rec.val_or_dst_reg = (uint8_t)(rt & 0xFFU);
+    rec.addr_base_reg = (uint8_t)(addr_w & 0xFFU);
+    rec.reserved = 0U;
+    g_site_stage[g_site_stage_count++] = rec;
+    g_site_stage_base = b->guest_start_pc;
+    g_site_stage_valid = true;
+}
+
+/* X-form MOVZ/MOVK for 64-bit immediates (TLB-base materialization). */
+static void emit_movz_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
+{
+    a64_emit(b, 0xD2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
+}
+
+static void emit_movk_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
+{
+    a64_emit(b, 0xF2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
+}
+
+static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_span, bool is_store)
+{
+    uint64_t base = (uint64_t)a32_vm32_tlb_base;
+    uint16_t h0 = (uint16_t)(base & 0xFFFFU);
+    uint16_t h1 = (uint16_t)((base >> 16) & 0xFFFFU);
+    uint16_t h2 = (uint16_t)((base >> 32) & 0xFFFFU);
+    uint16_t h3 = (uint16_t)((base >> 48) & 0xFFFFU);
+    uint32_t cur_pc = a32_jit_last_record_pc();
+    uint32_t tag_off = is_store ? 16U : 0U;
+
+    emit_movz_x(b, 21U, h0, 0U);
+    if (h1 != 0U) {
+        emit_movk_x(b, 21U, h1, 1U);
+    }
+    if (h2 != 0U) {
+        emit_movk_x(b, 21U, h2, 2U);
+    }
+    if (h3 != 0U) {
+        emit_movk_x(b, 21U, h3, 3U);
+    }
+    /* 20-bit Soft-TLB index: gva >> 12 (into x21 = &g_tlb[idx]). */
+    a64_emit_ubfm_w(b, 23U, addr_w, 12U, 31U);
+    a64_emit_orr_reg_w(b, 23U, A64_ZR, 23U, A64_SHIFT_LSL, 5U);
+    a64_emit_add_uxtw_x(b, 21U, 21U, 23U);
+    /* 64-bit tag load: ldr x23, [x21, #tag_off]; lsr x23, x23, #12 */
+    a64_emit(b, 0xF9400000U | ((tag_off / 8U) << 10) | (21U << 5) | 23U);
+    a64_emit(b, 0xD34CFC00U | (23U << 5) | 23U);
+    a64_emit_eor_reg_w(b, 23U, 23U, addr_w, A64_SHIFT_LSR, 12U);
+
+    if (byte_span <= 1U) {
+        size_t cbz = a64_emit_cbz_w_placeholder(b, false, 23U);
+        a64_emit_str_imm_w(b, addr_w, A64_XCTX,
+            (uint32_t)offsetof(a32_ctx_t, fault_addr));
+        a64_emit_mov_pc32(b, 15U, cur_pc);
+        a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
+        a64_emit_ret(b);
+        a64_patch_cbz_w(b, cbz, b->count);
+    } else {
+        size_t cbnz_miss0 = a64_emit_cbz_w_placeholder(b, true, 23U);
+        /* Fast-path check: does [addr_w, addr_w + byte_span - 1] cross a 4 KiB page? */
+        a64_emit_add_imm_w(b, false, 23U, addr_w, (uint16_t)(byte_span - 1U), 0U);
+        a64_emit_eor_reg_w(b, 23U, 23U, addr_w, A64_SHIFT_LSL, 0U);
+        a64_emit_ubfm_w(b, 23U, 23U, 12U, 31U);
+        size_t cbz_same = a64_emit_cbz_w_placeholder(b, false, 23U);
+
+        /* Cross-page slow path: reject 32-bit wraparound at 0xFFFFFFFF -> 0 */
+        a64_emit_add_imm_w(b, false, 23U, addr_w, (uint16_t)(byte_span - 1U), 0U);
+        a64_emit_ubfm_w(b, 23U, 23U, 12U, 31U);
+        size_t cbz_wrap = a64_emit_cbz_w_placeholder(b, false, 23U);
+
+        /* Verify second page tag at [x21, #(32 + tag_off)] == (addr_w >> 12) + 1 */
+        a64_emit(b, 0xF9400000U | (((32U + tag_off) / 8U) << 10) | (21U << 5) | 23U);
+        a64_emit(b, 0xD34CFC00U | (23U << 5) | 23U);
+        a64_emit_sub_imm_w(b, false, 23U, 23U, 1U, 0U);
+        a64_emit_eor_reg_w(b, 23U, 23U, addr_w, A64_SHIFT_LSR, 12U);
+        size_t cbz_hit2 = a64_emit_cbz_w_placeholder(b, false, 23U);
+
+        /* Second-page fault: fault_addr = addr_w + byte_span - 1 */
+        a64_patch_cbz_w(b, cbz_wrap, b->count);
+        a64_emit_add_imm_w(b, false, 23U, addr_w, (uint16_t)(byte_span - 1U), 0U);
+        a64_emit_str_imm_w(b, 23U, A64_XCTX,
+            (uint32_t)offsetof(a32_ctx_t, fault_addr));
+        a64_emit_mov_pc32(b, 15U, cur_pc);
+        a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
+        a64_emit_ret(b);
+
+        /* First-page fault: fault_addr = addr_w */
+        a64_patch_cbz_w(b, cbnz_miss0, b->count);
+        a64_emit_str_imm_w(b, addr_w, A64_XCTX,
+            (uint32_t)offsetof(a32_ctx_t, fault_addr));
+        a64_emit_mov_pc32(b, 15U, cur_pc);
+        a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
+        a64_emit_ret(b);
+
+        a64_patch_cbz_w(b, cbz_same, b->count);
+        a64_patch_cbz_w(b, cbz_hit2, b->count);
+    }
+    /* Hit: ldr x23, [x21, #8] (addend). */
+    a64_emit(b, 0xF9400000U | (1U << 10) | (21U << 5) | 23U);
+}
+
+void a64_emit_guest_addr_x(a64_buf_t *b, unsigned dst_x, unsigned addr_w,
+                           uint32_t byte_span, bool is_store)
+{
+    if (a32_vm32_current_regime() != A32_VM32_REGIME_A2_SOFT_TLB ||
+        a32_vm32_tlb_base == 0U) {
+        a64_emit_add_uxtw_x(b, dst_x, A64_XG, addr_w);
+        return;
+    }
+    emit_soft_tlb_check(b, addr_w, byte_span, is_store);
+    a64_emit_add_uxtw_x(b, dst_x, 23U, addr_w);
+}
+
+static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned addr_w)
+{
+    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+        a64_vfp_cache_flush(b, false);
+    }
+    emit_site_record(b, opc, rt, addr_w, (uint32_t)b->count);
+    if (a32_vm32_current_regime() != A32_VM32_REGIME_A2_SOFT_TLB ||
+        a32_vm32_tlb_base == 0U) {
+        a64_emit(b, opc | ((addr_w & 31U) << 16) | (A64_XG << 5) | (rt & 31U));
+        return;
+    }
+    {
+        uint32_t width = 1U << ((opc >> 30U) & 3U);
+        bool is_store = ((opc & 0x400000U) == 0U);
+        emit_soft_tlb_check(b, addr_w, width, is_store);
+        a64_emit(b, opc | ((addr_w & 31U) << 16) | (23U << 5) | (rt & 31U));
+    }
+}
 
 /* Guest memory accesses: [xG, wAddr, uxtw #0] */
 void a64_emit_guest_ldr_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
@@ -22,7 +199,7 @@ void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned add
     if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
-    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, addr_w);
+    a64_emit_guest_addr_x(b, A64_TMP2, addr_w, 8U, false);
     if (rt != rt2) {
         a64_emit(b, 0x29400000U | ((rt2 & 31U) << 10) | (A64_TMP2 << 5) | (rt & 31U));
     } else {
@@ -35,7 +212,7 @@ void a64_emit_guest_strd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned add
     if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
-    a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, addr_w);
+    a64_emit_guest_addr_x(b, A64_TMP2, addr_w, 8U, true);
     a64_emit(b, 0x29000000U | ((rt2 & 31U) << 10) | (A64_TMP2 << 5) | (rt & 31U));
 }
 
@@ -111,116 +288,7 @@ void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_
     emit_ctx_mem_imm(b, 0xB9000000U, 2U, true, rt, rn_x, byte_offset);
 }
 
-/* VFPv4-D32 / NEON context & guest memory loads/stores */
-static void vfp_ldr_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
-{
-    vfp_record_preheader_access(b, kind, (uint8_t)idx, false);
-    if (b->self_loop_vfp_active) {
-        for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-            if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
-                vfp_emit_reg_mov(b, kind, vt, 8U + i);
-                return;
-            }
-        }
-        vfp_emit_raw_ldr(b, kind, vt, idx);
-        return;
-    }
-    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-        if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&
-            vfp_regs_alias(b->vfp_slot_kind[i], b->vfp_slot_reg[i], kind, (uint8_t)idx)) {
-            vfp_flush_slot(b, i, true);
-        }
-    }
-    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-        if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
-            vfp_emit_reg_mov(b, kind, vt, 8U + i);
-            return;
-        }
-    }
-    vfp_emit_raw_ldr(b, kind, vt, idx);
-    if (b->cond_branch_depth == 0U) {
-        unsigned slot = vfp_alloc_slot(b, kind, (uint8_t)idx);
-        vfp_emit_reg_mov(b, kind, 8U + slot, vt);
-    }
-}
-
-static void vfp_str_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
-{
-    vfp_record_preheader_access(b, kind, (uint8_t)idx, true);
-    if (b->self_loop_vfp_active) {
-        for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-            if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
-                vfp_emit_reg_mov(b, kind, 8U + i, vt);
-                b->vfp_slot_dirty |= (1U << i);
-                return;
-            }
-        }
-        vfp_emit_raw_str(b, kind, vt, idx);
-        return;
-    }
-    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-        if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&
-            vfp_regs_alias(b->vfp_slot_kind[i], b->vfp_slot_reg[i], kind, (uint8_t)idx)) {
-            if (b->vfp_slot_kind[i] < kind && b->cond_branch_depth == 0U) {
-                b->vfp_slot_dirty &= ~(1U << i);
-                b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
-            } else {
-                vfp_flush_slot(b, i, true);
-            }
-        }
-    }
-    if (b->cond_branch_depth == 0U) {
-        for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-            if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
-                vfp_emit_reg_mov(b, kind, 8U + i, vt);
-                b->vfp_slot_dirty |= (1U << i);
-                return;
-            }
-        }
-        unsigned slot = vfp_alloc_slot(b, kind, (uint8_t)idx);
-        vfp_emit_reg_mov(b, kind, 8U + slot, vt);
-        b->vfp_slot_dirty |= (1U << slot);
-        return;
-    }
-    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
-        if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
-            b->vfp_slot_dirty &= ~(1U << i);
-            b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
-        }
-    }
-    vfp_emit_raw_str(b, kind, vt, idx);
-}
-
-void a64_emit_ldr_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx)
-{
-    vfp_ldr_ctx(b, A64_VFP_KIND_S, vt, s_idx);
-}
-
-void a64_emit_str_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx)
-{
-    vfp_str_ctx(b, A64_VFP_KIND_S, vt, s_idx);
-}
-
-void a64_emit_ldr_d_ctx(a64_buf_t *b, unsigned vt, unsigned d_idx)
-{
-    vfp_ldr_ctx(b, A64_VFP_KIND_D, vt, d_idx);
-}
-
-void a64_emit_str_d_ctx(a64_buf_t *b, unsigned vt, unsigned d_idx)
-{
-    vfp_str_ctx(b, A64_VFP_KIND_D, vt, d_idx);
-}
-
-void a64_emit_ldr_q_ctx(a64_buf_t *b, unsigned vt, unsigned q_idx)
-{
-    vfp_ldr_ctx(b, A64_VFP_KIND_Q, vt, q_idx);
-}
-
-void a64_emit_str_q_ctx(a64_buf_t *b, unsigned vt, unsigned q_idx)
-{
-    vfp_str_ctx(b, A64_VFP_KIND_Q, vt, q_idx);
-}
-
+/* VFPv4-D32 / NEON guest memory loads/stores */
 void a64_emit_guest_ldr_s(a64_buf_t *b, unsigned vt, unsigned addr_w)
 {
     emit_guest_mem(b, 0xBC604800U, vt, addr_w);
@@ -518,7 +586,7 @@ void a64_patch_cbz_w(a64_buf_t *b, size_t patch_idx, size_t target_idx)
 
 void a64_emit_ret(a64_buf_t *b)
 {
-    vfp_emit_exit_flush(b);
+    a64_vfp_emit_exit_flush(b);
     a64_emit(b, 0xD65F03C0U);
 }
 
@@ -587,7 +655,7 @@ void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc)
         a64_emit(b, 0x14000000U | ((uint32_t)back_disp & 0x03FFFFFFU));
         /* [9] .Lbail: flush VFP if self_loop_vfp_active, then return to trampoline */
         if (b->self_loop_vfp_active) {
-            vfp_emit_exit_flush(b);
+            a64_vfp_emit_exit_flush(b);
         }
         a64_emit_mov_pc32(b, A64_TMP0, target_pc);
         a64_emit_movz_w(b, A64_TMP1, A32_EXIT_BRANCH, 0U);
@@ -595,7 +663,7 @@ void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc)
         return;
     }
 
-    vfp_emit_exit_flush(b);
+    a64_vfp_emit_exit_flush(b);
 
     unsigned s = A64_MAX_EXIT_SLOTS;
     for (unsigned i = 0U; i < b->exit_slot_count; i++) {
@@ -652,7 +720,7 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
     if (b->lr_written_from_pc) {
         b->is_call = true;
     }
-    vfp_emit_exit_flush(b);
+    a64_vfp_emit_exit_flush(b);
     if (target_reg != A64_TMP0) {
         a64_emit_mov_w(b, A64_TMP0, target_reg);
     }

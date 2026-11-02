@@ -17,16 +17,12 @@
  * the interpreter and the DBT slow path observe one atomic order
  * (section 4.4). All RMWs are C11 __atomic SEQ_CST on HVA. Unaligned
  * addresses cannot reserve: the caller raises UNDEF. */
-static bool g_excl_valid = false;
-static uint32_t g_excl_addr = 0U;
-static unsigned g_excl_size = 0U;
-
 static bool do_ldrex(a32_ctx_t *ctx, uint32_t va, unsigned size,
     uint32_t *out)
 {
     void *hva;
     uint32_t v = 0U;
-    if (out == NULL || (size != 1U && size != 2U && size != 4U) ||
+    if (ctx == NULL || out == NULL || (size != 1U && size != 2U && size != 4U) ||
         (va & (size - 1U)) != 0U) {
         return false;
     }
@@ -39,9 +35,9 @@ static bool do_ldrex(a32_ctx_t *ctx, uint32_t va, unsigned size,
         v = __atomic_load_n((uint32_t *)(void *)hva, __ATOMIC_SEQ_CST);
     }
     a32_vm32_ll_record(ctx, va, size, v);
-    g_excl_valid = true;
-    g_excl_addr = va;
-    g_excl_size = size;
+    ctx->excl_valid = true;
+    ctx->excl_addr = va;
+    ctx->excl_size = size;
     *out = v;
     return true;
 }
@@ -50,15 +46,15 @@ static uint32_t do_strex(a32_ctx_t *ctx, uint32_t va, unsigned size,
     uint32_t val)
 {
     bool have;
-    if (size != 1U && size != 2U && size != 4U) {
+    if (ctx == NULL || (size != 1U && size != 2U && size != 4U)) {
         return 1U;
     }
     if ((va & (size - 1U)) != 0U) {
         return 1U;
     }
-    have = g_excl_valid && g_excl_addr == va && g_excl_size == size &&
+    have = ctx->excl_valid && ctx->excl_addr == va && ctx->excl_size == size &&
         a32_vm32_sc_attempt(ctx, va, size, val);
-    g_excl_valid = false;
+    ctx->excl_valid = false;
     return have ? 0U : 1U;
 }
 
@@ -321,7 +317,7 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
     if (cond == 0xFU) {
         if ((insn & 0xFE000000U) == 0xFA000000U) {
             int32_t off = (int32_t)((insn & 0x00FFFFFFU) << 8) >> 8;
-            uint32_t target = (uint32_t)((int32_t)(pc + 8U) + (off << 2));
+            uint32_t target = (pc + 8U) + ((uint32_t)off << 2U);
             ctx->regs[14] = pc + 4U;
             i_set_pc_branch(ctx, target, true);
             return A32_EXIT_NONE;
@@ -336,6 +332,9 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
         if ((insn & 0xFFF000F0U) == 0xF5700050U || (insn & 0xFFF000F0U) == 0xF5700040U ||
             (insn & 0xFFF000F0U) == 0xF5700060U || insn == 0xF57FF01FU ||
             (insn & 0xFD70F000U) == 0xF450F000U || (insn & 0xFD30F000U) == 0xF510F000U) {
+            if (insn == 0xF57FF01FU) {
+                ctx->excl_valid = false;
+            }
             ctx->regs[15] = pc + 4U;
             return A32_EXIT_NONE;
         }
@@ -376,7 +375,7 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
     if ((insn & 0x0E000000U) == 0x0A000000U) {
         bool link = ((insn >> 24) & 1U) != 0U;
         int32_t off = (int32_t)((insn & 0x00FFFFFFU) << 8) >> 8;
-        uint32_t target = (uint32_t)((int32_t)(pc + 8U) + (off << 2));
+        uint32_t target = (pc + 8U) + ((uint32_t)off << 2U);
         if (link) {
             ctx->regs[14] = pc + 4U;
         }

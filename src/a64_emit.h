@@ -110,6 +110,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
 
 void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs, unsigned count, uint32_t written_mask);
 void a64_vfp_cache_flush(a64_buf_t *b, bool invalidate);
+void a64_vfp_emit_exit_flush(a64_buf_t *b);
 
 static inline void a64_emit(a64_buf_t *b, uint32_t insn)
 {
@@ -249,6 +250,8 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
                       uint32_t pc_val, bool is_uncond, bool *out_ends_block);
 
 /* Guest memory loads/stores via [xG, wAddr, uxtw] */
+void a64_emit_guest_addr_x(a64_buf_t *b, unsigned dst_x, unsigned addr_w,
+                           uint32_t byte_span, bool is_store);
 void a64_emit_guest_ldr_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
 void a64_emit_guest_str_w(a64_buf_t *b, unsigned rt, unsigned addr_w);
 void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w);

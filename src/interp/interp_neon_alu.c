@@ -1,11 +1,21 @@
 /*
- * src/interp/interp_neon_alu.c - split-TU part 3/3 of src/vfp_neon.c (lines 1325-2036).
- * Compiled only via the src/vfp_neon.c wrapper; do not add to Makefile SRCS.
+ * src/interp/interp_neon_alu.c — NEON ALU lowering and top-level VFP/NEON dispatch
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "interp/decode_priv.h"
+
+bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
+{
+    /* 6. NEON 3-register different length, 2-register + scalar, & 3-register same */
+    if ((insn & 0x0E000000U) == 0x02000000U) {
+        bool u_bit    = ((insn >> 24) & 1U) != 0U;
+        unsigned size = (insn >> 20) & 3U;
+        unsigned op   = (insn >> 8) & 0xFU;
+        bool b4       = ((insn >> 4) & 1U) != 0U;
+        bool is_q     = ((insn >> 6) & 1U) != 0U;
         if ((insn & 0x00800000U) != 0U && size < 3U && !b4 && !is_q) {
             /* Narrowing 3-register different length: Dd, Qn, Qm (VADDHN/VRADDHN, VSUBHN/VRSUBHN) */
             if (op == 0x4U || op == 0x6U) {
@@ -694,14 +704,14 @@ bool a32_decode_vfp_neon_a32(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
     /* Unconditional: NEON instructions and ARMv8-A unconditional VFP (0xFE......) */
     if (cond == 15U) {
-        if (decode_neon(b, insn, pc)) {
+        if (a32_decode_neon(b, insn, pc)) {
             return true;
         }
         return decode_vfp_uncond(b, insn);
     }
 
     /* Conditional: VFPv4-D32 instructions */
-    return decode_vfp(b, insn, pc);
+    return a32_decode_vfp(b, insn, pc);
 }
 
 bool a32_decode_vfp_neon_t32(a64_buf_t *b, uint16_t hw1, uint16_t hw2, uint32_t pc)

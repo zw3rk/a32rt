@@ -155,6 +155,10 @@ typedef struct a32_ctx {
     /* Wave U3 A32-4: LDREX epoch snapshot for the shared vm32 LL table.
      * Appended at the end so all pinned offsets above are unchanged. */
     uint64_t    ll_epoch_snap;
+    /* Per-thread interpreter exclusive monitor state (A32-13) */
+    uint32_t    excl_addr;
+    uint32_t    excl_size;
+    bool        excl_valid;
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U

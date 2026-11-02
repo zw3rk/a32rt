@@ -1,10 +1,12 @@
 /*
- * src/dbt/dbt_jit_query.c - split-TU part 3/4 of src/jit.c (lines 1005-1266).
- * Compiled only via the src/jit.c wrapper; do not add to Makefile SRCS.
+ * src/dbt/dbt_jit_query.c — JIT block lookup and lookahead compilation
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#define _GNU_SOURCE
+#include "dbt/jit_priv.h"
 
 static bool range_is_readonly_exec(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
 {
@@ -28,9 +30,9 @@ static bool range_is_readonly_exec(const a32_ctx_t *ctx, uint32_t addr, uint32_t
 
 #define A32_JIT_LOOKAHEAD_MAX 16U
 
-static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, bool is_thumb,
-                                                  a32_cache_entry_t *oneshot_entry, bool flush_now,
-                                                  a32_block_snap_t *out_snap)
+a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, bool is_thumb,
+                                                   a32_cache_entry_t *oneshot_entry, bool flush_now,
+                                                   a32_block_snap_t *out_snap)
 {
     uint32_t aligned_pc = pc & (is_thumb ? ~1U : ~3U);
     uint32_t key        = a32_make_key(pc, is_thumb);
@@ -40,9 +42,9 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
     jit_lock_acquire();
     uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     if (!uncached) {
-        a32_cache_entry_t *existing = find_ht_entry_locked(key, cur_epoch);
+        a32_cache_entry_t *existing = a32_jit_find_ht_entry_locked(key, cur_epoch);
         if (existing != NULL) {
-            if (flush_now && g_batch_max > g_batch_min && flush_batch_locked(ctx) != 0) {
+            if (flush_now && g_batch_max > g_batch_min && a32_jit_flush_batch_locked(ctx) != 0) {
                 jit_lock_release();
                 return NULL;
             }
@@ -76,7 +78,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
                              ? A32_JIT_LOOKAHEAD_MAX
                              : 1U;
 
-    uint32_t stage_words[A32_AOT_MAX_WORDS];
+    static uint32_t stage_words[A32_AOT_MAX_WORDS];
     a32_cache_entry_t *first_entry = NULL;
 
     for (q_head = 0U; q_head < q_tail; q_head++) {
@@ -85,19 +87,19 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
 
         if (q_head > 0U) {
-            if (find_ht_entry_locked(cur_b_key, cur_epoch) != NULL) {
+            if (a32_jit_find_ht_entry_locked(cur_b_key, cur_epoch) != NULL) {
                 continue;
             }
             if (g_code_used + (A32_AOT_MAX_WORDS * sizeof(uint32_t)) > A32_CODE_CACHE_SIZE ||
                 g_side_table_count + MAX_STAGE_PC_MAP > A32_SIDE_TABLE_SIZE ||
-                find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
+                a32_jit_find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
                 break;
             }
             if (!range_is_readonly_exec(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
                 continue;
             }
-        } else if (!uncached && find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
-            reset_cache_locked(ctx);
+        } else if (!uncached && a32_jit_find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
+            a32_jit_reset_cache_locked(ctx);
             cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
         }
 
@@ -149,7 +151,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         }
 
         size_t code_bytes = buf.count * sizeof(uint32_t);
-        uint8_t *dst = allocate_code_space_locked(ctx, code_bytes);
+        uint8_t *dst = a32_jit_allocate_code_space_locked(ctx, code_bytes);
         if (dst == NULL) {
             if (q_head == 0U) {
                 jit_lock_release();
@@ -161,10 +163,10 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         memcpy(dst, stage_words, code_bytes);
         size_t side_start = 0U;
         size_t side_count = 0U;
-        commit_side_table_locked(dst, code_bytes, cur_b_pc, entry_itstate,
-                                 &side_start, &side_count);
+        a32_jit_commit_side_table_locked(dst, code_bytes, cur_b_pc, entry_itstate,
+                                         &side_start, &side_count);
 
-        if (is_mt && flush_now && g_batch_max > g_batch_min && flush_batch_locked(ctx) != 0) {
+        if (is_mt && flush_now && g_batch_max > g_batch_min && a32_jit_flush_batch_locked(ctx) != 0) {
             jit_lock_release();
             return NULL;
         }
@@ -174,18 +176,18 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         a32_cache_entry_t *res_entry = NULL;
 
         if (uncached && oneshot_entry != NULL) {
-            populate_ht_entry_locked(oneshot_entry, cur_b_key, dst, cur_b_pc, end_pc,
-                                     (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                     0U, stage_words, buf.count, false);
+            a32_jit_populate_ht_entry_locked(oneshot_entry, cur_b_key, dst, cur_b_pc, end_pc,
+                                             (uint32_t)code_bytes, buf.is_call, side_start, side_count,
+                                             0U, stage_words, buf.count, false);
             res_entry = oneshot_entry;
         } else {
-            res_entry = find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL);
+            res_entry = a32_jit_find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL);
             if (res_entry == NULL) {
                 res_entry = &g_ht[hash_key(cur_b_key)];
             }
-            populate_ht_entry_locked(res_entry, cur_b_key, dst, cur_b_pc, end_pc,
-                                     (uint32_t)code_bytes, buf.is_call, side_start, side_count,
-                                     cur_epoch, stage_words, buf.count, flush_now);
+            a32_jit_populate_ht_entry_locked(res_entry, cur_b_key, dst, cur_b_pc, end_pc,
+                                             (uint32_t)code_bytes, buf.is_call, side_start, side_count,
+                                             cur_epoch, stage_words, buf.count, flush_now);
         }
 
         ctx->blocks_compiled++;
@@ -227,7 +229,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
                     continue;
                 }
                 uint32_t c_key = a32_make_key(c_aligned, is_thumb);
-                if (find_ht_entry_locked(c_key, cur_epoch) == NULL &&
+                if (a32_jit_find_ht_entry_locked(c_key, cur_epoch) == NULL &&
                     range_is_readonly_exec(ctx, c_aligned, is_thumb ? 2U : 4U)) {
                     q_pcs[q_tail++] = c_aligned;
                 }
@@ -235,7 +237,7 @@ static a32_cache_entry_t *lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, b
         }
     }
 
-    if (flush_now && g_batch_max > g_batch_min && flush_batch_locked(ctx) != 0) {
+    if (flush_now && g_batch_max > g_batch_min && a32_jit_flush_batch_locked(ctx) != 0) {
         jit_lock_release();
         return NULL;
     }
@@ -249,8 +251,8 @@ static const void *compile_block_internal(a32_ctx_t *ctx, uint32_t guest_pc, boo
 {
     a32_cache_entry_t oneshot_entry;
     a32_block_snap_t  snap;
-    a32_cache_entry_t *entry = lookup_or_compile_entry(ctx, guest_pc, is_thumb,
-                                                       &oneshot_entry, flush_now, &snap);
+    a32_cache_entry_t *entry = a32_jit_lookup_or_compile_entry(ctx, guest_pc, is_thumb,
+                                                               &oneshot_entry, flush_now, &snap);
     if (entry == NULL) {
         return NULL;
     }

@@ -175,16 +175,16 @@ void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
 
 void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
 {
-    uint32_t start = start_gva & ~0xFFFU;
-    uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
-    uint32_t pages = (end > start) ? (end - start) >> 12U : 0U;
-    uint32_t i;
-    if (pages >= 512U) {
+    uint64_t start = (uint64_t)(start_gva & ~0xFFFU);
+    uint64_t end = ((uint64_t)end_gva + 0xFFFULL) & ~0xFFFULL;
+    uint64_t pages = (end > start) ? ((end - start) >> 12U) : 0ULL;
+    uint64_t i;
+    if (pages >= 512ULL) {
         a32_vm32_tlb_invalidate_all();
         return;
     }
-    for (i = 0U; i < pages; i++) {
-        uint32_t idx = tlb_index(start + (i << 12U));
+    for (i = 0ULL; i < pages; i++) {
+        uint32_t idx = tlb_index((uint32_t)(start + (i << 12U)));
         g_tlb[idx].read_tag = A32_VM32_TLB_INVALID_TAG;
         g_tlb[idx].write_tag = A32_VM32_TLB_INVALID_TAG;
         g_tlb[idx].flags_reserved = 0U;

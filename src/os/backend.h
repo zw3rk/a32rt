@@ -45,7 +45,7 @@ size_t a32_backend_page_size(void); /* 4096, 16384, or 65536, never fixed */
  * replace additionally allows clobbering (plain MAP_FIXED) for the
  * munmap/brk/mmap paths that intentionally replace live pages. */
 int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
-    int fixed, int replace, void **out_host_addr);
+    int fixed, int replace, int shared, void **out_host_addr);
 int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
     int shared, int fixed, int replace, int host_fd,
     uint64_t aligned_file_offset, void **out_host_addr);

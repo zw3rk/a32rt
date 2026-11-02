@@ -1,12 +1,82 @@
 /*
- * src/interp/interp_neon_mem.c - split-TU part 2/3 of src/vfp_neon.c (lines 676-1324).
- * Compiled only via the src/vfp_neon.c wrapper; do not add to Makefile SRCS.
+ * src/interp/interp_neon_mem.c — NEON memory, imm & shift lowering
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
+#include "interp/decode_priv.h"
+
+static bool neon_expand_imm(uint8_t cmode, uint8_t op, uint8_t imm8, uint64_t *out_val64)
+{
+    uint32_t w = 0U;
+    if ((cmode & 0xEU) == 0U) { /* 000x: 32-bit 000000imm8 */
+        w = imm8;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 2U) { /* 001x: 32-bit 0000imm800 */
+        w = (uint32_t)imm8 << 8;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 4U) { /* 010x: 32-bit 00imm80000 */
+        w = (uint32_t)imm8 << 16;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 6U) { /* 011x: 32-bit imm8000000 */
+        w = (uint32_t)imm8 << 24;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 8U) { /* 100x: 16-bit 00imm8 */
+        uint32_t h = imm8;
+        w = (h << 16) | h;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 10U) { /* 101x: 16-bit imm800 */
+        uint32_t h = (uint32_t)imm8 << 8;
+        w = (h << 16) | h;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if (cmode == 12U) { /* 1100: 32-bit 0000imm8FF */
+        w = ((uint32_t)imm8 << 8) | 0xFFU;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if (cmode == 13U) { /* 1101: 32-bit 00imm8FFFF */
+        w = ((uint32_t)imm8 << 16) | 0xFFFFU;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if (cmode == 14U) { /* 1110 */
+        if (op == 0U) {
+            uint32_t b = imm8;
+            w = (b << 24) | (b << 16) | (b << 8) | b;
+            *out_val64 = ((uint64_t)w << 32) | w;
+            return true;
+        }
+        uint64_t val = 0ULL;
+        for (unsigned i = 0U; i < 8U; i++) {
+            if ((imm8 >> i) & 1U) {
+                val |= (0xFFULL << (i * 8U));
+            }
+        }
+        *out_val64 = val;
+        return true;
+    }
+    if (cmode == 15U && op == 0U) { /* 1111: float imm */
+        w = vfp_expand_imm_single(imm8);
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    return false;
+}
+
+bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 {
     /* 1. VLD1 / VST1 / VLD2 / VST2 (0xF4...) */
     if ((insn & 0xFF100000U) == 0xF4000000U) {
@@ -155,8 +225,8 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 }
                 unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
                 a64_emit_mov_w(b, A64_ADDR, base_reg);
-                a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_ADDR);
                 if (type == 0x3U) {
+                    a64_emit_guest_addr_x(b, A64_TMP1, A64_ADDR, 32U, !l_bit);
                     /* 4-register VLD2 / VST2 ({Dd, Dd+1, Dd+2, Dd+3}) */
                     if (l_bit) {
                         a64_emit(b, 0x4C408000U | (elem_sz << 10) | (A64_TMP1 << 5) | 0U);
@@ -215,7 +285,7 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 uint32_t opc  = (n_st == 3U) ? 0x00004000U : 0x00000000U;
                 unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
                 a64_emit_mov_w(b, A64_ADDR, base_reg);
-                a64_emit_add_uxtw_x(b, A64_TMP1, A64_XG, A64_ADDR);
+                a64_emit_guest_addr_x(b, A64_TMP1, A64_ADDR, n_st * 8U, !l_bit);
                 if (l_bit) {
                     a64_emit(b, 0x0C400000U | opc | (elem_sz << 10) | (A64_TMP1 << 5) | 0U);
                     for (unsigned i = 0U; i < n_st; i++) {
@@ -647,10 +717,5 @@ static bool decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         }
     }
 
-    /* 6. NEON 3-register different length, 2-register + scalar, & 3-register same */
-    if ((insn & 0x0E000000U) == 0x02000000U) {
-        bool u_bit    = ((insn >> 24) & 1U) != 0U;
-        unsigned size = (insn >> 20) & 3U;
-        unsigned op   = (insn >> 8) & 0xFU;
-        bool b4       = ((insn >> 4) & 1U) != 0U;
-        bool is_q     = ((insn >> 6) & 1U) != 0U;
+    return a32_decode_neon_alu(b, insn);
+}

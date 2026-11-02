@@ -86,7 +86,11 @@ static int push_string_table(a32_ctx_t *ctx, uint32_t *sp, char **strs,
 {
     int count = 0;
     if (strs) {
-        while (count < max_count && count < 511 && strs[count] != NULL) {
+        while (count < max_count && strs[count] != NULL) {
+            if (count >= 511) {
+                errno = E2BIG;
+                return -1;
+            }
             count++;
         }
         for (int i = count - 1; i >= 0; i--) {
@@ -112,7 +116,7 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     void *host_stack = a32_guest_ptr(ctx, stack_base);
     void *res = NULL;
     if (a32_backend_map_anon(host_stack, A32_STACK_SIZE, PROT_READ | PROT_WRITE,
-                             1, 1, &res) != 0) {
+                             1, 1, 0, &res) != 0) {
         fprintf(stderr, "a32rt: failed to map guest stack: %s\n", strerror(errno));
         return -1;
     }
@@ -145,7 +149,7 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     uint32_t arg_ptrs[512];
     int envc = 0;
     int argc = 0;
-    if (push_string_table(ctx, &sp, host_envp, 511, env_ptrs, &envc) != 0 ||
+    if (push_string_table(ctx, &sp, host_envp, 512, env_ptrs, &envc) != 0 ||
         push_string_table(ctx, &sp, guest_argv, guest_argc, arg_ptrs, &argc) != 0) {
         return -1;
     }

@@ -1,12 +1,16 @@
 /*
- * src/os/os_sys_path.c - split-TU part 2/7 of src/syscalls.c (lines 540-1106).
- * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
+ * src/os/os_sys_path.c - Path resolution and virtual /proc synthesis
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-static int64_t map_dir_cookie(int fd, uint64_t host_off)
+#include "os/sys_priv.h"
+
+dir_cookie_entry_t g_dir_cookies[MAX_DIR_COOKIES];
+size_t             g_dir_cookie_count = 0U;
+
+int64_t map_dir_cookie(int fd, uint64_t host_off)
 {
     if (host_off < (uint64_t)DIR_COOKIE_BASE) {
         return (int64_t)host_off;
@@ -27,7 +31,7 @@ static int64_t map_dir_cookie(int fd, uint64_t host_off)
     return DIR_COOKIE_BASE + (int64_t)idx;
 }
 
-static bool unmap_dir_cookie(int fd, int64_t guest_off, off_t *out_host_off)
+bool unmap_dir_cookie(int fd, int64_t guest_off, off_t *out_host_off)
 {
     if (guest_off >= DIR_COOKIE_BASE &&
         (uint64_t)(guest_off - DIR_COOKIE_BASE) < g_dir_cookie_count) {
@@ -40,69 +44,7 @@ static bool unmap_dir_cookie(int fd, int64_t guest_off, off_t *out_host_off)
     return false;
 }
 
-static uint32_t host_ret(ssize_t r)
-{
-    if (r < 0) {
-        return (uint32_t)(-errno);
-    }
-    return (uint32_t)r;
-}
-
-static inline uint64_t u64_from_u32(uint32_t lo, uint32_t hi)
-{
-    return ((uint64_t)hi << 32) | (uint64_t)lo;
-}
-
-static int translate_at_fd(uint32_t guest_dfd)
-{
-    if (guest_dfd == 0xFFFFFF9CU || guest_dfd == (uint32_t)AT_FDCWD) {
-        return AT_FDCWD;
-    }
-    return (int)(int32_t)guest_dfd;
-}
-
-static int translate_open_flags(uint32_t guest_flags)
-{
-#if defined(__APPLE__)
-    int f = (int)(guest_flags & 3U);
-    if (guest_flags & 0x00000040U) f |= O_CREAT;
-    if (guest_flags & 0x00000080U) f |= O_EXCL;
-    if (guest_flags & 0x00000100U) f |= O_NOCTTY;
-    if (guest_flags & 0x00000200U) f |= O_TRUNC;
-    if (guest_flags & 0x00000400U) f |= O_APPEND;
-    if (guest_flags & 0x00000800U) f |= O_NONBLOCK;
-    if (guest_flags & 0x00001000U) f |= O_DSYNC;
-    if (guest_flags & (0x00004000U | 0x00010000U)) f |= O_DIRECTORY;
-    if (guest_flags & (0x00008000U | 0x00020000U)) f |= O_NOFOLLOW;
-    if (guest_flags & 0x00080000U) f |= O_CLOEXEC;
-    return f;
-#else
-    return (int)guest_flags;
-#endif
-}
-
-static inline uint32_t id16_to_32(uint32_t id)
-{
-    return ((id & 0xFFFFU) == 0xFFFFU) ? (uint32_t)-1 : (id & 0xFFFFU);
-}
-
-static inline int get_host_tid(a32_ctx_t *ctx)
-{
-    if (ctx->host_tid == 0) {
-#if defined(__linux__)
-        ctx->host_tid = (int)syscall(SYS_gettid);
-#elif defined(__APPLE__)
-        uint64_t tid64 = 0ULL;
-        (void)pthread_threadid_np(NULL, &tid64);
-        ctx->host_tid = (tid64 != 0ULL) ? (int)(tid64 & 0x3FFFFFFFULL) : (int)getpid();
-#else
-        ctx->host_tid = (int)getpid();
-#endif
-    }
-    return ctx->host_tid;
-}
-
-static size_t sysroot_prefix_len(const a32_ctx_t *ctx)
+size_t sysroot_prefix_len(const a32_ctx_t *ctx)
 {
     if (!ctx || !ctx->sysroot || ctx->sysroot[0] == '\0') {
         return 0U;
@@ -159,8 +101,8 @@ static bool is_passthrough_vpath(const char *sysroot_clean, const char *vpath)
     return false;
 }
 
-static int resolve_guest_path_str_at(const a32_ctx_t *ctx, int dirfd, const char *guest_path,
-                                     char *buf, size_t size, bool follow_final)
+int resolve_guest_path_str_at(const a32_ctx_t *ctx, int dirfd, const char *guest_path,
+                              char *buf, size_t size, bool follow_final)
 {
     if (!ctx || !guest_path || !buf || size == 0U) {
         return -1;
@@ -413,16 +355,49 @@ int a32_resolve_guest_path(const a32_ctx_t *ctx, const char *guest_path,
     return resolve_guest_path_str_at(ctx, AT_FDCWD, guest_path, buf, size, true);
 }
 
-static int resolve_guest_path_at(const a32_ctx_t *ctx, int dirfd, uint32_t guest_addr,
-                                 char *buf, size_t size, bool follow_final)
+int read_guest_cstr(const a32_ctx_t *ctx, uint32_t guest_addr,
+                    char *out, size_t max_len)
 {
-    if (!ctx || guest_addr < 0x1000U || guest_addr >= 0xFFFF0000U || !buf || size == 0U ||
-        !a32_guest_range_ok((a32_ctx_t *)ctx, guest_addr, 1U, PROT_READ)) {
+    if (!ctx || guest_addr < 0x1000U || guest_addr >= 0xFFFF0000U || !out || max_len == 0U) {
         return -EFAULT;
     }
-    const char *gpath = (const char *)a32_guest_ptr(ctx, guest_addr);
-    if (strnlen(gpath, PATH_MAX) >= PATH_MAX) {
-        return -ENAMETOOLONG;
+    size_t pos = 0U;
+    while (pos < max_len) {
+        uint32_t va = guest_addr + (uint32_t)pos;
+        if (va < guest_addr || va >= 0xFFFF0000U) {
+            return -EFAULT;
+        }
+        uint32_t page_rem = A32_PAGE_SIZE - (va & (A32_PAGE_SIZE - 1U));
+        size_t chunk = max_len - pos;
+        if (chunk > (size_t)page_rem) {
+            chunk = (size_t)page_rem;
+        }
+        if (!a32_guest_range_ok((a32_ctx_t *)ctx, va, (uint32_t)chunk, PROT_READ)) {
+            return -EFAULT;
+        }
+        const char *p = (const char *)a32_guest_ptr(ctx, va);
+        const void *nul = memchr(p, '\0', chunk);
+        if (nul != NULL) {
+            size_t copy_len = (size_t)((const char *)nul - p) + 1U;
+            memcpy(out + pos, p, copy_len);
+            return 0;
+        }
+        memcpy(out + pos, p, chunk);
+        pos += chunk;
+    }
+    return -ENAMETOOLONG;
+}
+
+int resolve_guest_path_at(const a32_ctx_t *ctx, int dirfd, uint32_t guest_addr,
+                          char *buf, size_t size, bool follow_final)
+{
+    char gpath[PATH_MAX];
+    if (!buf || size == 0U) {
+        return -EFAULT;
+    }
+    int rc = read_guest_cstr(ctx, guest_addr, gpath, sizeof(gpath));
+    if (rc != 0) {
+        return rc;
     }
     if (resolve_guest_path_str_at(ctx, dirfd, gpath, buf, size, follow_final) < 0) {
         return -ENAMETOOLONG;
@@ -534,7 +509,7 @@ static const char *skip_proc_prefix(const char *path)
     return p;
 }
 
-static bool is_proc_self_exe(const char *gpath, const char *resolved)
+bool is_proc_self_exe(const char *gpath, const char *resolved)
 {
     const char *leaf = skip_proc_prefix(gpath);
     if (!leaf) {
@@ -550,7 +525,7 @@ static bool is_proc_self_exe(const char *gpath, const char *resolved)
     return strcmp(sub, "exe") == 0;
 }
 
-static const char *get_guest_exe_path(const a32_ctx_t *ctx)
+const char *get_guest_exe_path(const a32_ctx_t *ctx)
 {
     const char *ep = (ctx->exec_path && ctx->exec_path[0])
                      ? ctx->exec_path
@@ -565,9 +540,7 @@ static const char *get_guest_exe_path(const a32_ctx_t *ctx)
     return ep;
 }
 
-#define VIRTUAL_PROC_NOT_MATCHED (-9999)
-
-static int try_open_virtual_proc(a32_ctx_t *ctx, const char *gpath, const char *resolved)
+int try_open_virtual_proc(a32_ctx_t *ctx, const char *gpath, const char *resolved)
 {
     const char *leaf = skip_proc_prefix(gpath);
     if (!leaf) {

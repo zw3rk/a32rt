@@ -59,13 +59,29 @@ SRCS := src/main.c \
         src/vm.c \
         src/elf32.c \
         src/stack32.c \
-        src/a64_emit.c \
-        src/decode_a32.c \
-        src/decode_t32.c \
-        src/vfp_neon.c \
-        src/jit.c \
-        src/aot.c \
-        src/syscalls.c \
+        src/core/core_emit_alu.c \
+        src/core/core_emit_mem.c \
+        src/core/core_emit_shared.c \
+        src/interp/interp_a32_ctl.c \
+        src/interp/interp_a32_dp.c \
+        src/interp/interp_t16.c \
+        src/interp/interp_t32_dp.c \
+        src/interp/interp_t32_mem.c \
+        src/interp/interp_vfp_core.c \
+        src/interp/interp_neon_mem.c \
+        src/interp/interp_neon_alu.c \
+        src/vm/vm_jit_mem.c \
+        src/vm/vm_jit_state.c \
+        src/dbt/dbt_jit_query.c \
+        src/dbt/dbt_jit_run.c \
+        src/dbt/dbt_aot_cache.c \
+        src/dbt/dbt_aot_scan.c \
+        src/os/os_sys_path.c \
+        src/os/os_sys_fork_time.c \
+        src/os/os_sys_thread_sig.c \
+        src/os/os_sys_sig_time.c \
+        src/os/os_sys_sock.c \
+        src/os/os_sys_fs_arm.c \
         src/signals.c \
         src/gdb.c \
         src/interp/interp.c \
@@ -79,9 +95,9 @@ SRCS := src/main.c \
         $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S
 HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
-        src/interp/interp.h src/interp/interp_priv.h src/dbt/difftest.h \
-        src/vm/vm32.h src/os/backend.h src/dbt/aot/aot.h \
-        $(wildcard src/core/*.c src/dbt/*.c src/vm/*.c src/os/*.c src/interp/*.c)
+        src/interp/interp.h src/interp/interp_priv.h src/interp/decode_priv.h \
+        src/dbt/difftest.h src/dbt/jit_priv.h \
+        src/vm/vm32.h src/os/backend.h src/os/sys_priv.h src/dbt/aot/aot.h
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
 TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
@@ -156,33 +172,46 @@ $(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
 tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M8
 
 define BUILD_ARM32_FIXTURE
-$(BUILD_DIR)/$(1): tests/$(2) | $(BUILD_DIR)
+$(BUILD_DIR)/$(1): $(addprefix tests/,$(2)) $(wildcard tests/*.h) | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $$@ ($(3))\n"
-	$(CLANG_RAW) $(ARM32_FREESTANDING_CFLAGS) $(3) -c $$< -o $(BUILD_DIR)/$(1).o
+	@objs=""; for s in $(2); do \
+		o="$(BUILD_DIR)/$(1)_$$$$(basename $$$$s .c).o"; \
+		$(CLANG_RAW) $(ARM32_FREESTANDING_CFLAGS) -Itests $(3) -c "tests/$$$$s" -o "$$$$o" || exit 1; \
+		objs="$$$$objs $$$$o"; \
+	done; \
 	$(LLD_RAW) -m armelf_linux_eabi -Bstatic --no-dynamic-linker \
-		--image-base=0x00010000 -e _start $(BUILD_DIR)/$(1).o -o $$@
+		--image-base=0x00010000 -e _start $$$$objs -o $$@
 endef
 
 define BUILD_ARM32_FIXTURE_SOFT
-$(BUILD_DIR)/$(1): tests/$(2) | $(BUILD_DIR)
+$(BUILD_DIR)/$(1): $(addprefix tests/,$(2)) $(wildcard tests/*.h) | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $$@ ($(3) soft)\n"
-	$(CLANG_RAW) $(ARM32_FREESTANDING_CFLAGS_SOFT) $(3) -c $$< -o $(BUILD_DIR)/$(1).o
+	@objs=""; for s in $(2); do \
+		o="$(BUILD_DIR)/$(1)_$$$$(basename $$$$s .c).o"; \
+		$(CLANG_RAW) $(ARM32_FREESTANDING_CFLAGS_SOFT) -Itests $(3) -c "tests/$$$$s" -o "$$$$o" || exit 1; \
+		objs="$$$$objs $$$$o"; \
+	done; \
 	$(LLD_RAW) -m armelf_linux_eabi -Bstatic --no-dynamic-linker \
-		--image-base=0x00010000 -e _start $(BUILD_DIR)/$(1).o -o $$@
+		--image-base=0x00010000 -e _start $$$$objs -o $$@
 endef
+
+M1_SRCS := test_m1_isa_fs.c test_m1_part2.c test_m1_part3.c test_m1_part4.c test_m1_part5.c
+M3_SRCS := test_m3_threads_signals.c test_m3_part2.c test_m3_part3.c test_m3_part4.c
+M4_SRCS := test_m4_vfp_neon.c test_m4_part2.c test_m4_part3.c test_m4_part4.c
+M5_SRCS := test_m5_ltp_gdb.c test_m5_part2.c test_m5_part3.c
 
 $(eval $(call BUILD_ARM32_FIXTURE,hello-armhf-static,hello.c,-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,hello-thumb-static,hello.c,-mthumb))
 $(eval $(call BUILD_ARM32_FIXTURE_SOFT,hello-armel-static,hello.c,-marm))
-$(eval $(call BUILD_ARM32_FIXTURE_SOFT,test-m1-armel,test_m1_isa_fs.c,-marm))
-$(eval $(call BUILD_ARM32_FIXTURE,test-m1-armhf,test_m1_isa_fs.c,-marm))
-$(eval $(call BUILD_ARM32_FIXTURE,test-m1-thumb,test_m1_isa_fs.c,-mthumb))
+$(eval $(call BUILD_ARM32_FIXTURE_SOFT,test-m1-armel,$(M1_SRCS),-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,test-m1-armhf,$(M1_SRCS),-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,test-m1-thumb,$(M1_SRCS),-mthumb))
 $(eval $(call BUILD_ARM32_FIXTURE,bench-coremark-armhf,bench_coremark.c,-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,bench-coremark-thumb,bench_coremark.c,-mthumb))
-$(eval $(call BUILD_ARM32_FIXTURE,test-m3-armhf,test_m3_threads_signals.c,-marm))
-$(eval $(call BUILD_ARM32_FIXTURE,test-m4-armhf,test_m4_vfp_neon.c,-marm))
-$(eval $(call BUILD_ARM32_FIXTURE,test-m4-thumb,test_m4_vfp_neon.c,-mthumb))
-$(eval $(call BUILD_ARM32_FIXTURE,test-m5-armhf,test_m5_ltp_gdb.c,-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,test-m3-armhf,$(M3_SRCS),-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,test-m4-armhf,$(M4_SRCS),-marm))
+$(eval $(call BUILD_ARM32_FIXTURE,test-m4-thumb,$(M4_SRCS),-mthumb))
+$(eval $(call BUILD_ARM32_FIXTURE,test-m5-armhf,$(M5_SRCS),-marm))
 $(eval $(call BUILD_ARM32_FIXTURE,test-h1-armhf,test_h1_smc.c,-marm))
 
 # Uniform libc guests (p3_torture, tcg smoke): static musl A32 builds of the
@@ -294,24 +323,26 @@ endef
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-armhf,test_m8_cpp_ehabi.cpp,-marm))
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-thumb,test_m8_cpp_ehabi.cpp,-mthumb))
 
-check: check-line-limits ## Host-runnable structural checks (line limits, x18/push/VLA bans)
+check: check-line-limits ## Host-runnable structural checks (line limits, x18/push/VLA/unity-include bans)
 	@bad=$$(grep -rnE '(^|[^0-9A-Za-z_])x18([^0-9A-Za-z_]|$$)' src --include='*.c' --include='*.h' --include='*.S' || true); \
 	if [ -n "$$bad" ]; then echo "ERROR: x18 platform register used:"; echo "$$bad"; exit 1; fi
 	@bad=$$(grep -rniE '^[[:space:]]*(push|pop)([[:space:]]|$$)' src --include='*.S' || true); \
 	if [ -n "$$bad" ]; then echo "ERROR: push/pop mnemonic in .S:"; echo "$$bad"; exit 1; fi
 	@bad=$$(grep -rnE '(^|[^_A-Za-z])_?_Generic([^_A-Za-z]|$$)|<threads\.h>' src --include='*.c' --include='*.h' || true); \
 	if [ -n "$$bad" ]; then echo "ERROR: banned C construct:"; echo "$$bad"; exit 1; fi
+	@bad=$$(grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]+[<"][^>"]*\.c[>"]' src include tests --include='*.c' --include='*.h' --include='*.S' || true); \
+	if [ -n "$$bad" ]; then echo "ERROR: unity-build #include of .c file:"; echo "$$bad"; exit 1; fi
 	@echo "=== check: PASS ==="
 
-check-line-limits: ## Fail if any src .c/.h/.S exceeds 900 lines
-	@over=$$(for f in $$(find src -name '*.c' -o -name '*.h' -o -name '*.S'); do \
+check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
+	@over=$$(for f in $$(find src include tests -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' \)); do \
 		n=$$(wc -l < "$$f"); \
 		if [ "$$n" -gt 900 ]; then echo "$$f: $$n lines"; fi; \
 	done); \
 	if [ -n "$$over" ]; then \
 		echo "files over the 900-line limit:"; echo "$$over"; exit 1; \
 	fi; \
-	echo "line limits OK (all src .c/.h/.S <= 900 lines)"
+	echo "line limits OK (all src/include/tests .c/.h/.S <= 900 lines)"
 
 check-headers: ## Verify include/a32host.h matches $(HL_DIR)/src/a32host.h
 	@cmp -s include/a32host.h $(HL_DIR)/src/a32host.h || (echo "ERROR: include/a32host.h out of sync with $(HL_DIR)/src/a32host.h" && exit 1)

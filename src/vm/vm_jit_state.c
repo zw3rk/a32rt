@@ -1,11 +1,12 @@
 /*
- * src/vm/vm_jit_state.c - split-TU part 2/4 of src/jit.c (lines 489-1004).
- * Compiled only via the src/jit.c wrapper; do not add to Makefile SRCS.
+ * src/vm/vm_jit_state.c — JIT state, hash-table population, and invalidation
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define _GNU_SOURCE
+#include "dbt/jit_priv.h"
 #include "os/backend.h"
 
 /* Last guest PC handed to a32_jit_record_pc_map during block translation.
@@ -83,7 +84,7 @@ int a32_jit_flush_batch(a32_ctx_t *ctx)
         return -1;
     }
     jit_lock_acquire();
-    int ret = flush_batch_locked(ctx);
+    int ret = a32_jit_flush_batch_locked(ctx);
     jit_lock_release();
     return ret;
 }
@@ -101,11 +102,11 @@ int a32_jit_init(a32_ctx_t *ctx)
         if (!atomic_load_explicit(&g_multithreaded, memory_order_relaxed)) {
             atomic_store_explicit(&g_multithreaded, true, memory_order_release);
             if (ctx != NULL && g_batch_max > g_batch_min) {
-                rc = flush_batch_locked(ctx);
+                rc = a32_jit_flush_batch_locked(ctx);
             }
             g_code_used = (g_code_used + A32_PAGE_SIZE - 1U) & ~(size_t)(A32_PAGE_SIZE - 1U);
         } else if (ctx != NULL && g_batch_max > g_batch_min) {
-            rc = flush_batch_locked(ctx);
+            rc = a32_jit_flush_batch_locked(ctx);
         }
         jit_lock_release();
         return rc;
@@ -281,12 +282,12 @@ static inline void link_entry_chain_slot_locked(a32_cache_entry_t *caller, uint3
     }
 }
 
-static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, const void *dst,
-                                     uint32_t guest_pc, uint32_t guest_end_pc, uint32_t code_bytes,
-                                     bool is_call, size_t side_start, size_t side_count,
-                                     uint32_t cur_epoch,
-                                     const uint32_t *words, size_t word_count,
-                                     bool link_reverse)
+void a32_jit_populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, const void *dst,
+                                      uint32_t guest_pc, uint32_t guest_end_pc, uint32_t code_bytes,
+                                      bool is_call, size_t side_start, size_t side_count,
+                                      uint32_t cur_epoch,
+                                      const uint32_t *words, size_t word_count,
+                                      bool link_reverse)
 {
     uint32_t old_ep  = atomic_load_explicit(&entry->epoch, memory_order_relaxed);
     uint32_t old_key = atomic_load_explicit(&entry->key, memory_order_relaxed);
@@ -354,7 +355,7 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
                             if (s_key == key) {
                                 atomic_store_explicit(&entry->slot_entry[s_idx_slot], entry, memory_order_relaxed);
                             } else {
-                                a32_cache_entry_t *se = find_ht_entry_locked(s_key, cur_epoch);
+                                a32_cache_entry_t *se = a32_jit_find_ht_entry_locked(s_key, cur_epoch);
                                 if (se != NULL && se != entry) {
                                     atomic_store_explicit(&entry->slot_entry[s_idx_slot], se, memory_order_relaxed);
                                     link_entry_chain_slot_locked(entry, s_key,
@@ -375,7 +376,7 @@ static void populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, con
         uint32_t is_t = key & 1U;
         uint32_t r_key = (guest_end_pc & (is_t ? ~1U : ~3U)) | is_t;
         atomic_store_explicit(&entry->ret_key, r_key, memory_order_relaxed);
-        a32_cache_entry_t *re = find_ht_entry_locked(r_key, cur_epoch);
+        a32_cache_entry_t *re = a32_jit_find_ht_entry_locked(r_key, cur_epoch);
         if (re != NULL && re != entry) {
             set_ht_ret_slot_locked(entry, r_key,
                                    atomic_load_explicit(&re->host_code, memory_order_relaxed),
@@ -469,13 +470,13 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
     jit_lock_acquire();
     uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     bool     exists    = false;
-    if (find_ht_slot_for_insert_locked(key, cur_epoch, &exists) == NULL || exists) {
+    if (a32_jit_find_ht_slot_for_insert_locked(key, cur_epoch, &exists) == NULL || exists) {
         jit_lock_release();
         return 0;
     }
 
     size_t code_bytes = word_count * sizeof(uint32_t);
-    uint8_t *dst = allocate_code_space_locked(ctx, code_bytes);
+    uint8_t *dst = a32_jit_allocate_code_space_locked(ctx, code_bytes);
     if (dst == NULL) {
         jit_lock_release();
         return -1;
@@ -492,21 +493,21 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
     }
     size_t side_start = 0U;
     size_t side_count = 0U;
-    commit_side_table_locked(dst, code_bytes, aligned_pc, 0U, &side_start, &side_count);
+    a32_jit_commit_side_table_locked(dst, code_bytes, aligned_pc, 0U, &side_start, &side_count);
 
     if (atomic_load_explicit(&g_multithreaded, memory_order_acquire) && g_batch_max > g_batch_min) {
-        if (flush_batch_locked(ctx) != 0) {
+        if (a32_jit_flush_batch_locked(ctx) != 0) {
             jit_lock_release();
             return -1;
         }
     }
 
     cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
-    a32_cache_entry_t *target_slot = find_ht_slot_for_insert_locked(key, cur_epoch, NULL);
+    a32_cache_entry_t *target_slot = a32_jit_find_ht_slot_for_insert_locked(key, cur_epoch, NULL);
     if (target_slot != NULL) {
-        populate_ht_entry_locked(target_slot, key, dst, aligned_pc, end_pc,
-                                 (uint32_t)code_bytes, is_call, side_start, side_count,
-                                 cur_epoch, words, word_count, false);
+        a32_jit_populate_ht_entry_locked(target_slot, key, dst, aligned_pc, end_pc,
+                                         (uint32_t)code_bytes, is_call, side_start, side_count,
+                                         cur_epoch, words, word_count, false);
     }
 
     jit_lock_release();

@@ -1,10 +1,11 @@
 /*
- * src/core/core_emit_shared.c - split-TU part 3/3 of src/a64_emit.c (lines 1368-1946).
- * Compiled only via the src/a64_emit.c wrapper; do not add to Makefile SRCS.
+ * src/core/core_emit_shared.c — Shared A32/T32 lowering helpers
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#include "a64_emit.h"
 
 /* Shared A32/T32 lowering helpers */
 void a64_emit_parallel_addsub(a64_buf_t *b, unsigned kind, bool is_16, bool swap_rm,
@@ -520,16 +521,17 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
         }
     }
     uint32_t total_bytes = count * 4U;
+    uint32_t span = (total_bytes > 0U) ? total_bytes : 4U;
     uint32_t start_offset = u_bit ? (p_bit ? 4U : 0U) : (total_bytes - (p_bit ? 0U : 4U));
 
     if (!u_bit) {
         a64_emit_sub_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
-        a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
+        a64_emit_guest_addr_x(b, A64_TMP2, A64_ADDR, span, !l_bit);
     } else if (start_offset != 0U) {
         a64_emit_add_imm_w(b, false, A64_ADDR, rn, (uint16_t)start_offset, 0U);
-        a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, A64_ADDR);
+        a64_emit_guest_addr_x(b, A64_TMP2, A64_ADDR, span, !l_bit);
     } else {
-        a64_emit_add_uxtw_x(b, A64_TMP2, A64_XG, rn);
+        a64_emit_guest_addr_x(b, A64_TMP2, rn, span, !l_bit);
     }
 
     /*

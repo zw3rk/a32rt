@@ -52,8 +52,8 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
 
     if (!skip) {
         if ((hw >> 11) == 0x1CU) {
-            int32_t off = (int32_t)((hw & 0x7FFU) << 21) >> 21;
-            i_set_pc_branch(ctx, (uint32_t)((int32_t)pc + 4 + (off << 1)), false);
+            int32_t off = (int32_t)((uint32_t)(hw & 0x7FFU) << 21U) >> 21;
+            i_set_pc_branch(ctx, (pc + 4U) + ((uint32_t)off << 1U), false);
             goto adv_it;
         }
         if ((hw & 0xFF00U) == 0xDF00U) {
@@ -92,37 +92,41 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 ctx->regs[rd] = r;
                 i_set_nzcv(&ctx->cpsr, r, c, o);
             } else {
-            unsigned op = top;
-            if (op == 0U || op == 1U) {
+                unsigned op = top;
                 unsigned rm = (hw >> 3) & 7U;
                 unsigned amt = (hw >> 6) & 31U;
                 uint32_t v = ctx->regs[rm];
                 bool carry = (ctx->cpsr & A32_CPSR_C) != 0U;
+                bool ov = (ctx->cpsr & A32_CPSR_V) != 0U;
                 uint32_t r;
-                if (amt == 0U) {
-                    r = v;
-                } else if (op == 0U) {
-                    carry = ((v >> (32U - amt)) & 1U) != 0U;
-                    r = v << amt;
+                if (op == 0U) {
+                    if (amt == 0U) {
+                        r = v;
+                    } else {
+                        carry = ((v >> (32U - amt)) & 1U) != 0U;
+                        r = v << amt;
+                    }
+                } else if (op == 1U) {
+                    if (amt == 0U) {
+                        carry = ((v >> 31U) & 1U) != 0U;
+                        r = 0U;
+                    } else {
+                        carry = ((v >> (amt - 1U)) & 1U) != 0U;
+                        r = v >> amt;
+                    }
                 } else {
-                    carry = ((v >> (amt - 1U)) & 1U) != 0U;
-                    r = v >> amt;
+                    if (amt == 0U) {
+                        carry = ((v >> 31U) & 1U) != 0U;
+                        r = ((v & 0x80000000U) != 0U) ? 0xFFFFFFFFU : 0U;
+                    } else {
+                        carry = ((v >> (amt - 1U)) & 1U) != 0U;
+                        r = (uint32_t)((int32_t)v >> amt);
+                    }
                 }
                 ctx->regs[rd] = r;
-                i_set_nzcv(&ctx->cpsr, r, carry, false);
-            } else {
-                unsigned amt = (hw >> 6) & 31U;
-                unsigned rm = (hw >> 3) & 7U;
-                uint32_t v = ctx->regs[rm];
-                uint32_t r = (uint32_t)((int32_t)v >> (amt == 0U ? 32U : amt));
-                bool carry = amt == 0U ? ((v >> 31) & 1U) != 0U :
-                    ((v >> (amt - 1U)) & 1U) != 0U;
-                if (amt == 0U) {
-                    r = ((v & 0x80000000U) != 0U) ? 0xFFFFFFFFU : 0U;
+                if (!use_it) {
+                    i_set_nzcv(&ctx->cpsr, r, carry, ov);
                 }
-                ctx->regs[rd] = r;
-                i_set_nzcv(&ctx->cpsr, r, carry, false);
-            }
             }
         } else if ((hw >> 13) == 0x1U) {
             /* 001xx: MOVS/CMP/ADDS/SUBS immediate. */
@@ -555,9 +559,9 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
             }
         } else if ((hw >> 12) == 0xDU) {
             unsigned cond8 = (hw >> 8) & 0xFU;
-            int32_t off = (int32_t)((hw & 0xFFU) << 24) >> 24;
+            int32_t off = (int32_t)((uint32_t)(hw & 0xFFU) << 24U) >> 24;
             if (a32_interp_cond_passes(ctx->cpsr, cond8)) {
-                i_set_pc_branch(ctx, (uint32_t)((int32_t)pc + 4 + (off << 1)), false);
+                i_set_pc_branch(ctx, (pc + 4U) + ((uint32_t)off << 1U), false);
                 goto adv_it;
             }
         } else {
@@ -603,33 +607,35 @@ static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2
         i_undef(ctx);
         return A32_EXIT_UNDEF;
     }
-    /* B.W T3/T4 only: every 32-bit Thumb branch fixes hw2[15:14]=10
-     * (BL/BLX use 11 and never reach here).  Data-processing
-     * modified-immediate (mov.w/bic.w: f04f/f020 with hw2 bit15=0)
-     * must NOT match: without the bit14 test they mis-decode as a
-     * wild branch instead of falling through to UNDEF. */
-    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xC000U) == 0x8000U) {
-        /* B.W: F0 9x / F0 Dx / F7 Fx with hw2[15:14]=10. */
-        int32_t s = (int32_t)((hw1 >> 10) & 1U);
-        int32_t j1 = (hw2 >> 13) & 1;
-        int32_t j2 = (hw2 >> 11) & 1;
-        bool link = ((hw1 >> 9) & 1U) != 0U || ((hw1 & 0x1000U) == 0U && ((hw2 >> 14) & 1U) != 0U);
-        (void)link;
-        int32_t i1 = (j1 == 0) ? (s ^ 1) : s;
-        int32_t i2 = (j2 == 0) ? (s ^ 1) : s;
-        int32_t off;
-        if ((hw1 & 0x0800U) != 0U) {
-            off = (s << 24) | (i1 << 23) | (i2 << 22) | ((hw1 & 0x3FF) << 12) | ((hw2 & 0x7FF) << 1);
-            off = (off << 7) >> 7;
-            ctx->regs[14] = (pc + 4U) | 1U;
-            i_set_pc_branch(ctx, (uint32_t)((int32_t)pc + 4 + off), false);
-            ctx->regs[15] &= ~1U;
-            ctx->cpsr |= A32_CPSR_T;
+    /* B.W T4 (unconditional, hw2[15:14,12]=101) and B<cond>.W T3
+     * (conditional, hw2[15:14,12]=100, cond=hw1[9:6] < 14).
+     * Data-processing modified-immediate has hw2[15]=0 and does not match. */
+    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x9000U) {
+        uint32_t s = (uint32_t)((hw1 >> 10U) & 1U);
+        uint32_t j1 = (uint32_t)((hw2 >> 13U) & 1U);
+        uint32_t j2 = (uint32_t)((hw2 >> 11U) & 1U);
+        uint32_t i1 = ~(j1 ^ s) & 1U;
+        uint32_t i2 = ~(j2 ^ s) & 1U;
+        uint32_t uoff = (s << 24U) | (i1 << 23U) | (i2 << 22U) |
+            ((uint32_t)(hw1 & 0x3FFU) << 12U) | ((uint32_t)(hw2 & 0x7FFU) << 1U);
+        int32_t off = (int32_t)(uoff << 7U) >> 7;
+        i_set_pc_branch(ctx, (pc + 4U) + (uint32_t)off, false);
+        return A32_EXIT_NONE;
+    }
+    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U &&
+        ((hw1 >> 6U) & 0xFU) < 14U) {
+        unsigned cond = (hw1 >> 6U) & 0xFU;
+        if (!a32_interp_cond_passes(ctx->cpsr, cond)) {
+            ctx->regs[15] = next;
             return A32_EXIT_NONE;
         }
-        off = (s << 20) | (i1 << 19) | (i2 << 18) | ((hw1 & 0x3FU) << 12) | ((hw2 & 0x7FF) << 1);
-        off = (off << 11) >> 11;
-        i_set_pc_branch(ctx, (uint32_t)((int32_t)pc + 4 + off), false);
+        uint32_t s = (uint32_t)((hw1 >> 10U) & 1U);
+        uint32_t j1 = (uint32_t)((hw2 >> 13U) & 1U);
+        uint32_t j2 = (uint32_t)((hw2 >> 11U) & 1U);
+        uint32_t uoff = (s << 20U) | (j2 << 19U) | (j1 << 18U) |
+            ((uint32_t)(hw1 & 0x3FU) << 12U) | ((uint32_t)(hw2 & 0x7FFU) << 1U);
+        int32_t off = (int32_t)(uoff << 11U) >> 11;
+        i_set_pc_branch(ctx, (pc + 4U) + (uint32_t)off, false);
         return A32_EXIT_NONE;
     }
     if ((hw1 & 0xFFF0U) == 0xF3C0U && (hw2 & 0xFF00U) == 0xBF00U) {

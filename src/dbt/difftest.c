@@ -180,7 +180,7 @@ static int difftest_replicate_region(const a32_ctx_t *ref, uint64_t dut_base,
         return -EINVAL;
     }
     map_rc = a32_backend_map_anon(dst, (size_t)len, PROT_READ | PROT_WRITE,
-        1, 1, &out);
+        1, 1, 0, &out);
     if (map_rc != 0 || out != dst) {
         return (map_rc != 0) ? map_rc : -EIO;
     }
@@ -223,7 +223,7 @@ static int difftest_sync_dut(const a32_ctx_t *ref, a32_ctx_t *dut)
             uint64_t len = (uint64_t)dut->regions[i].end - (uint64_t)dut->regions[i].start;
             void *out = NULL;
             if (len > 0U && len <= DIFFTEST_WINDOW_SIZE) {
-                (void)a32_backend_map_anon(dst, (size_t)len, 0, 1, 1, &out);
+                (void)a32_backend_map_anon(dst, (size_t)len, 0, 1, 1, 0, &out);
             }
         }
     }
@@ -325,7 +325,7 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
      * an engine against itself. */
     separate = true;
     if (a32_backend_map_anon(NULL, (size_t)DIFFTEST_WINDOW_SIZE, 0,
-            0, 0, &win_out) != 0 || win_out == NULL) {
+            0, 0, 0, &win_out) != 0 || win_out == NULL) {
         fprintf(stderr, "[difftest] shadow window allocation failed\n");
         return difftest_done(ctx, &ref, &dut, &s, stats, 1);
     }

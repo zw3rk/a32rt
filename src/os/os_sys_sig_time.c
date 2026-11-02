@@ -1,11 +1,24 @@
 /*
- * src/os/os_sys_sig_time.c - split-TU part 5/7 of src/syscalls.c (lines 2337-3178).
- * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
+ * src/os/os_sys_sig_time.c - Signal, clone/fork/execve, wait, timer, and futex syscalls
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "os/sys_priv.h"
+
+int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
+{
+    uint32_t nr = ctx->regs[7];
+    uint32_t a0 = ctx->regs[0];
+    uint32_t a1 = ctx->regs[1];
+    uint32_t a2 = ctx->regs[2];
+    uint32_t a3 = ctx->regs[3];
+    uint32_t a4 = ctx->regs[4];
+    uint32_t a5 = ctx->regs[5];
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+
+    switch (nr) {
     case ARM_NR_rt_sigpending: {
         FAIL_EINVAL_IF(a1 != 8U);
         uint64_t pend = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
@@ -861,25 +874,8 @@
         break;
     }
 
-    case ARM_NR_set_robust_list:
-        FAIL_EINVAL_IF(a1 != 12U);
-        ctx->robust_list_head = a0;
-        ctx->robust_list_len  = a1;
-        ctx->regs[0] = 0U;
-        break;
-
-    case ARM_NR_get_robust_list: {
-        FAIL_EINVAL_IF((int32_t)a0 < 0);
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 4U, PROT_WRITE) ||
-                       !a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE));
-        int self_tid = (ctx->host_tid != 0) ? ctx->host_tid : (int)getpid();
-        if (a0 != 0U && (int)a0 != self_tid) {
-            FAIL_ERR((kill((pid_t)a0, 0) < 0 && errno == ESRCH) ? ESRCH : EPERM);
-        }
-        uint32_t h = ctx->robust_list_head;
-        uint32_t l = (ctx->robust_list_len != 0U) ? ctx->robust_list_len : 12U;
-        memcpy(a32_guest_ptr(ctx, a1), &h, sizeof(h));
-        memcpy(a32_guest_ptr(ctx, a2), &l, sizeof(l));
-        ctx->regs[0] = 0U;
-        break;
+    default:
+        return a32_sys_dispatch_sock(ctx);
     }
+    return 0;
+}

@@ -294,7 +294,7 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         if (map_end > map_start) {
             void *res = NULL;
             if (a32_backend_map_anon(a32_guest_ptr(ctx, map_start), map_end - map_start,
-                                     PROT_READ | PROT_WRITE, 1, 1, &res) != 0) {
+                                     PROT_READ | PROT_WRITE, 1, 1, 0, &res) != 0) {
                 fprintf(stderr, "a32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
                         label, map_start, map_end, strerror(errno));
                 return -1;
@@ -468,7 +468,7 @@ int a32_kuser_setup(a32_ctx_t *ctx)
     const uint32_t kuser_va = 0xFFFF0000U;
     void *host_page = a32_guest_ptr(ctx, kuser_va);
     void *res = NULL;
-    if (a32_backend_map_anon(host_page, 4096U, PROT_READ | PROT_WRITE, 1, 1, &res) != 0) {
+    if (a32_backend_map_anon(host_page, 4096U, PROT_READ | PROT_WRITE, 1, 1, 0, &res) != 0) {
         fprintf(stderr, "a32rt: failed to map kuser page at 0xffff0000: %s\n",
                 strerror(errno));
         return -1;

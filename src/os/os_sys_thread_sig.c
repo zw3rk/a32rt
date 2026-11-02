@@ -1,11 +1,11 @@
-#include "vm/vm32.h"
 /*
- * src/os/os_sys_thread_sig.c - split-TU part 4/7 of src/syscalls.c (lines 1610-2336).
- * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
+ * src/os/os_sys_thread_sig.c - Thread/process/memory/stat/ioctl syscalls and top-level dispatcher
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#include "os/sys_priv.h"
 
 static void thread_exit_cleanup(a32_ctx_t *ctx)
 {
@@ -19,16 +19,7 @@ static void thread_exit_cleanup(a32_ctx_t *ctx)
     }
 }
 
-typedef struct child_thread_args {
-    a32_ctx_t   *child_ctx;
-    uint32_t     flags;
-    uint32_t     ptid_va;
-    uint32_t     ctid_va;
-    int          child_tid;
-    volatile int started;
-} child_thread_args_t;
-
-static void *guest_thread_start(void *arg)
+void *guest_thread_start(void *arg)
 {
     child_thread_args_t *args = (child_thread_args_t *)arg;
     a32_ctx_t *ctx    = args->child_ctx;
@@ -80,13 +71,13 @@ static void print_stats_if_enabled(const a32_ctx_t *ctx)
             (unsigned long long)ctx->guest_base);
 }
 
-static void check_pwait_signals(a32_ctx_t *ctx, uint64_t temp_mask)
+void check_pwait_signals(a32_ctx_t *ctx, uint64_t temp_mask)
 {
     ctx->sig_mask = temp_mask;
     a32_signals_check_pending(ctx);
 }
 
-static void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask)
+void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask)
 {
     if (ctx->exit_reason == A32_EXIT_BRANCH) {
         uint8_t *fp = (uint8_t *)a32_guest_ptr(ctx, ctx->regs[13]);
@@ -99,9 +90,9 @@ static void restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask)
     }
 }
 
-static int pwait_sigmask_enter(a32_ctx_t *ctx, uint32_t mask_va, uint32_t mask_sz,
-                               bool *has_temp_mask, uint64_t *saved_sig_mask,
-                               uint64_t *temp_mask)
+int pwait_sigmask_enter(a32_ctx_t *ctx, uint32_t mask_va, uint32_t mask_sz,
+                        bool *has_temp_mask, uint64_t *saved_sig_mask,
+                        uint64_t *temp_mask)
 {
     *has_temp_mask  = false;
     *saved_sig_mask = ctx->sig_mask;
@@ -132,8 +123,8 @@ static int pwait_sigmask_enter(a32_ctx_t *ctx, uint32_t mask_va, uint32_t mask_s
     return 0;
 }
 
-static void pwait_sigmask_leave(a32_ctx_t *ctx, bool has_temp_mask,
-                                uint64_t saved_sig_mask, uint64_t temp_mask)
+void pwait_sigmask_leave(a32_ctx_t *ctx, bool has_temp_mask,
+                         uint64_t saved_sig_mask, uint64_t temp_mask)
 {
     if (has_temp_mask) {
         check_pwait_signals(ctx, temp_mask);
@@ -141,9 +132,9 @@ static void pwait_sigmask_leave(a32_ctx_t *ctx, bool has_temp_mask,
     }
 }
 
-static int translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
-                               struct iovec *stack_iov, uint32_t stack_cap,
-                               struct iovec **out_iov)
+int translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
+                        struct iovec *stack_iov, uint32_t stack_cap,
+                        struct iovec **out_iov)
 {
     if ((int32_t)iovcnt < 0 || iovcnt > 1024U) {
         return -EINVAL;
@@ -177,7 +168,7 @@ static int translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
     return 0;
 }
 
-static bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count, int *out_count)
+bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count, int *out_count)
 {
     int count = 0;
     if (vec_va != 0U) {
@@ -206,8 +197,8 @@ static bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max
  * host 35), ETIMEDOUT 110, EINVAL 22 (same both sides).  No wait queue
  * yet: matched waits with a timeout sleep it out, then time out. */
 #if !defined(__linux__)
-static bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
-                              uint32_t a2, uint32_t a3, uint32_t a5, bool time64)
+bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
+                       uint32_t a2, uint32_t a3, uint32_t a5, bool time64)
 {
     uint32_t *uaddr = (uint32_t *)a32_guest_ptr(ctx, a0);
     if (basic_op == 9U && a5 == 0U) {
@@ -254,15 +245,7 @@ static bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
 }
 #endif /* !defined(__linux__) */
 
-#define FAIL_ERR(err)        do { ctx->regs[0] = (uint32_t)(-(err)); goto out; } while (0)
-#define FAIL_EFAULT_IF(cond) do { if (cond) FAIL_ERR(EFAULT); } while (0)
-#define FAIL_EINVAL_IF(cond) do { if (cond) FAIL_ERR(EINVAL); } while (0)
-#define RESOLVE_AT(dirfd, va, buf, follow) do { \
-    int _rc = resolve_guest_path_at(ctx, (dirfd), (va), (buf), sizeof(buf), (follow)); \
-    if (_rc < 0) { ctx->regs[0] = (uint32_t)_rc; goto out; } \
-} while (0)
-
-int a32_handle_syscall(a32_ctx_t *ctx)
+static int dispatch_thread_sig(a32_ctx_t *ctx)
 {
     uint32_t nr = ctx->regs[7];
     uint32_t a0 = ctx->regs[0];
@@ -271,11 +254,7 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     uint32_t a3 = ctx->regs[3];
     uint32_t a4 = ctx->regs[4];
     uint32_t a5 = ctx->regs[5];
-
-    if (ctx->trace_enabled) {
-        fprintf(stderr, "[a32rt] syscall nr=%u (0x%x) args=(0x%x, 0x%x, 0x%x, 0x%x)\n",
-                nr, nr, a0, a1, a2, a3);
-    }
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
 
     switch (nr) {
     case ARM_NR_restart_syscall:
@@ -822,3 +801,29 @@ int a32_handle_syscall(a32_ctx_t *ctx)
     case ARM_NR_rt_sigprocmask:
         ctx->regs[0] = (uint32_t)a32_sys_rt_sigprocmask(ctx, (int)a0, a1, a2, a3);
         break;
+
+    default:
+        return a32_sys_dispatch_sig_time(ctx);
+    }
+    return 0;
+}
+
+int a32_handle_syscall(a32_ctx_t *ctx)
+{
+    uint32_t nr = ctx->regs[7];
+    if (ctx->trace_enabled) {
+        fprintf(stderr, "[a32rt] syscall nr=%u (0x%x) args=(0x%x, 0x%x, 0x%x, 0x%x)\n",
+                nr, nr, ctx->regs[0], ctx->regs[1], ctx->regs[2], ctx->regs[3]);
+    }
+    int rc = dispatch_thread_sig(ctx);
+    if (rc != 0) {
+        return rc;
+    }
+    if ((ctx->exit_reason != A32_EXIT_BRANCH ||
+         nr == ARM_NR_sigreturn ||
+         nr == ARM_NR_rt_sigreturn) &&
+        __builtin_expect((__atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) & ~ctx->sig_mask) != 0ULL, 0)) {
+        a32_signals_check_pending(ctx);
+    }
+    return 0;
+}

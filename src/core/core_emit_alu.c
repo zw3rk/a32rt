@@ -1,24 +1,11 @@
 /*
- * src/core/core_emit_alu.c - split-TU part 1/3 of src/a64_emit.c (lines 1-602).
- * Compiled only via the src/a64_emit.c wrapper; do not add to Makefile SRCS.
- *
- * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
- * SPDX-License-Identifier: Apache-2.0
- */
-/*
- * src/a64_emit.c — Direct 32-bit AArch64 instruction encoder implementation
+ * src/core/core_emit_alu.c — Direct 32-bit AArch64 ALU & VFP cache encoder
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "a64_emit.h"
-#include "dbt/aot/aot.h"
-
-/* Last-PC stash maintained by a32_jit_record_pc_map (src/vm/vm_jit_state.c):
- * both translators record (count, cur_pc) immediately before emitting each
- * guest instruction, so this is the faulting instruction PC at emission. */
-extern uint32_t a32_jit_last_record_pc(void);
 
 void a64_emit_movz_w(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
 {
@@ -580,7 +567,7 @@ static void vfp_record_preheader_access(a64_buf_t *b, uint8_t kind, uint8_t reg,
     }
 }
 
-static void vfp_emit_exit_flush(a64_buf_t *b)
+void a64_vfp_emit_exit_flush(a64_buf_t *b)
 {
     if (b->self_loop_vfp_active) {
         for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
@@ -606,129 +593,112 @@ void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *
     b->loop_body_offset = b->count;
 }
 
-/* ---- Per-block AOT site staging (P2 #7) ----
- * The single-access memory emitters below append one 24-byte site record
- * per access; the batch is handed to a32_aot_site_track() when the block
- * changes or when a32_emit_sites_flush() runs (AOT save path). Records use
- * the fault-recovery layout of section 4.3.3; insn_word stays 0 because
- * the opcode word is not threaded to this layer, and npc_delta is the A32
- * 4-byte step (Thumb variable-length NPC is approximated). */
-static a32_vm32_mem_site_t g_site_stage[A32_AOT_SITE_PER_BLOCK];
-static uint32_t g_site_stage_base = 0U;
-static uint32_t g_site_stage_count = 0U;
-static bool g_site_stage_valid = false;
-
-void a32_emit_sites_flush(void)
+/* VFPv4-D32 / NEON context loads/stores */
+static void vfp_ldr_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
 {
-    if (g_site_stage_valid && g_site_stage_count > 0U) {
-        (void)a32_aot_site_track(g_site_stage_base, g_site_stage,
-            g_site_stage_count);
-    }
-    g_site_stage_valid = false;
-    g_site_stage_count = 0U;
-}
-
-static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
-    unsigned addr_w, uint32_t host_off)
-{
-    a32_vm32_mem_site_t rec;
-    uint32_t cur_pc;
-    if (g_site_stage_valid && b->guest_start_pc != g_site_stage_base) {
-        a32_emit_sites_flush();
-    }
-    if (g_site_stage_count >= A32_AOT_SITE_PER_BLOCK) {
+    vfp_record_preheader_access(b, kind, (uint8_t)idx, false);
+    if (b->self_loop_vfp_active) {
+        for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+            if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
+                vfp_emit_reg_mov(b, kind, vt, 8U + i);
+                return;
+            }
+        }
+        vfp_emit_raw_ldr(b, kind, vt, idx);
         return;
     }
-    cur_pc = a32_jit_last_record_pc();
-    memset(&rec, 0, sizeof(rec));
-    rec.seq_start_offset = 0U;
-    rec.host_insn_offset = (uint16_t)(host_off & 0xFFFFU);
-    rec.cont_insn_offset = 0U;
-    rec.guest_pc_delta = cur_pc - b->guest_start_pc;
-    rec.npc_delta = 4;
-    rec.insn_word = 0U;
-    rec.sp_rollback_delta = 0;
-    rec.npc_mode = (uint8_t)A32_VM32_NPC_SEQUENTIAL;
-    rec.width = (uint8_t)(1U << ((opc >> 30U) & 3U));
-    rec.flags = (((opc & 0x400000U) == 0U) ? (uint8_t)A32_VM32_SITE_STORE : 0U);
-    if (rec.width <= 2U && (opc & 0x800000U) != 0U) {
-        rec.flags |= (uint8_t)A32_VM32_SITE_SIGNED;
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&
+            vfp_regs_alias(b->vfp_slot_kind[i], b->vfp_slot_reg[i], kind, (uint8_t)idx)) {
+            vfp_flush_slot(b, i, true);
+        }
     }
-    rec.val_or_dst_reg = (uint8_t)(rt & 0xFFU);
-    rec.addr_base_reg = (uint8_t)(addr_w & 0xFFU);
-    rec.reserved = 0U;
-    g_site_stage[g_site_stage_count++] = rec;
-    g_site_stage_base = b->guest_start_pc;
-    g_site_stage_valid = true;
-}
-
-/* X-form MOVZ/MOVK for 64-bit immediates (TLB-base materialization). */
-static void emit_movz_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
-{
-    a64_emit(b, 0xD2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
-}
-
-static void emit_movk_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
-{
-    a64_emit(b, 0xF2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
-}
-
-static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned addr_w)
-{
-    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
-        a64_vfp_cache_flush(b, false);
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
+            vfp_emit_reg_mov(b, kind, vt, 8U + i);
+            return;
+        }
     }
-    emit_site_record(b, opc, rt, addr_w, (uint32_t)b->count);
-    if (a32_vm32_current_regime() != A32_VM32_REGIME_A2_SOFT_TLB ||
-        a32_vm32_tlb_base == 0U) {
-        a64_emit(b, opc | ((addr_w & 31U) << 16) | (A64_XG << 5) | (rt & 31U));
+    vfp_emit_raw_ldr(b, kind, vt, idx);
+    if (b->cond_branch_depth == 0U) {
+        unsigned slot = vfp_alloc_slot(b, kind, (uint8_t)idx);
+        vfp_emit_reg_mov(b, kind, 8U + slot, vt);
+    }
+}
+
+static void vfp_str_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
+{
+    vfp_record_preheader_access(b, kind, (uint8_t)idx, true);
+    if (b->self_loop_vfp_active) {
+        for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+            if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
+                vfp_emit_reg_mov(b, kind, 8U + i, vt);
+                b->vfp_slot_dirty |= (1U << i);
+                return;
+            }
+        }
+        vfp_emit_raw_str(b, kind, vt, idx);
         return;
     }
-    /* Regime A2: 7-instruction Soft-TLB lookup on x21 (section 4.3).
-     * x21 doubles as ALU scratch (TMP3), so the base is materialized per
-     * access; the 7 lookup instructions themselves never touch PSTATE or
-     * w0/w1, and a tag miss exits cleanly to the fault path below with
-     * (fault_addr, faulting PC, EXIT_FAULT) in (mem, w15, w16). Full TLB
-     * coverage (1M entries) makes every miss a genuine fault: no mid-block
-     * resume is required. Multi-word LDM/STM/LDRD/STRD keep direct
-     * addressing (correct but union-mapped); see the header notes. */
-    {
-        uint64_t base = (uint64_t)a32_vm32_tlb_base;
-        uint16_t h0 = (uint16_t)(base & 0xFFFFU);
-        uint16_t h1 = (uint16_t)((base >> 16) & 0xFFFFU);
-        uint16_t h2 = (uint16_t)((base >> 32) & 0xFFFFU);
-        uint16_t h3 = (uint16_t)((base >> 48) & 0xFFFFU);
-        uint32_t cur_pc = a32_jit_last_record_pc();
-        uint32_t tag_off = (((opc & 0x400000U) == 0U) ? 16U : 0U);
-        emit_movz_x(b, 21U, h0, 0U);
-        if (h1 != 0U) {
-            emit_movk_x(b, 21U, h1, 1U);
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&
+            vfp_regs_alias(b->vfp_slot_kind[i], b->vfp_slot_reg[i], kind, (uint8_t)idx)) {
+            if (b->vfp_slot_kind[i] < kind && b->cond_branch_depth == 0U) {
+                b->vfp_slot_dirty &= ~(1U << i);
+                b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
+            } else {
+                vfp_flush_slot(b, i, true);
+            }
         }
-        if (h2 != 0U) {
-            emit_movk_x(b, 21U, h2, 2U);
-        }
-        if (h3 != 0U) {
-            emit_movk_x(b, 21U, h3, 3U);
-        }
-        /* 20-bit Soft-TLB index: gva >> 12 (into x21 = &g_tlb[idx]). */
-        a64_emit_ubfm_w(b, 23U, addr_w, 12U, 31U);
-        a64_emit_orr_reg_w(b, 23U, A64_ZR, 23U, A64_SHIFT_LSL, 5U);
-        a64_emit_add_uxtw_x(b, 21U, 21U, 23U);
-        /* 64-bit tag load: ldr x23, [x21, #tag_off]; lsr x23, x23, #12 */
-        a64_emit(b, 0xF9400000U | ((tag_off / 8U) << 10) | (21U << 5) | 23U);
-        a64_emit(b, 0xD34CFC00U | (23U << 5) | 23U);
-        a64_emit_eor_reg_w(b, 23U, 23U, addr_w, A64_SHIFT_LSR, 12U);
-        {
-            size_t cbz = a64_emit_cbz_w_placeholder(b, false, 23U);
-            a64_emit_str_imm_w(b, addr_w, A64_XCTX,
-                (uint32_t)offsetof(a32_ctx_t, fault_addr));
-            a64_emit_mov_pc32(b, 15U, cur_pc);
-            a64_emit_movz_w(b, 16U, (uint16_t)A32_EXIT_FAULT, 0U);
-            a64_emit_ret(b);
-            a64_patch_cbz_w(b, cbz, b->count);
-        }
-        /* Hit: ldr x23, [x21, #8] (addend) and [x23, wA, uxtw] access. */
-        a64_emit(b, 0xF9400000U | (1U << 10) | (21U << 5) | 23U);
-        a64_emit(b, opc | ((addr_w & 31U) << 16) | (23U << 5) | (rt & 31U));
     }
+    if (b->cond_branch_depth == 0U) {
+        for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+            if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
+                vfp_emit_reg_mov(b, kind, 8U + i, vt);
+                b->vfp_slot_dirty |= (1U << i);
+                return;
+            }
+        }
+        unsigned slot = vfp_alloc_slot(b, kind, (uint8_t)idx);
+        vfp_emit_reg_mov(b, kind, 8U + slot, vt);
+        b->vfp_slot_dirty |= (1U << slot);
+        return;
+    }
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
+            b->vfp_slot_dirty &= ~(1U << i);
+            b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
+        }
+    }
+    vfp_emit_raw_str(b, kind, vt, idx);
+}
+
+void a64_emit_ldr_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx)
+{
+    vfp_ldr_ctx(b, A64_VFP_KIND_S, vt, s_idx);
+}
+
+void a64_emit_str_s_ctx(a64_buf_t *b, unsigned vt, unsigned s_idx)
+{
+    vfp_str_ctx(b, A64_VFP_KIND_S, vt, s_idx);
+}
+
+void a64_emit_ldr_d_ctx(a64_buf_t *b, unsigned vt, unsigned d_idx)
+{
+    vfp_ldr_ctx(b, A64_VFP_KIND_D, vt, d_idx);
+}
+
+void a64_emit_str_d_ctx(a64_buf_t *b, unsigned vt, unsigned d_idx)
+{
+    vfp_str_ctx(b, A64_VFP_KIND_D, vt, d_idx);
+}
+
+void a64_emit_ldr_q_ctx(a64_buf_t *b, unsigned vt, unsigned q_idx)
+{
+    vfp_ldr_ctx(b, A64_VFP_KIND_Q, vt, q_idx);
+}
+
+void a64_emit_str_q_ctx(a64_buf_t *b, unsigned vt, unsigned q_idx)
+{
+    vfp_str_ctx(b, A64_VFP_KIND_Q, vt, q_idx);
 }

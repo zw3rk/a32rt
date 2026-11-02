@@ -1,10 +1,38 @@
 /*
- * src/dbt/dbt_aot_scan.c - split-TU part 2/2 of src/aot.c (lines 526-939).
- * Compiled only via the src/aot.c wrapper; do not add to Makefile SRCS.
+ * src/dbt/dbt_aot_scan.c — Ahead-Of-Time (AOT) static target scanner and precompiler
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#define _GNU_SOURCE
+#include "a32rt.h"
+
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define A32_MAX_AOT_SCAN 4096U
+
+static inline int32_t sign_extend_24(uint32_t v)
+{
+    return (v & 0x00800000U) ? (int32_t)(v | 0xFF000000U) : (int32_t)(v & 0x00FFFFFFU);
+}
+
+typedef struct aot_scan_buf {
+    const a32_ctx_t *ctx;
+    uint32_t        *pcs;
+    bool            *thumbs;
+    uint32_t        *seen_keys;
+    size_t           count;
+    size_t           limit;
+} aot_scan_buf_t;
 
 static void add_target(aot_scan_buf_t *sb, uint32_t pc, bool thumb)
 {

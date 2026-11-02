@@ -11,6 +11,9 @@
  * make check on Linux. Curated C11.
  */
 
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #include "os/backend.h"
 
 #include <errno.h>
@@ -27,6 +30,7 @@
 
 #if defined(__APPLE__)
 #include <libkern/OSCacheControl.h>
+#include <mach/vm_inherit.h>
 #endif
 
 a32_backend_kind_t a32_backend_kind(void)
@@ -63,25 +67,30 @@ static int host_prot(int linux_prot)
 }
 
 int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
-    int fixed, int replace, void **out_host_addr)
+    int fixed, int replace, int shared, void **out_host_addr)
 {
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int flags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_ANONYMOUS;
     void *res;
     if (len == 0U || out_host_addr == NULL) {
         return -EINVAL;
     }
     if (replace && hint_addr != NULL) {
+        size_t hp = a32_backend_page_size();
+        uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
+        uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
+            ~(uintptr_t)(hp - 1U);
         if (linux_prot != 0) {
-            size_t hp = a32_backend_page_size();
-            uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
-            uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
-                ~(uintptr_t)(hp - 1U);
             if (mprotect((void *)start, end - start,
                     PROT_READ | PROT_WRITE) != 0) {
                 return -errno;
             }
             memset(hint_addr, 0, len);
         }
+#if defined(__APPLE__)
+        if (shared != 0) {
+            (void)minherit((void *)start, end - start, VM_INHERIT_SHARE);
+        }
+#endif
         *out_host_addr = hint_addr;
         return 0;
     }
@@ -112,34 +121,6 @@ int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
     void *res;
     if (len == 0U || host_fd < 0 || out_host_addr == NULL) {
         return -EINVAL;
-    }
-    if (replace && hint_addr != NULL) {
-        size_t hp = a32_backend_page_size();
-        uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
-        uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
-            ~(uintptr_t)(hp - 1U);
-        if (mprotect((void *)start, end - start,
-                PROT_READ | PROT_WRITE) != 0) {
-            return -errno;
-        }
-        memset(hint_addr, 0, len);
-        size_t done = 0U;
-        while (done < len) {
-            ssize_t r = pread(host_fd, (uint8_t *)hint_addr + done,
-                len - done, (off_t)(aligned_file_offset + done));
-            if (r < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return -errno;
-            }
-            if (r == 0) {
-                break;
-            }
-            done += (size_t)r;
-        }
-        *out_host_addr = hint_addr;
-        return 0;
     }
     if (replace) {
         flags |= MAP_FIXED;

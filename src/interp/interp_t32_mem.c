@@ -1,179 +1,30 @@
 /*
- * src/interp/interp_t32_mem.c - split-TU part 3/3 of src/decode_t32.c (lines 1157-1824).
- * Compiled only via the src/decode_t32.c wrapper; do not add to Makefile SRCS.
+ * src/interp/interp_t32_mem.c — T32 (Thumb-2) memory lowering and block translator
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-        if ((hw1 & 0xFF80U) == 0xFA00U && (hw2 & 0xF0F0U) == 0xF000U) {
-            /* LSL.W / LSR.W / ASR.W / ROR.W Rd, Rn, Rm */
-            unsigned shift_type = (hw1 >> 5) & 3U;
-            bool set_flags = ((hw1 >> 4) & 1U) != 0U;
-            /* Intra-block dead-NZCV flag liveness elimination */
-            if (set_flags && rd != 15U) {
-                if (!flags_live) {
-                    set_flags = false;
-                    ctx->flags_elided++;
-                }
-            }
-            a64_emit_arm_shift_reg_w(b, rd, rn, rm, shift_type, set_flags);
-            if (set_flags) {
-                a64_emit_update_nzc_keep_v_reg(b, rd, A64_TMP2);
-            }
-            return true;
-        }
-        if ((hw1 & 0xFF80U) == 0xFA00U && (hw2 & 0xF0C0U) == 0xF080U) {
-            /* SXTH / UXTH / SXTB16 / UXTB16 / SXTB / UXTB (+ add variants) */
-            unsigned op = (hw1 >> 4) & 7U;
-            if (op > 5U) {
-                return false;
-            }
-            a64_emit_xt_add(b, (op & 1U) == 0U, op < 2U, op == 2U || op == 3U,
-                            rd, rn, rm, ((hw2 >> 4) & 3U) * 8U);
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFA80U && (hw2 & 0xF0C0U) == 0xF080U) {
-            /* QADD / QDADD / QSUB / QDSUB Rd, Rm, Rn */
-            unsigned subop = (hw2 >> 4) & 3U;
-            a64_emit_qaddsub(b, rd, rm, rn, (subop & 2U) != 0U, (subop & 1U) != 0U);
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFAB0U && (hw2 & 0xF0C0U) == 0xF080U) {
-            /* CLZ Rd, Rm */
-            a64_emit_clz_w(b, rd, rm);
-            return true;
-        }
-        if ((hw1 & 0xFFE0U) == 0xFAC0U && (hw2 & 0xF0C0U) == 0xF080U) {
-            /* CRC32{B,H,W} / CRC32C{B,H,W} Rd, Rn, Rm */
-            unsigned c_bit = (hw1 >> 4) & 1U;
-            unsigned sz    = (hw2 >> 4) & 3U;
-            if (rd == 13U || rd == 15U || rn == 13U || rn == 15U ||
-                rm == 13U || rm == 15U || sz == 3U) {
-                return false;
-            }
-            a64_emit_crc32_w(b, rd, rn, rm, sz, c_bit);
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFA90U && (hw2 & 0xF0C0U) == 0xF080U) {
-            /* REV / REV16 / RBIT / REVSH */
-            unsigned subop = (hw2 >> 4) & 3U;
-            if (subop == 0U) {
-                a64_emit_rev_w(b, rd, rm);
-            } else if (subop == 1U) {
-                a64_emit_rev16_w(b, rd, rm);
-            } else if (subop == 2U) {
-                a64_emit_rbit_w(b, rd, rm);
-            } else {
-                a64_emit_rev16_w(b, rd, rm);
-                a64_emit_sbfm_w(b, rd, rd, 0U, 15U);
-            }
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFAA0U && (hw2 & 0xF0F0U) == 0xF080U) {
-            /* SEL Rd, Rn, Rm */
-            a64_emit_sel(b, rd, rn, rm);
-            return true;
-        }
-        if (((hw1 & 0xFFF0U) == 0xFA80U || (hw1 & 0xFFF0U) == 0xFAC0U ||
-             (hw1 & 0xFFF0U) == 0xFA90U || (hw1 & 0xFFF0U) == 0xFAD0U ||
-             (hw1 & 0xFFF0U) == 0xFAA0U || (hw1 & 0xFFF0U) == 0xFAE0U) &&
-            (hw2 & 0xF080U) == 0xF000U && ((hw2 >> 4) & 7U) != 3U && ((hw2 >> 4) & 7U) != 7U) {
-            unsigned op1 = (hw1 >> 4) & 7U;
-            unsigned op2 = (hw2 >> 4) & 7U;
-            bool is_16 = (op1 != 0U && op1 != 4U);
-            bool swap_rm = is_16 && (op1 == 2U || op1 == 6U);
-            unsigned sub_mask = 0U;
-            if (!is_16) {
-                sub_mask = ((hw1 & 0x0040U) != 0U) ? 0xFU : 0U;
-            } else if (op1 == 5U) {
-                sub_mask = 0x3U;
-            } else if (op1 == 2U) {
-                sub_mask = 0x1U;
-            } else if (op1 == 6U) {
-                sub_mask = 0x2U;
-            }
-            a64_emit_parallel_addsub(b, op2, is_16, swap_rm, sub_mask, rd, rn, rm);
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFB00U) {
-            /* MUL / MLA / MLS */
-            unsigned ra = (hw2 >> 12) & 0xFU;
-            unsigned subop = (hw2 >> 4) & 0xFU;
-            if (subop == 0U) {
-                a64_emit_madd_w(b, rd, rn, rm, (ra == 15U) ? A64_ZR : ra);
-            } else if (subop == 1U) {
-                a64_emit_msub_w(b, rd, rn, rm, ra);
-            } else {
-                return false;
-            }
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFB10U && (hw2 & 0x00C0U) == 0U) {
-            /* SMUL<x><y> and SMLA<x><y> */
-            a64_emit_smla_xy(b, rd, rn, rm, (hw2 >> 12) & 0xFU,
-                             ((hw2 >> 5) & 1U) != 0U, ((hw2 >> 4) & 1U) != 0U);
-            return true;
-        }
-        if (((hw1 & 0xFFF0U) == 0xFB20U || (hw1 & 0xFFF0U) == 0xFB40U) && (hw2 & 0x00E0U) == 0U) {
-            /* SMUAD{X} / SMUSD{X} / SMLAD{X} / SMLSD{X} */
-            a64_emit_smlad(b, rd, rn, rm, (hw2 >> 12) & 0xFU,
-                           (hw1 & 0xFFF0U) == 0xFB40U, ((hw2 >> 4) & 1U) != 0U);
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFB30U && (hw2 & 0x00E0U) == 0U) {
-            /* SMULW<y> and SMLAW<y> */
-            a64_emit_smlaw_y(b, rd, rn, rm, (hw2 >> 12) & 0xFU, ((hw2 >> 4) & 1U) != 0U);
-            return true;
-        }
-        if (((hw1 & 0xFFF0U) == 0xFB50U || (hw1 & 0xFFF0U) == 0xFB60U) && (hw2 & 0x00E0U) == 0U) {
-            /* SMMUL{R} / SMMLA{R} / SMMLS{R} */
-            a64_emit_smmla(b, rd, rn, rm, (hw2 >> 12) & 0xFU,
-                           (hw1 & 0xFFF0U) == 0xFB60U, ((hw2 >> 4) & 1U) != 0U);
-            return true;
-        }
-        if ((hw1 & 0xFFF0U) == 0xFB70U && (hw2 & 0x00F0U) == 0U) {
-            /* USAD8 / USADA8 */
-            a64_emit_usad8(b, rd, rn, rm, (hw2 >> 12) & 0xFU);
-            return true;
-        }
-        if ((hw1 & 0xFF80U) == 0xFB80U) {
-            /* SMULL / SDIV / UMULL / UDIV / SMLAL / SMLAL<x><y> / SMLALD / SMLSLD / UMLAL / UMAAL */
-            unsigned op = (hw1 >> 4) & 7U;
-            unsigned rd_lo = (hw2 >> 12) & 0xFU;
-            unsigned subop = (hw2 >> 4) & 0xFU;
-            if (op == 1U && subop == 0xFU) {
-                a64_emit_sdiv_w(b, rd, rn, rm);
-                return true;
-            }
-            if (op == 3U && subop == 0xFU) {
-                a64_emit_udiv_w(b, rd, rn, rm);
-                return true;
-            }
-            if (op == 6U && subop == 6U) {
-                /* UMAAL RdLo, RdHi, Rn, Rm */
-                a64_emit_umaal(b, rd_lo, rd, rn, rm);
-                return true;
-            }
-            if (op == 4U && (subop & 0xCU) == 8U) {
-                /* SMLAL<x><y> RdLo, RdHi, Rn, Rm */
-                a64_emit_smlal_xy(b, rd_lo, rd, rn, rm,
-                                  ((subop >> 1) & 1U) != 0U, (subop & 1U) != 0U);
-                return true;
-            }
-            if ((op == 4U || op == 5U) && (subop & 0xEU) == 0xCU) {
-                /* SMLALD{X} / SMLSLD{X} RdLo, RdHi, Rn, Rm */
-                a64_emit_smlald(b, rd_lo, rd, rn, rm, op == 5U, (subop & 1U) != 0U);
-                return true;
-            }
-            if (subop != 0U || (op != 0U && op != 2U && op != 4U && op != 6U)) {
-                return false;
-            }
-            a64_emit_mull(b, op == 0U || op == 4U, op >= 4U, false, rd_lo, rd, rn, rm);
-            return true;
-        }
-    }
+#include "interp/decode_priv.h"
 
+#include <stdio.h>
+
+#define T32_MAX_BLOCK_INSNS   128U
+#define T32_MAX_PRESCAN_INSNS (T32_MAX_BLOCK_INSNS + 8U)
+
+typedef struct {
+    uint32_t pc;
+    uint16_t hw1;
+    uint16_t hw2;
+    uint8_t  itstate;
+    bool     is_32bit;
+    bool     is_it;
+} t32_insn_info_t;
+
+bool a32_translate_t32_mem_insn(a64_buf_t *b, uint16_t hw1, uint16_t hw2,
+                                uint32_t pc_val, uint32_t pc_align4, bool is_uncond,
+                                bool *out_ends_block)
+{
     /* 6. Load/store multiple, dual, exclusive, table branch: (hw1 & 0xFE00) == 0xE800 */
     if ((hw1 & 0xFE00U) == 0xE800U) {
         if ((hw1 & 0xFE40U) == 0xE800U &&
@@ -220,7 +71,7 @@
             unsigned rd = (hw2 >> 8) & 0xFU;
             uint16_t offset = (uint16_t)((hw2 & 0xFFU) << 2);
             a64_emit_add_imm_w(b, false, A64_ADDR, rn, offset, 0U);
-            a64_emit_add_uxtw_x(b, A64_ADDR, A64_XG, A64_ADDR);
+            a64_emit_guest_addr_x(b, A64_ADDR, A64_ADDR, 4U, !is_load);
             if (is_load) {
                 a64_emit_ldxr_w(b, rt, A64_ADDR);
             } else {
@@ -236,7 +87,11 @@
             unsigned rt2 = (hw2 >> 8) & 0xFU;
             unsigned op3 = (hw2 >> 4) & 0xFU;
             unsigned rd  = hw2 & 0xFU;
-            a64_emit_add_uxtw_x(b, A64_ADDR, A64_XG, rn);
+            if (op3 != 4U && op3 != 5U && op3 != 7U) {
+                return false;
+            }
+            uint32_t ex_span = (op3 == 4U) ? 1U : (op3 == 5U) ? 2U : 8U;
+            a64_emit_guest_addr_x(b, A64_ADDR, rn, ex_span, !is_load);
             if (op3 == 4U) {
                 if (is_load) {
                     a64_emit_ldxr_b(b, rt, A64_ADDR);
@@ -430,6 +285,251 @@
     return false;
 }
 
+static bool t16_insn_uncond_ends_block(uint16_t insn)
+{
+    if ((insn >> 11) == 0x1CU) {
+        return true;
+    }
+    if ((insn & 0xFF07U) == 0x4700U) {
+        return true;
+    }
+    if ((insn & 0xFF00U) == 0xDF00U || (insn & 0xFF00U) == 0xDE00U) {
+        return true;
+    }
+    if ((insn & 0xFF00U) == 0xBE00U) {
+        return true;
+    }
+    if ((insn & 0xFF00U) == 0xBD00U) {
+        return true;
+    }
+    if ((insn & 0xFF87U) == 0x4487U || (insn & 0xFF87U) == 0x4687U) {
+        return true;
+    }
+    return false;
+}
+
+static bool t32_insn_uncond_ends_block(uint16_t hw1, uint16_t hw2)
+{
+    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0x8000U) != 0U) {
+        if ((hw2 & 0xD000U) == 0xD000U || (hw2 & 0xD000U) == 0xC000U ||
+            (hw2 & 0xD000U) == 0x9000U) {
+            return true;
+        }
+    }
+    if ((hw1 & 0xFFF0U) == 0xF7F0U && (hw2 & 0xF000U) == 0xA000U) {
+        return true;
+    }
+    if ((hw1 & 0xFFF0U) == 0xE8D0U && (hw2 & 0xFFE0U) == 0xF000U) {
+        return true;
+    }
+    if ((hw1 & 0xFE40U) == 0xE800U &&
+        (((hw1 >> 7) & 3U) == 1U || ((hw1 >> 7) & 3U) == 2U) &&
+        ((hw1 >> 4) & 1U) != 0U && (hw2 & 0x8000U) != 0U) {
+        return true;
+    }
+    if ((hw1 & 0xFF00U) == 0xF800U) {
+        unsigned size = (hw1 >> 5) & 3U;
+        bool is_load = ((hw1 >> 4) & 1U) != 0U;
+        unsigned rt = (hw2 >> 12) & 0xFU;
+        if (is_load && size == 2U && rt == 15U) {
+            return true;
+        }
+    }
+    if ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        unsigned rd = (hw2 >> 8) & 0xFU;
+        if (rd == 15U && !s_bit) {
+            return true;
+        }
+    }
+    if ((hw1 & 0xFE00U) == 0xEA00U && !((hw1 & 0xFFF0U) == 0xEAC0U && (hw2 & 0x8010U) == 0U)) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        unsigned rd = (hw2 >> 8) & 0xFU;
+        if (rd == 15U && !s_bit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool t32_insn_overwrites_all_flags(const t32_insn_info_t *info)
+{
+    if (info->itstate != 0U || info->is_it) {
+        return false;
+    }
+    if (!info->is_32bit) {
+        uint16_t hw1 = info->hw1;
+        unsigned top5 = (hw1 >> 11) & 0x1FU;
+        if (top5 == 0x03U) {
+            return true;
+        }
+        if (top5 >= 0x05U && top5 <= 0x07U) {
+            return true;
+        }
+        uint16_t top10 = hw1 & 0xFFC0U;
+        if (top10 == 0x4240U || top10 == 0x4280U || top10 == 0x42C0U) {
+            return true;
+        }
+        if ((hw1 & 0xFF00U) == 0x4500U) {
+            return true;
+        }
+        return false;
+    }
+
+    uint16_t hw1 = info->hw1;
+    uint16_t hw2 = info->hw2;
+
+    if ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (s_bit && (op == 0x8U || op == 0xDU || op == 0xEU)) {
+            return true;
+        }
+    }
+
+    if ((hw1 & 0xFE00U) == 0xEA00U && !((hw1 & 0xFFF0U) == 0xEAC0U && (hw2 & 0x8010U) == 0U)) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        unsigned op = (hw1 >> 5) & 0xFU;
+        bool is_rrx = (((hw2 >> 4) & 3U) == 3U && (((hw2 >> 12) & 7U) == 0U && ((hw2 >> 6) & 3U) == 0U));
+        if (s_bit && (op == 0x8U || op == 0xDU || op == 0xEU) && !is_rrx) {
+            return true;
+        }
+    }
+
+    if (hw1 == 0xEEF1U && hw2 == 0xFA10U) {
+        return true;
+    }
+
+    if ((hw1 & 0xFFF0U) == 0xF380U && (hw2 & 0xF0FFU) == 0x8000U && (hw2 & 0x0800U) != 0U) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool t32_insn_reads_flags(const t32_insn_info_t *info)
+{
+    uint16_t hw1 = info->hw1;
+    if (!info->is_32bit) {
+        if ((hw1 & 0xFF00U) == 0xDE00U) {
+            return true;
+        }
+        if ((hw1 >> 12) == 0xDU && ((hw1 >> 8) & 0xFU) < 14U) {
+            return true;
+        }
+        if ((hw1 & 0xF500U) == 0xB100U) {
+            return true;
+        }
+        if ((hw1 >> 10) == 0x10U) {
+            unsigned alu_op = (hw1 >> 6) & 0xFU;
+            if (alu_op == 0x5U || alu_op == 0x6U) {
+                return true;
+            }
+            if (info->itstate == 0U &&
+                (alu_op == 0x2U || alu_op == 0x3U || alu_op == 0x4U || alu_op == 0x7U)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint16_t hw2 = info->hw2;
+
+    if ((hw1 & 0xFFF0U) == 0xF7F0U && (hw2 & 0xF000U) == 0xA000U) {
+        return true;
+    }
+
+    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U) {
+        unsigned cond = (hw1 >> 6) & 0xFU;
+        if (cond < 14U) {
+            return true;
+        }
+    }
+
+    if ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (op == 0xAU || op == 0xBU) {
+            return true;
+        }
+    }
+
+    if ((hw1 & 0xFE00U) == 0xEA00U && !((hw1 & 0xFFF0U) == 0xEAC0U && (hw2 & 0x8010U) == 0U)) {
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (op == 0xAU || op == 0xBU) {
+            return true;
+        }
+        bool is_rrx = (((hw2 >> 4) & 3U) == 3U && (((hw2 >> 12) & 7U) == 0U && ((hw2 >> 6) & 3U) == 0U));
+        if (is_rrx) {
+            return true;
+        }
+    }
+
+    if ((hw1 & 0xFF90U) == 0xFA10U && (hw2 & 0xF0F0U) == 0xF000U) {
+        return true;
+    }
+
+    if (hw1 == 0xF3EFU && (hw2 & 0xF0FFU) == 0x8000U) {
+        return true;
+    }
+
+    if ((hw1 & 0xFF80U) == 0xFE00U && (hw2 & 0x0E50U) == 0x0A00U) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool t32_insn_partially_updates_flags(const t32_insn_info_t *info)
+{
+    uint16_t hw1 = info->hw1;
+    if (!info->is_32bit) {
+        unsigned top5 = (hw1 >> 11) & 0x1FU;
+        if ((hw1 >> 14) == 0U && top5 < 3U) {
+            return true;
+        }
+        if (top5 == 0x04U) {
+            return true;
+        }
+        if ((hw1 >> 10) == 0x10U) {
+            unsigned alu_op = (hw1 >> 6) & 0xFU;
+            if (alu_op == 0x0U || alu_op == 0x1U || alu_op == 0x2U ||
+                alu_op == 0x3U || alu_op == 0x4U || alu_op == 0x7U ||
+                alu_op == 0x8U || alu_op == 0xCU || alu_op == 0xDU ||
+                alu_op == 0xEU || alu_op == 0xFU) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint16_t hw2 = info->hw2;
+
+    if ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (s_bit && op <= 0x4U) {
+            return true;
+        }
+    }
+
+    if ((hw1 & 0xFE00U) == 0xEA00U && !((hw1 & 0xFFF0U) == 0xEAC0U && (hw2 & 0x8010U) == 0U)) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (s_bit && op <= 0x4U) {
+            return true;
+        }
+    }
+
+    if ((hw1 & 0xFF80U) == 0xFA00U && (hw2 & 0xF0F0U) == 0xF000U) {
+        bool s_bit = ((hw1 >> 4) & 1U) != 0U;
+        if (s_bit) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 {
     uint32_t pc = start_pc & ~1U;
@@ -577,7 +677,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         uint32_t cur_pc = info->pc;
         uint16_t hw1 = info->hw1;
 
-        if (idx > 0U && itstate == 0U && b->cap > b->count && b->cap - b->count < 128U) {
+        if (idx > 0U && itstate == 0U && (b->count + 1536U >= b->cap)) {
             b->guest_end_pc = cur_pc;
             a64_emit_exit_branch_imm(b, cur_pc, false);
             return true;
@@ -625,7 +725,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 
         if (info->is_32bit) {
             uint16_t hw2 = info->hw2;
-            ok = translate_t32_insn(ctx, b, cur_pc, hw1, hw2, is_uncond, flags_live[idx], &ends_block);
+            ok = a32_translate_t32_insn(ctx, b, cur_pc, hw1, hw2, is_uncond, flags_live[idx], &ends_block);
             if (!ok) {
                 if (ctx->trace_enabled) {
                     fprintf(stderr, "a32rt: unhandled T32 instruction 0x%04x 0x%04x at pc=0x%08x\n",
@@ -638,7 +738,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
                 a64_emit_exit_undef(b, cur_pc);
             }
         } else {
-            ok = translate_t16_insn(ctx, b, cur_pc, hw1, in_it, itstate, next_itstate, is_uncond, flags_live[idx], &ends_block);
+            ok = a32_translate_t16_insn(ctx, b, cur_pc, hw1, in_it, itstate, next_itstate, is_uncond, flags_live[idx], &ends_block);
             if (!ok) {
                 if (ctx->trace_enabled) {
                     fprintf(stderr, "a32rt: unhandled T16 instruction 0x%04x at pc=0x%08x\n",

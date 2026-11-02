@@ -207,7 +207,7 @@ uint32_t a32_interp_step(a32_ctx_t *ctx)
         pc &= ~3U;
         rc = i_a32_step(ctx, pc);
     }
-    if (rc == A32_EXIT_UNDEF) {
+    if (rc == A32_EXIT_UNDEF || rc == A32_EXIT_FAULT) {
         ctx->regs[15] = pc;
     }
     return rc;
@@ -253,7 +253,17 @@ int a32_interp_run(a32_ctx_t *ctx, uint64_t max_steps)
             return 128 + SIGTRAP;
         }
         if (rc == A32_EXIT_FAULT) {
-            return 139;
+            if (ctx->gdb_enabled) {
+                if (a32_gdb_handle_stop(ctx, SIGSEGV) == 0) {
+                    return 128 + SIGSEGV;
+                }
+                continue;
+            }
+            if (a32_signals_deliver_sync(ctx, SIGSEGV, ctx->fault_addr)) {
+                a32_signals_check_pending(ctx);
+                continue;
+            }
+            return 128 + SIGSEGV;
         }
         /* UNDEF single-step fallback: deliver SIGILL, else abort like JIT. */
         if (ctx->gdb_enabled) {

@@ -1,11 +1,24 @@
 /*
- * src/os/os_sys_fs_arm.c - split-TU part 7/7 of src/syscalls.c (lines 3698-4330).
- * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
+ * src/os/os_sys_fs_arm.c - Epoll, timerfd, VFS/xattr, and ARM private syscalls
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "os/sys_priv.h"
+
+int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
+{
+    uint32_t nr = ctx->regs[7];
+    uint32_t a0 = ctx->regs[0];
+    uint32_t a1 = ctx->regs[1];
+    uint32_t a2 = ctx->regs[2];
+    uint32_t a3 = ctx->regs[3];
+    uint32_t a4 = ctx->regs[4];
+    uint32_t a5 = ctx->regs[5];
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+
+    switch (nr) {
     case ARM_NR_ppoll:
     case ARM_NR_ppoll_time64: {
         bool time64 = (nr == ARM_NR_ppoll_time64);
@@ -237,13 +250,14 @@
 
     case ARM_NR_symlink:
     case ARM_NR_symlinkat: {
+        char target[PATH_MAX];
         char r_link[PATH_MAX];
         int newfd       = (nr == ARM_NR_symlinkat) ? translate_at_fd(a1) : AT_FDCWD;
         uint32_t lnk_va = (nr == ARM_NR_symlinkat) ? a2 : a1;
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 1U, PROT_READ));
-        const char *target = (const char *)a32_guest_ptr(ctx, a0);
-        if (strnlen(target, PATH_MAX) >= PATH_MAX) {
-            FAIL_ERR(ENAMETOOLONG);
+        int trc = read_guest_cstr(ctx, a0, target, sizeof(target));
+        if (trc != 0) {
+            ctx->regs[0] = (uint32_t)trc;
+            break;
         }
         RESOLVE_AT(newfd, lnk_va, r_link, false);
         ctx->regs[0] = host_ret(symlinkat(target, newfd, r_link));
@@ -481,6 +495,17 @@
     }
 
     case ARM_NR_kill:
+#if defined(__APPLE__)
+        if ((int)a1 >= 1 && (int)a1 <= 64) {
+            siginfo_t ksi;
+            memset(&ksi, 0, sizeof(ksi));
+            ksi.si_signo = (int)a1;
+            ksi.si_code  = 0;
+            ksi.si_pid   = getpid();
+            ksi.si_uid   = getuid();
+            a32_signals_preset_siginfo((int)a1, &ksi);
+        }
+#endif
         ctx->regs[0] = host_ret(kill((pid_t)a0, (int)a1));
         break;
 
@@ -488,6 +513,15 @@
 #if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_tkill, (pid_t)a0, (int)a1));
 #else
+        if ((int)a1 >= 1 && (int)a1 <= 64) {
+            siginfo_t ksi;
+            memset(&ksi, 0, sizeof(ksi));
+            ksi.si_signo = (int)a1;
+            ksi.si_code  = -6 /* SI_TKILL */;
+            ksi.si_pid   = getpid();
+            ksi.si_uid   = getuid();
+            a32_signals_preset_siginfo((int)a1, &ksi);
+        }
         ctx->regs[0] = host_ret(kill(getpid(), (int)a1));
 #endif
         break;
@@ -496,6 +530,15 @@
 #if defined(__linux__)
         ctx->regs[0] = host_ret(syscall(SYS_tgkill, (pid_t)a0, (pid_t)a1, (int)a2));
 #else
+        if ((int)a2 >= 1 && (int)a2 <= 64) {
+            siginfo_t ksi;
+            memset(&ksi, 0, sizeof(ksi));
+            ksi.si_signo = (int)a2;
+            ksi.si_code  = -6 /* SI_TKILL */;
+            ksi.si_pid   = getpid();
+            ksi.si_uid   = getuid();
+            a32_signals_preset_siginfo((int)a2, &ksi);
+        }
         ctx->regs[0] = host_ret(kill((pid_t)a0, (int)a2));
 #endif
         break;
@@ -721,17 +764,5 @@
         break;
     }
 
-out:
-    #undef RESOLVE_AT
-    #undef FAIL_EINVAL_IF
-    #undef FAIL_EFAULT_IF
-    #undef FAIL_ERR
-
-    if ((ctx->exit_reason != A32_EXIT_BRANCH ||
-         nr == ARM_NR_sigreturn ||
-         nr == ARM_NR_rt_sigreturn) &&
-        __builtin_expect((__atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) & ~ctx->sig_mask) != 0ULL, 0)) {
-        a32_signals_check_pending(ctx);
-    }
     return 0;
 }

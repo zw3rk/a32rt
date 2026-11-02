@@ -377,13 +377,16 @@ static void enqueue_async_signal(a32_ctx_t *ctx, int sig, const siginfo_t *info)
  * (SEGV/BUS/ILL/FPE/TRAP) is a genuine fault only for kernel codes;
  * user-sent instances (kill/tkill/tgkill/sigqueue) must enqueue for
  * guest delivery on both platforms. */
-static bool sig_code_is_user_sent(const siginfo_t *info)
+static bool sig_code_is_user_sent(int sig, const siginfo_t *info)
 {
+    if (sig >= 1 && sig <= 64 && g_preset_siginfo[sig].si_signo == sig) {
+        return true;
+    }
     if (info == NULL) {
         return false;
     }
 #ifdef __APPLE__
-    return info->si_code >= SI_USER;
+    return info->si_code <= 0 || info->si_code >= SI_USER;
 #else
     return info->si_code <= 0;
 #endif
@@ -401,7 +404,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 
     bool is_sync_trap = (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL ||
                          sig == SIGFPE  || sig == SIGTRAP);
-    if (!is_sync_trap || sig_code_is_user_sent(info)) {
+    if (!is_sync_trap || sig_code_is_user_sent(sig, info)) {
         enqueue_async_signal(ctx, sig, info);
         return;
     }
@@ -418,15 +421,9 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     bool in_block = a32_jit_lookup_host_pc(host_pc, &guest_pc, &itstate);
 
     if (!in_block) {
-        /* Not guest code: the thread was parked in host code (a syscall
-         * like kill/tkill, a host helper) when the trap arrived, so no
-         * guest PC can be attributed.  Kill-sent sync numbers land here
-         * on platforms whose kill() uses small-positive codes (verified:
-         * Darwin kill() reports si_code 1, colliding with BUS_ADRALN),
-         * and they must still reach the guest.  Enqueue for async guest
-         * delivery instead of escalating. */
-        enqueue_async_signal(ctx, sig, info);
-        return;
+        /* Genuine synchronous trap outside any translated guest block:
+         * terminate immediately instead of returning to the faulting host PC. */
+        _exit(128 + sig);
     }
 
     {
@@ -486,13 +483,6 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 #endif
         return;
     }
-
-    if ((sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) &&
-        info != NULL && !sig_code_is_user_sent(info)) {
-        _exit(128 + sig);
-    }
-
-    enqueue_async_signal(ctx, sig, info);
 }
 
 struct a64_kernel_sigaction {

@@ -1,12 +1,13 @@
 /*
- * src/os/os_sys_fork_time.c - split-TU part 3/7 of src/syscalls.c (lines 1107-1609).
- * Compiled only via the src/syscalls.c wrapper; do not add to Makefile SRCS.
+ * src/os/os_sys_fork_time.c - Stat/time struct shims, fork snapshot, and robust futex cleanup
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-static void fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struct stat *src)
+#include "os/sys_priv.h"
+
+void fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struct stat *src)
 {
     memset(dst, 0, sizeof(*dst));
     dst->st_dev        = (uint64_t)src->st_dev;
@@ -56,7 +57,7 @@ typedef struct fork_cluster {
     size_t   count;
 } fork_cluster_t;
 
-static pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
+pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
 {
     if (!ctx || !ctx->has_host_info) {
         return fork();
@@ -192,7 +193,7 @@ static pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     return pid;
 }
 
-static void fill_arm_rusage32(arm_rusage32_t *dst, const struct rusage *src)
+void fill_arm_rusage32(arm_rusage32_t *dst, const struct rusage *src)
 {
     memset(dst, 0, sizeof(*dst));
     dst->ru_utime.tv_sec  = (int32_t)src->ru_utime.tv_sec;
@@ -215,7 +216,7 @@ static void fill_arm_rusage32(arm_rusage32_t *dst, const struct rusage *src)
     dst->ru_nivcsw   = (int32_t)src->ru_nivcsw;
 }
 
-static void fill_arm_statfs64(arm_statfs64_t *dst, const struct statfs *src)
+void fill_arm_statfs64(arm_statfs64_t *dst, const struct statfs *src)
 {
     memset(dst, 0, sizeof(*dst));
     dst->f_type      = (uint32_t)src->f_type;
@@ -239,7 +240,7 @@ static void fill_arm_statfs64(arm_statfs64_t *dst, const struct statfs *src)
     dst->f_flags     = (uint32_t)src->f_flags;
 }
 
-static bool is_arm32_elf_file(const char *path)
+bool is_arm32_elf_file(const char *path)
 {
     if (access(path, X_OK) != 0) {
         return false;
@@ -264,7 +265,7 @@ static bool is_arm32_elf_file(const char *path)
     return false;
 }
 
-static bool guest_range_mapped(const a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_prot)
+bool guest_range_mapped(const a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_prot)
 {
     uint64_t end = (uint64_t)va + (uint64_t)len;
     uint64_t cur = (uint64_t)va;
@@ -311,25 +312,7 @@ bool a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_
     return guest_range_mapped(ctx, va, len, req_prot);
 }
 
-static inline bool guest_read(a32_ctx_t *ctx, void *dst, uint32_t va, uint32_t len)
-{
-    if (!a32_guest_range_ok(ctx, va, len, PROT_READ)) {
-        return false;
-    }
-    memcpy(dst, a32_guest_ptr(ctx, va), len);
-    return true;
-}
-
-static inline bool guest_write(a32_ctx_t *ctx, uint32_t va, const void *src, uint32_t len)
-{
-    if (!a32_guest_range_ok(ctx, va, len, PROT_WRITE)) {
-        return false;
-    }
-    memcpy(a32_guest_ptr(ctx, va), src, len);
-    return true;
-}
-
-static int translate_linux_clockid(uint32_t linux_clk, clockid_t *out_clk)
+int translate_linux_clockid(uint32_t linux_clk, clockid_t *out_clk)
 {
 #if defined(__APPLE__)
     switch (linux_clk) {
@@ -346,7 +329,7 @@ static int translate_linux_clockid(uint32_t linux_clk, clockid_t *out_clk)
 #endif
 }
 
-static bool read_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, struct timespec *out)
+bool read_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, struct timespec *out)
 {
     if (time64) {
         arm_timespec64_t ts64;
@@ -366,7 +349,7 @@ static bool read_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, struct
     return true;
 }
 
-static bool write_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, const struct timespec *in)
+bool write_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, const struct timespec *in)
 {
     if (time64) {
         arm_timespec64_t ts64 = { (int64_t)in->tv_sec, (int64_t)in->tv_nsec };
@@ -377,14 +360,14 @@ static bool write_guest_timespec(a32_ctx_t *ctx, uint32_t va, bool time64, const
 }
 
 #if defined(__linux__)
-static bool read_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, struct itimerspec *out)
+bool read_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, struct itimerspec *out)
 {
     uint32_t step = time64 ? 16U : 8U;
     return read_guest_timespec(ctx, va, time64, &out->it_interval) &&
            read_guest_timespec(ctx, va + step, time64, &out->it_value);
 }
 
-static bool write_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, const struct itimerspec *in)
+bool write_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, const struct itimerspec *in)
 {
     uint32_t step = time64 ? 16U : 8U;
     return write_guest_timespec(ctx, va, time64, &in->it_interval) &&
@@ -392,7 +375,7 @@ static bool write_guest_itimerspec(a32_ctx_t *ctx, uint32_t va, bool time64, con
 }
 #endif
 
-static bool read_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, struct timeval *out)
+bool read_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, struct timeval *out)
 {
     if (time64) {
         arm_timeval64_t tv64;
@@ -412,7 +395,7 @@ static bool read_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, struct 
     return true;
 }
 
-static bool write_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, const struct timeval *in)
+bool write_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, const struct timeval *in)
 {
     if (time64) {
         arm_timeval64_t tv64 = { (int64_t)in->tv_sec, (int64_t)in->tv_usec };
@@ -422,19 +405,19 @@ static bool write_guest_timeval(a32_ctx_t *ctx, uint32_t va, bool time64, const 
     return guest_write(ctx, va, &tv32, sizeof(tv32));
 }
 
-static bool read_guest_itimerval(a32_ctx_t *ctx, uint32_t va, struct itimerval *out)
+bool read_guest_itimerval(a32_ctx_t *ctx, uint32_t va, struct itimerval *out)
 {
     return read_guest_timeval(ctx, va, false, &out->it_interval) &&
            read_guest_timeval(ctx, va + (uint32_t)sizeof(arm_timeval32_t), false, &out->it_value);
 }
 
-static bool write_guest_itimerval(a32_ctx_t *ctx, uint32_t va, const struct itimerval *in)
+bool write_guest_itimerval(a32_ctx_t *ctx, uint32_t va, const struct itimerval *in)
 {
     return write_guest_timeval(ctx, va, false, &in->it_interval) &&
            write_guest_timeval(ctx, va + (uint32_t)sizeof(arm_timeval32_t), false, &in->it_value);
 }
 
-static int handle_fcntl_flock(a32_ctx_t *ctx, int fd, int cmd, uint32_t arg, bool is64)
+int handle_fcntl_flock(a32_ctx_t *ctx, int fd, int cmd, uint32_t arg, bool is64)
 {
     bool is_get = is64 ? (cmd == 12 /* F_GETLK64 */ || cmd == 36 /* F_OFD_GETLK */)
                        : (cmd == 5 /* F_GETLK */);

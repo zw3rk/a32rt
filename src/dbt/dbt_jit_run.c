@@ -1,11 +1,12 @@
 /*
- * src/dbt/dbt_jit_run.c - split-TU part 4/4 of src/jit.c (lines 1267-1740).
- * Compiled only via the src/jit.c wrapper; do not add to Makefile SRCS.
+ * src/dbt/dbt_jit_run.c — JIT block iteration, chaining, and execution dispatcher
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define _GNU_SOURCE
+#include "dbt/jit_priv.h"
 #include "dbt/difftest.h"
 
 void a32_jit_iter_blocks(a32_block_iter_fn fn, void *arg)
@@ -170,7 +171,7 @@ int a32_jit_run(a32_ctx_t *ctx)
     }
     int init_flush_rc = 0;
     if (g_batch_max > g_batch_min) {
-        init_flush_rc = flush_batch_locked(ctx);
+        init_flush_rc = a32_jit_flush_batch_locked(ctx);
     }
     jit_lock_release();
     if (init_flush_rc != 0) {
@@ -303,7 +304,7 @@ int a32_jit_run(a32_ctx_t *ctx)
         if (code == NULL) {
             a32_block_snap_t snap;
             ctx->exit_reason = A32_EXIT_NONE;
-            cur_entry = lookup_or_compile_entry(ctx, pc, is_thumb, &oneshot_entry, true, &snap);
+            cur_entry = a32_jit_lookup_or_compile_entry(ctx, pc, is_thumb, &oneshot_entry, true, &snap);
             if (cur_entry == NULL || snap.code == NULL) {
                 if (ctx->exit_reason == A32_EXIT_FAULT) {
                     prev_entry = NULL;
@@ -566,7 +567,7 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
      * them RX (plus icache flush). Normal dispatch seals via flush_now;
      * this direct run_block path must seal explicitly. */
     jit_lock_acquire();
-    seal_rc = flush_batch_locked(ctx);
+    seal_rc = a32_jit_flush_batch_locked(ctx);
     jit_lock_release();
     if (seal_rc != 0) {
         ctx->fault_addr = pc;
