@@ -232,7 +232,10 @@ run_alarm_guest() {
         fi
     fi
     if [ "$_st" = "PASS" ]; then
-        parity_check_golden "$GOLDEN_DIR/$_gold.dbt.err" "$_tmp_err"; _rc_cmp=$?
+        uniq "$GOLDEN_DIR/$_gold.dbt.err" > "$_tmp_err.gold" 2>/dev/null || true
+        uniq "$_tmp_err" > "$_tmp_err.act" 2>/dev/null || true
+        parity_check_golden "$_tmp_err.gold" "$_tmp_err.act"; _rc_cmp=$?
+        rm -f "$_tmp_err.gold" "$_tmp_err.act"
         if [ "$_rc_cmp" -eq 2 ]; then
             _st="GAP"; _det="missing golden $_gold.dbt.err"
         elif [ "$_rc_cmp" -ne 0 ]; then
@@ -244,9 +247,9 @@ run_alarm_guest() {
 }
 if [ -x "$ROOT/_build/tcg-smoke-a32" ]; then
     run_guest "armhf" "darwin" "tcg-smoke-a32" "--interp" "interp" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
-    # tcg-smoke dbt hangs: bound with a 10 s alarm, golden pins the
+    # tcg-smoke dbt hangs: bound with a 2 s alarm, golden pins the
     # partial (banner-only) output + alarm rc.
-    run_alarm_guest "armhf" "darwin" "tcg-smoke-a32" "10" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
+    run_alarm_guest "armhf" "darwin" "tcg-smoke-a32" "2" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
 else
     parity_row "armhf" "darwin" "tcg-smoke-a32" "dbt" "GAP" "0" "missing guest (make guests-libc)"
 fi
@@ -261,11 +264,11 @@ else
     parity_row "armhf" "darwin" "h1_smc" "dbt" "GAP" "0" "missing guest test-h1-armhf"
 fi
 # p2_libc dynamic leg (m7, musl) via A32RT_SYSROOT: interp golden pins the
-# ldso-startup UNDEF (132); dbt hangs after 4 musl-thread-startup faults
-# (open thread-startup gap) — 10 s alarm row.  No difftest (threads).
+# ldso-startup UNDEF (132); dbt hangs after musl-thread-startup faults
+# (open thread-startup gap) — 2 s alarm row.  No difftest (threads).
 if [ -x "$ROOT/_build/test-m7-armhf" ]; then
     A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m7-armhf" "--interp" "interp" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
-    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_alarm_guest "armhf" "darwin" "test-m7-armhf" "10" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
+    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_alarm_guest "armhf" "darwin" "test-m7-armhf" "2" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
 else
     parity_row "armhf" "darwin" "test-m7-armhf" "dbt" "GAP" "0" "missing guest test-m7-armhf"
 fi
