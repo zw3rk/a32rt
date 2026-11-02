@@ -620,6 +620,14 @@ uint32_t a32_vm_mmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_
     bool is_file = ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0);
     bool is_shared = ((host_flags & MAP_SHARED) != 0);
     uint32_t target_end = (uint32_t)((uint64_t)target_va + aligned_len);
+    /* MAP_FIXED replacement pre-flight (A32-R3-1 follow-up 2): when the
+     * new mapping needs file tracking, verify BEFORE retiring that the
+     * retire frees enough slots for the replacement record, so a failed
+     * capacity check cannot leave the old range mapped but untracked. */
+    if (is_file &&
+        a32_vmfile_check_replace(target_va, target_end, is_shared) != 0) {
+        return (uint32_t)(-ENOMEM);
+    }
     /* A32-R3-1: retire the previous mapping (regions, Soft-TLB, file
      * tracking) BEFORE installing the new host mapping, then publish the
      * new region and its backing together. Retiring first also frees the

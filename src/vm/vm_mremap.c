@@ -76,23 +76,40 @@ static mremap_priv_t mremap_priv_lookup(uint32_t old_addr, uint32_t old_end,
     return p;
 }
 
-/* Copy the surviving prefix after a move, skipping source pages the EOF
- * cut already retired: those read back as zeros, which the fresh file
- * population of the destination already provides. */
+/* Copy the surviving prefix after a move. Only source pages explicitly
+ * retired beyond EOF are skipped: those read back as zeros, which the
+ * fresh file population of the destination already provides. PROT_NONE
+ * pages carry real bytes, so the source and destination host protections
+ * are temporarily widened for the copy unless the page was cut by EOF
+ * truncation (A32-R3-3 follow-up 3). */
 static void mremap_copy_prefix(a32_ctx_t *ctx, uint32_t new_va,
     uint32_t old_addr, uint32_t copy_len)
 {
     uint32_t off = 0U;
     while (off < copy_len) {
         uint32_t chunk = copy_len - off;
+        void *src;
+        void *dst;
         if (chunk > 0x1000U) {
             chunk = 0x1000U;
         }
-        if (a32_vm32_range_prot_ok(old_addr + off, chunk,
-                (uint32_t)PROT_READ)) {
-            memcpy(a32_guest_ptr(ctx, new_va + off),
-                a32_guest_ptr(ctx, old_addr + off), chunk);
+        if (a32_vm32_page_eof_cut(old_addr + off)) {
+            off += chunk;
+            continue;
         }
+        src = a32_guest_ptr(ctx, old_addr + off);
+        dst = a32_guest_ptr(ctx, new_va + off);
+        if (!a32_vm32_range_prot_ok(old_addr + off, chunk,
+                (uint32_t)PROT_READ)) {
+            (void)a32_backend_protect(src, chunk,
+                PROT_READ | PROT_WRITE);
+        }
+        if (!a32_vm32_range_prot_ok(new_va + off, chunk,
+                (uint32_t)PROT_WRITE)) {
+            (void)a32_backend_protect(dst, chunk,
+                PROT_READ | PROT_WRITE);
+        }
+        memcpy(dst, src, chunk);
         off += chunk;
     }
 }

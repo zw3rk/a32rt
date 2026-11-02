@@ -123,6 +123,11 @@ void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
     bool readable, bool writable, bool executable);
 void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva);
 bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot);
+/* True when the 4 KiB page holding gva carries the EOF cut flag (pages
+ * wholly beyond a truncated file size). Unlike range_prot_ok, this
+ * distinguishes an explicit EOF cut from a plain PROT_NONE mapping, so
+ * mremap can preserve PROT_NONE bytes instead of skipping them. */
+bool a32_vm32_page_eof_cut(uint32_t gva);
 void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut);
 
 /* Soft-TLB base address for the A2 emitter/trampoline (x21). Set by
@@ -229,6 +234,11 @@ bool a32_vmfile_lookup_shared(uint32_t start_gva, int *out_fd,
 /* Slot pre-flight (0 when a later record is guaranteed a table slot) and
  * owned-duplicate private lookup for mremap. */
 int a32_vmfile_check_record(uint32_t start_gva, bool shared);
+/* MAP_FIXED replacement pre-flight: 0 when the retire of
+ * [start_gva, end_gva) frees enough slots for the replacement record.
+ * Call before retiring the old range. */
+int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
+    bool shared);
 bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
     uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
     uint32_t *out_map_start, uint32_t *out_map_end);

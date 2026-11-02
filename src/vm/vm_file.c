@@ -39,7 +39,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define A32_VMFILE_SLOTS 64U
+#define A32_VMFILE_SLOTS 1024U
+#define A32_VMFILE_INODES 512U
 
 typedef struct {
     bool used;
@@ -58,7 +59,7 @@ typedef struct {
     int dup_fd;
 } a32_vmfile_map_t;
 
-static a32_vmfile_inode_t g_inodes[A32_VMFILE_SLOTS];
+static a32_vmfile_inode_t g_inodes[A32_VMFILE_INODES];
 static a32_vmfile_map_t g_fmaps[A32_VMFILE_SLOTS];
 static pthread_mutex_t g_vmfile_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -118,6 +119,80 @@ int a32_vmfile_check_record(uint32_t start_gva, bool shared)
     return rc;
 }
 
+/* MAP_FIXED replacement pre-flight (A32-R3-1 follow-up 2): capacity
+ * check that accounts for slots the retire step is about to free. A
+ * same-start reuse needs no new slot; a fully covered entry frees one;
+ * a middle split (an old entry spanning beyond both sides) consumes one
+ * extra slot for its right half. Returns 0 when the replacement record
+ * is guaranteed a slot after the retire, -ENOMEM otherwise. Call BEFORE
+ * the retire step drops the old range. */
+int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
+    bool shared)
+{
+    unsigned free_fmap = 0U;
+    unsigned free_shared = 0U;
+    unsigned freed_fmap = 0U;
+    unsigned freed_shared = 0U;
+    unsigned extra_fmap = 0U;
+    unsigned extra_shared = 0U;
+    bool same_start_fmap = false;
+    bool same_start_shared = false;
+    unsigned need_fmap;
+    unsigned need_shared;
+    unsigned i;
+    if (end_gva <= start_gva) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&g_vmfile_lock);
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (!g_fmaps[i].used) {
+            free_fmap++;
+        } else if (g_fmaps[i].start_gva == start_gva) {
+            same_start_fmap = true;
+        }
+        if (!g_shared[i].used) {
+            free_shared++;
+        } else if (g_shared[i].start_gva == start_gva) {
+            same_start_shared = true;
+        }
+    }
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_fmaps[i].used && g_fmaps[i].start_gva != start_gva &&
+            g_fmaps[i].start_gva >= start_gva &&
+            g_fmaps[i].end_gva <= end_gva) {
+            freed_fmap++;
+        }
+        if (g_fmaps[i].used && g_fmaps[i].start_gva < start_gva &&
+            g_fmaps[i].end_gva > end_gva) {
+            extra_fmap++;
+        }
+        if (g_shared[i].used && g_shared[i].start_gva != start_gva &&
+            g_shared[i].start_gva >= start_gva &&
+            g_shared[i].end_gva <= end_gva) {
+            freed_shared++;
+        }
+        if (g_shared[i].used && g_shared[i].start_gva < start_gva &&
+            g_shared[i].end_gva > end_gva) {
+            extra_shared++;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    /* A same-start record overwrites its slot; any other record needs a
+     * fresh one. A middle split additionally consumes one slot for the
+     * right half the retire step creates. */
+    need_fmap = same_start_fmap ? extra_fmap : (1U + extra_fmap);
+    if (free_fmap + freed_fmap < need_fmap) {
+        return -ENOMEM;
+    }
+    if (shared) {
+        need_shared = same_start_shared ? extra_shared : (1U + extra_shared);
+        if (free_shared + freed_shared < need_shared) {
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
 /* Transactional record: the slot is secured before any mutation, so a
  * full table reports -ENOMEM without disturbing existing entries. */
 static int fmap_record_locked(uint64_t dev, uint64_t ino, uint32_t start_gva,
@@ -150,17 +225,17 @@ static int fmap_record_locked(uint64_t dev, uint64_t ino, uint32_t start_gva,
 static a32_vmfile_inode_t *inode_intern_locked(uint64_t dev, uint64_t ino)
 {
     unsigned i;
-    unsigned free_slot = A32_VMFILE_SLOTS;
-    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+    unsigned free_slot = A32_VMFILE_INODES;
+    for (i = 0U; i < A32_VMFILE_INODES; i++) {
         if (g_inodes[i].used && g_inodes[i].dev == dev &&
             g_inodes[i].ino == ino) {
             return &g_inodes[i];
         }
-        if (!g_inodes[i].used && free_slot == A32_VMFILE_SLOTS) {
+        if (!g_inodes[i].used && free_slot == A32_VMFILE_INODES) {
             free_slot = i;
         }
     }
-    if (free_slot == A32_VMFILE_SLOTS) {
+    if (free_slot == A32_VMFILE_INODES) {
         return NULL;
     }
     g_inodes[free_slot].used = true;
@@ -300,7 +375,7 @@ static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
     uintptr_t arena = a32_vm32_arena_base();
 
     pthread_mutex_lock(&g_vmfile_lock);
-    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+    for (i = 0U; i < A32_VMFILE_INODES; i++) {
         if (!g_inodes[i].used || g_inodes[i].dev != dev ||
             g_inodes[i].ino != ino) {
             continue;
@@ -616,9 +691,9 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
         }
     }
     /* Reclaim inode entries whose last mapping just disappeared so the
-     * 64-entry table cannot leak over the process lifetime (A32-R3-5).
+     * inode table cannot leak over the process lifetime (A32-R3-5).
      * Re-interning later restores the size from fstat. */
-    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+    for (unsigned i = 0U; i < A32_VMFILE_INODES; i++) {
         bool live = false;
         if (!g_inodes[i].used) {
             continue;

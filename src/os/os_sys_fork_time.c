@@ -87,9 +87,18 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     sigset_t saved_set;
     bool masked = false;
     if (!ctx || !ctx->has_host_info) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            fork_child_reset();
+        /* Plain-Linux fork (ground-truth oracle under lima): still
+         * order the JIT lock against fork() so a sibling thread
+         * mid-compile cannot leave the child with a half-mutated
+         * cache and a zeroed lock (A32-R3-4 follow-up 4). No guest
+         * snapshot is needed outside hl; the quiesce alone suffices. */
+        pid_t pid;
+        sigfillset(&block_all);
+        masked = (pthread_sigmask(SIG_BLOCK, &block_all, &saved_set) == 0);
+        a32_jit_fork_prepare();
+        pid = fork_reconciled();
+        if (masked) {
+            (void)pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
         }
         return pid;
     }

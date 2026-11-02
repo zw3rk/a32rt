@@ -355,6 +355,15 @@ bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot)
     return true;
 }
 
+bool a32_vm32_page_eof_cut(uint32_t gva)
+{
+    if (__atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE) == 0U) {
+        return false;
+    }
+    return (__atomic_load_n(&g_prot[gva >> 12U],
+        __ATOMIC_ACQUIRE) & A32_PROT_EOF_CUT) != 0U;
+}
+
 void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
 {
     uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);

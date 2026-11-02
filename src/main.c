@@ -93,6 +93,13 @@ static void exec_signal_restore(a32_ctx_t *ctx)
     uint64_t mask = getenv_hex("A32RT_EXEC_SIGMASK") & keep;
     uint64_t ign = getenv_hex("A32RT_EXEC_SIGIGN") & keep;
     uint64_t pend = getenv_hex("A32RT_EXEC_SIGPEND") & keep;
+    /* The carried state has been consumed here: drop it first so a
+     * later native child process never inherits stale execve-class
+     * signal state, even when the carried values are all zero
+     * (A32-R3-7 follow-up 5). */
+    unsetenv("A32RT_EXEC_SIGMASK");
+    unsetenv("A32RT_EXEC_SIGIGN");
+    unsetenv("A32RT_EXEC_SIGPEND");
     if ((mask | ign | pend) == 0ULL) {
         return;
     }
