@@ -320,6 +320,7 @@ uint32_t    a32_jit_run_block(a32_ctx_t *ctx, const void *code_ptr,
 void        a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t itstate);
 bool        a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t *out_itstate);
 const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes);
+const void *a32_jit_compile_block_leased(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, uint32_t *out_code_bytes);
 int         a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
                                       bool is_thumb, bool is_call,
                                       const uint32_t *words, size_t word_count,
@@ -349,6 +350,8 @@ void       a32_signals_preset_siginfo(int sig, const void *host_si);
 void       a32_signals_consume_siginfo(int sig, void *guest_si32);
 int        a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
                                 uint32_t oldact_va, uint32_t sigsetsize);
+uint64_t   a32_signals_ignored_mask(void);
+void       a32_signals_mark_ignored(uint64_t ign_mask);
 int        a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
                                   uint32_t oldset_va, uint32_t sigsetsize);
 int        a32_sys_rt_sigreturn(a32_ctx_t *ctx);

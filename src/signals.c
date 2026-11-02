@@ -870,3 +870,30 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
 
     return 0;
 }
+
+/* Snapshot of genuinely ignored dispositions for the execve carry. */
+uint64_t a32_signals_ignored_mask(void)
+{
+    uint64_t mask = 0ULL;
+    for (int s = 1; s <= 64; s++) {
+        if (g_guest_sigactions[s].handler == A32_SIG_IGN) {
+            mask |= 1ULL << (s - 1);
+        }
+    }
+    return mask;
+}
+
+/* Post-exec restore: re-apply ignored dispositions carried across the
+ * re-exec and pin host handlers so later deliveries pend as ignored
+ * instead of taking the host default action. */
+void a32_signals_mark_ignored(uint64_t ign_mask)
+{
+    for (int s = 1; s <= 64; s++) {
+        if ((ign_mask & (1ULL << (s - 1))) != 0ULL &&
+            s != SIGKILL && s != SIGSTOP) {
+            g_guest_sigactions[s].handler = A32_SIG_IGN;
+            (void)install_host_sigaction(s,
+                (unsigned long)(SA_SIGINFO | SA_NODEFER | SA_RESTART));
+        }
+    }
+}

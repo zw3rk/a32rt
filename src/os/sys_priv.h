@@ -701,6 +701,9 @@ bool  a32_sys_write_guest_itimerval(a32_ctx_t *ctx, uint32_t va, const struct it
 int   a32_sys_handle_fcntl_flock(a32_ctx_t *ctx, int fd, int cmd, uint32_t arg, bool is64);
 
 void *a32_sys_guest_thread_start(void *arg);
+int   a32_sys_handle_fork_clone(a32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+                                uint32_t a1, uint32_t a2, uint32_t a3,
+                                uint32_t a4);
 void  a32_sys_check_pwait_signals(a32_ctx_t *ctx, uint64_t temp_mask);
 void  a32_sys_restore_pwait_sigmask(a32_ctx_t *ctx, uint64_t saved_sig_mask);
 int   a32_sys_pwait_sigmask_enter(a32_ctx_t *ctx, uint32_t mask_va, uint32_t mask_sz,

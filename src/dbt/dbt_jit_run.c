@@ -567,7 +567,6 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
     const void *code;
     uint32_t reason;
     bool saved_step;
-    int seal_rc;
     if (ctx == NULL) {
         return A32_EXIT_UNDEF;
     }
@@ -576,26 +575,15 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
     ctx->exit_reason = A32_EXIT_NONE;
     saved_step = ctx->single_step;
     ctx->single_step = true;
-    code = a32_jit_compile_block(ctx, pc, is_thumb, &code_bytes);
+    /* A32-R3-6: compile, seal the W^X batch, and acquire the execution
+     * lease in one locked operation, so another thread cannot reset and
+     * recycle the block between compilation and execution. */
+    code = a32_jit_compile_block_leased(ctx, pc, is_thumb, &code_bytes);
     ctx->single_step = saved_step;
     if (code == NULL || code_bytes == 0U) {
         if (ctx->exit_reason == A32_EXIT_NONE) {
             ctx->exit_reason = A32_EXIT_UNDEF;
         }
-        return ctx->exit_reason;
-    }
-    /* W^X: fresh blocks live in RW staging pages until the batch seals
-     * them RX (plus icache flush). Normal dispatch seals via flush_now;
-     * this direct run_block path must seal explicitly. */
-    jit_lock_acquire();
-    seal_rc = a32_jit_flush_batch_locked(ctx);
-    if (seal_rc == 0) {
-        atomic_fetch_add_explicit(&g_jit_exec_readers, 1U, memory_order_acq_rel);
-    }
-    jit_lock_release();
-    if (seal_rc != 0) {
-        ctx->fault_addr = pc;
-        ctx->exit_reason = A32_EXIT_FAULT;
         return ctx->exit_reason;
     }
     ctx->blocks_executed++;

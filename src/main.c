@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,45 @@ static const char *strip_sysroot_prefix(const char *path, const char *prefix)
         return path + len;
     }
     return NULL;
+}
+
+static uint64_t getenv_hex(const char *name)
+{
+    const char *s = getenv(name);
+    char *endp = NULL;
+    unsigned long long v;
+    if (s == NULL || s[0] == '\0') {
+        return 0ULL;
+    }
+    errno = 0;
+    v = strtoull(s, &endp, 16);
+    if (errno != 0 || endp == NULL || endp == s || *endp != '\0') {
+        return 0ULL;
+    }
+    return (uint64_t)v;
+}
+
+/* Cross-RT execve class: a re-exec replaces the image, so the blocked
+ * mask, ignored dispositions, and pending signals carried through the
+ * environment are re-applied here — Linux preserves all three while
+ * caught handlers revert to default. */
+static void exec_signal_restore(a32_ctx_t *ctx)
+{
+    uint64_t keep = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    uint64_t mask = getenv_hex("A32RT_EXEC_SIGMASK") & keep;
+    uint64_t ign = getenv_hex("A32RT_EXEC_SIGIGN") & keep;
+    uint64_t pend = getenv_hex("A32RT_EXEC_SIGPEND") & keep;
+    if ((mask | ign | pend) == 0ULL) {
+        return;
+    }
+    ctx->sig_mask = mask;
+    ctx->pending_signals = pend;
+    a32_signals_mark_ignored(ign);
+    while (mask != 0ULL) {
+        int s = __builtin_ctzll(mask) + 1;
+        mask &= mask - 1ULL;
+        a32_signals_ensure_host_handler(s);
+    }
 }
 
 static void usage(const char *prog)
@@ -307,6 +347,7 @@ int main(int argc, char **argv, char **envp)
     if (a32_signals_init(&ctx) != 0 || a32_jit_init(&ctx) != 0) {
         return 1;
     }
+    exec_signal_restore(&ctx);
 
     if (ctx.aot_mode) {
         return a32_aot_generate(&ctx, &elf_info, exec_path);

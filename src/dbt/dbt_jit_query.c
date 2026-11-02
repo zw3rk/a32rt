@@ -275,3 +275,16 @@ const void *a32_jit_compile_block(a32_ctx_t *ctx, uint32_t pc, bool is_thumb, ui
     }
     return compile_block_internal(ctx, pc, is_thumb, out_code_bytes, false);
 }
+
+/* Lease-bearing compile (A32-R3-6): compilation, batch sealing, and
+ * execution-lease acquisition happen inside one locked operation, so the
+ * returned code cannot be recycled by another thread's reset before the
+ * caller runs it. The caller must pair success with a32_jit_exec_leave. */
+const void *a32_jit_compile_block_leased(a32_ctx_t *ctx, uint32_t pc,
+    bool is_thumb, uint32_t *out_code_bytes)
+{
+    if (!ctx) {
+        return NULL;
+    }
+    return compile_block_internal(ctx, pc, is_thumb, out_code_bytes, true);
+}

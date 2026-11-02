@@ -107,6 +107,34 @@ static void flush_icache_range(a32_ctx_t *ctx, const void *start, size_t len)
 #endif
 }
 
+/* Fork coordination (A32-R3-4): the forking thread serializes cache
+ * mutation under the JIT lock, blocks new execution entrants, and waits
+ * out in-flight readers, so the child never inherits a reader count for
+ * vanished threads or a snapshot of partially mutated cache state. The
+ * forking thread itself holds no lease at a fork syscall: JIT execution
+ * leases are released before SVC dispatch on every engine path. */
+void a32_jit_fork_prepare(void)
+{
+    jit_lock_acquire();
+    atomic_store_explicit(&g_jit_reset_pending, 1U, memory_order_seq_cst);
+    while (atomic_load_explicit(&g_jit_exec_readers, memory_order_acquire) != 0U) {
+        __asm__ volatile("yield" ::: "memory");
+    }
+}
+
+void a32_jit_fork_parent(void)
+{
+    atomic_store_explicit(&g_jit_reset_pending, 0U, memory_order_release);
+    jit_lock_release();
+}
+
+void a32_jit_fork_child(void)
+{
+    atomic_store_explicit(&g_jit_exec_readers, 0U, memory_order_release);
+    atomic_store_explicit(&g_jit_reset_pending, 0U, memory_order_release);
+    atomic_store_explicit(&g_jit_lock, 0U, memory_order_release);
+}
+
 void a32_jit_reset_cache_locked(a32_ctx_t *ctx)
 {
     uint32_t old_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);

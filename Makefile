@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build build-darwin tests check check-line-limits check-headers \
+.PHONY: help all build build-darwin test tests check check-line-limits check-headers \
         test-hello-hl test-hello-lima \
         test-m1-hl test-m1-lima \
         test-m2-hl test-m2-lima \
@@ -39,7 +39,12 @@ LLD_RAW        := $(shell [ -x $(LLD_CACHED) ] && echo $(LLD_CACHED) || command 
 LIMACTL_CACHED := /nix/store/piidmzyl8dvi91i5y6hs8kaclbalk7bf-lima-2.1.4/bin/limactl
 LIMACTL        ?= $(shell command -v limactl 2>/dev/null || ([ -x $(LIMACTL_CACHED) ] && echo $(LIMACTL_CACHED)))
 
-CFLAGS := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
+# Shared warning policy (A32-R3-7): runtime, fixture, and bench recipes
+# all enforce the same -Werror policy; architecture/ABI options stay in
+# the per-recipe flags.
+A32RT_WARN_C := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra
+A32RT_WARN_CXX := -std=c++17 -Werror -Wall -Wextra
+CFLAGS := $(A32RT_WARN_C) -O2 -fPIE \
           -fno-stack-protector -Iinclude -Isrc
 LDFLAGS := -static-pie -Wl,-z,max-page-size=4096
 
@@ -91,13 +96,15 @@ SRCS := src/main.c \
         src/dbt/difftest.c \
         src/vm/vm32.c \
         src/vm/vm_file.c \
+        src/vm/vm_file_map.c \
+        src/vm/vm_mremap.c \
         src/dbt/aot/aot_sites.c \
         $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S
 HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
         src/interp/interp.h src/interp/interp_priv.h src/interp/decode_priv.h \
         src/dbt/difftest.h src/dbt/jit_priv.h \
-        src/vm/vm32.h src/os/backend.h src/os/sys_priv.h src/dbt/aot/aot.h
+        src/vm/vm32.h src/vm/vm_priv.h src/os/backend.h src/os/sys_priv.h src/dbt/aot/aot.h
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
 TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
@@ -112,6 +119,7 @@ TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
              $(BUILD_DIR)/test-m4-armhf \
              $(BUILD_DIR)/test-m4-thumb \
              $(BUILD_DIR)/test-m5-armhf \
+             $(BUILD_DIR)/test-h1-armhf \
              $(BUILD_DIR)/test-m7-armhf \
              $(BUILD_DIR)/test-m7-thumb \
              $(BUILD_DIR)/test-m8-glibc-armhf \
@@ -122,13 +130,13 @@ TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
              $(BUILD_DIR)/test-m8-cpp-glibc-thumb
 
 ARM32_FREESTANDING_CFLAGS := --target=armv7a-unknown-linux-eabihf -march=armv7ve -mfpu=neon-vfpv4 \
-                             -mfloat-abi=hard -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+                             -mfloat-abi=hard $(A32RT_WARN_C) -O2 \
                              -ffreestanding -fno-stack-protector -nostdlib -DA32RT_FREESTANDING_TEST
 # armel (soft-float ABI) variant: same freestanding recipe, gnueabi target.
 # Integer-only fixtures (hello, m1) build here; the VFP/NEON fixture (m4)
 # needs compiler-emitted __aeabi_fp helpers, so it stays hard-float-only.
 ARM32_FREESTANDING_CFLAGS_SOFT := --target=armv7a-unknown-linux-gnueabi -march=armv7ve -mfpu=neon-vfpv4 \
-                             -mfloat-abi=soft -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+                             -mfloat-abi=soft $(A32RT_WARN_C) -O2 \
                              -ffreestanding -fno-stack-protector -nostdlib -DA32RT_FREESTANDING_TEST
 
 help: ## Show available build and verification targets
@@ -161,13 +169,15 @@ build: $(A32RT_BIN) ## Build static-PIE aarch64-linux a32rt binary
 build-darwin: ## Build native darwin-arm64 binary (Backend 2) with host cc
 	@$(MAKE) $(BUILD_DIR)/a32rt-darwin CC=cc OBJ_DIR=$(BUILD_DIR)/darwin-obj \
 		A32RT_BIN=$(BUILD_DIR)/a32rt-darwin \
-		CFLAGS="-std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra -O2 -Iinclude -Isrc" \
+		CFLAGS="$(A32RT_WARN_C) -O2 -Iinclude -Isrc" \
 		LDFLAGS=""
 
 $(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
 	@printf "\033[32m▸ Linking\033[0m $@\n"
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
 	@ln -sf a32rt $(BUILD_DIR)/a32rt-binfmt-p
+
+test: check build-darwin tests ## Host-runnable gate: checks + darwin translator + all fixtures build clean under -Werror
 
 tests: $(TEST_BINS) ## Build arm32 (A32 and Thumb-2) test fixtures for M0..M8
 
@@ -247,7 +257,7 @@ define BUILD_ARM32_MUSL_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $$@ ($(3), musl dynamic)\n"
 	$(CLANG_RAW) --target=armv7a-unknown-linux-musleabihf -march=armv7ve -mfpu=neon-vfpv4 \
-		-mfloat-abi=hard $(3) -std=c11 -Werror=vla -Wall -Wextra -O2 -fPIE \
+		-mfloat-abi=hard $(3) $(A32RT_WARN_C) -O2 -fPIE \
 		-isystem $(SYSROOT_ARMV7)/usr/include -c $$< -o $(BUILD_DIR)/$(1).o
 	$(LLD_RAW) -m armelf_linux_eabi -pie -dynamic-linker /lib/ld-musl-armhf.so.1 \
 		$(SYSROOT_ARMV7)/usr/lib/Scrt1.o $(SYSROOT_ARMV7)/usr/lib/crti.o \
@@ -265,7 +275,7 @@ define BUILD_ARM32_GLIBC_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-glibc-armhf/lib/ld-linux-armhf.so.3 $(BUILD_DIR)/sysroot-glibc-armhf/usr/include/c++/12/iostream | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $$@ ($(3), glibc 2.36 dynamic)\n"
 	$(CLANG_RAW) --target=armv7a-unknown-linux-gnueabihf -march=armv7ve -mfpu=neon-vfpv4 \
-		-mfloat-abi=hard $(3) -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 -fPIE \
+		-mfloat-abi=hard $(3) $(A32RT_WARN_C) -O2 -fPIE \
 		-isystem $(SYSROOT_GLIBC)/usr/include/arm-linux-gnueabihf -isystem $(SYSROOT_GLIBC)/usr/include \
 		-c $$< -o $(BUILD_DIR)/$(1).o
 	$(LLD_RAW) -m armelf_linux_eabi -pie --sysroot=$(SYSROOT_GLIBC) --dynamic-linker=/lib/ld-linux-armhf.so.3 \
@@ -285,7 +295,7 @@ define BUILD_ARM32_CPP_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-armv7/usr/bin/gcc | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $$@ ($(3), C++17 & ARM EHABI)\n"
 	$(CLANGXX_RAW) --target=armv7a-unknown-linux-musleabihf -march=armv7ve -mfpu=neon-vfpv4 \
-		-mfloat-abi=hard $(3) -std=c++17 -Wall -Wextra -O2 -fPIE -fexceptions -frtti \
+		-mfloat-abi=hard $(3) $(A32RT_WARN_CXX) -O2 -fPIE -fexceptions -frtti \
 		-isystem $(SYSROOT_ARMV7)/usr/include/c++/14.2.0 \
 		-isystem $(SYSROOT_ARMV7)/usr/include/c++/14.2.0/armv7-alpine-linux-musleabihf \
 		-isystem $(SYSROOT_ARMV7)/usr/include -c $$< -o $(BUILD_DIR)/$(1).o
@@ -305,7 +315,7 @@ define BUILD_ARM32_GLIBC_CPP_FIXTURE
 $(BUILD_DIR)/$(1): tests/$(2) $(BUILD_DIR)/sysroot-glibc-armhf/usr/include/c++/12/iostream | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $$@ ($(3), glibc 2.36 C++17 & ARM EHABI)\n"
 	$(CLANGXX_RAW) --target=armv7a-unknown-linux-gnueabihf -march=armv7ve -mfpu=neon-vfpv4 \
-		-mfloat-abi=hard $(3) -std=c++17 -Wall -Wextra -O2 -fPIE -fexceptions -frtti \
+		-mfloat-abi=hard $(3) $(A32RT_WARN_CXX) -O2 -fPIE -fexceptions -frtti \
 		-isystem $(SYSROOT_GLIBC)/usr/include/c++/12 \
 		-isystem $(SYSROOT_GLIBC)/usr/include/arm-linux-gnueabihf/c++/12 \
 		-isystem $(SYSROOT_GLIBC)/usr/include/arm-linux-gnueabihf \
@@ -566,19 +576,19 @@ $(eval $(call BUILD_ARM32_FIXTURE,bench-suite-thumb,bench_suite.c,-mthumb))
 
 $(BUILD_DIR)/bench-suite-aarch64: tests/bench_suite.c | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $@ (aarch64)\n"
-	$(CLANG_RAW) --target=aarch64-unknown-linux-gnu -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+	$(CLANG_RAW) --target=aarch64-unknown-linux-gnu $(A32RT_WARN_C) -O2 \
 		-ffreestanding -fno-stack-protector -nostdlib -c $< -o $@.o
 	$(LLD_RAW) -m aarch64linux -Bstatic --no-dynamic-linker --image-base=0x00400000 -e _start $@.o -o $@
 
 $(BUILD_DIR)/bench-suite-x86_64: tests/bench_suite.c | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $@ (x86_64)\n"
-	$(CLANG_RAW) --target=x86_64-unknown-linux-gnu -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+	$(CLANG_RAW) --target=x86_64-unknown-linux-gnu $(A32RT_WARN_C) -O2 \
 		-ffreestanding -fno-stack-protector -nostdlib -c $< -o $@.o
 	$(LLD_RAW) -m elf_x86_64 -Bstatic --no-dynamic-linker --image-base=0x00400000 -e _start $@.o -o $@
 
 $(BUILD_DIR)/bench-suite-i386: tests/bench_suite.c | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $@ (i386)\n"
-	$(CLANG_RAW) --target=i686-unknown-linux-gnu -std=c11 -Werror=vla -pedantic -Wall -Wextra -O2 \
+	$(CLANG_RAW) --target=i686-unknown-linux-gnu $(A32RT_WARN_C) -O2 \
 		-ffreestanding -fno-stack-protector -nostdlib -c $< -o $@.o
 	$(LLD_RAW) -m elf_i386 -Bstatic --no-dynamic-linker -e _start $@.o -o $@
 

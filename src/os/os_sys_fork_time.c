@@ -6,6 +6,7 @@
  */
 
 #include "os/sys_priv.h"
+#include "dbt/jit_priv.h"
 
 void fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struct stat *src)
 {
@@ -57,15 +58,57 @@ typedef struct fork_cluster {
     size_t   count;
 } fork_cluster_t;
 
+/* The fork child starts with exactly one thread: drop every lock and
+ * lease a vanished thread may have held. */
+static void fork_child_reset(void)
+{
+    a32_jit_fork_child();
+    a32_vm_fork_child_reset();
+    a32_vmfile_fork_child_reset();
+}
+
+/* Reconcile one fork() return issued after a32_jit_fork_prepare: the
+ * child resets, the parent (or a failed fork, which only has a parent)
+ * resumes execution entrants. */
+static pid_t fork_reconciled(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        fork_child_reset();
+    } else {
+        a32_jit_fork_parent();
+    }
+    return pid;
+}
+
 pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
 {
+    sigset_t block_all;
+    sigset_t saved_set;
+    bool masked = false;
     if (!ctx || !ctx->has_host_info) {
-        return fork();
+        pid_t pid = fork();
+        if (pid == 0) {
+            fork_child_reset();
+        }
+        return pid;
     }
+
+    /* A32-R3-4: quiesce JIT execution/mutation before the snapshot so the
+     * child inherits no leases of vanished threads and no partially
+     * mutated cache state. Signals stay blocked until both sides have
+     * reconciled, so no handler runs inside the PROT_NONE window. */
+    sigfillset(&block_all);
+    masked = (pthread_sigmask(SIG_BLOCK, &block_all, &saved_set) == 0);
+    a32_jit_fork_prepare();
 
     a32_vm_sync_ctx(ctx);
     if (ctx->region_count == 0U) {
-        return fork();
+        pid_t pid = fork_reconciled();
+        if (masked) {
+            (void)pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
+        }
+        return pid;
     }
 
     fork_subregion_t *r_list   = (fork_subregion_t *)calloc(ctx->region_count, sizeof(fork_subregion_t));
@@ -73,7 +116,11 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     if (!r_list || !clusters) {
         free(clusters);
         free(r_list);
-        return fork();
+        pid_t pid = fork_reconciled();
+        if (masked) {
+            (void)pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
+        }
+        return pid;
     }
 
     size_t   r_count     = 0U;
@@ -109,7 +156,11 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     if (r_count == 0U || total_bytes == 0U) {
         free(clusters);
         free(r_list);
-        return fork();
+        pid_t pid = fork_reconciled();
+        if (masked) {
+            (void)pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
+        }
+        return pid;
     }
 
     size_t c_count = 0U;
@@ -131,7 +182,11 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     if (snap_buf == MAP_FAILED) {
         free(clusters);
         free(r_list);
-        return fork();
+        pid_t pid = fork_reconciled();
+        if (masked) {
+            (void)pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
+        }
+        return pid;
     }
 
     for (size_t i = 0U; i < r_count; i++) {
@@ -156,6 +211,11 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
 
     pid_t pid = fork();
     int saved_errno = errno;
+    if (pid == 0) {
+        fork_child_reset();
+    } else {
+        a32_jit_fork_parent();
+    }
 
     if (sp_low > ctx->stack_base) {
         (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
@@ -189,8 +249,144 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     (void)munmap(snap_buf, total_bytes);
     free(clusters);
     free(r_list);
+    if (masked) {
+        (void)pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
+    }
     errno = saved_errno;
     return pid;
+}
+
+/* fork/vfork/clone dispatch moved here from os_sys_sig_time.c (A32-R3):
+ * process forking shares this file's snapshot + JIT/VM coordination, and
+ * the move keeps os_sys_sig_time.c under the 900-line limit. */
+int a32_sys_handle_fork_clone(a32_ctx_t *ctx, uint32_t nr, uint32_t a0,
+    uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    if (nr == ARM_NR_fork || nr == ARM_NR_vfork) {
+        pid_t pid = fork_with_guest_snapshot(ctx, 0U);
+        if (pid < 0) {
+            FAIL_ERR(errno);
+        } else if (pid == 0) {
+            ctx->host_tid = 0;
+            ctx->host_tid = get_host_tid(ctx);
+            ctx->is_thread_clone = false;
+            ctx->clear_child_tid = 0U;
+            ctx->robust_list_head = 0U;
+            ctx->robust_list_len = 0U;
+            ctx->pending_signals = 0ULL;
+            a32_signals_set_thread_ctx(ctx);
+            ctx->regs[0] = 0U;
+        } else {
+            ctx->regs[0] = (uint32_t)pid;
+        }
+        return 0;
+    }
+    if (nr != ARM_NR_clone) {
+        FAIL_ERR(ENOSYS);
+    }
+    {
+        uint32_t flags = a0;
+        FAIL_EINVAL_IF(((flags & CLONE_SIGHAND) != 0U &&
+                        (flags & CLONE_VM) == 0U) ||
+                       ((flags & CLONE_THREAD) != 0U &&
+                        (flags & CLONE_SIGHAND) == 0U));
+        FAIL_EFAULT_IF(((flags & CLONE_PARENT_SETTID) != 0U &&
+                        !a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)) ||
+                       ((flags & CLONE_CHILD_SETTID) != 0U &&
+                        !a32_guest_range_ok(ctx, a4, 4U, PROT_WRITE)));
+        bool is_thread = ((flags & CLONE_VM) != 0U &&
+                          (flags & CLONE_VFORK) == 0U);
+        if (is_thread) {
+            a32_ctx_t *child_ctx = (a32_ctx_t *)calloc(1, sizeof(a32_ctx_t));
+            if (!child_ctx) {
+                FAIL_ERR(ENOMEM);
+            }
+            a32_vm_sync_ctx(ctx);
+            memcpy(child_ctx, ctx, sizeof(a32_ctx_t));
+            child_ctx->regs[0]          = 0U;
+            child_ctx->regs[13]         = a1 ? a1 : ctx->regs[13];
+            child_ctx->clear_child_tid  = (flags & CLONE_CHILD_CLEARTID) ? a4 : 0U;
+            child_ctx->robust_list_head = 0U;
+            child_ctx->robust_list_len  = 0U;
+            child_ctx->pending_signals  = 0ULL;
+            child_ctx->altstack_sp      = 0U;
+            child_ctx->altstack_size    = 0U;
+            child_ctx->altstack_flags   = SS_DISABLE;
+            child_ctx->ras_top          = 0U;
+            memset(child_ctx->ras, 0, sizeof(child_ctx->ras));
+            memset(child_ctx->ibtc, 0, sizeof(child_ctx->ibtc));
+            if (flags & CLONE_SETTLS) {
+                child_ctx->tls_tp = a3;
+            }
+
+            child_thread_args_t targs = {
+                .child_ctx = child_ctx,
+                .flags     = flags,
+                .ptid_va   = a2,
+                .ctid_va   = a4,
+                .child_tid = 0,
+                .started   = 0,
+            };
+
+            (void)a32_jit_init(child_ctx);
+
+            pthread_t pt;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+            int prc = pthread_create(&pt, &attr, guest_thread_start, &targs);
+            pthread_attr_destroy(&attr);
+            if (prc != 0) {
+                free(child_ctx);
+                FAIL_ERR(prc);
+            }
+
+            while (!__atomic_load_n(&targs.started, __ATOMIC_SEQ_CST)) {
+                sched_yield();
+            }
+
+            ctx->regs[0] = (uint32_t)targs.child_tid;
+            return 0;
+        }
+
+        /* Non-thread clone: process fork */
+        pid_t pid = fork_with_guest_snapshot(ctx, a1);
+        if (pid < 0) {
+            FAIL_ERR(errno);
+        } else if (pid == 0) {
+            ctx->host_tid         = 0;
+            ctx->host_tid         = get_host_tid(ctx);
+            ctx->is_thread_clone  = false;
+            ctx->robust_list_head = 0U;
+            ctx->robust_list_len  = 0U;
+            ctx->pending_signals  = 0ULL;
+            a32_signals_set_thread_ctx(ctx);
+            if (a1 != 0U) {
+                ctx->regs[13] = a1;
+            }
+            if (flags & CLONE_SETTLS) {
+                ctx->tls_tp = a3;
+            }
+            if ((flags & CLONE_PARENT_SETTID) &&
+                a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)) {
+                *(uint32_t *)a32_guest_ptr(ctx, a2) = (uint32_t)ctx->host_tid;
+            }
+            if ((flags & CLONE_CHILD_SETTID) &&
+                a32_guest_range_ok(ctx, a4, 4U, PROT_WRITE)) {
+                *(uint32_t *)a32_guest_ptr(ctx, a4) = (uint32_t)ctx->host_tid;
+            }
+            ctx->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? a4 : 0U;
+            ctx->regs[0] = 0U;
+        } else {
+            if ((flags & CLONE_PARENT_SETTID) &&
+                a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)) {
+                *(uint32_t *)a32_guest_ptr(ctx, a2) = (uint32_t)pid;
+            }
+            ctx->regs[0] = (uint32_t)pid;
+        }
+        return 0;
+    }
 }
 
 void fill_arm_rusage32(arm_rusage32_t *dst, const struct rusage *src)

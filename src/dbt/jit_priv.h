@@ -272,6 +272,9 @@ a32_cache_entry_t *a32_jit_find_ht_slot_for_insert_locked(uint32_t key, uint32_t
                                                           bool *out_exists);
 a32_cache_entry_t *a32_jit_find_ht_entry_locked(uint32_t key, uint32_t cur_epoch);
 void a32_jit_reset_cache_locked(a32_ctx_t *ctx);
+void a32_jit_fork_prepare(void);
+void a32_jit_fork_parent(void);
+void a32_jit_fork_child(void);
 int a32_jit_flush_batch_locked(a32_ctx_t *ctx);
 uint8_t *a32_jit_allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes);
 void a32_jit_commit_side_table_locked(const void *dst, size_t code_bytes,

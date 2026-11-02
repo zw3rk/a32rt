@@ -62,33 +62,89 @@ static a32_vmfile_inode_t g_inodes[A32_VMFILE_SLOTS];
 static a32_vmfile_map_t g_fmaps[A32_VMFILE_SLOTS];
 static pthread_mutex_t g_vmfile_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void fmap_record_locked(uint64_t dev, uint64_t ino, uint32_t start_gva,
-    uint32_t end_gva, uint64_t file_offset, int host_fd)
+typedef struct {
+    bool used;
+    uint32_t start_gva;
+    uint32_t end_gva;
+    int dup_fd;
+    uint32_t pgoffset;
+} a32_vmfile_shared_t;
+
+static a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
+
+/* Slot selection without mutation: same-start overwrite reuses its slot,
+ * otherwise a free slot is required. Returns the slot index or -1 when
+ * tracking cannot be maintained (A32-R3-5: reserve before mutation). */
+static int fmap_slot_for_locked(uint32_t start_gva)
 {
-    unsigned slot = A32_VMFILE_SLOTS;
+    int free_slot = -1;
     for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
         if (g_fmaps[i].used && g_fmaps[i].start_gva == start_gva) {
-            if (g_fmaps[i].dup_fd >= 0) {
-                close(g_fmaps[i].dup_fd);
-                g_fmaps[i].dup_fd = -1;
-            }
-            slot = i;
-            break;
+            return (int)i;
         }
-        if (!g_fmaps[i].used && slot == A32_VMFILE_SLOTS) {
-            slot = i;
+        if (!g_fmaps[i].used && free_slot < 0) {
+            free_slot = (int)i;
         }
     }
-    if (slot < A32_VMFILE_SLOTS) {
-        g_fmaps[slot].used = true;
-        g_fmaps[slot].dev = dev;
-        g_fmaps[slot].ino = ino;
-        g_fmaps[slot].start_gva = start_gva;
-        g_fmaps[slot].end_gva = end_gva;
-        g_fmaps[slot].file_offset = file_offset;
-        g_fmaps[slot].dup_fd = (host_fd >= 0)
-            ? fcntl(host_fd, F_DUPFD_CLOEXEC, 3) : -1;
+    return free_slot;
+}
+
+static int shared_slot_for_locked(uint32_t start_gva)
+{
+    int free_slot = -1;
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used && g_shared[i].start_gva == start_gva) {
+            return (int)i;
+        }
+        if (!g_shared[i].used && free_slot < 0) {
+            free_slot = (int)i;
+        }
     }
+    return free_slot;
+}
+
+/* Pre-flight capacity check used before mutating host mappings: 0 when a
+ * later record for [start_gva, end_gva) is guaranteed a table slot,
+ * -ENOMEM otherwise. Inode capacity is verified at record time. */
+int a32_vmfile_check_record(uint32_t start_gva, bool shared)
+{
+    int rc = 0;
+    pthread_mutex_lock(&g_vmfile_lock);
+    if (fmap_slot_for_locked(start_gva) < 0 ||
+        (shared && shared_slot_for_locked(start_gva) < 0)) {
+        rc = -ENOMEM;
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    return rc;
+}
+
+/* Transactional record: the slot is secured before any mutation, so a
+ * full table reports -ENOMEM without disturbing existing entries. */
+static int fmap_record_locked(uint64_t dev, uint64_t ino, uint32_t start_gva,
+    uint32_t end_gva, uint64_t file_offset, int host_fd)
+{
+    int slot = fmap_slot_for_locked(start_gva);
+    int dup_fd = -1;
+    if (slot < 0) {
+        return -ENOMEM;
+    }
+    if (host_fd >= 0) {
+        dup_fd = fcntl(host_fd, F_DUPFD_CLOEXEC, 3);
+        if (dup_fd < 0) {
+            return -errno;
+        }
+    }
+    if (g_fmaps[slot].used && g_fmaps[slot].dup_fd >= 0) {
+        close(g_fmaps[slot].dup_fd);
+    }
+    g_fmaps[slot].used = true;
+    g_fmaps[slot].dev = dev;
+    g_fmaps[slot].ino = ino;
+    g_fmaps[slot].start_gva = start_gva;
+    g_fmaps[slot].end_gva = end_gva;
+    g_fmaps[slot].file_offset = file_offset;
+    g_fmaps[slot].dup_fd = dup_fd;
+    return 0;
 }
 
 static a32_vmfile_inode_t *inode_intern_locked(uint64_t dev, uint64_t ino)
@@ -114,154 +170,19 @@ static a32_vmfile_inode_t *inode_intern_locked(uint64_t dev, uint64_t ino)
     return &g_inodes[free_slot];
 }
 
-/* Populate a fresh MAP_PRIVATE file mapping: pread the file bytes while
- * the range is temporarily RW, propagate errors, zero-fill the EOF tail
- * only inside the mapped range, then apply the final guest prot. On
- * failure the range is left PROT_NONE. Non-private mappings return 0. */
-int a32_vmfile_populate_if_private(void *hva, int host_fd,
-    uint64_t file_offset, size_t len, int host_flags, int final_prot)
+/* Enforce the EOF boundary for one fresh mapping: pages wholly beyond
+ * round_up(file_size) become inaccessible (A32-R3-2). File-backed pages
+ * are left alone here; the caller publishes them through the normal
+ * region path afterward. Deliberately never clears: fresh pages carry no
+ * stale cuts (the retire step dropped them), and clearing would PROT_NONE
+ * pages the populate step is about to fill. */
+static void vmfile_enforce_eof_locked(uint32_t start_gva, uint32_t len,
+    uint64_t file_offset, uint64_t file_size)
 {
-    bool rw_stage;
-    int rc;
-    if ((host_flags & (MAP_ANONYMOUS | MAP_SHARED)) != 0) {
-        return 0;
+    uint32_t keep = a32_vmfile_eof_keep(len, file_offset, file_size);
+    if ((uint64_t)keep < (uint64_t)len) {
+        a32_vm32_set_eof_cut(start_gva + keep, len - keep, true);
     }
-    if (hva == NULL || host_fd < 0 || len == 0U) {
-        return -EINVAL;
-    }
-    rw_stage = ((final_prot & (PROT_READ | PROT_WRITE)) !=
-        (PROT_READ | PROT_WRITE));
-    if (rw_stage) {
-        rc = a32_backend_protect(hva, len, PROT_READ | PROT_WRITE);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    rc = a32_vmfile_populate_private(hva, host_fd, file_offset, len);
-    if (rc == 0 && rw_stage) {
-        rc = a32_backend_protect(hva, len, final_prot);
-    }
-    if (rc != 0) {
-        void *out = NULL;
-        (void)a32_backend_map_anon(hva, len, 0, 1, 1, 0, &out);
-    }
-    return rc;
-}
-
-/* A2 staged mapping (RC-U3-r3 #5): reserve anonymous RW memory for a
- * private file range. The caller preads the file bytes over it (see
- * a32_vmfile_populate_private) and flips to the committed protection
- * afterward, so no file-backed page can SIGBUS on a beyond-EOF touch. */
-int a32_vmfile_map_staged(void *hint_addr, size_t len, int host_fd,
-    uint64_t file_offset, void **out)
-{
-    (void)host_fd;
-    (void)file_offset;
-    if (hint_addr == NULL || len == 0U || out == NULL) {
-        return -EINVAL;
-    }
-    return a32_backend_map_anon(hint_addr, len, PROT_READ | PROT_WRITE,
-        1, 1, 0, out);
-}
-
-static int vmfile_create_shared_anon_fd(size_t len)
-{
-#if defined(__linux__)
-    int mfd = memfd_create("a32-shanon", MFD_CLOEXEC);
-    if (mfd >= 0) {
-        size_t mhp = a32_backend_page_size();
-        size_t mfsize = (len + mhp - 1U) & ~(mhp - 1U);
-        if (ftruncate(mfd, (off_t)mfsize) != 0) {
-            int merr = errno;
-            close(mfd);
-            return -merr;
-        }
-        return mfd;
-    }
-#endif
-    const char *dir = getenv("TMPDIR");
-    if (dir == NULL || dir[0] == '\0') {
-        dir = getenv("A32RT_CACHE");
-    }
-    if (dir == NULL || dir[0] == '\0') {
-        dir = "/tmp";
-    }
-    char tmpl[256];
-    int tlen = snprintf(tmpl, sizeof(tmpl), "%s/a32-shanon-XXXXXX", dir);
-    if (tlen <= 0 || (size_t)tlen >= sizeof(tmpl)) {
-        return -ENAMETOOLONG;
-    }
-    int fd = mkstemp(tmpl);
-    if (fd < 0) {
-        return -errno;
-    }
-    (void)unlink(tmpl);
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
-    size_t hp = a32_backend_page_size();
-    size_t fsize = (len + hp - 1U) & ~(hp - 1U);
-    if (ftruncate(fd, (off_t)fsize) != 0) {
-        int err = errno;
-        close(fd);
-        return -err;
-    }
-    return fd;
-}
-
-/* Reserve the host mapping for one guest range and pread-populate it.
- * When a2_stage is set the range is an A2 private file mapping: stage
- * it in anonymous memory instead of a native file-backed mmap so no
- * file-backed page can SIGBUS on a beyond-EOF touch. The staged range
- * then flows through the same populate + final-protection path. */
-int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
-    int host_fd, uint64_t file_offset, int host_flags, bool a2_stage,
-    void **out)
-{
-    int map_rc;
-    int pop_rc;
-    void *res = NULL;
-
-    if (host_target == NULL || len == 0U || out == NULL) {
-        return -EINVAL;
-    }
-    if (a2_stage) {
-        map_rc = a32_vmfile_map_staged(host_target, len, host_fd,
-            file_offset, &res);
-    } else if ((host_flags & (MAP_ANONYMOUS | MAP_SHARED)) ==
-        (MAP_ANONYMOUS | MAP_SHARED)) {
-        int sh_fd = vmfile_create_shared_anon_fd(len);
-        if (sh_fd < 0) {
-            return sh_fd;
-        }
-        map_rc = a32_backend_map_file(host_target, len, host_prot,
-            1, 1, 1, sh_fd, 0ULL, &res);
-        if (map_rc == 0) {
-            uintptr_t arena = a32_vm32_arena_base();
-            if ((uintptr_t)res >= arena &&
-                ((uintptr_t)res - arena) + len <= A32_VM32_WINDOW_SIZE) {
-                uint32_t sgva = (uint32_t)((uintptr_t)res - arena);
-                a32_vmfile_record_shared(sgva, sgva + (uint32_t)len,
-                    sh_fd, 0U);
-            }
-        }
-        close(sh_fd);
-    } else if ((host_flags & MAP_ANONYMOUS) != 0) {
-        map_rc = a32_backend_map_anon(host_target, len, host_prot,
-            1, 1, (host_flags & MAP_SHARED) != 0, &res);
-    } else {
-        map_rc = a32_backend_map_file(host_target, len, host_prot,
-            (host_flags & MAP_SHARED) != 0, 1, 1, host_fd, file_offset,
-            &res);
-    }
-    if (map_rc != 0) {
-        return map_rc;
-    }
-    pop_rc = a32_vmfile_populate_if_private(res, host_fd, file_offset,
-        len, host_flags, host_prot);
-    if (pop_rc != 0) {
-        return pop_rc;
-    }
-    *out = res;
-    return 0;
 }
 
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
@@ -269,6 +190,7 @@ int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
 {
     struct stat st;
     size_t done = 0U;
+    int rec_rc = 0;
     if (hva == NULL || host_fd < 0 || len == 0U) {
         return -EINVAL;
     }
@@ -280,23 +202,29 @@ int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
         pthread_mutex_lock(&g_vmfile_lock);
         a32_vmfile_inode_t *e =
             inode_intern_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
-        if (e != NULL) {
-            uint64_t end = file_offset + (uint64_t)len;
-            if (end > e->file_size) {
-                e->file_size = end;
-            }
-            if ((uint64_t)st.st_size > e->file_size) {
-                e->file_size = (uint64_t)st.st_size;
-            }
+        if (e == NULL) {
+            pthread_mutex_unlock(&g_vmfile_lock);
+            return -ENOMEM;
         }
+        /* Track the actual file size, never the mapping extent: extent
+         * would corrupt the growth/shrink baseline and hide beyond-EOF
+         * pages that must stay inaccessible (A32-R3-2). */
+        e->file_size = (uint64_t)st.st_size;
         if ((uintptr_t)hva >= arena &&
             ((uintptr_t)hva - arena) + len <= A32_VM32_WINDOW_SIZE) {
             uint32_t sgva = (uint32_t)((uintptr_t)hva - arena);
-            fmap_record_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino,
-                sgva, sgva + (uint32_t)len, file_offset, host_fd);
-            a32_vm32_set_eof_cut(sgva, (uint32_t)len, false);
+            rec_rc = fmap_record_locked((uint64_t)st.st_dev,
+                (uint64_t)st.st_ino, sgva, sgva + (uint32_t)len,
+                file_offset, host_fd);
+            if (rec_rc == 0) {
+                vmfile_enforce_eof_locked(sgva, (uint32_t)len, file_offset,
+                    (uint64_t)st.st_size);
+            }
         }
         pthread_mutex_unlock(&g_vmfile_lock);
+        if (rec_rc != 0) {
+            return rec_rc;
+        }
     }
     while (done < len) {
         ssize_t r = pread(host_fd, (char *)hva + done, len - done,
@@ -476,60 +404,71 @@ int a32_vmfile_sync_path(const char *host_path)
         (uint64_t)st.st_size);
 }
 
-typedef struct {
-    bool used;
-    uint32_t start_gva;
-    uint32_t end_gva;
-    int dup_fd;
-    uint32_t pgoffset;
-} a32_vmfile_shared_t;
-
-static a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
-
-void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
+/* Transactional shared record (A32-R3-5): the descriptor is duplicated
+ * before locking, both table slots are secured before any mutation, and
+ * the inode entry is interned before anything is published. Any failure
+ * reports a negative errno with all tables untouched. */
+int a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
     uint32_t pgoffset)
 {
     struct stat st;
+    bool have_st = false;
+    int dup_fd;
+    int fmap_slot;
+    int sh_slot;
+    int frc;
     if (fd < 0 || start_gva >= end_gva) {
-        return;
+        return -EINVAL;
     }
-    int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
     if (dup_fd < 0) {
-        return;
+        return -errno;
     }
-    bool have_st = (fstat(dup_fd, &st) == 0);
+    have_st = (fstat(dup_fd, &st) == 0);
     pthread_mutex_lock(&g_vmfile_lock);
+    fmap_slot = fmap_slot_for_locked(start_gva);
+    sh_slot = shared_slot_for_locked(start_gva);
+    if (fmap_slot < 0 || sh_slot < 0) {
+        pthread_mutex_unlock(&g_vmfile_lock);
+        close(dup_fd);
+        return -ENOMEM;
+    }
     if (have_st) {
         a32_vmfile_inode_t *e =
             inode_intern_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino);
-        if (e != NULL && (uint64_t)st.st_size > e->file_size) {
-            e->file_size = (uint64_t)st.st_size;
+        if (e == NULL) {
+            pthread_mutex_unlock(&g_vmfile_lock);
+            close(dup_fd);
+            return -ENOMEM;
         }
-        fmap_record_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+        e->file_size = (uint64_t)st.st_size;
+    }
+    if (have_st) {
+        frc = fmap_record_locked((uint64_t)st.st_dev, (uint64_t)st.st_ino,
             start_gva, end_gva, (uint64_t)pgoffset * 4096ULL, -1);
-        a32_vm32_set_eof_cut(start_gva, end_gva - start_gva, false);
-    }
-    unsigned slot = A32_VMFILE_SLOTS;
-    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (g_shared[i].used && g_shared[i].start_gva == start_gva) {
-            close(g_shared[i].dup_fd);
-            slot = i;
-            break;
+        if (frc == 0) {
+            vmfile_enforce_eof_locked(start_gva, end_gva - start_gva,
+                (uint64_t)pgoffset * 4096ULL, (uint64_t)st.st_size);
         }
-        if (!g_shared[i].used && slot == A32_VMFILE_SLOTS) {
-            slot = i;
-        }
-    }
-    if (slot < A32_VMFILE_SLOTS) {
-        g_shared[slot].used = true;
-        g_shared[slot].start_gva = start_gva;
-        g_shared[slot].end_gva = end_gva;
-        g_shared[slot].dup_fd = dup_fd;
-        g_shared[slot].pgoffset = pgoffset;
     } else {
-        close(dup_fd);
+        frc = 0;
+    }
+    if (frc == 0) {
+        if (g_shared[sh_slot].used && g_shared[sh_slot].dup_fd >= 0) {
+            close(g_shared[sh_slot].dup_fd);
+        }
+        g_shared[sh_slot].used = true;
+        g_shared[sh_slot].start_gva = start_gva;
+        g_shared[sh_slot].end_gva = end_gva;
+        g_shared[sh_slot].dup_fd = dup_fd;
+        g_shared[sh_slot].pgoffset = pgoffset;
+        dup_fd = -1;
     }
     pthread_mutex_unlock(&g_vmfile_lock);
+    if (dup_fd >= 0) {
+        close(dup_fd);
+    }
+    return frc;
 }
 
 bool a32_vmfile_lookup_shared(uint32_t start_gva, int *out_fd,
@@ -575,13 +514,26 @@ int a32_vmfile_grow_shared(int sh_fd, uint32_t sh_pgoff, uint64_t new_len)
     return 0;
 }
 
+/* Free-slot probe for a spanning split (A32-R3-5): secures the table
+ * slot before the caller duplicates any descriptor or truncates the
+ * original entry. Returns the slot, or -1 when the split cannot be
+ * tracked — the caller must then leave the original entry untouched. */
+static int vmfile_free_slot_locked(bool is_shared)
+{
+    for (unsigned j = 0U; j < A32_VMFILE_SLOTS; j++) {
+        bool taken = is_shared ? g_shared[j].used : g_fmaps[j].used;
+        if (!taken) {
+            return (int)j;
+        }
+    }
+    return -1;
+}
+
 void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
 {
     if (unmap_end <= unmap_start) {
         return;
     }
-    size_t hp = a32_backend_page_size();
-    uintptr_t arena = a32_vm32_arena_base();
     pthread_mutex_lock(&g_vmfile_lock);
     for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
         if (g_shared[i].used) {
@@ -589,12 +541,10 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
             uint32_t e = g_shared[i].end_gva;
             if (e > unmap_start && s < unmap_end) {
                 if (s >= unmap_start && e <= unmap_end) {
-                    if (hp > 4096U && arena != 0U && (s & (hp - 1U)) == 0U) {
-                        size_t hlen = ((size_t)(e - s) + hp - 1U) & ~(hp - 1U);
-                        (void)mmap((void *)(arena + s), hlen,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-                    }
+                    /* Fully covered: drop tracking only. The host range
+                     * stays whatever the caller installed (PROT_NONE on
+                     * munmap, the new mapping on MAP_FIXED retire) —
+                     * never resurrected as anonymous memory (A32-R3-1). */
                     close(g_shared[i].dup_fd);
                     g_shared[i].used = false;
                 } else if (s < unmap_start && e <= unmap_end) {
@@ -603,26 +553,24 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
                     g_shared[i].pgoffset += (unmap_end - s) / 4096U;
                     g_shared[i].start_gva = unmap_end;
                 } else {
-                    g_shared[i].end_gva = unmap_start;
-                    int r_fd = fcntl(g_shared[i].dup_fd, F_DUPFD_CLOEXEC, 3);
-                    if (r_fd >= 0) {
-                        bool placed = false;
-                        for (unsigned j = 0U; j < A32_VMFILE_SLOTS; j++) {
-                            if (!g_shared[j].used) {
-                                g_shared[j].used = true;
-                                g_shared[j].start_gva = unmap_end;
-                                g_shared[j].end_gva = e;
-                                g_shared[j].dup_fd = r_fd;
-                                g_shared[j].pgoffset =
-                                    g_shared[i].pgoffset + (unmap_end - s) / 4096U;
-                                placed = true;
-                                break;
-                            }
-                        }
-                        if (!placed) {
+                    int r_slot = vmfile_free_slot_locked(true);
+                    int r_fd = (r_slot >= 0)
+                        ? fcntl(g_shared[i].dup_fd, F_DUPFD_CLOEXEC, 3) : -1;
+                    if (r_slot < 0 || r_fd < 0) {
+                        /* Cannot track the right half: keep the whole
+                         * entry so still-mapped memory stays tracked. */
+                        if (r_fd >= 0) {
                             close(r_fd);
                         }
+                        continue;
                     }
+                    g_shared[i].end_gva = unmap_start;
+                    g_shared[r_slot].used = true;
+                    g_shared[r_slot].start_gva = unmap_end;
+                    g_shared[r_slot].end_gva = e;
+                    g_shared[r_slot].dup_fd = r_fd;
+                    g_shared[r_slot].pgoffset =
+                        g_shared[i].pgoffset + (unmap_end - s) / 4096U;
                 }
             }
         }
@@ -642,32 +590,110 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
                     g_fmaps[i].file_offset += (uint64_t)(unmap_end - s);
                     g_fmaps[i].start_gva = unmap_end;
                 } else {
-                    g_fmaps[i].end_gva = unmap_start;
-                    int r_fd = (g_fmaps[i].dup_fd >= 0)
-                        ? fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3) : -1;
-                    bool placed = false;
-                    for (unsigned j = 0U; j < A32_VMFILE_SLOTS; j++) {
-                        if (!g_fmaps[j].used) {
-                            g_fmaps[j].used = true;
-                            g_fmaps[j].dev = g_fmaps[i].dev;
-                            g_fmaps[j].ino = g_fmaps[i].ino;
-                            g_fmaps[j].start_gva = unmap_end;
-                            g_fmaps[j].end_gva = e;
-                            g_fmaps[j].file_offset =
-                                g_fmaps[i].file_offset + (uint64_t)(unmap_end - s);
-                            g_fmaps[j].dup_fd = r_fd;
-                            placed = true;
-                            break;
+                    int r_slot = vmfile_free_slot_locked(false);
+                    int r_fd = -1;
+                    if (r_slot >= 0 && g_fmaps[i].dup_fd >= 0) {
+                        r_fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
+                    }
+                    if (r_slot < 0 ||
+                        (g_fmaps[i].dup_fd >= 0 && r_fd < 0)) {
+                        if (r_fd >= 0) {
+                            close(r_fd);
                         }
+                        continue;
                     }
-                    if (!placed && r_fd >= 0) {
-                        close(r_fd);
-                    }
+                    g_fmaps[i].end_gva = unmap_start;
+                    g_fmaps[r_slot].used = true;
+                    g_fmaps[r_slot].dev = g_fmaps[i].dev;
+                    g_fmaps[r_slot].ino = g_fmaps[i].ino;
+                    g_fmaps[r_slot].start_gva = unmap_end;
+                    g_fmaps[r_slot].end_gva = e;
+                    g_fmaps[r_slot].file_offset =
+                        g_fmaps[i].file_offset + (uint64_t)(unmap_end - s);
+                    g_fmaps[r_slot].dup_fd = r_fd;
                 }
             }
         }
     }
+    /* Reclaim inode entries whose last mapping just disappeared so the
+     * 64-entry table cannot leak over the process lifetime (A32-R3-5).
+     * Re-interning later restores the size from fstat. */
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        bool live = false;
+        if (!g_inodes[i].used) {
+            continue;
+        }
+        for (unsigned j = 0U; j < A32_VMFILE_SLOTS; j++) {
+            if (g_fmaps[j].used && g_fmaps[j].dev == g_inodes[i].dev &&
+                g_fmaps[j].ino == g_inodes[i].ino) {
+                live = true;
+                break;
+            }
+        }
+        if (!live) {
+            g_inodes[i].used = false;
+        }
+    }
     pthread_mutex_unlock(&g_vmfile_lock);
+}
+
+/* Borrow-free private lookup for mremap (A32-R3-3): returns an owned
+ * duplicate of the backing descriptor covering gva, so the caller can
+ * safely map from it after this function unlocks. */
+bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
+    uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
+    uint32_t *out_map_start, uint32_t *out_map_end)
+{
+    bool found = false;
+    int dup_fd = -1;
+    pthread_mutex_lock(&g_vmfile_lock);
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_fmaps[i].used && g_fmaps[i].dup_fd >= 0 &&
+            gva >= g_fmaps[i].start_gva && gva < g_fmaps[i].end_gva) {
+            dup_fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
+            if (dup_fd < 0) {
+                break;
+            }
+            if (out_dev != NULL) {
+                *out_dev = g_fmaps[i].dev;
+            }
+            if (out_ino != NULL) {
+                *out_ino = g_fmaps[i].ino;
+            }
+            if (out_file_offset != NULL) {
+                *out_file_offset = g_fmaps[i].file_offset;
+            }
+            if (out_map_start != NULL) {
+                *out_map_start = g_fmaps[i].start_gva;
+            }
+            if (out_map_end != NULL) {
+                *out_map_end = g_fmaps[i].end_gva;
+            }
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    if (out_dup_fd != NULL) {
+        *out_dup_fd = dup_fd;
+    } else if (dup_fd >= 0) {
+        close(dup_fd);
+    }
+    if (!found && dup_fd >= 0) {
+        close(dup_fd);
+        if (out_dup_fd != NULL) {
+            *out_dup_fd = -1;
+        }
+    }
+    return found;
+}
+
+/* Fork-child reset (A32-R3-4): the surviving thread must not inherit a
+ * mutex held by a vanished thread. */
+void a32_vmfile_fork_child_reset(void)
+{
+    (void)pthread_mutex_destroy(&g_vmfile_lock);
+    (void)pthread_mutex_init(&g_vmfile_lock, NULL);
 }
 
 bool a32_vmfile_can_coalesce(uint32_t end_a, uint32_t start_b)

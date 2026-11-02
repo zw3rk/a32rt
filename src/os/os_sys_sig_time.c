@@ -454,128 +454,9 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
     }
 
     case ARM_NR_fork:
-    case ARM_NR_vfork: {
-        pid_t pid = fork_with_guest_snapshot(ctx, 0U);
-        if (pid < 0) {
-            FAIL_ERR(errno);
-        } else if (pid == 0) {
-            ctx->host_tid = 0;
-            ctx->host_tid = get_host_tid(ctx);
-            ctx->is_thread_clone = false;
-            ctx->clear_child_tid = 0U;
-            ctx->robust_list_head = 0U;
-            ctx->robust_list_len = 0U;
-            ctx->pending_signals = 0ULL;
-            a32_signals_set_thread_ctx(ctx);
-            ctx->regs[0] = 0U;
-        } else {
-            ctx->regs[0] = (uint32_t)pid;
-        }
-        break;
-    }
-
+    case ARM_NR_vfork:
     case ARM_NR_clone: {
-        uint32_t flags = a0;
-        FAIL_EINVAL_IF(((flags & CLONE_SIGHAND) != 0U &&
-                        (flags & CLONE_VM) == 0U) ||
-                       ((flags & CLONE_THREAD) != 0U &&
-                        (flags & CLONE_SIGHAND) == 0U));
-        FAIL_EFAULT_IF(((flags & CLONE_PARENT_SETTID) != 0U &&
-                        !a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)) ||
-                       ((flags & CLONE_CHILD_SETTID) != 0U &&
-                        !a32_guest_range_ok(ctx, a4, 4U, PROT_WRITE)));
-        bool is_thread = ((flags & CLONE_VM) != 0U &&
-                          (flags & CLONE_VFORK) == 0U);
-        if (is_thread) {
-            a32_ctx_t *child_ctx = (a32_ctx_t *)calloc(1, sizeof(a32_ctx_t));
-            if (!child_ctx) {
-                FAIL_ERR(ENOMEM);
-            }
-            a32_vm_sync_ctx(ctx);
-            memcpy(child_ctx, ctx, sizeof(a32_ctx_t));
-            child_ctx->regs[0]          = 0U;
-            child_ctx->regs[13]         = a1 ? a1 : ctx->regs[13];
-            child_ctx->clear_child_tid  = (flags & CLONE_CHILD_CLEARTID) ? a4 : 0U;
-            child_ctx->robust_list_head = 0U;
-            child_ctx->robust_list_len  = 0U;
-            child_ctx->pending_signals  = 0ULL;
-            child_ctx->altstack_sp      = 0U;
-            child_ctx->altstack_size    = 0U;
-            child_ctx->altstack_flags   = SS_DISABLE;
-            child_ctx->ras_top          = 0U;
-            memset(child_ctx->ras, 0, sizeof(child_ctx->ras));
-            memset(child_ctx->ibtc, 0, sizeof(child_ctx->ibtc));
-            if (flags & CLONE_SETTLS) {
-                child_ctx->tls_tp = a3;
-            }
-
-            child_thread_args_t targs = {
-                .child_ctx = child_ctx,
-                .flags     = flags,
-                .ptid_va   = a2,
-                .ctid_va   = a4,
-                .child_tid = 0,
-                .started   = 0,
-            };
-
-            (void)a32_jit_init(child_ctx);
-
-            pthread_t pt;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-            int prc = pthread_create(&pt, &attr, guest_thread_start, &targs);
-            pthread_attr_destroy(&attr);
-            if (prc != 0) {
-                free(child_ctx);
-                FAIL_ERR(prc);
-            }
-
-            while (!__atomic_load_n(&targs.started, __ATOMIC_SEQ_CST)) {
-                sched_yield();
-            }
-
-            ctx->regs[0] = (uint32_t)targs.child_tid;
-            break;
-        }
-
-        /* Non-thread clone: process fork */
-        pid_t pid = fork_with_guest_snapshot(ctx, a1);
-        if (pid < 0) {
-            FAIL_ERR(errno);
-        } else if (pid == 0) {
-            ctx->host_tid         = 0;
-            ctx->host_tid         = get_host_tid(ctx);
-            ctx->is_thread_clone  = false;
-            ctx->robust_list_head = 0U;
-            ctx->robust_list_len  = 0U;
-            ctx->pending_signals  = 0ULL;
-            a32_signals_set_thread_ctx(ctx);
-            if (a1 != 0U) {
-                ctx->regs[13] = a1;
-            }
-            if (flags & CLONE_SETTLS) {
-                ctx->tls_tp = a3;
-            }
-            if ((flags & CLONE_PARENT_SETTID) &&
-                a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)) {
-                *(uint32_t *)a32_guest_ptr(ctx, a2) = (uint32_t)ctx->host_tid;
-            }
-            if ((flags & CLONE_CHILD_SETTID) &&
-                a32_guest_range_ok(ctx, a4, 4U, PROT_WRITE)) {
-                *(uint32_t *)a32_guest_ptr(ctx, a4) = (uint32_t)ctx->host_tid;
-            }
-            ctx->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? a4 : 0U;
-            ctx->regs[0] = 0U;
-        } else {
-            if ((flags & CLONE_PARENT_SETTID) &&
-                a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)) {
-                *(uint32_t *)a32_guest_ptr(ctx, a2) = (uint32_t)pid;
-            }
-            ctx->regs[0] = (uint32_t)pid;
-        }
-        break;
+        return a32_sys_handle_fork_clone(ctx, nr, a0, a1, a2, a3, a4);
     }
 
     case ARM_NR_execve:
@@ -765,7 +646,36 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
                 re_argv[rpos++] = new_argv[k];
             }
             re_argv[rpos] = NULL;
-            execve(self_exe, re_argv, target_envp);
+            /* Cross-RT execve class: a re-exec replaces the image, so the
+             * blocked mask, ignored dispositions, and pending signals must
+             * travel in the environment — Linux keeps the mask and the
+             * ignored set across exec, and caught handlers revert to
+             * default (nothing caught survives here by construction). */
+            char exec_mask_env[64];
+            char exec_ign_env[64];
+            char exec_pend_env[64];
+            char *re_envp[520];
+            int repos = 0;
+            uint64_t nochld = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+            uint64_t exec_ign = a32_signals_ignored_mask() & nochld;
+            uint64_t exec_pend =
+                __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & nochld;
+            snprintf(exec_mask_env, sizeof(exec_mask_env), "A32RT_EXEC_SIGMASK=%llx",
+                (unsigned long long)(ctx->sig_mask & nochld));
+            snprintf(exec_ign_env, sizeof(exec_ign_env), "A32RT_EXEC_SIGIGN=%llx",
+                (unsigned long long)exec_ign);
+            snprintf(exec_pend_env, sizeof(exec_pend_env), "A32RT_EXEC_SIGPEND=%llx",
+                (unsigned long long)exec_pend);
+            if (target_envp != NULL) {
+                for (; target_envp[repos] != NULL && repos < 516; repos++) {
+                    re_envp[repos] = target_envp[repos];
+                }
+            }
+            re_envp[repos++] = exec_mask_env;
+            re_envp[repos++] = exec_ign_env;
+            re_envp[repos++] = exec_pend_env;
+            re_envp[repos] = NULL;
+            execve(self_exe, re_argv, re_envp);
         } else {
             execve(path, new_argv, target_envp);
         }

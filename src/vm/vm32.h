@@ -207,6 +207,8 @@ int a32_vmfile_map_staged(void *hint_addr, size_t len, int host_fd,
 int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
     int host_fd, uint64_t file_offset, int host_flags, bool a2_stage,
     void **out);
+uint32_t a32_vmfile_eof_keep(uint32_t len, uint64_t file_offset,
+    uint64_t file_size);
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
     size_t len);
 int a32_vmfile_populate_if_private(void *hva, int host_fd,
@@ -220,10 +222,19 @@ void a32_vmfile_promote_range(uint32_t start_gva, uint32_t end_gva,
  * when the file cannot be stated); unknown files are ignored. */
 int a32_vmfile_sync_fd(int host_fd);
 int a32_vmfile_sync_path(const char *host_path);
-void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
+int a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
     uint32_t pgoffset);
 bool a32_vmfile_lookup_shared(uint32_t start_gva, int *out_fd,
     uint32_t *out_pgoffset);
+/* Slot pre-flight (0 when a later record is guaranteed a table slot) and
+ * owned-duplicate private lookup for mremap. */
+int a32_vmfile_check_record(uint32_t start_gva, bool shared);
+bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
+    uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
+    uint32_t *out_map_start, uint32_t *out_map_end);
+/* Fork-child lock reset for the VM and file-tracking layers. */
+void a32_vm_fork_child_reset(void);
+void a32_vmfile_fork_child_reset(void);
 int a32_vmfile_grow_shared(int sh_fd, uint32_t sh_pgoff, uint64_t new_len);
 void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end);
 bool a32_vmfile_can_coalesce(uint32_t end_a, uint32_t start_b);
