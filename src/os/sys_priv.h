@@ -17,6 +17,7 @@
 
 #include "a32rt.h"
 #include "vm/vm32.h"
+#include "vm/vm_priv.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -665,7 +666,46 @@ static inline bool guest_write(a32_ctx_t *ctx, uint32_t va, const void *src, uin
         return false;
     }
     memcpy(a32_guest_ptr(ctx, va), src, len);
+    /* Every emulator-side store breaks reservations on all spanned
+     * 64-byte buckets (cross-RT LL/SC class). */
+    a32_vm32_copyout_invalidate(va, len);
     return true;
+}
+
+/* Bulk-copyout commit for kernel-direct guest writes (read/readv-style
+ * paths pass guest pointers straight to the host kernel, bypassing
+ * guest_write): invalidate every spanned LL/SC bucket and drop
+ * translated blocks over the written bytes (SMC), preserving the
+ * caller's total transferred count. */
+static inline void copyout_commit_range(a32_ctx_t *ctx, uint32_t va, size_t len)
+{
+    uint64_t end;
+    if (len == 0U) {
+        return;
+    }
+    a32_vm32_copyout_invalidate(va, len);
+    end = (uint64_t)va + (uint64_t)len;
+    a32_vm_invalidate_jit(ctx, va,
+        (end > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)end);
+}
+
+/* Vectored variant: distribute the total transferred count across the
+ * host iovec (entries alias the translated guest buffers) and commit
+ * each written prefix span, so SMC invalidation stays precise without
+ * touching the reported total. */
+static inline void copyout_commit_iov(a32_ctx_t *ctx,
+    const struct iovec *hiov, uint32_t iovcnt, size_t total)
+{
+    size_t left = total;
+    for (uint32_t i = 0U; i < iovcnt && left > 0U; i++) {
+        size_t chunk = (hiov[i].iov_len < left) ? hiov[i].iov_len : left;
+        if (chunk > 0U && hiov[i].iov_base != NULL) {
+            uint32_t gva = (uint32_t)((uintptr_t)hiov[i].iov_base -
+                ctx->guest_base);
+            copyout_commit_range(ctx, gva, chunk);
+        }
+        left -= chunk;
+    }
 }
 
 /* Shared helpers across os_sys_*.c */

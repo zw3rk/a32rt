@@ -83,6 +83,42 @@ static uint64_t getenv_hex(const char *name)
     return (uint64_t)v;
 }
 
+/* Transport keys for the execve signal-state carry (see the execve
+ * path in src/os/os_sys_sig_time.c). */
+static bool is_exec_sig_key(const char *s)
+{
+    return strncmp(s, "A32RT_EXEC_SIGMASK=", 19) == 0 ||
+           strncmp(s, "A32RT_EXEC_SIGIGN=", 18) == 0 ||
+           strncmp(s, "A32RT_EXEC_SIGPEND=", 19) == 0;
+}
+
+/* Filtered process-lifetime copy of envp without transport entries
+ * (A32-R4-7): main's envp points at the initial stack image, which
+ * unsetenv() does not rewrite, so the guest stack builder must receive
+ * a copy with stale entries removed — otherwise the guest inherits
+ * them verbatim and the next execve would carry duplicates. */
+static char **filter_exec_sig_env(char **envp)
+{
+    size_t n = 0U;
+    size_t w = 0U;
+    char **out;
+    while (envp != NULL && envp[n] != NULL) {
+        n++;
+    }
+    out = (char **)malloc((n + 1U) * sizeof(char *));
+    if (out == NULL) {
+        return envp;
+    }
+    for (size_t r = 0U; r < n; r++) {
+        if (is_exec_sig_key(envp[r])) {
+            continue;
+        }
+        out[w++] = envp[r];
+    }
+    out[w] = NULL;
+    return out;
+}
+
 /* Cross-RT execve class: a re-exec replaces the image, so the blocked
  * mask, ignored dispositions, and pending signals carried through the
  * environment are re-applied here — Linux preserves all three while
@@ -345,8 +381,15 @@ int main(int argc, char **argv, char **envp)
         return 1;
     }
 
+    /* A32-R4-7: consume the transport entries BEFORE constructing the
+     * guest stack environment, and build the stack from a filtered
+     * copy. Installing handlers this early is idempotent with the
+     * a32_signals_init() call below. */
+    exec_signal_restore(&ctx);
+    char **clean_envp = filter_exec_sig_env(envp);
+
     uint32_t initial_sp = 0U;
-    if (a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, envp, &initial_sp) != 0) {
+    if (a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp) != 0) {
         return 1;
     }
 
@@ -354,7 +397,6 @@ int main(int argc, char **argv, char **envp)
     if (a32_signals_init(&ctx) != 0 || a32_jit_init(&ctx) != 0) {
         return 1;
     }
-    exec_signal_restore(&ctx);
 
     if (ctx.aot_mode) {
         return a32_aot_generate(&ctx, &elf_info, exec_path);

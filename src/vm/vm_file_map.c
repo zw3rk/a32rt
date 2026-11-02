@@ -5,10 +5,11 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Split out of src/vm/vm_file.c (A32-R3): the host-side install path
- * (staged A2 anonymous reservation, shared-anon memfd, native file mmap)
- * and the MAP_PRIVATE populate wrapper. Uses only public vm32/backend
- * APIs plus the published record/retire entry points; the tracking
- * tables themselves stay in vm_file.c. Curated C11, no inline asm.
+ * (staged A2 anonymous reservation, shared-anon memfd, native file mmap),
+ * the MAP_PRIVATE populate wrapper, and (A32-R4) the private-lookup,
+ * span/coalesce, and fork-reset helpers. The tracking tables live in
+ * vm_file.c and are shared via src/vm/vm_priv.h. Curated C11, no
+ * inline asm.
  */
 
 #if defined(__APPLE__)
@@ -17,10 +18,12 @@
 #define _GNU_SOURCE
 #endif
 #include "vm/vm32.h"
+#include "vm/vm_priv.h"
 #include "os/backend.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -98,7 +101,9 @@ int a32_vmfile_populate_if_private(void *hva, int host_fd,
             ((uintptr_t)hva - arena) + len <= A32_VM32_WINDOW_SIZE &&
             len <= 0xFFFFFFFFULL) {
             uint32_t sgva = (uint32_t)((uintptr_t)hva - arena);
-            a32_vmfile_unmap_shared(sgva, sgva + (uint32_t)len);
+            /* The retired range is exactly the record just created, so
+             * no middle split can demand a slot: infallible here. */
+            (void)a32_vmfile_unmap_shared(sgva, sgva + (uint32_t)len);
         }
     }
     return rc;
@@ -223,4 +228,261 @@ int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
     }
     *out = res;
     return 0;
+}
+
+/* Borrow-free private lookup for mremap (A32-R3-3): returns an owned
+ * duplicate of the backing descriptor covering gva, so the caller can
+ * safely map from it after this function unlocks. */
+bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
+    uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
+    uint32_t *out_map_start, uint32_t *out_map_end)
+{
+    bool found = false;
+    int dup_fd = -1;
+    pthread_mutex_lock(&g_vmfile_lock);
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_fmaps[i].used && g_fmaps[i].dup_fd >= 0 &&
+            gva >= g_fmaps[i].start_gva && gva < g_fmaps[i].end_gva) {
+            dup_fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
+            if (dup_fd < 0) {
+                break;
+            }
+            if (out_dev != NULL) {
+                *out_dev = g_fmaps[i].dev;
+            }
+            if (out_ino != NULL) {
+                *out_ino = g_fmaps[i].ino;
+            }
+            if (out_file_offset != NULL) {
+                *out_file_offset = g_fmaps[i].file_offset;
+            }
+            if (out_map_start != NULL) {
+                *out_map_start = g_fmaps[i].start_gva;
+            }
+            if (out_map_end != NULL) {
+                *out_map_end = g_fmaps[i].end_gva;
+            }
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    if (out_dup_fd != NULL) {
+        *out_dup_fd = dup_fd;
+    } else if (dup_fd >= 0) {
+        close(dup_fd);
+    }
+    if (!found && dup_fd >= 0) {
+        close(dup_fd);
+        if (out_dup_fd != NULL) {
+            *out_dup_fd = -1;
+        }
+    }
+    return found;
+}
+
+/* Fork-child reset (A32-R3-4): the surviving thread must not inherit a
+ * mutex held by a vanished thread. */
+void a32_vmfile_fork_child_reset(void)
+{
+    (void)pthread_mutex_destroy(&g_vmfile_lock);
+    (void)pthread_mutex_init(&g_vmfile_lock, NULL);
+}
+
+/* Spanning private lookup for mremap (A32-R4-1): resolves backing
+ * across contiguous compatible records. After an in-place mremap
+ * extension the enlarged range is covered by two adjacent records (the
+ * original plus the extension); a single-record lookup would report
+ * "absent" and the caller would silently fall back to anonymous
+ * backing, losing file identity on the next grow or move. Every
+ * visited record must share (dev, ino) with the first and carry a
+ * contiguous file offset; the returned descriptor is an owned duplicate
+ * of the first record's fd. Returns 1 when [start_gva, end_gva) is
+ * fully covered, 0 when no private backing exists there, or a negative
+ * errno when a descriptor cannot be duplicated (the caller must
+ * propagate, never treat as anonymous). */
+int a32_vmfile_lookup_private_span(uint32_t start_gva, uint32_t end_gva,
+    uint64_t *out_dev, uint64_t *out_ino, uint64_t *out_file_offset,
+    int *out_dup_fd)
+{
+    uint64_t dev = 0ULL;
+    uint64_t ino = 0ULL;
+    uint64_t first_off = 0ULL;
+    uint32_t cur = start_gva;
+    bool have_first = false;
+    int dup_fd = -1;
+    int rc = 0;
+    if (end_gva <= start_gva) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&g_vmfile_lock);
+    while (cur < end_gva) {
+        bool advanced = false;
+        for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+            if (!g_fmaps[i].used || g_fmaps[i].dup_fd < 0 ||
+                cur < g_fmaps[i].start_gva || cur >= g_fmaps[i].end_gva) {
+                continue;
+            }
+            if (!have_first) {
+                int fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
+                if (fd < 0) {
+                    rc = -errno;
+                    break;
+                }
+                dev = g_fmaps[i].dev;
+                ino = g_fmaps[i].ino;
+                dup_fd = fd;
+                first_off = g_fmaps[i].file_offset +
+                    (uint64_t)(cur - g_fmaps[i].start_gva);
+                have_first = true;
+            } else {
+                uint64_t expect = first_off + (uint64_t)(cur - start_gva);
+                uint64_t got = g_fmaps[i].file_offset +
+                    (uint64_t)(cur - g_fmaps[i].start_gva);
+                if (g_fmaps[i].dev != dev || g_fmaps[i].ino != ino ||
+                    got != expect) {
+                    break;
+                }
+            }
+            if (g_fmaps[i].end_gva <= cur) {
+                break;
+            }
+            cur = g_fmaps[i].end_gva;
+            advanced = true;
+            break;
+        }
+        if (rc != 0 || !advanced) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    if (rc != 0) {
+        if (dup_fd >= 0) {
+            close(dup_fd);
+        }
+        if (out_dup_fd != NULL) {
+            *out_dup_fd = -1;
+        }
+        return rc;
+    }
+    if (!have_first || cur < end_gva) {
+        /* Absent (or only partially covered): no private backing. Any
+         * duplicate taken above belongs to a prefix that cannot serve
+         * the whole span, so release it. */
+        if (dup_fd >= 0) {
+            close(dup_fd);
+        }
+        if (out_dup_fd != NULL) {
+            *out_dup_fd = -1;
+        }
+        return 0;
+    }
+    if (out_dev != NULL) {
+        *out_dev = dev;
+    }
+    if (out_ino != NULL) {
+        *out_ino = ino;
+    }
+    if (out_file_offset != NULL) {
+        *out_file_offset = first_off;
+    }
+    if (out_dup_fd != NULL) {
+        *out_dup_fd = dup_fd;
+    } else {
+        close(dup_fd);
+    }
+    return 1;
+}
+
+/* Merge contiguous compatible private records inside [start_gva,
+ * end_gva) back into one entry (A32-R4-1): repeated in-place mremap
+ * growth otherwise strands one record per extension, and the next span
+ * lookup degrades (or a future table-exhaustion path fails). Records
+ * merge only when adjacent with matching (dev, ino) and a contiguous
+ * file offset; the survivor keeps the lowest slot's descriptor.
+ * Returns 0 on success (including nothing to merge). */
+int a32_vmfile_coalesce_private(uint32_t start_gva, uint32_t end_gva)
+{
+    bool merged;
+    if (end_gva <= start_gva) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&g_vmfile_lock);
+    do {
+        merged = false;
+        for (unsigned i = 0U; i < A32_VMFILE_SLOTS && !merged; i++) {
+            if (!g_fmaps[i].used || g_fmaps[i].dup_fd < 0 ||
+                g_fmaps[i].start_gva < start_gva ||
+                g_fmaps[i].end_gva > end_gva) {
+                continue;
+            }
+            for (unsigned j = 0U; j < A32_VMFILE_SLOTS; j++) {
+                if (i == j || !g_fmaps[j].used ||
+                    g_fmaps[j].start_gva != g_fmaps[i].end_gva ||
+                    g_fmaps[j].start_gva < start_gva ||
+                    g_fmaps[j].end_gva > end_gva) {
+                    continue;
+                }
+                if (g_fmaps[j].dev != g_fmaps[i].dev ||
+                    g_fmaps[j].ino != g_fmaps[i].ino ||
+                    g_fmaps[j].file_offset != g_fmaps[i].file_offset +
+                        (uint64_t)(g_fmaps[i].end_gva - g_fmaps[i].start_gva)) {
+                    continue;
+                }
+                g_fmaps[i].end_gva = g_fmaps[j].end_gva;
+                if (g_fmaps[j].dup_fd >= 0) {
+                    close(g_fmaps[j].dup_fd);
+                }
+                g_fmaps[j].used = false;
+                merged = true;
+                break;
+            }
+        }
+    } while (merged);
+    pthread_mutex_unlock(&g_vmfile_lock);
+    return 0;
+}
+
+bool a32_vmfile_can_coalesce(uint32_t end_a, uint32_t start_b)
+{
+    if (end_a != start_b) {
+        return false;
+    }
+    bool ok = true;
+    pthread_mutex_lock(&g_vmfile_lock);
+    const a32_vmfile_shared_t *sh_a = NULL;
+    const a32_vmfile_shared_t *sh_b = NULL;
+    const a32_vmfile_map_t *fm_a = NULL;
+    const a32_vmfile_map_t *fm_b = NULL;
+    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used) {
+            if (end_a > g_shared[i].start_gva && end_a <= g_shared[i].end_gva) {
+                sh_a = &g_shared[i];
+            }
+            if (start_b >= g_shared[i].start_gva && start_b < g_shared[i].end_gva) {
+                sh_b = &g_shared[i];
+            }
+        }
+        if (g_fmaps[i].used) {
+            if (end_a > g_fmaps[i].start_gva && end_a <= g_fmaps[i].end_gva) {
+                fm_a = &g_fmaps[i];
+            }
+            if (start_b >= g_fmaps[i].start_gva && start_b < g_fmaps[i].end_gva) {
+                fm_b = &g_fmaps[i];
+            }
+        }
+    }
+    if (sh_a != sh_b) {
+        ok = false;
+    }
+    if (fm_a != fm_b) {
+        if (fm_a == NULL || fm_b == NULL ||
+            fm_a->dev != fm_b->dev || fm_a->ino != fm_b->ino ||
+            fm_a->file_offset + (uint64_t)(end_a - fm_a->start_gva) !=
+                fm_b->file_offset + (uint64_t)(start_b - fm_b->start_gva)) {
+            ok = false;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    return ok;
 }

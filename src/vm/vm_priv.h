@@ -11,6 +11,7 @@
 #ifndef A32RT_VM_PRIV_H
 #define A32RT_VM_PRIV_H
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -34,6 +35,33 @@ static inline uint64_t a32_vm_page_align_up(uint64_t v)
 {
     return (v + 0xFFFULL) & ~0xFFFULL;
 }
+
+/* ---- Provider A file-backing tables (A32-R4 file split) ----
+ * Storage lives in src/vm/vm_file.c; src/vm/vm_file_map.c shares it for
+ * the lookup/coalesce/retire helpers moved there. */
+#define A32_VMFILE_SLOTS 1024U
+
+typedef struct {
+    bool used;
+    uint64_t dev;
+    uint64_t ino;
+    uint32_t start_gva;
+    uint32_t end_gva;
+    uint64_t file_offset;
+    int dup_fd;
+} a32_vmfile_map_t;
+
+typedef struct {
+    bool used;
+    uint32_t start_gva;
+    uint32_t end_gva;
+    int dup_fd;
+    uint32_t pgoffset;
+} a32_vmfile_shared_t;
+
+extern a32_vmfile_map_t g_fmaps[A32_VMFILE_SLOTS];
+extern a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
+extern pthread_mutex_t g_vmfile_lock;
 
 bool a32_vm_range_overlaps(uint32_t start, uint32_t end);
 bool a32_vm_mapped_range(uint32_t start, uint32_t end, uint32_t *out_prot,

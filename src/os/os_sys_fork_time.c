@@ -106,7 +106,12 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     /* A32-R3-4: quiesce JIT execution/mutation before the snapshot so the
      * child inherits no leases of vanished threads and no partially
      * mutated cache state. Signals stay blocked until both sides have
-     * reconciled, so no handler runs inside the PROT_NONE window. */
+     * reconciled, so no handler runs inside the PROT_NONE window.
+     * Lock order throughout fork/truncate/futex is JIT -> VM -> vmfile
+     * (never inverted): this path holds the JIT lock across fork(),
+     * takes the VM lock only briefly via a32_vm_sync_ctx, and consults
+     * file/EOF state through lock-free atomics; truncate takes only
+     * the vmfile lock and futex takes none. */
     sigfillset(&block_all);
     masked = (pthread_sigmask(SIG_BLOCK, &block_all, &saved_set) == 0);
     a32_jit_fork_prepare();
@@ -199,13 +204,25 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     }
 
     for (size_t i = 0U; i < r_count; i++) {
-        void    *src   = a32_guest_ptr(ctx, r_list[i].start);
-        uint32_t s_len = r_list[i].end - r_list[i].start;
-        int      hprot = a32_host_prot(ctx, r_list[i].prot);
-        if ((hprot & PROT_READ) == 0) {
-            (void)mprotect(src, s_len, hprot | PROT_READ);
+        uint32_t rs = r_list[i].start;
+        uint32_t re = r_list[i].end;
+        int hprot = a32_host_prot(ctx, r_list[i].prot);
+        /* A32-R4-4: file mappings keep their VMA permissions even when
+         * truncation retired pages past EOF (A32_PROT_EOF_CUT). Copy
+         * page by page and skip cut pages: touching them here would
+         * fault while signals are blocked. */
+        for (uint32_t p = rs; p < re; p += 0x1000U) {
+            uint32_t chunk = (re - p > 0x1000U) ? 0x1000U : (re - p);
+            void *src;
+            if (a32_vm32_page_eof_cut(p)) {
+                continue;
+            }
+            src = a32_guest_ptr(ctx, p);
+            if ((hprot & PROT_READ) == 0) {
+                (void)mprotect(src, chunk, hprot | PROT_READ);
+            }
+            memcpy(snap_buf + r_list[i].buf_off + (p - rs), src, chunk);
         }
-        memcpy(snap_buf + r_list[i].buf_off, src, s_len);
     }
 
     for (size_t c = 0U; c < c_count; c++) {
@@ -221,37 +238,101 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     pid_t pid = fork();
     int saved_errno = errno;
     if (pid == 0) {
+        /* Child: drop locks held by vanished threads, then rebuild
+         * writable working copies from the snapshot. EOF-cut pages
+         * are neither copied (the snapshot holds no bytes for them)
+         * nor widened: they stay PROT_NONE like the post-truncate
+         * mapping they came from. */
         fork_child_reset();
-    } else {
-        a32_jit_fork_parent();
-    }
-
-    if (sp_low > ctx->stack_base) {
-        (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
-                       sp_low - ctx->stack_base, PROT_READ | PROT_WRITE);
-    }
-    if (pid == 0) {
         for (size_t c = 0U; c < c_count; c++) {
             (void)mprotect(a32_guest_ptr(ctx, clusters[c].start),
                            clusters[c].end - clusters[c].start,
                            PROT_READ | PROT_WRITE);
         }
+        if (sp_low > ctx->stack_base) {
+            (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
+                           sp_low - ctx->stack_base, PROT_READ | PROT_WRITE);
+        }
         for (size_t i = 0U; i < r_count; i++) {
-            memcpy(a32_guest_ptr(ctx, r_list[i].start),
-                   snap_buf + r_list[i].buf_off,
-                   r_list[i].end - r_list[i].start);
+            uint32_t rs = r_list[i].start;
+            uint32_t re = r_list[i].end;
             int hprot = a32_host_prot(ctx, r_list[i].prot);
-            if (hprot != (PROT_READ | PROT_WRITE)) {
-                (void)mprotect(a32_guest_ptr(ctx, r_list[i].start),
-                               r_list[i].end - r_list[i].start,
-                               hprot);
+            uint32_t p = rs;
+            while (p < re) {
+                /* One mprotect per contiguous run with identical
+                 * treatment, so cut-free regions keep the previous
+                 * single-call shape. */
+                uint32_t q = p + 0x1000U;
+                if (a32_vm32_page_eof_cut(p)) {
+                    while (q < re && a32_vm32_page_eof_cut(q)) {
+                        q += 0x1000U;
+                    }
+                    (void)mprotect(a32_guest_ptr(ctx, p), q - p,
+                        PROT_NONE);
+                } else {
+                    while (q < re && !a32_vm32_page_eof_cut(q)) {
+                        q += 0x1000U;
+                    }
+                    memcpy(a32_guest_ptr(ctx, p),
+                           snap_buf + r_list[i].buf_off + (p - rs),
+                           q - p);
+                    if (hprot != (PROT_READ | PROT_WRITE)) {
+                        (void)mprotect(a32_guest_ptr(ctx, p), q - p,
+                            hprot);
+                    }
+                }
+                p = q;
             }
         }
     } else {
+        /* Parent, including the failed-fork path: restore guest
+         * protections BEFORE reopening JIT execution (A32-R4-3), so no
+         * resumed guest thread can run inside the PROT_NONE window and
+         * fault on valid memory. Cut pages return to PROT_NONE rather
+         * than the wider VMA permissions (A32-R4-4). */
+        int restore_err = 0;
+        if (sp_low > ctx->stack_base) {
+            if (mprotect(a32_guest_ptr(ctx, ctx->stack_base),
+                    sp_low - ctx->stack_base,
+                    PROT_READ | PROT_WRITE) != 0 && restore_err == 0) {
+                restore_err = errno;
+            }
+        }
         for (size_t i = 0U; i < r_count; i++) {
-            (void)mprotect(a32_guest_ptr(ctx, r_list[i].start),
-                           r_list[i].end - r_list[i].start,
-                           a32_host_prot(ctx, r_list[i].prot));
+            uint32_t rs = r_list[i].start;
+            uint32_t re = r_list[i].end;
+            int hprot = a32_host_prot(ctx, r_list[i].prot);
+            uint32_t p = rs;
+            while (p < re) {
+                uint32_t q = p + 0x1000U;
+                int want;
+                if (a32_vm32_page_eof_cut(p)) {
+                    while (q < re && a32_vm32_page_eof_cut(q)) {
+                        q += 0x1000U;
+                    }
+                    want = PROT_NONE;
+                } else {
+                    while (q < re && !a32_vm32_page_eof_cut(q)) {
+                        q += 0x1000U;
+                    }
+                    want = hprot;
+                }
+                if (mprotect(a32_guest_ptr(ctx, p), q - p, want) != 0 &&
+                    restore_err == 0) {
+                    restore_err = errno;
+                }
+                p = q;
+            }
+        }
+        /* The execution barrier lifts only after every protection is
+         * back (checked above); a failed restore with a live child is
+         * reported but cannot stop the reopening without deadlocking
+         * every future JIT user. */
+        a32_jit_fork_parent();
+        if (restore_err != 0 && pid >= 0) {
+            static const char msg[] =
+                "a32rt: fork parent protection restore failed\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1U);
         }
     }
 

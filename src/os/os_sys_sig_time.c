@@ -7,6 +7,17 @@
 
 #include "os/sys_priv.h"
 
+/* Transport keys for the execve signal-state carry. The guest stack
+ * starts clean (see filter_exec_sig_env in src/main.c), but a guest
+ * that re-execs with an explicit envp can still pass stale triples;
+ * both exec branches below filter them (A32-R4-7). */
+static bool is_exec_sig_transport(const char *s)
+{
+    return strncmp(s, "A32RT_EXEC_SIGMASK=", 19) == 0 ||
+           strncmp(s, "A32RT_EXEC_SIGIGN=", 18) == 0 ||
+           strncmp(s, "A32RT_EXEC_SIGPEND=", 19) == 0;
+}
+
 int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
 {
     uint32_t nr = ctx->regs[7];
@@ -667,8 +678,14 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
             snprintf(exec_pend_env, sizeof(exec_pend_env), "A32RT_EXEC_SIGPEND=%llx",
                 (unsigned long long)exec_pend);
             if (target_envp != NULL) {
-                for (; target_envp[repos] != NULL && repos < 516; repos++) {
-                    re_envp[repos] = target_envp[repos];
+                for (int tpos = 0; target_envp[tpos] != NULL && repos < 516; tpos++) {
+                    /* A32-R4-7: drop stale transport entries carried in
+                     * the guest-supplied environment so exactly one
+                     * current value per key is appended below. */
+                    if (is_exec_sig_transport(target_envp[tpos])) {
+                        continue;
+                    }
+                    re_envp[repos++] = target_envp[tpos];
                 }
             }
             re_envp[repos++] = exec_mask_env;
@@ -677,7 +694,20 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
             re_envp[repos] = NULL;
             execve(self_exe, re_argv, re_envp);
         } else {
-            execve(path, new_argv, target_envp);
+            /* Native child: strip transport entries instead of leaking
+             * stale execve-class state into a non-translator image. */
+            char *native_envp[520];
+            int npos = 0;
+            if (target_envp != NULL) {
+                for (int tpos = 0; target_envp[tpos] != NULL && npos < 519; tpos++) {
+                    if (is_exec_sig_transport(target_envp[tpos])) {
+                        continue;
+                    }
+                    native_envp[npos++] = target_envp[tpos];
+                }
+            }
+            native_envp[npos] = NULL;
+            execve(path, new_argv, native_envp);
         }
         if (saved_fd_flags >= 0 && (saved_fd_flags & FD_CLOEXEC) != 0) {
             int saved_err = errno;

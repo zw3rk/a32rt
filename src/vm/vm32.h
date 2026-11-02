@@ -174,6 +174,13 @@ bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
  * path (DBT slow path, interp, copyout, sigframe). */
 void a32_vm32_reservation_bump(uint32_t gva_aligned);
 
+/* Bulk-copyout invalidation (cross-RT LL/SC class): bump EVERY 64-byte
+ * reservation bucket spanned by [gva, gva + len), not just the first
+ * and last, so a syscall or emulator write that lands inside a
+ * reservation fails a stale STREX instead of winning silently.
+ * Zero-length writes are a no-op; overlong spans clamp at 4 GiB. */
+void a32_vm32_copyout_invalidate(uint32_t gva, size_t len);
+
 /* ---- Relative DBT memory-site records (section 4.3.3) ---- */
 
 typedef enum {
@@ -242,11 +249,22 @@ int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
 bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
     uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
     uint32_t *out_map_start, uint32_t *out_map_end);
+/* Spanning private lookup (1 covered, 0 absent, negative errno on
+ * descriptor-duplication failure) and adjacent-record coalescing for
+ * repeated private mremap growth (A32-R4-1). */
+int a32_vmfile_lookup_private_span(uint32_t start_gva, uint32_t end_gva,
+    uint64_t *out_dev, uint64_t *out_ino, uint64_t *out_file_offset,
+    int *out_dup_fd);
+int a32_vmfile_coalesce_private(uint32_t start_gva, uint32_t end_gva);
 /* Fork-child lock reset for the VM and file-tracking layers. */
 void a32_vm_fork_child_reset(void);
 void a32_vmfile_fork_child_reset(void);
 int a32_vmfile_grow_shared(int sh_fd, uint32_t sh_pgoff, uint64_t new_len);
-void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end);
+/* Transactional retire (0 success, -ENOMEM/-errno without mutation,
+ * -EINVAL on empty range) plus its side-effect-free pre-flight
+ * (A32-R4-6). */
+int a32_vmfile_preflight_unmap(uint32_t unmap_start, uint32_t unmap_end);
+int a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end);
 bool a32_vmfile_can_coalesce(uint32_t end_a, uint32_t start_b);
 
 #endif /* A32RT_VM_VM32_H */

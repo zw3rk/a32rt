@@ -29,7 +29,7 @@
 #include <unistd.h>
 
 /* Private backing carried across the operation: owned duplicate
- * descriptor, file offset of old_addr, and the tracked entry bounds. */
+ * descriptor and file page offset of old_addr. */
 typedef struct {
     bool     present;
     int      fd;
@@ -45,35 +45,35 @@ static void mremap_priv_release(mremap_priv_t *p)
     p->fd = -1;
 }
 
-static mremap_priv_t mremap_priv_lookup(uint32_t old_addr, uint32_t old_end,
-    bool is_sh_file, uint32_t keep_flags)
+/* Resolve private file backing for [old_addr, old_end), spanning
+ * contiguous compatible records (A32-R4-1): after an in-place extension
+ * the enlarged range is covered by the original record plus the
+ * extension record, and a single-record lookup would misreport it as
+ * anonymous. Returns 1 with *out filled, 0 when no private backing
+ * covers the span, or a negative errno when the backing exists but its
+ * descriptor cannot be duplicated — the caller must propagate the
+ * error, never silently fall back to anonymous backing. */
+static int mremap_priv_lookup(uint32_t old_addr, uint32_t old_end,
+    bool is_sh_file, uint32_t keep_flags, mremap_priv_t *out)
 {
-    mremap_priv_t p;
-    uint32_t map_start = 0U;
-    uint32_t map_end = 0U;
     uint64_t file_offset = 0ULL;
     int dup_fd = -1;
-    p.present = false;
-    p.fd = -1;
-    p.pgoff_at_old = 0U;
+    int rc;
+    out->present = false;
+    out->fd = -1;
+    out->pgoff_at_old = 0U;
     if (is_sh_file || (keep_flags & A32_MAP_ANONYMOUS) != 0U) {
-        return p;
+        return 0;
     }
-    if (!a32_vmfile_lookup_private(old_addr, NULL, NULL, &file_offset,
-            &dup_fd, &map_start, &map_end)) {
-        return p;
+    rc = a32_vmfile_lookup_private_span(old_addr, old_end, NULL, NULL,
+        &file_offset, &dup_fd);
+    if (rc <= 0) {
+        return rc;
     }
-    if (map_start > old_addr || map_end < old_end || dup_fd < 0) {
-        if (dup_fd >= 0) {
-            close(dup_fd);
-        }
-        return p;
-    }
-    p.present = true;
-    p.fd = dup_fd;
-    p.pgoff_at_old =
-        (uint32_t)((file_offset + (uint64_t)(old_addr - map_start)) / 4096ULL);
-    return p;
+    out->present = true;
+    out->fd = dup_fd;
+    out->pgoff_at_old = (uint32_t)(file_offset / 4096ULL);
+    return 1;
 }
 
 /* Copy the surviving prefix after a move. Only source pages explicitly
@@ -157,8 +157,18 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     bool        is_sh_file  = ((keep_flags & 0x01U) != 0U) &&
                               a32_vmfile_lookup_shared(old_addr, &sh_fd, &sh_pgoff);
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
-    mremap_priv_t priv = mremap_priv_lookup(old_addr,
-        (uint32_t)((uint64_t)old_addr + old_aligned), is_sh_file, keep_flags);
+    mremap_priv_t priv;
+    int priv_rc = mremap_priv_lookup(old_addr,
+        (uint32_t)((uint64_t)old_addr + old_aligned), is_sh_file, keep_flags,
+        &priv);
+    if (priv_rc < 0) {
+        /* Backing exists but cannot be carried across (e.g. EMFILE):
+         * report the failure instead of silently dropping file
+         * identity (A32-R4-1). */
+        a32_vm_sync_to_ctx(ctx);
+        a32_vm_lock_release();
+        return (uint32_t)priv_rc;
+    }
     if (priv.present) {
         map_flags = 0x02U;
     }
@@ -206,6 +216,13 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                      * tracked entries, never untracked. */
                     (void)a32_vmfile_record_shared(old_addr,
                         (uint32_t)new_end, sh_fd, sh_pgoff);
+                } else if (priv.present) {
+                    /* Merge the extension record back into the
+                     * original (A32-R4-1): without this the enlarged
+                     * range stays split in two records and the next
+                     * grow or move loses file identity. */
+                    (void)a32_vmfile_coalesce_private(old_addr,
+                        (uint32_t)new_end);
                 }
                 uint32_t ext_end = (uint32_t)new_end;
                 a32_vm_note_grown(old_addr, ext_end);
@@ -264,7 +281,19 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
     }
     mremap_priv_release(&priv);
-    (void)a32_vm_unmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+    /* Roll back on retire failure (A32-R4-6): the new mapping is fully
+     * installed at this point, so drop it again and keep the old range
+     * rather than aliasing both or leaking file identity. */
+    {
+        int unmap_rc = a32_vm_unmap_locked(ctx, old_addr,
+            (uint32_t)old_aligned);
+        if (unmap_rc != 0) {
+            (void)a32_vm_unmap_locked(ctx, new_va, (uint32_t)new_aligned);
+            a32_vm_sync_to_ctx(ctx);
+            a32_vm_lock_release();
+            return (uint32_t)unmap_rc;
+        }
+    }
     a32_vm_sync_to_ctx(ctx);
     a32_vm_lock_release();
 

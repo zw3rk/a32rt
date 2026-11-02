@@ -75,6 +75,13 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
         return -EINVAL;
     }
     if (replace && hint_addr != NULL) {
+        /* A32-R4-2: install genuinely fresh anonymous backing instead
+         * of patching the previous mapping in place. Zeroing in place
+         * writes through a shared-file mapping into the file itself
+         * and leaves the range attached to the old object; skipping
+         * the zeroing for PROT_NONE leaves stale bytes that a later
+         * mprotect re-exposes. A fresh MAP_FIXED anonymous mapping
+         * detaches both cases. */
         size_t hp = a32_backend_page_size();
         uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
         uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
@@ -83,21 +90,63 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
             (((uintptr_t)hint_addr & (hp - 1U)) != 0U)) {
             return -EINVAL;
         }
-        if (linux_prot != 0) {
-            if (mprotect((void *)start, end - start,
-                    PROT_READ | PROT_WRITE) != 0) {
+        if (start == (uintptr_t)hint_addr && end == (uintptr_t)hint_addr + len) {
+            res = mmap(hint_addr, len, host_prot(linux_prot),
+                flags | MAP_FIXED, -1, 0);
+            if (res == MAP_FAILED) {
                 return -errno;
             }
-            memset(hint_addr, 0, len);
-        }
 #if defined(__APPLE__)
-        if (minherit((void *)start, end - start,
-                shared != 0 ? VM_INHERIT_SHARE : VM_INHERIT_COPY) != 0) {
-            return -errno;
-        }
+            if (minherit(hint_addr, len,
+                    shared != 0 ? VM_INHERIT_SHARE : VM_INHERIT_COPY) != 0) {
+                return -errno;
+            }
 #endif
-        *out_host_addr = hint_addr;
-        return 0;
+            *out_host_addr = hint_addr;
+            return 0;
+        }
+        /* Sub-page replacement (a 4 KiB guest range inside a larger
+         * host page): replacing the whole host page would detach the
+         * unaffected 4 KiB siblings from their backing, so snapshot
+         * the host page, install fresh storage, restore the siblings
+         * around the zeroed target, and keep the new pages private
+         * (shared replacements are always host-page-aligned by the
+         * gap rules in src/vm.c, so COPY is correct here). */
+        {
+            size_t hlen = end - start;
+            uintptr_t off = (uintptr_t)hint_addr - start;
+            uint8_t *saved = (uint8_t *)malloc(hlen);
+            if (saved == NULL) {
+                return -ENOMEM;
+            }
+            memcpy(saved, (void *)start, hlen);
+            res = mmap((void *)start, hlen, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (res == MAP_FAILED) {
+                int merr = errno;
+                free(saved);
+                return -merr;
+            }
+            if (off > 0U) {
+                memcpy((void *)start, saved, off);
+            }
+            if (off + len < hlen) {
+                memcpy((void *)(start + off + len), saved + off + len,
+                    hlen - off - len);
+            }
+            memset((void *)(start + off), 0, len);
+            free(saved);
+#if defined(__APPLE__)
+            if (minherit((void *)start, hlen, VM_INHERIT_COPY) != 0) {
+                return -errno;
+            }
+#endif
+            /* Large-page hosts keep guest pages RW at host level (see
+             * a32_backend_protect); per-4 KiB guest protection stays a
+             * Soft-TLB matter. */
+            *out_host_addr = hint_addr;
+            return 0;
+        }
     }
     if (replace) {
         flags |= MAP_FIXED;

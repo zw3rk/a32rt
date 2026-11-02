@@ -479,6 +479,25 @@ void a32_vm32_reservation_bump(uint32_t gva_aligned)
     atomic_store(&g_ll[h].owner, NULL);
 }
 
+void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
+{
+    uint64_t end;
+    uint64_t line;
+    if (len == 0U) {
+        return;
+    }
+    end = (uint64_t)gva + (uint64_t)len;
+    if (end > 0x100000000ULL) {
+        end = 0x100000000ULL;
+    }
+    /* Every 64-byte bucket the write touches: ll_index() hashes each
+     * 64-byte line, so stepping by 64 covers the span exactly. */
+    line = (uint64_t)(gva & ~63U);
+    for (; line < end; line += 64U) {
+        a32_vm32_reservation_bump((uint32_t)line);
+    }
+}
+
 bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     uint32_t val)
 {

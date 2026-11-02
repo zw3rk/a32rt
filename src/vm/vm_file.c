@@ -24,6 +24,7 @@
 #define _GNU_SOURCE
 #endif
 #include "vm/vm32.h"
+#include "vm/vm_priv.h"
 #include "os/backend.h"
 
 #include <errno.h>
@@ -39,7 +40,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define A32_VMFILE_SLOTS 1024U
 #define A32_VMFILE_INODES 512U
 
 typedef struct {
@@ -49,29 +49,13 @@ typedef struct {
     uint64_t file_size;
 } a32_vmfile_inode_t;
 
-typedef struct {
-    bool used;
-    uint64_t dev;
-    uint64_t ino;
-    uint32_t start_gva;
-    uint32_t end_gva;
-    uint64_t file_offset;
-    int dup_fd;
-} a32_vmfile_map_t;
-
 static a32_vmfile_inode_t g_inodes[A32_VMFILE_INODES];
-static a32_vmfile_map_t g_fmaps[A32_VMFILE_SLOTS];
-static pthread_mutex_t g_vmfile_lock = PTHREAD_MUTEX_INITIALIZER;
 
-typedef struct {
-    bool used;
-    uint32_t start_gva;
-    uint32_t end_gva;
-    int dup_fd;
-    uint32_t pgoffset;
-} a32_vmfile_shared_t;
-
-static a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
+/* Tracking-table storage shared with src/vm/vm_file_map.c (see
+ * src/vm/vm_priv.h); the inode size sidecar stays private to this file. */
+a32_vmfile_map_t g_fmaps[A32_VMFILE_SLOTS];
+a32_vmfile_shared_t g_shared[A32_VMFILE_SLOTS];
+pthread_mutex_t g_vmfile_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Slot selection without mutation: same-start overwrite reuses its slot,
  * otherwise a free slot is required. Returns the slot index or -1 when
@@ -119,13 +103,15 @@ int a32_vmfile_check_record(uint32_t start_gva, bool shared)
     return rc;
 }
 
-/* MAP_FIXED replacement pre-flight (A32-R3-1 follow-up 2): capacity
- * check that accounts for slots the retire step is about to free. A
- * same-start reuse needs no new slot; a fully covered entry frees one;
- * a middle split (an old entry spanning beyond both sides) consumes one
- * extra slot for its right half. Returns 0 when the replacement record
- * is guaranteed a slot after the retire, -ENOMEM otherwise. Call BEFORE
- * the retire step drops the old range. */
+/* MAP_FIXED replacement pre-flight (A32-R3-1 follow-up 2, A32-R4-5):
+ * capacity check that accounts for slots the retire step is about to
+ * free. Only a fully covered record frees its slot for reuse: a
+ * same-start record that survives as a suffix ([start, end) covers just
+ * its prefix) keeps its slot, so the replacement record still needs a
+ * fresh one. A middle split (an old entry spanning beyond both sides)
+ * consumes one extra slot for its right half. Returns 0 when the
+ * replacement record is guaranteed a slot after the retire, -ENOMEM
+ * otherwise. Call BEFORE the retire step drops the old range. */
 int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
     bool shared)
 {
@@ -135,8 +121,6 @@ int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
     unsigned freed_shared = 0U;
     unsigned extra_fmap = 0U;
     unsigned extra_shared = 0U;
-    bool same_start_fmap = false;
-    bool same_start_shared = false;
     unsigned need_fmap;
     unsigned need_shared;
     unsigned i;
@@ -147,48 +131,77 @@ int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
     for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
         if (!g_fmaps[i].used) {
             free_fmap++;
-        } else if (g_fmaps[i].start_gva == start_gva) {
-            same_start_fmap = true;
+        } else if (g_fmaps[i].start_gva >= start_gva &&
+                   g_fmaps[i].end_gva <= end_gva) {
+            /* Fully covered (same-start or not): the retire drops this
+             * entry, freeing its slot for the replacement record. A
+             * same-start prefix survivor is NOT counted here. */
+            freed_fmap++;
+        } else if (g_fmaps[i].start_gva < start_gva &&
+                   g_fmaps[i].end_gva > end_gva) {
+            extra_fmap++;
         }
         if (!g_shared[i].used) {
             free_shared++;
-        } else if (g_shared[i].start_gva == start_gva) {
-            same_start_shared = true;
-        }
-    }
-    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (g_fmaps[i].used && g_fmaps[i].start_gva != start_gva &&
-            g_fmaps[i].start_gva >= start_gva &&
-            g_fmaps[i].end_gva <= end_gva) {
-            freed_fmap++;
-        }
-        if (g_fmaps[i].used && g_fmaps[i].start_gva < start_gva &&
-            g_fmaps[i].end_gva > end_gva) {
-            extra_fmap++;
-        }
-        if (g_shared[i].used && g_shared[i].start_gva != start_gva &&
-            g_shared[i].start_gva >= start_gva &&
-            g_shared[i].end_gva <= end_gva) {
+        } else if (g_shared[i].start_gva >= start_gva &&
+                   g_shared[i].end_gva <= end_gva) {
             freed_shared++;
-        }
-        if (g_shared[i].used && g_shared[i].start_gva < start_gva &&
-            g_shared[i].end_gva > end_gva) {
+        } else if (g_shared[i].start_gva < start_gva &&
+                   g_shared[i].end_gva > end_gva) {
             extra_shared++;
         }
     }
     pthread_mutex_unlock(&g_vmfile_lock);
-    /* A same-start record overwrites its slot; any other record needs a
-     * fresh one. A middle split additionally consumes one slot for the
-     * right half the retire step creates. */
-    need_fmap = same_start_fmap ? extra_fmap : (1U + extra_fmap);
+    /* The replacement record always needs exactly one slot after the
+     * retire (a same-start survivor keeps its own slot in place); each
+     * middle split additionally consumes one slot for the right half
+     * the retire step creates. */
+    need_fmap = 1U + extra_fmap;
     if (free_fmap + freed_fmap < need_fmap) {
         return -ENOMEM;
     }
     if (shared) {
-        need_shared = same_start_shared ? extra_shared : (1U + extra_shared);
+        need_shared = 1U + extra_shared;
         if (free_shared + freed_shared < need_shared) {
             return -ENOMEM;
         }
+    }
+    return 0;
+}
+
+/* Unmap retire pre-flight (A32-R4-6): 0 when the retire of
+ * [unmap_start, unmap_end) cannot run out of split slots. Fully covered
+ * and edge-truncated records free or reuse slots in place; only middle
+ * splits (an old entry spanning beyond both sides) consume one fresh
+ * slot each. Call BEFORE any host or VMA mutation. */
+int a32_vmfile_preflight_unmap(uint32_t unmap_start, uint32_t unmap_end)
+{
+    unsigned free_fmap = 0U;
+    unsigned free_shared = 0U;
+    unsigned need_fmap = 0U;
+    unsigned need_shared = 0U;
+    unsigned i;
+    if (unmap_end <= unmap_start) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&g_vmfile_lock);
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (!g_fmaps[i].used) {
+            free_fmap++;
+        } else if (g_fmaps[i].start_gva < unmap_start &&
+                   g_fmaps[i].end_gva > unmap_end) {
+            need_fmap++;
+        }
+        if (!g_shared[i].used) {
+            free_shared++;
+        } else if (g_shared[i].start_gva < unmap_start &&
+                   g_shared[i].end_gva > unmap_end) {
+            need_shared++;
+        }
+    }
+    pthread_mutex_unlock(&g_vmfile_lock);
+    if (free_fmap < need_fmap || free_shared < need_shared) {
+        return -ENOMEM;
     }
     return 0;
 }
@@ -604,13 +617,114 @@ static int vmfile_free_slot_locked(bool is_shared)
     return -1;
 }
 
-void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
+/* Transactional retire for munmap/MAP_FIXED (A32-R4-6): all split
+ * slots and duplicated descriptors are reserved BEFORE any mutation,
+ * so exhaustion or EMFILE reports an error with every table untouched.
+ * Returns 0 on success, -ENOMEM when a middle split cannot be tracked,
+ * -errno when a descriptor cannot be duplicated, -EINVAL on an empty
+ * range. Callers must check BEFORE mutating host or VMA state. */
+int a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
 {
+    unsigned need_shared = 0U;
+    unsigned need_fmap = 0U;
+    unsigned free_shared = 0U;
+    unsigned free_fmap = 0U;
+    unsigned i;
+    unsigned si;
+    unsigned fi;
+    int *sh_dup = NULL;
+    int *fm_dup = NULL;
+    int rc = 0;
     if (unmap_end <= unmap_start) {
-        return;
+        return -EINVAL;
     }
     pthread_mutex_lock(&g_vmfile_lock);
-    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used) {
+            if (g_shared[i].start_gva < unmap_start &&
+                g_shared[i].end_gva > unmap_end) {
+                need_shared++;
+            }
+        } else {
+            free_shared++;
+        }
+        if (g_fmaps[i].used) {
+            if (g_fmaps[i].start_gva < unmap_start &&
+                g_fmaps[i].end_gva > unmap_end) {
+                need_fmap++;
+            }
+        } else {
+            free_fmap++;
+        }
+    }
+    if (free_shared < need_shared || free_fmap < need_fmap) {
+        pthread_mutex_unlock(&g_vmfile_lock);
+        return -ENOMEM;
+    }
+    if (need_shared > 0U) {
+        sh_dup = (int *)calloc(need_shared, sizeof(int));
+        if (sh_dup == NULL) {
+            pthread_mutex_unlock(&g_vmfile_lock);
+            return -ENOMEM;
+        }
+        for (i = 0U; i < need_shared; i++) {
+            sh_dup[i] = -1;
+        }
+    }
+    if (need_fmap > 0U) {
+        fm_dup = (int *)calloc(need_fmap, sizeof(int));
+        if (fm_dup == NULL) {
+            free(sh_dup);
+            pthread_mutex_unlock(&g_vmfile_lock);
+            return -ENOMEM;
+        }
+        for (i = 0U; i < need_fmap; i++) {
+            fm_dup[i] = -1;
+        }
+    }
+    /* Reserve every descriptor the splits need. No table has been
+     * touched yet, so any failure below leaves all state intact. */
+    si = 0U;
+    fi = 0U;
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
+        if (g_shared[i].used && g_shared[i].start_gva < unmap_start &&
+            g_shared[i].end_gva > unmap_end) {
+            int fd = fcntl(g_shared[i].dup_fd, F_DUPFD_CLOEXEC, 3);
+            if (fd < 0) {
+                rc = -errno;
+                break;
+            }
+            sh_dup[si] = fd;
+            si++;
+        }
+        if (g_fmaps[i].used && g_fmaps[i].start_gva < unmap_start &&
+            g_fmaps[i].end_gva > unmap_end && g_fmaps[i].dup_fd >= 0) {
+            int fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
+            if (fd < 0) {
+                rc = -errno;
+                break;
+            }
+            fm_dup[fi] = fd;
+            fi++;
+        }
+    }
+    if (rc != 0) {
+        for (i = 0U; i < si; i++) {
+            close(sh_dup[i]);
+        }
+        for (i = 0U; i < fi; i++) {
+            close(fm_dup[i]);
+        }
+        free(sh_dup);
+        free(fm_dup);
+        pthread_mutex_unlock(&g_vmfile_lock);
+        return rc;
+    }
+    /* All resources are secured: the mutation below cannot fail. Middle
+     * splits consume the reserved slots/descriptors in record order. */
+    si = 0U;
+    fi = 0U;
+    for (i = 0U; i < A32_VMFILE_SLOTS; i++) {
         if (g_shared[i].used) {
             uint32_t s = g_shared[i].start_gva;
             uint32_t e = g_shared[i].end_gva;
@@ -629,23 +743,18 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
                     g_shared[i].start_gva = unmap_end;
                 } else {
                     int r_slot = vmfile_free_slot_locked(true);
-                    int r_fd = (r_slot >= 0)
-                        ? fcntl(g_shared[i].dup_fd, F_DUPFD_CLOEXEC, 3) : -1;
-                    if (r_slot < 0 || r_fd < 0) {
-                        /* Cannot track the right half: keep the whole
-                         * entry so still-mapped memory stays tracked. */
-                        if (r_fd >= 0) {
-                            close(r_fd);
-                        }
-                        continue;
-                    }
+                    /* r_slot is guaranteed: preflight secured one free
+                     * slot per middle split, and only middle splits
+                     * consume slots here. */
                     g_shared[i].end_gva = unmap_start;
                     g_shared[r_slot].used = true;
                     g_shared[r_slot].start_gva = unmap_end;
                     g_shared[r_slot].end_gva = e;
-                    g_shared[r_slot].dup_fd = r_fd;
+                    g_shared[r_slot].dup_fd = sh_dup[si];
                     g_shared[r_slot].pgoffset =
                         g_shared[i].pgoffset + (unmap_end - s) / 4096U;
+                    sh_dup[si] = -1;
+                    si++;
                 }
             }
         }
@@ -667,15 +776,13 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
                 } else {
                     int r_slot = vmfile_free_slot_locked(false);
                     int r_fd = -1;
-                    if (r_slot >= 0 && g_fmaps[i].dup_fd >= 0) {
-                        r_fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
-                    }
-                    if (r_slot < 0 ||
-                        (g_fmaps[i].dup_fd >= 0 && r_fd < 0)) {
-                        if (r_fd >= 0) {
-                            close(r_fd);
-                        }
-                        continue;
+                    if (g_fmaps[i].dup_fd >= 0) {
+                        /* Pre-duplicated above in record order; the
+                         * fi-th anonymous-backed middle split takes
+                         * the fi-th reserved descriptor. */
+                        r_fd = fm_dup[fi];
+                        fm_dup[fi] = -1;
+                        fi++;
                     }
                     g_fmaps[i].end_gva = unmap_start;
                     g_fmaps[r_slot].used = true;
@@ -709,108 +816,8 @@ void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end)
             g_inodes[i].used = false;
         }
     }
+    free(sh_dup);
+    free(fm_dup);
     pthread_mutex_unlock(&g_vmfile_lock);
-}
-
-/* Borrow-free private lookup for mremap (A32-R3-3): returns an owned
- * duplicate of the backing descriptor covering gva, so the caller can
- * safely map from it after this function unlocks. */
-bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
-    uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
-    uint32_t *out_map_start, uint32_t *out_map_end)
-{
-    bool found = false;
-    int dup_fd = -1;
-    pthread_mutex_lock(&g_vmfile_lock);
-    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (g_fmaps[i].used && g_fmaps[i].dup_fd >= 0 &&
-            gva >= g_fmaps[i].start_gva && gva < g_fmaps[i].end_gva) {
-            dup_fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
-            if (dup_fd < 0) {
-                break;
-            }
-            if (out_dev != NULL) {
-                *out_dev = g_fmaps[i].dev;
-            }
-            if (out_ino != NULL) {
-                *out_ino = g_fmaps[i].ino;
-            }
-            if (out_file_offset != NULL) {
-                *out_file_offset = g_fmaps[i].file_offset;
-            }
-            if (out_map_start != NULL) {
-                *out_map_start = g_fmaps[i].start_gva;
-            }
-            if (out_map_end != NULL) {
-                *out_map_end = g_fmaps[i].end_gva;
-            }
-            found = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_vmfile_lock);
-    if (out_dup_fd != NULL) {
-        *out_dup_fd = dup_fd;
-    } else if (dup_fd >= 0) {
-        close(dup_fd);
-    }
-    if (!found && dup_fd >= 0) {
-        close(dup_fd);
-        if (out_dup_fd != NULL) {
-            *out_dup_fd = -1;
-        }
-    }
-    return found;
-}
-
-/* Fork-child reset (A32-R3-4): the surviving thread must not inherit a
- * mutex held by a vanished thread. */
-void a32_vmfile_fork_child_reset(void)
-{
-    (void)pthread_mutex_destroy(&g_vmfile_lock);
-    (void)pthread_mutex_init(&g_vmfile_lock, NULL);
-}
-
-bool a32_vmfile_can_coalesce(uint32_t end_a, uint32_t start_b)
-{
-    if (end_a != start_b) {
-        return false;
-    }
-    bool ok = true;
-    pthread_mutex_lock(&g_vmfile_lock);
-    const a32_vmfile_shared_t *sh_a = NULL;
-    const a32_vmfile_shared_t *sh_b = NULL;
-    const a32_vmfile_map_t *fm_a = NULL;
-    const a32_vmfile_map_t *fm_b = NULL;
-    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (g_shared[i].used) {
-            if (end_a > g_shared[i].start_gva && end_a <= g_shared[i].end_gva) {
-                sh_a = &g_shared[i];
-            }
-            if (start_b >= g_shared[i].start_gva && start_b < g_shared[i].end_gva) {
-                sh_b = &g_shared[i];
-            }
-        }
-        if (g_fmaps[i].used) {
-            if (end_a > g_fmaps[i].start_gva && end_a <= g_fmaps[i].end_gva) {
-                fm_a = &g_fmaps[i];
-            }
-            if (start_b >= g_fmaps[i].start_gva && start_b < g_fmaps[i].end_gva) {
-                fm_b = &g_fmaps[i];
-            }
-        }
-    }
-    if (sh_a != sh_b) {
-        ok = false;
-    }
-    if (fm_a != fm_b) {
-        if (fm_a == NULL || fm_b == NULL ||
-            fm_a->dev != fm_b->dev || fm_a->ino != fm_b->ino ||
-            fm_a->file_offset + (uint64_t)(end_a - fm_a->start_gva) !=
-                fm_b->file_offset + (uint64_t)(start_b - fm_b->start_gva)) {
-            ok = false;
-        }
-    }
-    pthread_mutex_unlock(&g_vmfile_lock);
-    return ok;
+    return 0;
 }

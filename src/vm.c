@@ -179,9 +179,27 @@ static void vm_coalesce_regions_locked(void)
     g_vm_region_count = dst + 1U;
 }
 
-static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
+/* Retire the previous mapping over [unmap_start, unmap_end): VMA
+ * regions, Soft-TLB translations, and file tracking (A32-R3-1, A32-R4-6).
+ * The file-tracking retire runs FIRST and is transactional: exhaustion
+ * or descriptor failure returns an error with no VMA, host, or tracking
+ * state changed, so the caller can abort before mutating anything. */
+static int vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
 {
-    size_t i = 0U;
+    int rc;
+    size_t i;
+    if (unmap_end <= unmap_start) {
+        return -EINVAL;
+    }
+    rc = a32_vmfile_preflight_unmap(unmap_start, unmap_end);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = a32_vmfile_unmap_shared(unmap_start, unmap_end);
+    if (rc != 0) {
+        return rc;
+    }
+    i = 0U;
     while (i < g_vm_region_count) {
         a32_region_t *r = &g_vm_regions[i];
         if (r->end <= unmap_start || r->start >= unmap_end) {
@@ -218,9 +236,10 @@ static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
         }
         i++;
     }
-    /* Wave U3 A32-4: drop Soft-TLB translations and file tracking for the unmapped span. */
+    /* Wave U3 A32-4: drop Soft-TLB translations for the unmapped span
+     * (file tracking retired above, before any VMA mutation). */
     a32_vm32_sync_unmap(unmap_start, unmap_end);
-    a32_vmfile_unmap_shared(unmap_start, unmap_end);
+    return 0;
 }
 
 /* Pure insertion (A32-R3-1): retiring the previous mapping — regions,
@@ -255,7 +274,39 @@ int a32_vm_record_region_locked(uint32_t start, uint32_t end,
     return rc;
 }
 
-static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot)
+/* Protection-change pre-flight (A32-R4-8): count the VMA entries a
+ * partial mprotect over [mp_start, mp_end) must allocate (a middle
+ * split needs two, an edge split one, a fully covered region none)
+ * and refuse with -ENOMEM when the region table cannot represent the
+ * result. Call BEFORE changing any host permission so a capacity
+ * failure leaves every table and mapping untouched. */
+static int vm_mprotect_preflight_locked(uint32_t mp_start, uint32_t mp_end)
+{
+    size_t need = 0U;
+    if (mp_end <= mp_start) {
+        return -EINVAL;
+    }
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        const a32_region_t *r = &g_vm_regions[i];
+        if (r->end <= mp_start || r->start >= mp_end) {
+            continue;
+        }
+        if (r->start >= mp_start && r->end <= mp_end) {
+            continue;
+        }
+        if (r->start < mp_start && r->end > mp_end) {
+            need += 2U;
+        } else {
+            need += 1U;
+        }
+    }
+    if ((uint64_t)g_vm_region_count + (uint64_t)need > (uint64_t)A32_MAX_REGIONS) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static int vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32_t prot)
 {
     size_t i = 0U;
     while (i < g_vm_region_count) {
@@ -271,22 +322,22 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
         }
         a32_region_t orig = *r;
         if (orig.start < mp_start && orig.end > mp_end) {
-            if (g_vm_region_count + 2U <= A32_MAX_REGIONS) {
-                r->end = mp_start;
-                (void)vm_insert_region_raw(mp_start, mp_end, prot, orig.flags, orig.name);
-                (void)vm_insert_region_raw(mp_end, orig.end, orig.prot, orig.flags, orig.name);
-                i += 3U;
-            } else {
-                r->prot = prot;
-                i++;
+            /* Pre-flight guaranteed two free entries; a failure here
+             * leaves the region untouched rather than widening the
+             * metadata beyond the requested range (A32-R4-8). */
+            r->end = mp_start;
+            if (vm_insert_region_raw(mp_start, mp_end, prot, orig.flags, orig.name) != 0 ||
+                vm_insert_region_raw(mp_end, orig.end, orig.prot, orig.flags, orig.name) != 0) {
+                *r = orig;
+                return -ENOMEM;
             }
+            i += 3U;
         } else if (orig.start < mp_start) {
             if (vm_insert_region_raw(mp_start, orig.end, prot, orig.flags, orig.name) == 0) {
                 g_vm_regions[i].end = mp_start;
                 i += 2U;
             } else {
-                r->prot = prot;
-                i++;
+                return -ENOMEM;
             }
         } else {
             r->start = mp_end;
@@ -294,8 +345,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
                 i += 2U;
             } else {
                 r->start = orig.start;
-                r->prot  = prot;
-                i++;
+                return -ENOMEM;
             }
         }
     }
@@ -304,6 +354,7 @@ static void vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint3
      * protections so Regime A2 faults match the guest view. */
     a32_vm32_sync_region(mp_start, mp_end, (prot & 0x1U) != 0U,
         (prot & 0x2U) != 0U, (prot & 0x4U) != 0U);
+    return 0;
 }
 
 bool a32_vm_range_overlaps(uint32_t start, uint32_t end)
@@ -544,9 +595,17 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
         }
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
+        /* A32-R4-6: retire tracking/VMA first so a capacity failure
+         * keeps brk intact; the PROT_NONE re-reserve below then only
+         * preserves the window reservation. */
+        if (vm_unmap_regions_locked(new_page, old_page) != 0) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            a32_vm_lock_release();
+            return curr;
+        }
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
         (void)vm_reserve_prot_none(ctx, new_page, len);
-        vm_unmap_regions_locked(new_page, old_page);
     }
 
     g_vm_brk_curr = new_brk;
@@ -631,8 +690,16 @@ uint32_t a32_vm_mmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_
     /* A32-R3-1: retire the previous mapping (regions, Soft-TLB, file
      * tracking) BEFORE installing the new host mapping, then publish the
      * new region and its backing together. Retiring first also frees the
-     * old slots, mirroring MAP_FIXED replace semantics. */
-    vm_unmap_regions_locked(target_va, target_end);
+     * old slots, mirroring MAP_FIXED replace semantics. The retire is
+     * transactional (A32-R4-6): failure leaves every table and the host
+     * mapping untouched, so the error propagates before anything is
+     * installed. */
+    {
+        int retire_rc = vm_unmap_regions_locked(target_va, target_end);
+        if (retire_rc != 0) {
+            return (uint32_t)retire_rc;
+        }
+    }
     /* A32-R3-5: refuse before installing the new host mapping when file
      * tracking cannot be maintained. */
     if (is_file &&
@@ -718,6 +785,13 @@ int a32_vm_protect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t 
         return -ENOMEM;
     }
 
+    /* A32-R4-8: verify the region table can represent the split
+     * protection change BEFORE touching host permissions, so -ENOMEM
+     * leaves every table, translation, and host page untouched. */
+    int pre_rc = vm_mprotect_preflight_locked(addr, (uint32_t)end64);
+    if (pre_rc != 0) {
+        return pre_rc;
+    }
     int prot_rc = a32_vm32_protect(ctx, addr, (size_t)aligned_len, prot);
     if (prot_rc != 0) {
         return prot_rc;
@@ -726,8 +800,7 @@ int a32_vm_protect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t 
         a32_vmfile_promote_range(addr, (uint32_t)end64, (prot & 0x1U) != 0U, true);
     }
 
-    vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
-    return 0;
+    return vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
 }
 
 int a32_vm_mprotect(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot)
@@ -760,14 +833,20 @@ int a32_vm_unmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len)
     }
 
     uint32_t start = a32_page_down(addr);
+    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
+    /* A32-R4-6: retire tracking/VMA state BEFORE the host mapping
+     * changes, so exhaustion or descriptor failure aborts with the
+     * mapping (and its backing records) intact. */
+    int rc = vm_unmap_regions_locked(start, end);
+    if (rc != 0) {
+        return rc;
+    }
     /* Keep the [G, G+4GiB) reservation intact by replacing unmapped pages with PROT_NONE */
-    int rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
+    rc = vm_reserve_prot_none(ctx, start, (uint32_t)aligned_len);
     if (rc != 0) {
         return rc;
     }
 
-    uint32_t end = (uint32_t)((uint64_t)start + aligned_len);
-    vm_unmap_regions_locked(start, end);
     if (g_vm_mmap_cursor == end && start >= A32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
     }

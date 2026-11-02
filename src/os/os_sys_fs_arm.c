@@ -7,6 +7,25 @@
 
 #include "os/sys_priv.h"
 
+#if defined(__linux__)
+/* Full-extent writability check for the epoll_wait/epoll_pwait result
+ * buffer (A32-R4-9): validating only the first event lets the kernel
+ * write later events across a guest protection boundary on hosts whose
+ * page granule is coarser than the guest's 4 KiB. Linux-only: the
+ * epoll dispatch below is likewise guarded, and struct epoll_event is
+ * incomplete on Darwin. */
+static bool epoll_out_ok(a32_ctx_t *ctx, uint32_t base_va, uint32_t maxevents)
+{
+    uint64_t bytes =
+        (uint64_t)maxevents * (uint64_t)sizeof(struct epoll_event);
+    if (bytes == 0ULL || bytes > 0xFFFFFFFFULL) {
+        return false;
+    }
+    return a32_guest_range_ok(ctx, base_va, (uint32_t)bytes,
+        (uint32_t)PROT_WRITE);
+}
+#endif
+
 int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
 {
     uint32_t nr = ctx->regs[7];
@@ -86,12 +105,12 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
                                               a3 ? (struct epoll_event *)a32_guest_ptr(ctx, a3) : NULL));
         } else if (nr == ARM_NR_epoll_wait) {
             FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
-            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(struct epoll_event), PROT_WRITE));
+            FAIL_EFAULT_IF(!epoll_out_ok(ctx, a1, a2));
             ctx->regs[0] = host_ret(epoll_wait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
                                                (int)a2, (int)a3));
         } else if (nr == ARM_NR_epoll_pwait) {
             FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
-            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(struct epoll_event), PROT_WRITE));
+            FAIL_EFAULT_IF(!epoll_out_ok(ctx, a1, a2));
             bool     has_temp_mask  = false;
             uint64_t saved_sig_mask = ctx->sig_mask;
             uint64_t temp_mask      = 0ULL;
