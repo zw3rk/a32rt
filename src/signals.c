@@ -11,6 +11,7 @@
 #define _XOPEN_SOURCE 600
 #endif
 #include "a32rt.h"
+#include "vm/vm32.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -269,11 +270,17 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
 
     sp = (sp - (uint32_t)sizeof(a32_rt_sigframe_t)) & ~7U;
     uint32_t frame_va = sp;
-    if (frame_va < 0x1000U || (uint64_t)frame_va + sizeof(a32_rt_sigframe_t) > 0xFFFF0000ULL) {
+    bool frame_ok = (a32_vm32_arena_base() != 0U)
+        ? a32_vm32_range_prot_ok(frame_va, (uint32_t)sizeof(a32_rt_sigframe_t), (uint32_t)PROT_WRITE)
+        : a32_guest_range_ok(ctx, frame_va, (uint32_t)sizeof(a32_rt_sigframe_t), (uint32_t)PROT_WRITE);
+    if (frame_va < 0x1000U || (uint64_t)frame_va + sizeof(a32_rt_sigframe_t) > 0xFFFF0000ULL || !frame_ok) {
         _exit(128 + SIGSEGV);
     }
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, frame_va);
     memset(frame, 0, sizeof(*frame));
+    for (uint32_t off = 0U; off < (uint32_t)sizeof(a32_rt_sigframe_t); off += 4U) {
+        a32_vm32_reservation_bump(frame_va + off);
+    }
 
     frame->retcode[0]    = 0xE3A070ADU; /* mov r7, #173 (ARM_NR_rt_sigreturn) */
     frame->retcode[1]    = 0xEF000000U; /* svc #0 */
@@ -392,6 +399,32 @@ static bool sig_code_is_user_sent(int sig, const siginfo_t *info)
 #endif
 }
 
+static void append_u32_hex(char *buf, size_t *pos, uint32_t val)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        buf[(*pos)++] = hex[(val >> shift) & 0xFU];
+    }
+}
+
+static void write_unhandled_sig_msg(int sig, uint32_t guest_pc, uint32_t fault_addr)
+{
+    char buf[128];
+    size_t pos = 0U;
+    const char *p1 = "a32rt: unhandled guest signal ";
+    const char *p2 = " at guest pc=0x";
+    const char *p3 = ", fault_addr=0x";
+    while (*p1) buf[pos++] = *p1++;
+    if (sig >= 10) buf[pos++] = (char)('0' + (sig / 10) % 10);
+    buf[pos++] = (char)('0' + (sig % 10));
+    while (*p2) buf[pos++] = *p2++;
+    append_u32_hex(buf, &pos, guest_pc);
+    while (*p3) buf[pos++] = *p3++;
+    append_u32_hex(buf, &pos, fault_addr);
+    buf[pos++] = '\n';
+    (void)write(STDERR_FILENO, buf, pos);
+}
+
 static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 {
     a32_ctx_t *ctx = g_tls_ctx;
@@ -458,8 +491,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
             return;
         }
         if (act->handler == A32_SIG_DFL) {
-            fprintf(stderr, "a32rt: unhandled guest signal %d at guest pc=0x%08x, fault_addr=0x%08x\n",
-                    sig, guest_pc, ctx->fault_addr);
+            write_unhandled_sig_msg(sig, guest_pc, ctx->fault_addr);
             _exit(128 + sig);
         }
 
@@ -700,20 +732,20 @@ int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
         set &= ~A32_UNMASKABLE_SIGNALS;
 
         switch (how) {
-        case SIG_BLOCK:
+        case 0: /* Linux SIG_BLOCK */
             ctx->sig_mask |= set;
             break;
-        case SIG_UNBLOCK:
+        case 1: /* Linux SIG_UNBLOCK */
             ctx->sig_mask &= ~set;
             break;
-        case SIG_SETMASK:
+        case 2: /* Linux SIG_SETMASK */
             ctx->sig_mask = set;
             break;
         default:
             return -EINVAL;
         }
 
-        if (how == SIG_BLOCK || how == SIG_SETMASK) {
+        if (how == 0 || how == 2) {
             uint64_t need_install = ctx->sig_mask & ~g_host_handler_installed_mask;
             while (need_install != 0ULL) {
                 int s = __builtin_ctzll(need_install) + 1;

@@ -1,0 +1,1 @@
+M8 C++17 & ARM EHABI (.ARM.exidx unwind, RTTI, RAII, STL, std::thread/future): PASS

@@ -162,7 +162,8 @@ static void vm_coalesce_regions_locked(void)
         a32_region_t *prev = &g_vm_regions[dst];
         const a32_region_t *curr = &g_vm_regions[src];
         if (prev->end == curr->start && prev->prot == curr->prot &&
-            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0) {
+            prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0 &&
+            a32_vmfile_can_coalesce(prev->end, curr->start)) {
             prev->end = curr->end;
         } else {
             dst++;
@@ -368,8 +369,10 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint64_t align, uint32_
     }
     uint64_t cand = (uint64_t)A32_MMAP_BASE_32;
     for (size_t i = 0U; i < g_vm_region_count; i++) {
+        uint64_t r_align = ((g_vm_regions[i].flags & 0x01U) != 0U)
+            ? (uint64_t)a32_backend_page_size() : align;
         uint64_t r_start = (uint64_t)g_vm_regions[i].start;
-        uint64_t r_end   = (page_align_up((uint64_t)g_vm_regions[i].end) + align - 1ULL) & ~(align - 1ULL);
+        uint64_t r_end   = (page_align_up((uint64_t)g_vm_regions[i].end) + r_align - 1ULL) & ~(r_align - 1ULL);
         if (r_end <= cand) {
             continue;
         }
@@ -556,41 +559,41 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         return (uint32_t)(-ENOMEM);
     }
 
-    int host_flags = 0;
-    if (flags & 0x01U) {
-        host_flags |= MAP_SHARED;
-    }
-    if (flags & 0x02U) {
-        host_flags |= MAP_PRIVATE;
-    }
-    if (flags & A32_MAP_ANONYMOUS) {
-        host_flags |= MAP_ANONYMOUS;
-    }
-
-    uint64_t gap_align = ((host_flags & MAP_SHARED) != 0 && (host_flags & MAP_ANONYMOUS) == 0)
+    int host_flags = ((flags & 0x01U) ? MAP_SHARED : 0) |
+                     ((flags & 0x02U) ? MAP_PRIVATE : 0) |
+                     ((flags & A32_MAP_ANONYMOUS) ? MAP_ANONYMOUS : 0);
+    uint64_t gap_align = ((host_flags & MAP_SHARED) != 0)
         ? (uint64_t)a32_backend_page_size() : (uint64_t)A32_PAGE_SIZE;
+    uint64_t gap_len = (aligned_len + gap_align - 1ULL) & ~(gap_align - 1ULL);
     uint32_t target_va     = 0U;
     bool     update_cursor = false;
     if ((flags & (A32_MAP_FIXED | A32_MAP_FIXED_NOREPLACE)) != 0U) {
-        if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < A32_LOW_GUARD_SIZE) {
+        if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < A32_LOW_GUARD_SIZE ||
+            ((uint64_t)addr & (gap_align - 1ULL)) != 0ULL ||
+            ((host_flags & (MAP_SHARED | MAP_ANONYMOUS)) == MAP_SHARED &&
+             (((uint64_t)pgoffset * A32_PAGE_SIZE) & (gap_align - 1ULL)) != 0ULL)) {
             return (uint32_t)(-EINVAL);
         }
-        if ((uint64_t)addr + aligned_len > (uint64_t)A32_KUSER_BASE_32) {
+        if ((uint64_t)addr + gap_len > (uint64_t)A32_KUSER_BASE_32) {
             return (uint32_t)(-ENOMEM);
         }
         if ((flags & A32_MAP_FIXED_NOREPLACE) != 0U &&
-            vm_range_overlaps_locked(addr, (uint32_t)((uint64_t)addr + aligned_len))) {
+            vm_range_overlaps_locked(addr, (uint32_t)((uint64_t)addr + gap_len))) {
             return (uint32_t)(-EEXIST);
+        }
+        if (gap_len > aligned_len &&
+            vm_range_overlaps_locked(addr + (uint32_t)aligned_len,
+                                     (uint32_t)((uint64_t)addr + gap_len))) {
+            return (uint32_t)(-EINVAL);
         }
         target_va = addr;
     } else {
         uint32_t hint_va = (uint32_t)((uint64_t)a32_page_down(addr) & ~(gap_align - 1ULL));
-        if (addr != 0U &&
-            hint_va >= A32_MMAP_BASE_32 &&
-            (uint64_t)hint_va + aligned_len <= (uint64_t)A32_MMAP_TOP_32 &&
-            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + aligned_len))) {
+        if (addr != 0U && hint_va >= A32_MMAP_BASE_32 &&
+            (uint64_t)hint_va + gap_len <= (uint64_t)A32_MMAP_TOP_32 &&
+            !vm_range_overlaps_locked(hint_va, (uint32_t)((uint64_t)hint_va + gap_len))) {
             target_va = hint_va;
-        } else if (vm_find_free_gap_locked(aligned_len, gap_align, &target_va) != 0) {
+        } else if (vm_find_free_gap_locked(gap_len, gap_align, &target_va) != 0) {
             return (uint32_t)(-ENOMEM);
         } else {
             update_cursor = true;
@@ -609,8 +612,7 @@ static uint32_t vm_mmap2_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uin
         return (uint32_t)map_rc;
     }
     if (update_cursor) {
-        g_vm_mmap_cursor = (uint32_t)(((uint64_t)target_va + aligned_len + gap_align - 1ULL) &
-                                      ~(gap_align - 1ULL));
+        g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + gap_len);
     }
     if ((flags & (0x01U | A32_MAP_ANONYMOUS)) == 0x01U && fd >= 0) {
         a32_vmfile_record_shared(target_va, (uint32_t)((uint64_t)target_va + aligned_len), fd, pgoffset);
@@ -777,12 +779,16 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         return (uint32_t)(-EFAULT);
     }
     uint32_t    keep_flags  = orig_flags & 0x23U;
+    uint32_t    sh_flags    = keep_flags & ~A32_MAP_ANONYMOUS;
     uint32_t    map_flags   = (((keep_flags & 0x01U) != 0U) ? 0x01U : 0x02U) | A32_MAP_ANONYMOUS;
     int         sh_fd       = -1;
     uint32_t    sh_pgoff    = 0U;
-    bool        is_sh_file  = ((keep_flags & (0x01U | A32_MAP_ANONYMOUS)) == 0x01U) &&
+    bool        is_sh_file  = ((keep_flags & 0x01U) != 0U) &&
                               a32_vmfile_lookup_shared(old_addr, &sh_fd, &sh_pgoff);
     const char *region_name = (orig_name[0] != '\0') ? orig_name : "[mmap]";
+    if (is_sh_file && (keep_flags & A32_MAP_ANONYMOUS) != 0U && new_aligned > old_aligned) {
+        (void)a32_vmfile_grow_shared(sh_fd, sh_pgoff, new_aligned);
+    }
 
     if ((flags & A32_MREMAP_FIXED) == 0U) {
         if (new_aligned == old_aligned) {
@@ -807,7 +813,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         uint64_t new_end = (uint64_t)old_addr + new_aligned;
         if (new_end <= (uint64_t)A32_KUSER_BASE_32 &&
             !vm_range_overlaps_locked(old_end, (uint32_t)new_end)) {
-            uint32_t ext_flags = (is_sh_file ? keep_flags : map_flags) | A32_MAP_FIXED;
+            uint32_t ext_flags = (is_sh_file ? sh_flags : map_flags) | A32_MAP_FIXED;
             uint32_t ext_pgoff = is_sh_file ? (sh_pgoff + (uint32_t)(old_aligned / A32_PAGE_SIZE)) : 0U;
             uint32_t ext = vm_mmap2_locked(ctx, old_end, (uint32_t)(new_aligned - old_aligned),
                                            prot, ext_flags, is_sh_file ? sh_fd : -1, ext_pgoff);
@@ -847,7 +853,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
 
     bool     is_fixed = (flags & A32_MREMAP_FIXED) != 0U;
     uint32_t rw_prot  = is_sh_file ? prot : ((prot & ~((uint32_t)PROT_EXEC)) | (uint32_t)(PROT_READ | PROT_WRITE));
-    uint32_t mv_flags = (is_sh_file ? keep_flags : map_flags) | (is_fixed ? A32_MAP_FIXED : 0U);
+    uint32_t mv_flags = (is_sh_file ? sh_flags : map_flags) | (is_fixed ? A32_MAP_FIXED : 0U);
     uint32_t new_va   = vm_mmap2_locked(ctx, is_fixed ? new_addr : 0U, (uint32_t)new_aligned,
                                         rw_prot, mv_flags, is_sh_file ? sh_fd : -1, is_sh_file ? sh_pgoff : 0U);
     if (new_va > 0xFFFFF000U) {
@@ -868,9 +874,6 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
     }
     (void)vm_record_region_locked(new_va, (uint32_t)((uint64_t)new_va + new_aligned), prot, keep_flags, region_name);
     (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
-    if (is_sh_file) {
-        a32_vmfile_unmap_shared(old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
-    }
     vm_sync_to_ctx(ctx);
     vm_lock_release();
 

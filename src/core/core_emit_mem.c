@@ -27,7 +27,7 @@ void a32_emit_sites_flush(void)
 }
 
 static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
-    unsigned addr_w, uint32_t host_off)
+    unsigned addr_w, uint32_t host_off, bool is_store)
 {
     a32_vm32_mem_site_t rec;
     uint32_t cur_pc;
@@ -48,7 +48,7 @@ static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
     rec.sp_rollback_delta = 0;
     rec.npc_mode = (uint8_t)A32_VM32_NPC_SEQUENTIAL;
     rec.width = (uint8_t)(1U << ((opc >> 30U) & 3U));
-    rec.flags = (((opc & 0x400000U) == 0U) ? (uint8_t)A32_VM32_SITE_STORE : 0U);
+    rec.flags = is_store ? (uint8_t)A32_VM32_SITE_STORE : 0U;
     if (rec.width <= 2U && (opc & 0x800000U) != 0U) {
         rec.flags |= (uint8_t)A32_VM32_SITE_SIGNED;
     }
@@ -164,12 +164,13 @@ void a64_emit_guest_addr_x(a64_buf_t *b, unsigned dst_x, unsigned addr_w,
     a64_emit_add_uxtw_x(b, dst_x, 23U, addr_w);
 }
 
-static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned addr_w)
+static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt,
+                           unsigned addr_w, bool is_store)
 {
     if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
-    emit_site_record(b, opc, rt, addr_w, (uint32_t)b->count);
+    emit_site_record(b, opc, rt, addr_w, (uint32_t)b->count, is_store);
     if (a32_vm32_current_regime() != A32_VM32_REGIME_A2_SOFT_TLB ||
         a32_vm32_tlb_base == 0U) {
         a64_emit(b, opc | ((addr_w & 31U) << 16) | (A64_XG << 5) | (rt & 31U));
@@ -177,7 +178,6 @@ static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned add
     }
     {
         uint32_t width = 1U << ((opc >> 30U) & 3U);
-        bool is_store = ((opc & 0x400000U) == 0U);
         emit_soft_tlb_check(b, addr_w, width, is_store);
         a64_emit(b, opc | ((addr_w & 31U) << 16) | (23U << 5) | (rt & 31U));
     }
@@ -186,12 +186,12 @@ static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt, unsigned add
 /* Guest memory accesses: [xG, wAddr, uxtw #0] */
 void a64_emit_guest_ldr_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0xB8604800U, rt, addr_w);
+    emit_guest_mem(b, 0xB8604800U, rt, addr_w, false);
 }
 
 void a64_emit_guest_str_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0xB8204800U, rt, addr_w);
+    emit_guest_mem(b, 0xB8204800U, rt, addr_w, true);
 }
 
 void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w)
@@ -218,32 +218,32 @@ void a64_emit_guest_strd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned add
 
 void a64_emit_guest_ldrb_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0x38604800U, rt, addr_w);
+    emit_guest_mem(b, 0x38604800U, rt, addr_w, false);
 }
 
 void a64_emit_guest_ldrsb_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0x38A04800U, rt, addr_w);
+    emit_guest_mem(b, 0x38A04800U, rt, addr_w, false);
 }
 
 void a64_emit_guest_strb_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0x38204800U, rt, addr_w);
+    emit_guest_mem(b, 0x38204800U, rt, addr_w, true);
 }
 
 void a64_emit_guest_ldrh_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0x78604800U, rt, addr_w);
+    emit_guest_mem(b, 0x78604800U, rt, addr_w, false);
 }
 
 void a64_emit_guest_ldrsh_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0x78A04800U, rt, addr_w);
+    emit_guest_mem(b, 0x78A04800U, rt, addr_w, false);
 }
 
 void a64_emit_guest_strh_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0x78204800U, rt, addr_w);
+    emit_guest_mem(b, 0x78204800U, rt, addr_w, true);
 }
 
 static void emit_ctx_mem_imm(a64_buf_t *b, uint32_t opc, unsigned shift, bool is_store,
@@ -291,22 +291,22 @@ void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_
 /* VFPv4-D32 / NEON guest memory loads/stores */
 void a64_emit_guest_ldr_s(a64_buf_t *b, unsigned vt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0xBC604800U, vt, addr_w);
+    emit_guest_mem(b, 0xBC604800U, vt, addr_w, false);
 }
 
 void a64_emit_guest_str_s(a64_buf_t *b, unsigned vt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0xBC204800U, vt, addr_w);
+    emit_guest_mem(b, 0xBC204800U, vt, addr_w, true);
 }
 
 void a64_emit_guest_ldr_d(a64_buf_t *b, unsigned vt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0xFC604800U, vt, addr_w);
+    emit_guest_mem(b, 0xFC604800U, vt, addr_w, false);
 }
 
 void a64_emit_guest_str_d(a64_buf_t *b, unsigned vt, unsigned addr_w)
 {
-    emit_guest_mem(b, 0xFC204800U, vt, addr_w);
+    emit_guest_mem(b, 0xFC204800U, vt, addr_w, true);
 }
 
 /* Scalar FP instructions */

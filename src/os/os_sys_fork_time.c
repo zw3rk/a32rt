@@ -305,11 +305,16 @@ bool a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_
     if (end > max_end) {
         return false;
     }
-    if (guest_range_mapped(ctx, va, len, req_prot)) {
-        return true;
+    if (!guest_range_mapped(ctx, va, len, req_prot)) {
+        a32_vm_sync_ctx(ctx);
+        if (!guest_range_mapped(ctx, va, len, req_prot)) {
+            return false;
+        }
     }
-    a32_vm_sync_ctx(ctx);
-    return guest_range_mapped(ctx, va, len, req_prot);
+    if (a32_vm32_arena_base() != 0U && !a32_vm32_range_prot_ok(va, len, req_prot)) {
+        return false;
+    }
+    return true;
 }
 
 int translate_linux_clockid(uint32_t linux_clk, clockid_t *out_clk)

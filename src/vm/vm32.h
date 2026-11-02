@@ -81,6 +81,7 @@ uintptr_t a32_vm32_arena_base(void);
 #define A32_VM32_TLB_BITS 20U
 #define A32_VM32_TLB_SIZE (1U << A32_VM32_TLB_BITS) /* 1048576 entries */
 #define A32_VM32_TLB_INVALID_TAG (~UINT64_C(0))
+#define A32_PROT_EOF_CUT 0x80U
 
 typedef struct {
     uint64_t read_tag; /* Offset 0: (gva & ~0xFFF) if readable, else ~0 */
@@ -121,6 +122,8 @@ void a32_vm32_tlb_invalidate_all(void);
 void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
     bool readable, bool writable, bool executable);
 void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva);
+bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot);
+void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut);
 
 /* Soft-TLB base address for the A2 emitter/trampoline (x21). Set by
  * a32_vm32_init: &g_tlb[0] when regime == A2_SOFT_TLB, 0 (unused) in A1. */
@@ -221,6 +224,8 @@ void a32_vmfile_record_shared(uint32_t start_gva, uint32_t end_gva, int fd,
     uint32_t pgoffset);
 bool a32_vmfile_lookup_shared(uint32_t start_gva, int *out_fd,
     uint32_t *out_pgoffset);
+int a32_vmfile_grow_shared(int sh_fd, uint32_t sh_pgoff, uint64_t new_len);
 void a32_vmfile_unmap_shared(uint32_t unmap_start, uint32_t unmap_end);
+bool a32_vmfile_can_coalesce(uint32_t end_a, uint32_t start_b);
 
 #endif /* A32RT_VM_VM32_H */

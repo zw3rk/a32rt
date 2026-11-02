@@ -11,7 +11,9 @@
  */
 
 #include "interp.h"
+#include "interp_priv.h"
 
+#include <fenv.h>
 #include <math.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -20,6 +22,39 @@
 #define FPSCR_Z (1U << 30)
 #define FPSCR_C (1U << 29)
 #define FPSCR_V (1U << 28)
+
+static void vfp_fenv_begin(const a32_ctx_t *ctx, fenv_t *saved_env)
+{
+    (void)fegetenv(saved_env);
+    (void)feclearexcept(FE_ALL_EXCEPT);
+    switch ((ctx->fpscr >> 22) & 3U) {
+    case 1U: (void)fesetround(FE_UPWARD); break;
+    case 2U: (void)fesetround(FE_DOWNWARD); break;
+    case 3U: (void)fesetround(FE_TOWARDZERO); break;
+    default: (void)fesetround(FE_TONEAREST); break;
+    }
+}
+
+static void vfp_fenv_end(a32_ctx_t *ctx, const fenv_t *saved_env)
+{
+    int ex = fetestexcept(FE_ALL_EXCEPT);
+    if ((ex & FE_INVALID) != 0) {
+        ctx->fpscr |= (1U << 0);
+    }
+    if ((ex & FE_DIVBYZERO) != 0) {
+        ctx->fpscr |= (1U << 1);
+    }
+    if ((ex & FE_OVERFLOW) != 0) {
+        ctx->fpscr |= (1U << 2);
+    }
+    if ((ex & FE_UNDERFLOW) != 0) {
+        ctx->fpscr |= (1U << 3);
+    }
+    if ((ex & FE_INEXACT) != 0) {
+        ctx->fpscr |= (1U << 4);
+    }
+    (void)fesetenv(saved_env);
+}
 
 static float get_s(const a32_ctx_t *ctx, unsigned s)
 {
@@ -98,24 +133,12 @@ static void cmp_set_fpscr(a32_ctx_t *ctx, bool n, bool z, bool c, bool v)
 
 static bool mem_r(a32_ctx_t *ctx, uint32_t va, void *out, uint32_t len)
 {
-    if (!a32_guest_range_ok(ctx, va, len, 1)) {
-        ctx->fault_addr = va;
-        ctx->exit_reason = A32_EXIT_FAULT;
-        return false;
-    }
-    memcpy(out, a32_guest_ptr(ctx, va), len);
-    return true;
+    return i_load_bytes(ctx, va, out, len);
 }
 
 static bool mem_w(a32_ctx_t *ctx, uint32_t va, const void *in, uint32_t len)
 {
-    if (!a32_guest_range_ok(ctx, va, len, 2)) {
-        ctx->fault_addr = va;
-        ctx->exit_reason = A32_EXIT_FAULT;
-        return false;
-    }
-    memcpy(a32_guest_ptr(ctx, va), in, len);
-    return true;
+    return i_store_bytes(ctx, va, in, len);
 }
 
 static inline unsigned vfp_idx(bool is_double, bool hi_bit, unsigned lo4)
@@ -422,12 +445,21 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             return true;
         }
         if (opc2 == 1U) {
-            if (dbl) {
-                double a = get_d(ctx, vm);
-                put_d(ctx, vd, n_bit ? sqrt(a) : -a);
+            if (n_bit) {
+                fenv_t saved_env;
+                vfp_fenv_begin(ctx, &saved_env);
+                if (dbl) {
+                    put_d(ctx, vd, sqrt(get_d(ctx, vm)));
+                } else {
+                    put_s(ctx, vd, sqrtf(get_s(ctx, vm)));
+                }
+                vfp_fenv_end(ctx, &saved_env);
             } else {
-                float a = get_s(ctx, vm);
-                put_s(ctx, vd, n_bit ? sqrtf(a) : -a);
+                if (dbl) {
+                    put_d(ctx, vd, -get_d(ctx, vm));
+                } else {
+                    put_s(ctx, vd, -get_s(ctx, vm));
+                }
             }
             ctx->regs[15] = pc + 4U;
             return true;
@@ -438,6 +470,9 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 double a = get_d(ctx, vd);
                 double b = zero ? 0.0 : get_d(ctx, vm);
                 if (a != a || b != b) {
+                    if (n_bit) {
+                        ctx->fpscr |= (1U << 0);
+                    }
                     cmp_set_fpscr(ctx, false, false, true, true);
                 } else if (a == b) {
                     cmp_set_fpscr(ctx, false, true, true, false);
@@ -450,6 +485,9 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 float a = get_s(ctx, vd);
                 float b = zero ? 0.0f : get_s(ctx, vm);
                 if (a != a || b != b) {
+                    if (n_bit) {
+                        ctx->fpscr |= (1U << 0);
+                    }
                     cmp_set_fpscr(ctx, false, false, true, true);
                 } else if (a == b) {
                     cmp_set_fpscr(ctx, false, true, true, false);
@@ -463,6 +501,8 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             return true;
         }
         if (opc2 == 7U && n_bit) {
+            fenv_t saved_env;
+            vfp_fenv_begin(ctx, &saved_env);
             if (dbl) {
                 unsigned s = (vd_b << 1) | (d_bit ? 1U : 0U);
                 put_s(ctx, s, (float)get_d(ctx, vm));
@@ -470,10 +510,13 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 unsigned d = (d_bit ? 16U : 0U) | vd_b;
                 put_d(ctx, d, (double)get_s(ctx, vm));
             }
+            vfp_fenv_end(ctx, &saved_env);
             ctx->regs[15] = pc + 4U;
             return true;
         }
         if (opc2 == 8U) {
+            fenv_t saved_env;
+            vfp_fenv_begin(ctx, &saved_env);
             unsigned m = (vm_b << 1) | (m_bit ? 1U : 0U);
             float f = get_s(ctx, m);
             uint32_t raw = 0U;
@@ -483,36 +526,59 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             } else {
                 put_s(ctx, vd, n_bit ? (float)(int32_t)raw : (float)raw);
             }
+            vfp_fenv_end(ctx, &saved_env);
             ctx->regs[15] = pc + 4U;
             return true;
         }
         if (opc2 == 12U || opc2 == 13U) {
+            fenv_t saved_env;
+            vfp_fenv_begin(ctx, &saved_env);
             bool is_signed = (opc2 == 13U);
             unsigned s = (vd_b << 1) | (d_bit ? 1U : 0U);
             double v = dbl ? get_d(ctx, vm) : (double)get_s(ctx, vm);
             if (!n_bit) {
-                v = nearbyint(v);
+                v = rint(v);
+            } else {
+                double tr = trunc(v);
+                if (tr != v && isfinite(v)) {
+                    (void)feraiseexcept(FE_INEXACT);
+                }
+                v = tr;
             }
             uint32_t out_w = 0U;
             if (v != v) {
+                (void)feraiseexcept(FE_INVALID);
                 out_w = 0U;
             } else if (is_signed) {
-                if (v >= 2147483647.0) {
+                if (v > 2147483647.0) {
+                    (void)feraiseexcept(FE_INVALID);
                     out_w = 0x7FFFFFFFU;
+                } else if (v >= 2147483647.0) {
+                    out_w = 0x7FFFFFFFU;
+                } else if (v < -2147483648.0) {
+                    (void)feraiseexcept(FE_INVALID);
+                    out_w = 0x80000000U;
                 } else if (v <= -2147483648.0) {
                     out_w = 0x80000000U;
                 } else {
                     out_w = (uint32_t)(int32_t)v;
                 }
             } else {
-                if (v >= 4294967295.0) {
+                if (v > 4294967295.0) {
+                    (void)feraiseexcept(FE_INVALID);
                     out_w = 0xFFFFFFFFU;
+                } else if (v >= 4294967295.0) {
+                    out_w = 0xFFFFFFFFU;
+                } else if (v < 0.0) {
+                    (void)feraiseexcept(FE_INVALID);
+                    out_w = 0U;
                 } else if (v <= 0.0) {
                     out_w = 0U;
                 } else {
                     out_w = (uint32_t)v;
                 }
             }
+            vfp_fenv_end(ctx, &saved_env);
             float out_f = 0.0f;
             memcpy(&out_f, &out_w, 4U);
             put_s(ctx, s, out_f);
@@ -523,6 +589,8 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
     }
 
     if (opc1 <= 3U || (opc1 == 8U && !op_bit) || opc1 == 9U || opc1 == 10U) {
+        fenv_t saved_env;
+        vfp_fenv_begin(ctx, &saved_env);
         if (dbl) {
             double a = get_d(ctx, vn);
             double b = get_d(ctx, vm);
@@ -558,6 +626,7 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             }
             put_s(ctx, vd, r);
         }
+        vfp_fenv_end(ctx, &saved_env);
         ctx->regs[15] = pc + 4U;
         return true;
     }

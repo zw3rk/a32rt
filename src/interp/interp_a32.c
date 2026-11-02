@@ -365,7 +365,7 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
     }
     if (is_vfp_word(insn)) {
         if (a32_interp_vfp_step(ctx, insn)) {
-            return A32_EXIT_NONE;
+            return ctx->exit_reason;
         }
         ctx->regs[15] = pc + 4U;
         i_undef(ctx);

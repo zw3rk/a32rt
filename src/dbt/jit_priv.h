@@ -101,6 +101,8 @@ typedef struct a32_pending_bucket {
 extern _Atomic uint32_t     g_jit_lock;
 extern _Atomic uint32_t     g_cache_epoch;
 extern _Atomic bool         g_multithreaded;
+extern _Atomic uint32_t     g_jit_exec_readers;
+extern _Atomic uint32_t     g_jit_reset_pending;
 
 extern uint8_t             *g_code_cache;
 extern size_t               g_code_used;
@@ -118,7 +120,7 @@ extern a32_pending_bucket_t g_pending_slot_callers[A32_PENDING_BUCKETS];
 extern a32_pending_bucket_t g_pending_ret_callers[A32_PENDING_BUCKETS];
 
 extern a32_side_entry_t    *g_side_table;
-extern size_t               g_side_table_count;
+extern _Atomic size_t       g_side_table_count;
 
 extern a32_pc_map_stage_t   g_stage_pc_map[MAX_STAGE_PC_MAP];
 extern size_t               g_stage_pc_map_count;
@@ -131,6 +133,25 @@ static inline void jit_lock_acquire(void)
 static inline void jit_lock_release(void)
 {
     a32_spin_unlock(&g_jit_lock);
+}
+
+static inline void a32_jit_exec_enter(void)
+{
+    for (;;) {
+        while (atomic_load_explicit(&g_jit_reset_pending, memory_order_acquire) != 0U) {
+            __asm__ volatile("yield" ::: "memory");
+        }
+        atomic_fetch_add_explicit(&g_jit_exec_readers, 1U, memory_order_acq_rel);
+        if (atomic_load_explicit(&g_jit_reset_pending, memory_order_acquire) == 0U) {
+            return;
+        }
+        atomic_fetch_sub_explicit(&g_jit_exec_readers, 1U, memory_order_acq_rel);
+    }
+}
+
+static inline void a32_jit_exec_leave(void)
+{
+    atomic_fetch_sub_explicit(&g_jit_exec_readers, 1U, memory_order_acq_rel);
 }
 
 static inline uint32_t hash_key(uint32_t key)

@@ -46,8 +46,7 @@ bool a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t 
         host_pc >= (uintptr_t)g_code_cache + A32_CODE_CACHE_SIZE) {
         return false;
     }
-    jit_lock_acquire();
-    size_t total    = g_side_table_count;
+    size_t total    = atomic_load_explicit(&g_side_table_count, memory_order_acquire);
     size_t count    = (total <= A32_SIDE_TABLE_SIZE) ? total : A32_SIDE_TABLE_SIZE;
     size_t base_idx = (total <= A32_SIDE_TABLE_SIZE) ? 0U : (total % A32_SIDE_TABLE_SIZE);
     size_t lo       = 0U;
@@ -70,11 +69,9 @@ bool a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t 
             if (out_itstate != NULL) {
                 *out_itstate = e->itstate;
             }
-            jit_lock_release();
             return true;
         }
     }
-    jit_lock_release();
     return false;
 }
 

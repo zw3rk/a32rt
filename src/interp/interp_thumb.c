@@ -293,12 +293,12 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 unsigned rt = hw & 7U;
                 uint32_t ea = ctx->regs[rb] + ctx->regs[ro];
                 if (op == 0U) {
-                    if (!i_store_u32(ctx, ea & ~3U, ctx->regs[rt])) {
+                    if (!i_store_u32(ctx, ea, ctx->regs[rt])) {
                         return A32_EXIT_FAULT;
                     }
                 } else if (op == 1U) {
                     uint16_t hv = (uint16_t)ctx->regs[rt];
-                    if (!i_store_bytes(ctx, ea & ~1U, &hv, 2U)) {
+                    if (!i_store_bytes(ctx, ea, &hv, 2U)) {
                         return A32_EXIT_FAULT;
                     }
                 } else if (op == 2U) {
@@ -314,13 +314,13 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     ctx->regs[rt] = (uint32_t)(int32_t)bv;
                 } else if (op == 4U) {
                     uint32_t v = 0U;
-                    if (!i_load_u32(ctx, ea & ~3U, &v)) {
+                    if (!i_load_u32(ctx, ea, &v)) {
                         return A32_EXIT_FAULT;
                     }
                     ctx->regs[rt] = v;
                 } else if (op == 5U) {
                     uint16_t hv = 0U;
-                    if (!i_load_bytes(ctx, ea & ~1U, &hv, 2U)) {
+                    if (!i_load_bytes(ctx, ea, &hv, 2U)) {
                         return A32_EXIT_FAULT;
                     }
                     ctx->regs[rt] = hv;
@@ -332,7 +332,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     ctx->regs[rt] = bv;
                 } else {
                     int16_t hv = 0;
-                    if (!i_load_bytes(ctx, ea & ~1U, &hv, 2U)) {
+                    if (!i_load_bytes(ctx, ea, &hv, 2U)) {
                         return A32_EXIT_FAULT;
                     }
                     ctx->regs[rt] = (uint32_t)(int32_t)hv;
@@ -353,7 +353,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                         ctx->regs[rt] = bv;
                     } else {
                         uint32_t v = 0U;
-                        if (!i_load_u32(ctx, ea & ~3U, &v)) {
+                        if (!i_load_u32(ctx, ea, &v)) {
                             return A32_EXIT_FAULT;
                         }
                         ctx->regs[rt] = v;
@@ -365,7 +365,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                             return A32_EXIT_FAULT;
                         }
                     } else {
-                        if (!i_store_u32(ctx, ea & ~3U, ctx->regs[rt])) {
+                        if (!i_store_u32(ctx, ea, ctx->regs[rt])) {
                             return A32_EXIT_FAULT;
                         }
                     }
@@ -378,13 +378,13 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 uint32_t ea = ctx->regs[rb] + (((hw >> 6) & 31U) << 1);
                 if (l) {
                     uint16_t hv = 0U;
-                    if (!i_load_bytes(ctx, ea & ~1U, &hv, 2U)) {
+                    if (!i_load_bytes(ctx, ea, &hv, 2U)) {
                         return A32_EXIT_FAULT;
                     }
                     ctx->regs[rt] = hv;
                 } else {
                     uint16_t hv = (uint16_t)ctx->regs[rt];
-                    if (!i_store_bytes(ctx, ea & ~1U, &hv, 2U)) {
+                    if (!i_store_bytes(ctx, ea, &hv, 2U)) {
                         return A32_EXIT_FAULT;
                     }
                 }
@@ -395,12 +395,12 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 uint32_t ea = ctx->regs[13] + ((hw & 0xFFU) << 2);
                 if (l) {
                     uint32_t v = 0U;
-                    if (!i_load_u32(ctx, ea & ~3U, &v)) {
+                    if (!i_load_u32(ctx, ea, &v)) {
                         return A32_EXIT_FAULT;
                     }
                     ctx->regs[rt] = v;
                 } else {
-                    if (!i_store_u32(ctx, ea & ~3U, ctx->regs[rt])) {
+                    if (!i_store_u32(ctx, ea, ctx->regs[rt])) {
                         return A32_EXIT_FAULT;
                     }
                 }
@@ -598,6 +598,9 @@ static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2
         uint32_t word = ((uint32_t)hw1 << 16) | hw2;
         /* Rebuild the A32-style coprocessor view for the VFP unit. */
         if (a32_interp_vfp_step(ctx, word)) {
+            if (ctx->exit_reason != A32_EXIT_NONE) {
+                return ctx->exit_reason;
+            }
             if (ctx->regs[15] == pc) {
                 ctx->regs[15] = next;
             }
@@ -644,46 +647,113 @@ static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2
         ctx->regs[15] = next;
         return A32_EXIT_NONE;
     }
-    if ((hw1 & 0xFF70U) == 0xF810U) {
-        /* LDRB.W / LDRH.W / LDR.W literal-ish subset. */
-        unsigned rn = hw1 & 0xFU;
-        unsigned rt = (hw2 >> 8) & 0xFU;
-        uint32_t base = (rn == 15U) ? (pc + 4U) & ~3U : ctx->regs[rn];
-        int32_t off = (int32_t)(hw2 & 0xFFFU);
-        if (((hw1 >> 4) & 1U) == 0U) {
-            off = -off;
+    if ((hw1 & 0xFE00U) == 0xF800U) {
+        bool sign_ext = ((hw1 >> 8) & 1U) != 0U;
+        bool u_imm12  = ((hw1 >> 7) & 1U) != 0U;
+        unsigned size = (hw1 >> 5) & 3U; /* 0=byte, 1=half, 2=word */
+        bool is_load  = ((hw1 >> 4) & 1U) != 0U;
+        unsigned rn   = hw1 & 0xFU;
+        unsigned rt   = (hw2 >> 12) & 0xFU;
+
+        if (size > 2U || (size == 2U && sign_ext) ||
+            (!is_load && (sign_ext || rt == 15U || rn == 15U))) {
+            ctx->regs[15] = next;
+            i_undef(ctx);
+            return A32_EXIT_UNDEF;
         }
-        uint32_t ea = (uint32_t)((int32_t)base + off);
-        uint32_t v = 0U;
-        if (!i_load_u32(ctx, ea & ~3U, &v)) {
-            return A32_EXIT_FAULT;
-        }
-        ctx->regs[rt] = v;
-        ctx->regs[15] = next;
-        return A32_EXIT_NONE;
-    }
-    if ((hw1 & 0xFFE0U) == 0xF840U || (hw1 & 0xFFE0U) == 0xF800U) {
-        bool l = ((hw1 >> 4) & 1U) != 0U;
-        unsigned rn = hw1 & 0xFU;
-        unsigned rt = (hw2 >> 8) & 0xFU;
-        int32_t off = (int32_t)(hw2 & 0xFFFU);
-        if (((hw1 >> 5) & 1U) != 0U && ((hw1 & 1U) == 0U)) {
-            off = (int32_t)((hw2 & 0xFFU));
-            if (((hw1 >> 4) & 3U) == 0U) {
-                off = -off;
+
+        uint32_t ea = 0U;
+        uint32_t wb_val = 0U;
+        bool do_wb = false;
+
+        if (rn == 15U) {
+            uint32_t base = (pc + 4U) & ~3U;
+            uint32_t imm12 = (uint32_t)(hw2 & 0xFFFU);
+            ea = u_imm12 ? (base + imm12) : (base - imm12);
+        } else if (u_imm12) {
+            uint32_t imm12 = (uint32_t)(hw2 & 0xFFFU);
+            ea = ctx->regs[rn] + imm12;
+        } else if ((hw2 & 0x0800U) == 0U) {
+            if ((hw2 & 0x0FC0U) != 0U) {
+                ctx->regs[15] = next;
+                i_undef(ctx);
+                return A32_EXIT_UNDEF;
             }
+            unsigned rm = hw2 & 0xFU;
+            unsigned shift = (hw2 >> 4) & 3U;
+            ea = ctx->regs[rn] + (ctx->regs[rm] << shift);
+        } else {
+            bool p_bit = ((hw2 >> 10) & 1U) != 0U;
+            bool u_bit = ((hw2 >> 9) & 1U) != 0U;
+            bool w_bit = ((hw2 >> 8) & 1U) != 0U;
+            if (!p_bit && !w_bit) {
+                ctx->regs[15] = next;
+                i_undef(ctx);
+                return A32_EXIT_UNDEF;
+            }
+            if (rt == 15U && is_load && size != 2U && (hw2 & 0x0F00U) != 0x0C00U) {
+                ctx->regs[15] = next;
+                i_undef(ctx);
+                return A32_EXIT_UNDEF;
+            }
+            uint32_t imm8 = (uint32_t)(hw2 & 0xFFU);
+            uint32_t base = ctx->regs[rn];
+            wb_val = u_bit ? (base + imm8) : (base - imm8);
+            ea = p_bit ? wb_val : base;
+            do_wb = (!p_bit || w_bit) && (rn != rt || !is_load);
         }
-        uint32_t base = ctx->regs[rn];
-        uint32_t ea = (uint32_t)((int32_t)base + off);
-        if (l) {
+
+        if (rt == 15U && is_load && size != 2U) {
+            /* PLD / PLI hint */
+            ctx->regs[15] = next;
+            return A32_EXIT_NONE;
+        }
+
+        if (is_load) {
             uint32_t v = 0U;
-            if (!i_load_u32(ctx, ea & ~3U, &v)) {
-                return A32_EXIT_FAULT;
+            if (size == 0U) {
+                uint8_t b = 0U;
+                if (!i_load_bytes(ctx, ea, &b, 1U)) {
+                    return A32_EXIT_FAULT;
+                }
+                v = sign_ext ? (uint32_t)(int32_t)(int8_t)b : (uint32_t)b;
+            } else if (size == 1U) {
+                uint16_t h = 0U;
+                if (!i_load_bytes(ctx, ea, &h, 2U)) {
+                    return A32_EXIT_FAULT;
+                }
+                v = sign_ext ? (uint32_t)(int32_t)(int16_t)h : (uint32_t)h;
+            } else {
+                if (!i_load_u32(ctx, ea, &v)) {
+                    return A32_EXIT_FAULT;
+                }
+            }
+            if (do_wb) {
+                ctx->regs[rn] = wb_val;
+            }
+            if (rt == 15U) {
+                i_set_pc_branch(ctx, v, true);
+                return A32_EXIT_NONE;
             }
             ctx->regs[rt] = v;
         } else {
-            if (!i_store_u32(ctx, ea & ~3U, ctx->regs[rt])) {
-                return A32_EXIT_FAULT;
+            if (size == 0U) {
+                uint8_t b = (uint8_t)ctx->regs[rt];
+                if (!i_store_bytes(ctx, ea, &b, 1U)) {
+                    return A32_EXIT_FAULT;
+                }
+            } else if (size == 1U) {
+                uint16_t h = (uint16_t)ctx->regs[rt];
+                if (!i_store_bytes(ctx, ea, &h, 2U)) {
+                    return A32_EXIT_FAULT;
+                }
+            } else {
+                if (!i_store_u32(ctx, ea, ctx->regs[rt])) {
+                    return A32_EXIT_FAULT;
+                }
+            }
+            if (do_wb) {
+                ctx->regs[rn] = wb_val;
             }
         }
         ctx->regs[15] = next;

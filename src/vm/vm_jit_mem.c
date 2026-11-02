@@ -11,6 +11,8 @@
 _Atomic uint32_t     g_jit_lock = 0;
 _Atomic uint32_t     g_cache_epoch = 1;
 _Atomic bool         g_multithreaded = false;
+_Atomic uint32_t     g_jit_exec_readers = 0;
+_Atomic uint32_t     g_jit_reset_pending = 0;
 
 uint8_t             *g_code_cache = NULL;
 size_t               g_code_used  = 0U;
@@ -28,7 +30,7 @@ a32_pending_bucket_t g_pending_slot_callers[A32_PENDING_BUCKETS];
 a32_pending_bucket_t g_pending_ret_callers[A32_PENDING_BUCKETS];
 
 a32_side_entry_t    *g_side_table = NULL;
-size_t               g_side_table_count = 0U;
+_Atomic size_t       g_side_table_count = 0U;
 
 a32_pc_map_stage_t   g_stage_pc_map[MAX_STAGE_PC_MAP];
 size_t               g_stage_pc_map_count = 0U;
@@ -108,7 +110,11 @@ static void flush_icache_range(a32_ctx_t *ctx, const void *start, size_t len)
 void a32_jit_reset_cache_locked(a32_ctx_t *ctx)
 {
     uint32_t old_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
-    atomic_store_explicit(&g_cache_epoch, 0U, memory_order_release);
+    atomic_store_explicit(&g_jit_reset_pending, 1U, memory_order_seq_cst);
+    atomic_store_explicit(&g_cache_epoch, 0U, memory_order_seq_cst);
+    while (atomic_load_explicit(&g_jit_exec_readers, memory_order_acquire) != 0U) {
+        __asm__ volatile("yield" ::: "memory");
+    }
 #if defined(__APPLE__)
     pthread_jit_write_protect_np(0);
 #else
@@ -141,12 +147,13 @@ void a32_jit_reset_cache_locked(a32_ctx_t *ctx)
     }
     memset(g_pending_slot_callers, 0, sizeof(g_pending_slot_callers));
     memset(g_pending_ret_callers, 0, sizeof(g_pending_ret_callers));
-    g_side_table_count = 0U;
+    atomic_store_explicit(&g_side_table_count, 0U, memory_order_release);
     uint32_t new_epoch = old_epoch + 1U;
     if (new_epoch == 0U) {
         new_epoch = 1U;
     }
     atomic_store_explicit(&g_cache_epoch, new_epoch, memory_order_release);
+    atomic_store_explicit(&g_jit_reset_pending, 0U, memory_order_release);
 }
 
 int a32_jit_flush_batch_locked(a32_ctx_t *ctx)
@@ -260,14 +267,16 @@ void a32_jit_commit_side_table_locked(const void *dst, size_t code_bytes,
                                       size_t *out_side_start, size_t *out_side_count)
 {
     uintptr_t base      = (uintptr_t)dst;
-    size_t    start_idx = g_side_table_count;
+    size_t    cur_count = atomic_load_explicit(&g_side_table_count, memory_order_relaxed);
+    size_t    start_idx = cur_count;
 
     if (g_stage_pc_map_count == 0U) {
-        size_t idx = g_side_table_count++ % A32_SIDE_TABLE_SIZE;
+        size_t idx = cur_count++ % A32_SIDE_TABLE_SIZE;
         g_side_table[idx].host_pc_start = base;
         g_side_table[idx].host_pc_end   = base + code_bytes;
         g_side_table[idx].guest_pc      = block_guest_pc;
         g_side_table[idx].itstate       = block_itstate;
+        atomic_store_explicit(&g_side_table_count, cur_count, memory_order_release);
         if (out_side_start != NULL) {
             *out_side_start = start_idx;
         }
@@ -288,12 +297,13 @@ void a32_jit_commit_side_table_locked(const void *dst, size_t code_bytes,
         if (seg_end <= seg_start) {
             seg_end = seg_start + 4U;
         }
-        size_t idx = g_side_table_count++ % A32_SIDE_TABLE_SIZE;
+        size_t idx = cur_count++ % A32_SIDE_TABLE_SIZE;
         g_side_table[idx].host_pc_start = seg_start;
         g_side_table[idx].host_pc_end   = seg_end;
         g_side_table[idx].guest_pc      = g_stage_pc_map[i].guest_pc;
         g_side_table[idx].itstate       = g_stage_pc_map[i].itstate;
     }
+    atomic_store_explicit(&g_side_table_count, cur_count, memory_order_release);
 
     if (out_side_start != NULL) {
         *out_side_start = start_idx;

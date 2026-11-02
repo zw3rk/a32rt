@@ -423,13 +423,27 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
     case ARM_NR_prctl: {
         static _Thread_local char tls_comm[16] = "a32rt";
         if (a0 == 15U /* PR_SET_NAME */) {
-            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 1U, PROT_READ));
-            const char *src = (const char *)a32_guest_ptr(ctx, a1);
-            size_t n = strnlen(src, 15U);
-            memcpy(tls_comm, src, n);
+            char kbuf[16];
+            size_t n = 0U;
+            bool ok = false;
+            for (; n < 16U; n++) {
+                if (!guest_read(ctx, &kbuf[n], a1 + (uint32_t)n, 1U)) {
+                    break;
+                }
+                if (kbuf[n] == '\0') {
+                    ok = true;
+                    break;
+                }
+                if (n == 15U) {
+                    kbuf[15] = '\0';
+                    ok = true;
+                }
+            }
+            FAIL_EFAULT_IF(!ok);
+            memcpy(tls_comm, kbuf, n);
             memset(tls_comm + n, 0, 16U - n);
 #if defined(__linux__)
-            ctx->regs[0] = host_ret(prctl(PR_SET_NAME, (unsigned long)(uintptr_t)src,
+            ctx->regs[0] = host_ret(prctl(PR_SET_NAME, (unsigned long)(uintptr_t)tls_comm,
                                           (unsigned long)a2, (unsigned long)a3,
                                           (unsigned long)a4));
 #else

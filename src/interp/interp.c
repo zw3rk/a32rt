@@ -254,7 +254,7 @@ int a32_interp_run(a32_ctx_t *ctx, uint64_t max_steps)
         }
         if (rc == A32_EXIT_FAULT) {
             if (ctx->gdb_enabled) {
-                if (a32_gdb_handle_stop(ctx, SIGSEGV) == 0) {
+                if (a32_gdb_handle_stop(ctx, SIGSEGV) != 0) {
                     return 128 + SIGSEGV;
                 }
                 continue;
@@ -269,7 +269,7 @@ int a32_interp_run(a32_ctx_t *ctx, uint64_t max_steps)
         if (ctx->gdb_enabled) {
             uint32_t stop = ctx->regs[15];
             (void)stop;
-            if (a32_gdb_handle_stop(ctx, SIGILL) == 0) {
+            if (a32_gdb_handle_stop(ctx, SIGILL) != 0) {
                 return 128 + SIGILL;
             }
             continue;

@@ -234,6 +234,10 @@ run_alarm_guest() {
     if [ "$_st" = "PASS" ]; then
         uniq "$GOLDEN_DIR/$_gold.dbt.err" > "$_tmp_err.gold" 2>/dev/null || true
         uniq "$_tmp_err" > "$_tmp_err.act" 2>/dev/null || true
+        if [ "${PARITY_UPDATE_GOLDEN:-0}" = "1" ]; then
+            cp "$_tmp_err.act" "$GOLDEN_DIR/$_gold.dbt.err"
+            cp "$_tmp_err.act" "$_tmp_err.gold"
+        fi
         parity_check_golden "$_tmp_err.gold" "$_tmp_err.act"; _rc_cmp=$?
         rm -f "$_tmp_err.gold" "$_tmp_err.act"
         if [ "$_rc_cmp" -eq 2 ]; then

@@ -56,6 +56,9 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
                 out_snap->code_bytes   = atomic_load_explicit(&existing->code_bytes, memory_order_relaxed);
                 out_snap->epoch        = cur_epoch;
             }
+            if (flush_now) {
+                atomic_fetch_add_explicit(&g_jit_exec_readers, 1U, memory_order_acq_rel);
+            }
             jit_lock_release();
             return existing;
         }
@@ -242,6 +245,9 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         return NULL;
     }
 
+    if (flush_now && first_entry != NULL) {
+        atomic_fetch_add_explicit(&g_jit_exec_readers, 1U, memory_order_acq_rel);
+    }
     jit_lock_release();
     return first_entry;
 }

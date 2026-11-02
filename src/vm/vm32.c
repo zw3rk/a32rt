@@ -89,7 +89,7 @@ void *a32_vm32_hva(const a32_ctx_t *ctx, uint32_t gva)
 
 uintptr_t a32_vm32_arena_base(void)
 {
-    return g_arena_base;
+    return __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
 }
 
 /* Rebase the arena (RC-U3-r4 #2): point the global window at a new base
@@ -98,7 +98,7 @@ uintptr_t a32_vm32_arena_base(void)
  * next miss refills them. A no-op when base is unchanged. */
 void a32_vm32_set_arena_base(uintptr_t base)
 {
-    uintptr_t old = g_arena_base;
+    uintptr_t old = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
     intptr_t delta;
     uint32_t i;
 
@@ -107,13 +107,16 @@ void a32_vm32_set_arena_base(uintptr_t base)
     }
     delta = (intptr_t)(base - old);
     for (i = 0u; i < A32_VM32_TLB_SIZE; i++) {
-        if (g_tlb[i].read_tag != A32_VM32_TLB_INVALID_TAG ||
-            g_tlb[i].write_tag != A32_VM32_TLB_INVALID_TAG) {
-            g_tlb[i].addend =
-                (uintptr_t)((intptr_t)g_tlb[i].addend + delta);
+        uint64_t rtag = __atomic_load_n(&g_tlb[i].read_tag, __ATOMIC_RELAXED);
+        uint64_t wtag = __atomic_load_n(&g_tlb[i].write_tag, __ATOMIC_RELAXED);
+        if (rtag != A32_VM32_TLB_INVALID_TAG ||
+            wtag != A32_VM32_TLB_INVALID_TAG) {
+            uintptr_t old_add = __atomic_load_n(&g_tlb[i].addend, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_tlb[i].addend,
+                (uintptr_t)((intptr_t)old_add + delta), __ATOMIC_RELEASE);
         }
     }
-    g_arena_base = base;
+    __atomic_store_n(&g_arena_base, base, __ATOMIC_RELEASE);
 }
 
 /* ---- Soft-TLB data side ---- */
@@ -143,19 +146,23 @@ bool a32_vm32_tlb_probe(uint32_t gva, bool is_store, uint32_t width,
         return false;
     }
     idx = tlb_index(gva);
-    tag = is_store ? g_tlb[idx].write_tag : g_tlb[idx].read_tag;
+    tag = is_store
+        ? __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_ACQUIRE)
+        : __atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_ACQUIRE);
     if (tag != (uint64_t)(gva & ~0xFFFU)) {
         return false;
     }
     if (width > 1U && ((gva & 0xFFFU) + width - 1U) >> 12U != 0U) {
         uint32_t idx2 = (idx + 1U) & (A32_VM32_TLB_SIZE - 1U);
-        uint64_t tag2 = is_store ? g_tlb[idx2].write_tag : g_tlb[idx2].read_tag;
+        uint64_t tag2 = is_store
+            ? __atomic_load_n(&g_tlb[idx2].write_tag, __ATOMIC_ACQUIRE)
+            : __atomic_load_n(&g_tlb[idx2].read_tag, __ATOMIC_ACQUIRE);
         if (tag2 != (uint64_t)(((gva & ~0xFFFU) + 0x1000U) & 0xFFFFF000U)) {
             return false;
         }
     }
     if (addend_out != NULL) {
-        *addend_out = g_tlb[idx].addend;
+        *addend_out = __atomic_load_n(&g_tlb[idx].addend, __ATOMIC_RELAXED);
     }
     return true;
 }
@@ -165,10 +172,15 @@ void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
 {
     uint32_t idx = tlb_index(gva_page);
     uint64_t vpn = (uint64_t)(gva_page & ~0xFFFU);
-    g_tlb[idx].addend = host_page_base - (uintptr_t)vpn;
-    g_tlb[idx].read_tag = readable ? vpn : A32_VM32_TLB_INVALID_TAG;
-    g_tlb[idx].write_tag = writable ? vpn : A32_VM32_TLB_INVALID_TAG;
-    g_tlb[idx].flags_reserved = 0U;
+    uint8_t pbits = __atomic_load_n(&g_prot[idx], __ATOMIC_RELAXED);
+    bool cut = (pbits & A32_PROT_EOF_CUT) != 0U;
+    __atomic_store_n(&g_tlb[idx].addend, host_page_base - (uintptr_t)vpn,
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlb[idx].read_tag,
+        (!cut && readable) ? vpn : A32_VM32_TLB_INVALID_TAG, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlb[idx].write_tag,
+        (!cut && writable) ? vpn : A32_VM32_TLB_INVALID_TAG, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
     /* A remap breaks any LDREX reservation on this page. */
     atomic_fetch_add(&g_ll[ll_index(gva_page & ~0xFFFU)].epoch, 1ULL);
 }
@@ -179,15 +191,13 @@ void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
     uint64_t end = ((uint64_t)end_gva + 0xFFFULL) & ~0xFFFULL;
     uint64_t pages = (end > start) ? ((end - start) >> 12U) : 0ULL;
     uint64_t i;
-    if (pages >= 512ULL) {
-        a32_vm32_tlb_invalidate_all();
-        return;
-    }
     for (i = 0ULL; i < pages; i++) {
         uint32_t idx = tlb_index((uint32_t)(start + (i << 12U)));
-        g_tlb[idx].read_tag = A32_VM32_TLB_INVALID_TAG;
-        g_tlb[idx].write_tag = A32_VM32_TLB_INVALID_TAG;
-        g_tlb[idx].flags_reserved = 0U;
+        __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
+            __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
+            __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
     }
 }
 
@@ -195,10 +205,12 @@ void a32_vm32_tlb_invalidate_all(void)
 {
     uint32_t i;
     for (i = 0U; i < A32_VM32_TLB_SIZE; i++) {
-        g_tlb[i].read_tag = A32_VM32_TLB_INVALID_TAG;
-        g_tlb[i].write_tag = A32_VM32_TLB_INVALID_TAG;
-        g_tlb[i].addend = 0U;
-        g_tlb[i].flags_reserved = 0U;
+        __atomic_store_n(&g_tlb[i].read_tag, A32_VM32_TLB_INVALID_TAG,
+            __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tlb[i].write_tag, A32_VM32_TLB_INVALID_TAG,
+            __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tlb[i].addend, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_tlb[i].flags_reserved, 0U, __ATOMIC_RELAXED);
     }
 }
 
@@ -207,23 +219,31 @@ int a32_vm32_tlb_miss(a32_ctx_t *ctx, uint32_t gva, bool is_store,
 {
     uint32_t idx;
     uint64_t tag;
+    uintptr_t base;
     (void)ctx;
     if (hva_out == NULL) {
         return -EINVAL;
     }
     idx = tlb_index(gva);
-    tag = is_store ? g_tlb[idx].write_tag : g_tlb[idx].read_tag;
+    tag = is_store
+        ? __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_ACQUIRE)
+        : __atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_ACQUIRE);
     if (tag != (uint64_t)(gva & ~0xFFFU)) {
-        uint8_t bits = g_prot[gva >> 12U];
+        uint8_t bits = __atomic_load_n(&g_prot[gva >> 12U], __ATOMIC_ACQUIRE);
+        if ((bits & A32_PROT_EOF_CUT) != 0U) {
+            return -EFAULT;
+        }
         bool ok = is_store ? ((bits & 2U) != 0U) : ((bits & 1U) != 0U);
-        if (!ok || g_arena_base == 0U) {
+        base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
+        if (!ok || base == 0U) {
             return -EFAULT;
         }
         a32_vm32_tlb_fill(gva & ~0xFFFU,
-            g_arena_base + (uintptr_t)(gva & ~0xFFFU),
+            base + (uintptr_t)(gva & ~0xFFFU),
             (bits & 1U) != 0U, (bits & 2U) != 0U);
     }
-    *hva_out = (void *)(g_tlb[idx].addend + (uintptr_t)gva);
+    *hva_out = (void *)(__atomic_load_n(&g_tlb[idx].addend, __ATOMIC_RELAXED) +
+        (uintptr_t)gva);
     return 0;
 }
 
@@ -232,7 +252,8 @@ static void vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
     size_t host_page;
     uint32_t hp_start;
     uint32_t hp_end;
-    if (g_regime != A32_VM32_REGIME_A2_SOFT_TLB || g_arena_base == 0U ||
+    uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
+    if (g_regime != A32_VM32_REGIME_A2_SOFT_TLB || base == 0U ||
         end_gva <= start_gva) {
         return;
     }
@@ -250,12 +271,13 @@ static void vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
             hp_page_end = 0xFFFFFFFFU;
         }
         for (uint32_t sp = hp; sp < hp_page_end; sp += 0x1000U) {
-            union_prot |= g_prot[sp >> 12U];
+            union_prot |= (uint32_t)(__atomic_load_n(&g_prot[sp >> 12U],
+                __ATOMIC_RELAXED) & 0x7U);
             if (sp + 0x1000U < sp) {
                 break;
             }
         }
-        (void)a32_backend_protect((void *)(g_arena_base + (uintptr_t)hp),
+        (void)a32_backend_protect((void *)(base + (uintptr_t)hp),
             host_page, (int)(union_prot & 0x7U));
         if (hp + (uint32_t)host_page < hp) {
             break;
@@ -270,15 +292,17 @@ void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
 {
     uint32_t page;
     uint8_t bits;
-    if (g_arena_base == 0U) {
+    uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
+    if (base == 0U) {
         return;
     }
     bits = (uint8_t)(((readable ? 1U : 0U) | (writable ? 2U : 0U)) |
         (executable ? 4U : 0U));
     for (page = start_gva & ~0xFFFU; page < end_gva; page += 0x1000U) {
-        a32_vm32_tlb_fill(page, g_arena_base + (uintptr_t)page,
-            readable, writable);
-        g_prot[page >> 12U] = bits;
+        uint8_t old_b = __atomic_load_n(&g_prot[page >> 12U], __ATOMIC_RELAXED);
+        __atomic_store_n(&g_prot[page >> 12U],
+            (uint8_t)((old_b & A32_PROT_EOF_CUT) | bits), __ATOMIC_RELEASE);
+        a32_vm32_tlb_fill(page, base + (uintptr_t)page, readable, writable);
         if (page + 0x1000U < page) {
             break;
         }
@@ -293,13 +317,15 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
     uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
     for (uint32_t p = start; p < end; p += 0x1000U) {
         uint32_t idx = tlb_index(p);
-        if (g_tlb[idx].read_tag == (uint64_t)p ||
-            g_tlb[idx].write_tag == (uint64_t)p) {
-            g_tlb[idx].read_tag = A32_VM32_TLB_INVALID_TAG;
-            g_tlb[idx].write_tag = A32_VM32_TLB_INVALID_TAG;
-            g_tlb[idx].flags_reserved = 0U;
+        if (__atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_RELAXED) == (uint64_t)p ||
+            __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_RELAXED) == (uint64_t)p) {
+            __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
+                __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
+                __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
         }
-        g_prot[p >> 12U] = 0U;
+        __atomic_store_n(&g_prot[p >> 12U], 0U, __ATOMIC_RELEASE);
         if (p + 0x1000U < p) {
             break;
         }
@@ -307,13 +333,71 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
     vm32_sync_host_pages_a2(start, end);
 }
 
+bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot)
+{
+    if (len == 0U) {
+        return true;
+    }
+    if (__atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE) == 0U) {
+        return false;
+    }
+    uint64_t end = (uint64_t)va + (uint64_t)len;
+    if (end > 0x100000000ULL) {
+        return false;
+    }
+    uint8_t req = (uint8_t)(req_prot & 0x7U);
+    for (uint64_t p = (uint64_t)(va & ~0xFFFU); p < end; p += 0x1000ULL) {
+        uint8_t pr = __atomic_load_n(&g_prot[p >> 12U], __ATOMIC_ACQUIRE);
+        if ((pr & A32_PROT_EOF_CUT) != 0U || (pr & req) != req) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
+{
+    uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
+    if (base == 0U || len == 0U) {
+        return;
+    }
+    uint64_t s = (uint64_t)(gva & ~0xFFFU);
+    uint64_t e = ((uint64_t)gva + (uint64_t)len + 0xFFFULL) & ~0xFFFULL;
+    if (e > 0x100000000ULL) {
+        e = 0x100000000ULL;
+    }
+    for (uint64_t p = s; p < e; p += 0x1000ULL) {
+        uint32_t page = (uint32_t)p;
+        uint32_t idx = page >> 12U;
+        uint8_t old_b = __atomic_load_n(&g_prot[idx], __ATOMIC_RELAXED);
+        uint8_t eff = (uint8_t)(old_b & 0x7U);
+        uint8_t new_b = cut ? (uint8_t)(eff | A32_PROT_EOF_CUT) : eff;
+        __atomic_store_n(&g_prot[idx], new_b, __ATOMIC_RELEASE);
+        if (cut) {
+            __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
+                __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
+                __ATOMIC_RELEASE);
+            if (g_regime == A32_VM32_REGIME_A1_DIRECT) {
+                (void)a32_backend_protect((void *)(base + (uintptr_t)page),
+                    0x1000U, 0);
+            }
+        } else {
+            a32_vm32_tlb_fill(page, base + (uintptr_t)page,
+                (eff & 1U) != 0U, (eff & 2U) != 0U);
+            if (g_regime == A32_VM32_REGIME_A1_DIRECT) {
+                (void)a32_backend_protect((void *)(base + (uintptr_t)page),
+                    0x1000U, (int)eff);
+            }
+        }
+    }
+}
+
 /* Regime-aware mprotect (see vm32.h). A1 forwards guest-sized ranges
- * directly; A2 (>4 KiB host pages) protects each covering host page with
- * the union of its 4 KiB sub-pages. Target sub-pages use guest_prot;
- * neighbours keep their recorded g_prot permissions so a 4 KiB guest
- * mprotect never silently widens or narrows its host page siblings. X is
- * unioned faithfully like R/W (A1 maps guest-X with host PROT_EXEC;
- * never invent or drop it here). */
+ * directly; A2 (>4 KiB host pages) computes the union of its 4 KiB
+ * sub-pages and passes it to a32_backend_protect, which on Darwin keeps
+ * any active host page mapped PROT_READ | PROT_WRITE (never PROT_EXEC)
+ * while the Soft-TLB and g_prot[] enforce 4 KiB R/W/X in software. */
 int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
     uint32_t guest_prot)
 {
@@ -344,7 +428,8 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
             if (sp >= addr && (uint64_t)sp - (uint64_t)addr < (uint64_t)len) {
                 union_prot |= guest_prot & 0x7U;
             } else {
-                union_prot |= g_prot[sp >> 12U];
+                union_prot |= (uint32_t)(__atomic_load_n(&g_prot[sp >> 12U],
+                    __ATOMIC_RELAXED) & 0x7U);
             }
             if (sp + 0x1000U < sp) {
                 break;

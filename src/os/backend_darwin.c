@@ -79,6 +79,10 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
         uintptr_t start = (uintptr_t)hint_addr & ~(uintptr_t)(hp - 1U);
         uintptr_t end = ((uintptr_t)hint_addr + len + hp - 1U) &
             ~(uintptr_t)(hp - 1U);
+        if (shared != 0 && hp > 4096U &&
+            (((uintptr_t)hint_addr & (hp - 1U)) != 0U)) {
+            return -EINVAL;
+        }
         if (linux_prot != 0) {
             if (mprotect((void *)start, end - start,
                     PROT_READ | PROT_WRITE) != 0) {
@@ -87,8 +91,9 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
             memset(hint_addr, 0, len);
         }
 #if defined(__APPLE__)
-        if (shared != 0) {
-            (void)minherit((void *)start, end - start, VM_INHERIT_SHARE);
+        if (minherit((void *)start, end - start,
+                shared != 0 ? VM_INHERIT_SHARE : VM_INHERIT_COPY) != 0) {
+            return -errno;
         }
 #endif
         *out_host_addr = hint_addr;
@@ -122,6 +127,13 @@ int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
     if (len == 0U || host_fd < 0 || out_host_addr == NULL) {
         return -EINVAL;
     }
+    if ((replace || fixed) && hint_addr != NULL) {
+        size_t hp = a32_backend_page_size();
+        if ((((uintptr_t)hint_addr & (hp - 1U)) != 0U) ||
+            ((aligned_file_offset & (uint64_t)(hp - 1U)) != 0ULL)) {
+            return -EINVAL;
+        }
+    }
     if (replace) {
         flags |= MAP_FIXED;
     } else if (fixed) {
@@ -138,6 +150,15 @@ int a32_backend_map_file(void *hint_addr, size_t len, int linux_prot,
         munmap(res, len);
         return -EEXIST;
     }
+#if defined(__APPLE__)
+    if (shared == 0) {
+        size_t hp = a32_backend_page_size();
+        uintptr_t start = (uintptr_t)res & ~(uintptr_t)(hp - 1U);
+        uintptr_t end = ((uintptr_t)res + len + hp - 1U) &
+            ~(uintptr_t)(hp - 1U);
+        (void)minherit((void *)start, end - start, VM_INHERIT_COPY);
+    }
+#endif
     *out_host_addr = res;
     return 0;
 }

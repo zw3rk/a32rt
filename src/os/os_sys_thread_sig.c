@@ -28,6 +28,7 @@ void *guest_thread_start(void *arg)
     uint32_t ctid_va  = args->ctid_va;
 
     a32_signals_set_thread_ctx(ctx);
+    ctx->host_tid        = 0;
     ctx->host_tid        = get_host_tid(ctx);
     ctx->is_thread_clone = true;
     args->child_tid      = ctx->host_tid;
@@ -172,15 +173,36 @@ bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count,
 {
     int count = 0;
     if (vec_va != 0U) {
-        if (!a32_guest_range_ok(ctx, vec_va, 4U, PROT_READ)) {
-            return false;
-        }
-        const uint32_t *g_vec = (const uint32_t *)a32_guest_ptr(ctx, vec_va);
-        while (g_vec[count] != 0U && count < max_count) {
-            if (!a32_guest_range_ok(ctx, g_vec[count], 1U, PROT_READ)) {
+        for (;;) {
+            uint32_t slot_va = vec_va + (uint32_t)count * 4U;
+            uint32_t str_va = 0U;
+            if (!guest_read(ctx, &str_va, slot_va, 4U)) {
                 return false;
             }
-            out[count] = (char *)a32_guest_ptr(ctx, g_vec[count]);
+            if (str_va == 0U) {
+                break;
+            }
+            if (count >= max_count) {
+                return false;
+            }
+            /* Verify string is NUL-terminated within readable guest pages */
+            uint32_t cur = str_va;
+            for (;;) {
+                uint32_t page_rem = A32_PAGE_SIZE - (cur & (A32_PAGE_SIZE - 1U));
+                if (!a32_guest_range_ok(ctx, cur, 1U, PROT_READ)) {
+                    return false;
+                }
+                const char *p = (const char *)a32_guest_ptr(ctx, cur);
+                const void *nul = memchr(p, '\0', page_rem);
+                if (nul != NULL) {
+                    break;
+                }
+                if (cur + page_rem < cur) {
+                    return false;
+                }
+                cur += page_rem;
+            }
+            out[count] = (char *)a32_guest_ptr(ctx, str_va);
             count++;
         }
     }
