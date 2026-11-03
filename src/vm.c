@@ -46,8 +46,7 @@ void a32_vm_lock_release(void)
     a32_spin_unlock(&g_vm_lock);
 }
 
-/* Fork-child reset (A32-R3-4): never inherit a VM lock held by a thread
- * that did not survive fork(). */
+/* Fork-child reset (A32-R3-4): never inherit a lock held by a dead thread. */
 void a32_vm_fork_child_reset(void)
 {
     atomic_store_explicit(&g_vm_lock, 0U, memory_order_release);
@@ -179,11 +178,8 @@ static void vm_coalesce_regions_locked(void)
     g_vm_region_count = dst + 1U;
 }
 
-/* Retire the previous mapping over [unmap_start, unmap_end): VMA
- * regions, Soft-TLB translations, and file tracking (A32-R3-1, A32-R4-6).
- * The file-tracking retire runs FIRST and is transactional: exhaustion
- * or descriptor failure returns an error with no VMA, host, or tracking
- * state changed, so the caller can abort before mutating anything. */
+/* Retire [unmap_start, unmap_end): VMA, Soft-TLB, file tracking (A32-R3-1, A32-R4-6). */
+/* File-tracking retire runs first and is transactional: failure changes nothing. */
 static int vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
 {
     int rc;
@@ -242,10 +238,8 @@ static int vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
     return 0;
 }
 
-/* Pure insertion (A32-R3-1): retiring the previous mapping — regions,
- * Soft-TLB translations, and file tracking — is the caller's job and
- * happens BEFORE the new host mapping is installed, so registration can
- * never delete backing metadata it just created. */
+/* Pure insertion (A32-R3-1): caller retires the old mapping BEFORE installing */
+/* the new host mapping, so registration never deletes backing it just created. */
 int a32_vm_record_region_locked(uint32_t start, uint32_t end,
                                    uint32_t prot, uint32_t flags, const char *name)
 {
@@ -679,36 +673,29 @@ uint32_t a32_vm_mmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_
     bool is_file = ((host_flags & MAP_ANONYMOUS) == 0 && fd >= 0);
     bool is_shared = ((host_flags & MAP_SHARED) != 0);
     uint32_t target_end = (uint32_t)((uint64_t)target_va + aligned_len);
-    /* MAP_FIXED replacement pre-flight (A32-R3-1 follow-up 2): when the
-     * new mapping needs file tracking, verify BEFORE retiring that the
-     * retire frees enough slots for the replacement record, so a failed
-     * capacity check cannot leave the old range mapped but untracked. */
+    /* MAP_FIXED pre-flight (A32-R3-1): verify tracking capacity BEFORE retiring, */
+    /* so a failed check cannot leave the old range mapped but untracked. */
     if (is_file &&
         a32_vmfile_check_replace(target_va, target_end, is_shared) != 0) {
         return (uint32_t)(-ENOMEM);
     }
-    /* A32-R5-2: private replace must not detach shared host-page siblings. */
-    {
-        size_t hp = a32_backend_page_size();
-        if (hp > 4096U && !is_shared) {
-            uint64_t ps[2] = { (uint64_t)target_va & ~(hp - 1U), ((uint64_t)target_end - 1U) & ~(hp - 1U) };
-            for (unsigned k = 0U; k < 2U; k++) {
-                uint64_t p = ps[k], s;
-                if ((uint64_t)target_va <= p && p + hp <= (uint64_t)target_end) continue;
-                for (s = p; s < p + hp; s += 4096U) {
-                    int f = -1; uint32_t o = 0U;
-                    if ((s < target_va || s + 4096U > target_end) && a32_vmfile_lookup_shared((uint32_t)s, &f, &o)) return (uint32_t)(-EINVAL);
+    /* A32-R5-2: private replace must not split a host page with shared siblings. */
+    size_t hp = a32_backend_page_size();
+    if (hp > 4096U && !is_shared) {
+        uint64_t ps[2] = { (uint64_t)target_va & ~(hp - 1U), ((uint64_t)target_end - 1U) & ~(hp - 1U) };
+        for (unsigned k = 0U; k < 2U; k++) {
+            for (uint64_t s = ps[k]; s < ps[k] + hp; s += 4096U) {
+                if (s >= target_va && s + 4096U <= target_end) continue;
+                for (size_t i = 0U; i < g_vm_region_count; i++) {
+                    const a32_region_t *r = &g_vm_regions[i];
+                    if (r->start < s + 4096U && r->end > s && (r->flags & 0x01U) != 0U) return (uint32_t)(-EINVAL);
                 }
             }
         }
     }
-    /* A32-R3-1: retire the previous mapping (regions, Soft-TLB, file
-     * tracking) BEFORE installing the new host mapping, then publish the
-     * new region and its backing together. Retiring first also frees the
-     * old slots, mirroring MAP_FIXED replace semantics. The retire is
-     * transactional (A32-R4-6): failure leaves every table and the host
-     * mapping untouched, so the error propagates before anything is
-     * installed. */
+    /* A32-R3-1: retire the old mapping (regions, Soft-TLB, tracking) BEFORE */
+    /* installing the new host mapping, freeing old slots per MAP_FIXED replace. */
+    /* Transactional (A32-R4-6): failure leaves every table and host mapping untouched. */
     {
         int retire_rc = vm_unmap_regions_locked(target_va, target_end);
         if (retire_rc != 0) {

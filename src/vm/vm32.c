@@ -451,19 +451,11 @@ void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     res_unlock();
 }
 
-void a32_vm32_reservation_bump(uint32_t gva_aligned)
-{
-    uint32_t h = ll_index(gva_aligned);
-    res_lock();
-    atomic_fetch_add(&g_ll[h].epoch, 1ULL);
-    atomic_store(&g_ll[h].owner, NULL);
-    res_unlock();
-}
-
 void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
 {
     uint64_t end;
     uint64_t line;
+    bool locked;
     if (len == 0U) {
         return;
     }
@@ -471,13 +463,18 @@ void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
     if (end > 0x100000000ULL) {
         end = 0x100000000ULL;
     }
-    res_lock();
+    /* A32-R5-6: signal-handler reentrancy — never spin when this thread */
+    /* already holds g_res_lock; the table entries are _Atomic anyway. */
+    locked = !atomic_flag_test_and_set_explicit(&g_res_lock,
+        memory_order_acquire);
     for (line = (uint64_t)(gva & ~63U); line < end; line += 64U) {
         uint32_t h = ll_index((uint32_t)line);
         atomic_fetch_add(&g_ll[h].epoch, 1ULL);
         atomic_store(&g_ll[h].owner, NULL);
     }
-    res_unlock();
+    if (locked) {
+        res_unlock();
+    }
 }
 
 bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
