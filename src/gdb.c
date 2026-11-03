@@ -512,7 +512,7 @@ int a32_gdb_handle_stop(a32_ctx_t *ctx, int sig)
                     send_packet(g_client_sock, "E01");
                     continue;
                 }
-                if (!a32_guest_range_ok((a32_ctx_t *)ctx, addr, (uint32_t)len, PROT_READ) ||
+                if (!a32_guest_range_ok((a32_ctx_t *)ctx, addr, (uint32_t)len, PROT_WRITE) ||
                     (uint64_t)addr + (uint64_t)len > (uint64_t)A32_KUSER_BASE_32) {
                     send_packet(g_client_sock, "E14");
                     continue;

@@ -420,6 +420,7 @@ static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
                     uint32_t zgva = g_fmaps[i].start_gva + (uint32_t)z_start;
                     if (a32_vm32_range_prot_ok(zgva, (uint32_t)(z_end - z_start), PROT_WRITE)) {
                         memset((void *)(arena + (uintptr_t)zgva), 0, (size_t)(z_end - z_start));
+                        a32_vm32_copyout_invalidate(zgva, (size_t)(z_end - z_start));
                     }
                 }
             }
@@ -457,6 +458,7 @@ static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
                         (void)pread(g_fmaps[i].dup_fd,
                             (void *)(arena + (uintptr_t)ugva), ulen,
                             (off_t)(g_fmaps[i].file_offset + u_start_off));
+                        a32_vm32_copyout_invalidate(ugva, ulen);
                     }
                 }
             }

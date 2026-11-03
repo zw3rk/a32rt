@@ -193,7 +193,7 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
             (rl.rlim_cur > 0xFFFFFFFFUL) ? 0xFFFFFFFFU : (uint32_t)rl.rlim_cur,
             (rl.rlim_max > 0xFFFFFFFFUL) ? 0xFFFFFFFFU : (uint32_t)rl.rlim_max
         };
-        memcpy(a32_guest_ptr(ctx, a1), &rl32, sizeof(rl32));
+        (void)guest_write(ctx, a1, &rl32, sizeof(rl32));
         ctx->regs[0] = 0U;
         break;
     }
@@ -791,7 +791,8 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
 
     case ARM_NR_futex:
     case ARM_NR_futex_time64: {
-        FAIL_EFAULT_IF(a0 < 0x1000U);
+        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 4U,
+                                           (uint32_t)(PROT_READ | PROT_WRITE)));
         bool time64 = (nr == ARM_NR_futex_time64);
         uint32_t basic_op = a1 & 0x7FU;
         bool has_timeout = (basic_op == 0U  /* FUTEX_WAIT */ ||

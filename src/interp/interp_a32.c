@@ -641,7 +641,7 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
         } else {
             tmp = __atomic_exchange_n((uint32_t *)(void *)hva, ctx->regs[rm], __ATOMIC_SEQ_CST);
         }
-        a32_vm32_copyout_invalidate(va, size);
+        a32_vm32_copyout_invalidate_exec(ctx, va, size);
         ctx->regs[rd] = tmp;
         ctx->regs[15] = pc + 4U;
         return A32_EXIT_NONE;

@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "a32rt.h"
 #include "os/backend.h"
+#include "vm/vm_priv.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -115,6 +116,13 @@ int a32_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *elf_info,
     uint32_t stack_base = A32_STACK_TOP - A32_STACK_SIZE;
     void *host_stack = a32_guest_ptr(ctx, stack_base);
     void *res = NULL;
+    /* Retire any mapping (e.g. PT_LOAD) overlapping the stack window
+     * before installing the stack VMA (A32-R9-13). */
+    if (a32_vm_range_overlaps(stack_base, A32_STACK_TOP) &&
+        a32_vm_munmap(ctx, stack_base, A32_STACK_SIZE) != 0) {
+        fprintf(stderr, "a32rt: failed to retire stack overlap\n");
+        return -1;
+    }
     if (a32_backend_map_anon(host_stack, A32_STACK_SIZE, PROT_READ | PROT_WRITE,
                              1, 1, 0, &res) != 0) {
         fprintf(stderr, "a32rt: failed to map guest stack: %s\n", strerror(errno));

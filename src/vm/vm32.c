@@ -133,6 +133,36 @@ static inline uint32_t ll_index(uint32_t gva_aligned)
     return (gva_aligned >> A32_VM32_LL_LINE_SHIFT) & (A32_VM32_LL_LINES - 1U);
 }
 
+/* Bump every reservation-bucket epoch spanned by [start_gva, start_gva+len):
+ * unmap/remap/protect/EOF-cut recycling must fail a stale STREX (A32-R9-7).
+ * A span covering the full 64 KiB hash stride bumps all buckets once.
+ * Epoch-only and lock-free: a mismatched snapshot already fails STREX. */
+static void vm32_bump_spanned(uint32_t start_gva, uint64_t len)
+{
+    uint64_t s;
+    uint64_t e;
+    if (len == 0ULL) {
+        return;
+    }
+    s = (uint64_t)(start_gva & ~63U);
+    e = (uint64_t)start_gva + len;
+    if (e > 0x100000000ULL) {
+        e = 0x100000000ULL;
+    }
+    if (e <= s) {
+        return;
+    }
+    if (e - s >= ((uint64_t)A32_VM32_LL_LINES << A32_VM32_LL_LINE_SHIFT)) {
+        for (uint32_t h = 0U; h < A32_VM32_LL_LINES; h++) {
+            atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+        }
+        return;
+    }
+    for (uint64_t line = s; line < e; line += 64ULL) {
+        atomic_fetch_add(&g_ll[ll_index((uint32_t)line)].epoch, 1ULL);
+    }
+}
+
 void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     bool readable, bool writable)
 {
@@ -147,8 +177,8 @@ void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     __atomic_store_n(&g_tlb[idx].write_tag,
         (!cut && writable) ? vpn : A32_VM32_TLB_INVALID_TAG, __ATOMIC_RELEASE);
     __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
-    /* A remap breaks any LDREX reservation on this page. */
-    atomic_fetch_add(&g_ll[ll_index(gva_page & ~0xFFFU)].epoch, 1ULL);
+    /* A remap breaks every LDREX reservation on this page (A32-R9-7). */
+    vm32_bump_spanned(gva_page & ~0xFFFU, 0x1000ULL);
 }
 
 void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
@@ -296,6 +326,8 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
             break;
         }
     }
+    /* Dropping translations recycles the range: fail stale STREX (A32-R9-7). */
+    vm32_bump_spanned(start, (uint64_t)end - (uint64_t)start);
     vm32_sync_host_pages_a2(start, end);
 }
 
@@ -341,6 +373,8 @@ void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
     if (e > 0x100000000ULL) {
         e = 0x100000000ULL;
     }
+    /* EOF-cut transitions recycle pages: fail stale STREX (A32-R9-7). */
+    vm32_bump_spanned((uint32_t)s, e - s);
     for (uint64_t p = s; p < e; p += 0x1000ULL) {
         uint32_t page = (uint32_t)p;
         uint32_t idx = page >> 12U;
@@ -493,6 +527,41 @@ void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
     }
     if (locked) {
         res_unlock();
+    }
+}
+
+/* Store-path invalidation with SMC flush (A32-R9-6): reservation bump
+ * plus a JIT flush when any written page is guest-EXEC. */
+void a32_vm32_copyout_invalidate_exec(a32_ctx_t *ctx, uint32_t gva, size_t len)
+{
+    uint64_t end;
+    uint32_t inv_end;
+    a32_vm32_copyout_invalidate(gva, len);
+    if (ctx == NULL || len == 0U) {
+        return;
+    }
+    end = (uint64_t)gva + (uint64_t)len;
+    if (end > 0x100000000ULL) {
+        end = 0x100000000ULL;
+    }
+    inv_end = (end >= 0x100000000ULL) ? 0xFFFFFFFFU : (uint32_t)end;
+    for (uint64_t p = (uint64_t)(gva & ~0xFFFU); p < end; p += 0x1000ULL) {
+        if (a32_vm32_range_prot_ok((uint32_t)p, 1U, (uint32_t)PROT_EXEC)) {
+            (void)a32_jit_invalidate_range(ctx, gva, inv_end);
+            return;
+        }
+    }
+}
+
+/* Fork/clone-child reset (A32-R9-10): drop reservations owned by the
+ * vanished parent context so the child's first STREX starts clean. */
+void a32_vm32_ll_clear_owner(const a32_ctx_t *ctx)
+{
+    for (uint32_t h = 0U; h < A32_VM32_LL_LINES; h++) {
+        if (atomic_load(&g_ll[h].owner) == ctx) {
+            atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+            atomic_store(&g_ll[h].owner, NULL);
+        }
     }
 }
 

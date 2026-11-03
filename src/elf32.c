@@ -130,6 +130,17 @@ static int load_elf32_image(a32_ctx_t *ctx, int fd, uint32_t default_pie_base,
         fprintf(stderr, "a32rt: %s: not a 32-bit little-endian ARM ELF\n", label);
         return -1;
     }
+    /* Admit only EABIv5 with a single float ABI (A32-R9-11). */
+    if ((ehdr.e_flags & 0xFF000000U) != 0x05000000U) {
+        fprintf(stderr, "a32rt: %s: unsupported ARM EABI version (e_flags 0x%x)\n",
+                label, ehdr.e_flags);
+        return -1;
+    }
+    if ((ehdr.e_flags & 0x600U) == 0x600U) {
+        fprintf(stderr, "a32rt: %s: conflicting float ABI flags (e_flags 0x%x)\n",
+                label, ehdr.e_flags);
+        return -1;
+    }
     if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) {
         fprintf(stderr, "a32rt: %s: unsupported ELF type %u\n", label, ehdr.e_type);
         return -1;
@@ -586,9 +597,11 @@ int a32_kuser_setup(a32_ctx_t *ctx)
     }
 
     /* W^X: the kuser helpers are A32 data translated by the JIT, never host
-     * code executed in place; the host mapping must never be PROT_EXEC. */
+     * code executed in place; the host mapping must never be PROT_EXEC.
+     * The guest view is READ|EXEC so the interpreter can fetch helpers
+     * (A32-R9-12); the JIT carve-out stays non-EXEC on the host. */
     a32_vm_record_region(ctx, kuser_va, kuser_va + 4096U,
-                         (uint32_t)PROT_READ, 0x12U, "[vectors]");
+                         (uint32_t)(PROT_READ | PROT_EXEC), 0x12U, "[vectors]");
     if (a32_vm32_protect(ctx, kuser_va, 4096U, (uint32_t)PROT_READ) != 0) {
         fprintf(stderr, "a32rt: failed to mprotect kuser page: %s\n", strerror(errno));
         return -1;

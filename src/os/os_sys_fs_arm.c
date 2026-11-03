@@ -106,8 +106,13 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
         } else if (nr == ARM_NR_epoll_wait) {
             FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
             FAIL_EFAULT_IF(!epoll_out_ok(ctx, a1, a2));
-            ctx->regs[0] = host_ret(epoll_wait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
-                                               (int)a2, (int)a3));
+            int nev = epoll_wait((int)a0, (struct epoll_event *)a32_guest_ptr(ctx, a1),
+                                 (int)a2, (int)a3);
+            if (nev > 0) {
+                a32_vm32_copyout_invalidate_exec(ctx, a1,
+                    (uint32_t)nev * (uint32_t)sizeof(struct epoll_event));
+            }
+            ctx->regs[0] = host_ret(nev);
         } else if (nr == ARM_NR_epoll_pwait) {
             FAIL_EINVAL_IF((int32_t)a2 <= 0 || a2 > (uint32_t)(INT_MAX / sizeof(struct epoll_event)));
             FAIL_EFAULT_IF(!epoll_out_ok(ctx, a1, a2));
@@ -124,6 +129,10 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
             long r = syscall(SYS_epoll_pwait, (int)a0,
                              (struct epoll_event *)a32_guest_ptr(ctx, a1), (int)a2, (int)a3,
                              has_temp_mask ? &temp_mask : NULL, (size_t)8);
+            if (r > 0) {
+                a32_vm32_copyout_invalidate_exec(ctx, a1,
+                    (uint32_t)r * (uint32_t)sizeof(struct epoll_event));
+            }
             ctx->regs[0] = host_ret(r);
             pwait_sigmask_leave(ctx, has_temp_mask, saved_sig_mask, temp_mask);
         } else if (nr == ARM_NR_eventfd || nr == ARM_NR_eventfd2) {
@@ -510,9 +519,7 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
                        (uint64_t)a0 + aligned_len > 0xFFFF0000ULL);
 #if defined(__linux__)
         if (a1 > 0U) {
-            if (madvise(a32_guest_ptr(ctx, a0), 0U, (int)a2) != 0) {
-                FAIL_ERR(errno);
-            }
+            /* Validate the VMA range first, then issue one madvise (A32-R9-1). */
             a32_vm_sync_ctx(ctx);
             if (!guest_range_mapped(ctx, a0, (uint32_t)aligned_len, PROT_NONE)) {
                 FAIL_ERR(ENOMEM);

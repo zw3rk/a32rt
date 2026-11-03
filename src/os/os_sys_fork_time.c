@@ -6,6 +6,7 @@
  */
 
 #include "os/sys_priv.h"
+#include "os/backend.h"
 #include "dbt/jit_priv.h"
 
 void fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struct stat *src)
@@ -65,6 +66,22 @@ static void fork_child_reset(void)
     a32_jit_fork_child();
     a32_vm_fork_child_reset();
     a32_vmfile_fork_child_reset();
+}
+
+/* Host-page-aligned protect for fork-time widening/quiesce (A32-R9-9):
+ * raw 4 KiB mprotect silently fails on 16 KiB hosts when the range is
+ * not host-aligned, so round out to the host granule. Only used for
+ * temporary transitions; per-region restores use a32_vm32_protect for
+ * host-page-union correctness. */
+static void fork_protect(a32_ctx_t *ctx, uint32_t va, uint32_t len, int hprot)
+{
+    size_t hp = a32_backend_page_size();
+    uint64_t hva = (uint64_t)(uintptr_t)a32_guest_ptr(ctx, va);
+    uint64_t lo = hva & ~(hp - 1U);
+    uint64_t hi = (hva + (uint64_t)len + hp - 1U) & ~(hp - 1U);
+    if (hi > lo) {
+        (void)a32_backend_protect((void *)(uintptr_t)lo, (size_t)(hi - lo), hprot);
+    }
 }
 
 /* Reconcile one fork() return issued after a32_jit_fork_prepare: the
@@ -142,7 +159,9 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
     uint32_t sp_low      = ctx->stack_base;
     for (size_t i = 0U; i < ctx->region_count; i++) {
         const a32_region_t *r = &ctx->regions[i];
-        if (r->end <= r->start || (r->prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0U) {
+        /* Snapshot every region including PROT_NONE (A32-R9-8): skipping
+         * them lets the child rebuild the span as writable. */
+        if (r->end <= r->start) {
             continue;
         }
         uint32_t s_start = r->start;
@@ -219,20 +238,19 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
             }
             src = a32_guest_ptr(ctx, p);
             if ((hprot & PROT_READ) == 0) {
-                (void)mprotect(src, chunk, hprot | PROT_READ);
+                fork_protect(ctx, p, chunk, hprot | PROT_READ);
             }
             memcpy(snap_buf + r_list[i].buf_off + (p - rs), src, chunk);
         }
     }
 
     for (size_t c = 0U; c < c_count; c++) {
-        (void)mprotect(a32_guest_ptr(ctx, clusters[c].start),
-                       clusters[c].end - clusters[c].start,
-                       PROT_NONE);
+        fork_protect(ctx, clusters[c].start,
+                     clusters[c].end - clusters[c].start, PROT_NONE);
     }
     if (sp_low > ctx->stack_base) {
-        (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
-                       sp_low - ctx->stack_base, PROT_NONE);
+        fork_protect(ctx, ctx->stack_base,
+                     sp_low - ctx->stack_base, PROT_NONE);
     }
 
     pid_t pid = fork();
@@ -244,22 +262,27 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
          * nor widened: they stay PROT_NONE like the post-truncate
          * mapping they came from. */
         fork_child_reset();
+        /* ARM drops exclusive monitors across fork (A32-R9-10). */
+        ctx->ll_epoch_snap = 0ULL;
+        ctx->excl_valid = false;
+        a32_vm32_ll_clear_owner(ctx);
         for (size_t c = 0U; c < c_count; c++) {
-            (void)mprotect(a32_guest_ptr(ctx, clusters[c].start),
-                           clusters[c].end - clusters[c].start,
-                           PROT_READ | PROT_WRITE);
+            fork_protect(ctx, clusters[c].start,
+                         clusters[c].end - clusters[c].start,
+                         PROT_READ | PROT_WRITE);
         }
         if (sp_low > ctx->stack_base) {
-            (void)mprotect(a32_guest_ptr(ctx, ctx->stack_base),
-                           sp_low - ctx->stack_base, PROT_READ | PROT_WRITE);
+            fork_protect(ctx, ctx->stack_base,
+                         sp_low - ctx->stack_base, PROT_READ | PROT_WRITE);
         }
         for (size_t i = 0U; i < r_count; i++) {
             uint32_t rs = r_list[i].start;
             uint32_t re = r_list[i].end;
             int hprot = a32_host_prot(ctx, r_list[i].prot);
+            uint32_t gprot = r_list[i].prot & 0x7U;
             uint32_t p = rs;
             while (p < re) {
-                /* One mprotect per contiguous run with identical
+                /* One protect per contiguous run with identical
                  * treatment, so cut-free regions keep the previous
                  * single-call shape. */
                 uint32_t q = p + 0x1000U;
@@ -267,8 +290,7 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
                     while (q < re && a32_vm32_page_eof_cut(q)) {
                         q += 0x1000U;
                     }
-                    (void)mprotect(a32_guest_ptr(ctx, p), q - p,
-                        PROT_NONE);
+                    (void)a32_vm32_protect(ctx, p, q - p, 0U);
                 } else {
                     while (q < re && !a32_vm32_page_eof_cut(q)) {
                         q += 0x1000U;
@@ -277,8 +299,7 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
                            snap_buf + r_list[i].buf_off + (p - rs),
                            q - p);
                     if (hprot != (PROT_READ | PROT_WRITE)) {
-                        (void)mprotect(a32_guest_ptr(ctx, p), q - p,
-                            hprot);
+                        (void)a32_vm32_protect(ctx, p, q - p, gprot);
                     }
                 }
                 p = q;
@@ -292,34 +313,34 @@ pid_t fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp)
          * than the wider VMA permissions (A32-R4-4). */
         int restore_err = 0;
         if (sp_low > ctx->stack_base) {
-            if (mprotect(a32_guest_ptr(ctx, ctx->stack_base),
-                    sp_low - ctx->stack_base,
-                    PROT_READ | PROT_WRITE) != 0 && restore_err == 0) {
-                restore_err = errno;
+            int sprc = a32_vm32_protect(ctx, ctx->stack_base,
+                sp_low - ctx->stack_base, (uint32_t)(PROT_READ | PROT_WRITE));
+            if (sprc != 0 && restore_err == 0) {
+                restore_err = -sprc;
             }
         }
         for (size_t i = 0U; i < r_count; i++) {
             uint32_t rs = r_list[i].start;
             uint32_t re = r_list[i].end;
-            int hprot = a32_host_prot(ctx, r_list[i].prot);
             uint32_t p = rs;
             while (p < re) {
                 uint32_t q = p + 0x1000U;
-                int want;
+                uint32_t gwant;
+                int prc;
                 if (a32_vm32_page_eof_cut(p)) {
                     while (q < re && a32_vm32_page_eof_cut(q)) {
                         q += 0x1000U;
                     }
-                    want = PROT_NONE;
+                    gwant = 0U;
                 } else {
                     while (q < re && !a32_vm32_page_eof_cut(q)) {
                         q += 0x1000U;
                     }
-                    want = hprot;
+                    gwant = r_list[i].prot & 0x7U;
                 }
-                if (mprotect(a32_guest_ptr(ctx, p), q - p, want) != 0 &&
-                    restore_err == 0) {
-                    restore_err = errno;
+                prc = a32_vm32_protect(ctx, p, q - p, gwant);
+                if (prc != 0 && restore_err == 0) {
+                    restore_err = -prc;
                 }
                 p = q;
             }
@@ -363,6 +384,9 @@ int a32_sys_handle_fork_clone(a32_ctx_t *ctx, uint32_t nr, uint32_t a0,
             ctx->clear_child_tid = 0U;
             ctx->robust_list_head = 0U;
             ctx->robust_list_len = 0U;
+            ctx->ll_epoch_snap = 0ULL;
+            ctx->excl_valid = false;
+            a32_vm32_ll_clear_owner(ctx);
             ctx->pending_signals = 0ULL;
             a32_signals_set_thread_ctx(ctx);
             ctx->regs[0] = 0U;
@@ -394,6 +418,8 @@ int a32_sys_handle_fork_clone(a32_ctx_t *ctx, uint32_t nr, uint32_t a0,
             a32_vm_sync_ctx(ctx);
             memcpy(child_ctx, ctx, sizeof(a32_ctx_t));
             child_ctx->regs[0]          = 0U;
+            child_ctx->ll_epoch_snap    = 0ULL;
+            child_ctx->excl_valid       = false;
             child_ctx->regs[13]         = a1 ? a1 : ctx->regs[13];
             child_ctx->clear_child_tid  = (flags & CLONE_CHILD_CLEARTID) ? a4 : 0U;
             child_ctx->robust_list_head = 0U;
@@ -450,6 +476,9 @@ int a32_sys_handle_fork_clone(a32_ctx_t *ctx, uint32_t nr, uint32_t a0,
             ctx->is_thread_clone  = false;
             ctx->robust_list_head = 0U;
             ctx->robust_list_len  = 0U;
+            ctx->ll_epoch_snap = 0ULL;
+            ctx->excl_valid = false;
+            a32_vm32_ll_clear_owner(ctx);
             ctx->pending_signals  = 0ULL;
             a32_signals_set_thread_ctx(ctx);
             if (a1 != 0U) {
@@ -587,7 +616,15 @@ bool a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_
         return false;
     }
     uint64_t end = (uint64_t)va + (uint64_t)len;
-    uint64_t max_end = (req_prot == (uint32_t)PROT_READ) ? 0x100000000ULL : 0xFFFF0000ULL;
+    uint64_t max_end;
+    if (req_prot == (uint32_t)PROT_READ) {
+        max_end = 0x100000000ULL;
+    } else if (va >= 0xFFFF0000U && end <= 0xFFFF1000ULL) {
+        /* kuser helpers page: guest-EXEC, host-READ (A32-R9-12). */
+        max_end = 0xFFFF1000ULL;
+    } else {
+        max_end = 0xFFFF0000ULL;
+    }
     if (end > max_end) {
         return false;
     }

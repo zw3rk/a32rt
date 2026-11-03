@@ -181,6 +181,10 @@ void a32_vm32_reservation_bump(uint32_t gva_aligned);
  * reservation fails a stale STREX instead of winning silently.
  * Zero-length writes are a no-op; overlong spans clamp at 4 GiB. */
 void a32_vm32_copyout_invalidate(uint32_t gva, size_t len);
+/* Reservation bump plus JIT flush when any written page is guest-EXEC. */
+void a32_vm32_copyout_invalidate_exec(a32_ctx_t *ctx, uint32_t gva, size_t len);
+/* Drop shared reservations owned by a vanished fork/clone parent. */
+void a32_vm32_ll_clear_owner(const a32_ctx_t *ctx);
 
 /* ---- Relative DBT memory-site records (section 4.3.3) ---- */
 

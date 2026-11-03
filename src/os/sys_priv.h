@@ -699,9 +699,31 @@ static inline bool guest_write(a32_ctx_t *ctx, uint32_t va, const void *src, uin
     }
     memcpy(a32_guest_ptr(ctx, va), src, len);
     /* Every emulator-side store breaks reservations on all spanned
-     * 64-byte buckets (cross-RT LL/SC class). */
-    a32_vm32_copyout_invalidate(va, len);
+     * 64-byte buckets (cross-RT LL/SC class) and flushes JIT code when
+     * any written page is guest-EXEC (A32-R9-6). */
+    a32_vm32_copyout_invalidate_exec(ctx, va, len);
     return true;
+}
+
+/* Post-syscall invalidation for host-side stores into guest iov buffers
+ * (readv/recvmsg class, A32-R9-6): reservation bump plus JIT flush when
+ * any touched page is guest-EXEC. HVA is canonical (G + gva) in both
+ * regimes, so the guest address is recovered by subtracting the base. */
+static inline void guest_iov_invalidate(a32_ctx_t *ctx, const struct iovec *hiov,
+    uint32_t iovcnt)
+{
+    uint32_t i;
+    if (ctx == NULL || hiov == NULL) {
+        return;
+    }
+    for (i = 0U; i < iovcnt; i++) {
+        if (hiov[i].iov_base == NULL || hiov[i].iov_len == 0U) {
+            continue;
+        }
+        uint32_t gva =
+            (uint32_t)((uintptr_t)hiov[i].iov_base - (uintptr_t)ctx->guest_base);
+        a32_vm32_copyout_invalidate_exec(ctx, gva, hiov[i].iov_len);
+    }
 }
 
 /* Shared helpers across os_sys_*.c */
@@ -749,7 +771,7 @@ void  a32_sys_pwait_sigmask_leave(a32_ctx_t *ctx, bool has_temp_mask,
                                   uint64_t saved_sig_mask, uint64_t temp_mask);
 int   a32_sys_translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
                                   struct iovec *stack_iov, uint32_t stack_cap,
-                                  struct iovec **out_iov);
+                                  struct iovec **out_iov, uint32_t req_prot);
 bool  a32_sys_read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count, int *out_count);
 #if !defined(__linux__)
 bool  a32_sys_futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,

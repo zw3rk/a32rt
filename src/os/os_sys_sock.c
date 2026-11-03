@@ -67,8 +67,8 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         }
         uint32_t h = ctx->robust_list_head;
         uint32_t l = (ctx->robust_list_len != 0U) ? ctx->robust_list_len : 12U;
-        memcpy(a32_guest_ptr(ctx, a1), &h, sizeof(h));
-        memcpy(a32_guest_ptr(ctx, a2), &l, sizeof(l));
+        (void)guest_write(ctx, a1, &h, sizeof(h));
+        (void)guest_write(ctx, a2, &l, sizeof(l));
         ctx->regs[0] = 0U;
         break;
     }
@@ -608,8 +608,10 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
 
         struct iovec host_iov[16];
         struct iovec *hiov = NULL;
+        uint32_t msg_prot = (nr == ARM_NR_recvmsg)
+            ? (uint32_t)PROT_WRITE : (uint32_t)PROT_READ;
         int iov_rc = translate_guest_iov(ctx, hdr.msg_iov, (int)hdr.msg_iovlen,
-                                         host_iov, 16U, &hiov);
+                                         host_iov, 16U, &hiov, msg_prot);
         if (iov_rc < 0) {
             free(cbuf_dyn);
             free(csnap);
@@ -622,6 +624,9 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         ssize_t r = (nr == ARM_NR_sendmsg) ? sendmsg((int)a0, &hm, (int)a2)
                                            : recvmsg((int)a0, &hm, (int)a2);
         if (r >= 0 && nr == ARM_NR_recvmsg) {
+            guest_iov_invalidate(ctx, hiov, hdr.msg_iovlen);
+            (void)a32_vm32_copyout_invalidate_exec(ctx, a1,
+                (uint32_t)sizeof(arm_msghdr32_t));
             gm->msg_namelen = (uint32_t)hm.msg_namelen;
             gm->msg_flags   = (uint32_t)hm.msg_flags;
             if (hdr.msg_control != 0U) {
@@ -671,6 +676,9 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                         gm->msg_flags |= MSG_CTRUNC;
                     }
                     off64 += CMSG_ALIGN(cm64->cmsg_len);
+                }
+                if (off32 > 0U) {
+                    (void)a32_vm32_copyout_invalidate_exec(ctx, hdr.msg_control, off32);
                 }
                 gm->msg_controllen = off32;
             }

@@ -125,7 +125,7 @@ bool i_store_bytes(a32_ctx_t *ctx, uint32_t va, const void *in, uint32_t len)
         return false;
     }
     memcpy(a32_guest_ptr(ctx, va), in, len);
-    a32_vm32_copyout_invalidate(va, (size_t)len);
+    a32_vm32_copyout_invalidate_exec(ctx, va, (size_t)len);
     return true;
 }
 

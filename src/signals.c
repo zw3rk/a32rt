@@ -78,6 +78,8 @@ static inline bool guest_write(a32_ctx_t *ctx, uint32_t va, const void *src, uin
         return false;
     }
     memcpy(a32_guest_ptr(ctx, va), src, len);
+    /* Break reservations and flush JIT on EXEC pages (A32-R9-5, A32-R9-6). */
+    a32_vm32_copyout_invalidate_exec(ctx, va, len);
     return true;
 }
 
@@ -273,7 +275,7 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     }
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, frame_va);
     memset(frame, 0, sizeof(*frame));
-    a32_vm32_copyout_invalidate(frame_va, sizeof(*frame));
+    a32_vm32_copyout_invalidate_exec(ctx, frame_va, sizeof(*frame));
 
     frame->retcode[0]    = 0xE3A070ADU; /* mov r7, #173 (ARM_NR_rt_sigreturn) */
     frame->retcode[1]    = 0xEF000000U; /* svc #0 */

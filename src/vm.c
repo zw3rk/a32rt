@@ -178,14 +178,36 @@ static void vm_coalesce_regions_locked(void)
     g_vm_region_count = dst + 1U;
 }
 
+/* Unmap pre-flight (A32-R9-14): count the VMA entries a middle split
+ * needs (one per strictly containing region) and refuse with -ENOMEM
+ * BEFORE file tracking retires, so a full table cannot diverge the
+ * file identity from the VMA. */
+static int vm_unmap_preflight_locked(uint32_t unmap_start, uint32_t unmap_end)
+{
+    size_t need = 0U;
+    if (unmap_end <= unmap_start) {
+        return -EINVAL;
+    }
+    for (size_t i = 0U; i < g_vm_region_count; i++) {
+        if (g_vm_regions[i].start < unmap_start && g_vm_regions[i].end > unmap_end) {
+            need += 1U;
+        }
+    }
+    if (g_vm_region_count + need > (uint64_t)A32_MAX_REGIONS) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
 /* Retire [unmap_start, unmap_end): VMA, Soft-TLB, file tracking (A32-R3-1, A32-R4-6). */
 /* File-tracking retire runs first and is transactional: failure changes nothing. */
 static int vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
 {
     int rc;
     size_t i;
-    if (unmap_end <= unmap_start) {
-        return -EINVAL;
+    rc = vm_unmap_preflight_locked(unmap_start, unmap_end);
+    if (rc != 0) {
+        return rc;
     }
     rc = a32_vmfile_preflight_unmap(unmap_start, unmap_end);
     if (rc != 0) {
@@ -207,22 +229,12 @@ static int vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
             continue;
         }
         if (r->start < unmap_start && r->end > unmap_end) {
-            if (g_vm_region_count + 1U >= A32_MAX_REGIONS) {
-                size_t before = g_vm_region_count;
-                vm_coalesce_regions_locked();
-                if (g_vm_region_count != before) {
-                    i = 0U;
-                    continue;
-                }
-            }
+            /* Pre-flight above guarantees one free entry for this split. */
             a32_region_t orig = *r;
-            if (vm_insert_region_raw(unmap_end, orig.end,
-                                     orig.prot, orig.flags, orig.name) == 0) {
-                g_vm_regions[i].end = unmap_start;
-                i += 2U;
-            } else {
-                i++;
-            }
+            g_vm_regions[i].end = unmap_start;
+            (void)vm_insert_region_raw(unmap_end, orig.end,
+                                       orig.prot, orig.flags, orig.name);
+            i += 2U;
             continue;
         }
         if (r->start < unmap_start) {
@@ -620,7 +632,8 @@ uint32_t a32_vm_mmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_
                                 uint32_t flags, int fd, uint32_t pgoffset,
                                 const char *name)
 {
-    if (!ctx || len == 0U || (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
+    if (!ctx || len == 0U || (prot & ~0x7U) != 0U ||
+        (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
         return (uint32_t)(-EINVAL);
     }
 

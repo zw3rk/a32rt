@@ -135,7 +135,7 @@ void pwait_sigmask_leave(a32_ctx_t *ctx, bool has_temp_mask,
 
 int translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
                         struct iovec *stack_iov, uint32_t stack_cap,
-                        struct iovec **out_iov)
+                        struct iovec **out_iov, uint32_t req_prot)
 {
     if ((int32_t)iovcnt < 0 || iovcnt > 1024U) {
         return -EINVAL;
@@ -156,14 +156,24 @@ int translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovcnt,
     }
     const arm_iovec32_t *giov = (const arm_iovec32_t *)a32_guest_ptr(ctx, iov_va);
     for (uint32_t i = 0U; i < iovcnt; i++) {
-        if (giov[i].iov_len > 0U && giov[i].iov_base < 0x1000U) {
+        uint32_t base = giov[i].iov_base;
+        uint32_t len = giov[i].iov_len;
+        if (len == 0U) {
+            hiov[i].iov_base = NULL;
+            hiov[i].iov_len  = 0U;
+            continue;
+        }
+        /* Validate each buffer, not just the array: 32-bit wrap plus
+         * direction-appropriate permissions (A32-R9-3). */
+        if (base < 0x1000U || (uint64_t)base + (uint64_t)len > 0x100000000ULL ||
+            !a32_guest_range_ok(ctx, base, len, req_prot)) {
             if (hiov != stack_iov) {
                 free(hiov);
             }
             return -EFAULT;
         }
-        hiov[i].iov_base = (giov[i].iov_len > 0U) ? a32_guest_ptr(ctx, giov[i].iov_base) : NULL;
-        hiov[i].iov_len  = (size_t)giov[i].iov_len;
+        hiov[i].iov_base = a32_guest_ptr(ctx, base);
+        hiov[i].iov_len  = (size_t)len;
     }
     *out_iov = hiov;
     return 0;
@@ -347,7 +357,9 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
     case ARM_NR_pwritev: {
         struct iovec host_iov[64];
         struct iovec *iov_ptr = NULL;
-        int irc = translate_guest_iov(ctx, a1, a2, host_iov, 64U, &iov_ptr);
+        uint32_t iov_prot = (nr == ARM_NR_readv || nr == ARM_NR_preadv)
+            ? (uint32_t)PROT_WRITE : (uint32_t)PROT_READ;
+        int irc = translate_guest_iov(ctx, a1, a2, host_iov, 64U, &iov_ptr, iov_prot);
         if (irc < 0) {
             FAIL_ERR(-irc);
         }
@@ -368,6 +380,9 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
         }
         if ((nr == ARM_NR_writev || nr == ARM_NR_pwritev) && r > 0) {
             (void)a32_vmfile_sync_fd((int)a0);
+        }
+        if (r > 0 && (nr == ARM_NR_readv || nr == ARM_NR_preadv)) {
+            guest_iov_invalidate(ctx, iov_ptr, a2);
         }
         if (iov_ptr != host_iov) {
             free(iov_ptr);
@@ -445,7 +460,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
                 ures = (uint64_t)map_dir_cookie((int)a0, ures);
             }
         }
-        memcpy(a32_guest_ptr(ctx, a3), &ures, sizeof(ures));
+        (void)guest_write(ctx, a3, &ures, sizeof(ures));
         ctx->regs[0] = 0U;
         break;
     }
