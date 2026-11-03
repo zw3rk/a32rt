@@ -34,8 +34,8 @@
 #endif
 
 #define A32_SIGFRAME_MAGIC 0x53494746U /* "SIGF" */
-#define A32_VFP_MAGIC      0x56465001U /* VFP coprocessor sigframe magic */
-#define A32_FPEXC_EN       0x40000000U /* VFP FPEXC_EN bit */
+#define A32_VFP_MAGIC      0x56465001U /* VFP magic */
+#define A32_FPEXC_EN       0x40000000U /* FPEXC_EN */
 
 #define A32_SIG_DFL      0U
 #define A32_SIG_IGN      1U
@@ -116,16 +116,11 @@ typedef struct a32_stack {
     uint32_t ss_size;
 } a32_stack_t;
 
-/* VFP sigframe in uc_regspace: total size = 0x120 (288 bytes) */
+/* VFP sigframe in uc_regspace: 0x120 bytes. */
 typedef struct a32_vfp_sigframe {
-    uint32_t magic;         /* 0x56465001U (VFP_MAGIC) */
-    uint32_t size;          /* 0x00000120U (288 bytes) */
-    uint64_t fpregs[32];    /* d0..d31 (256 bytes, from ctx->vfp_d[0..31]) */
-    uint32_t fpscr;         /* ctx->fpscr */
-    uint32_t fpexc;         /* 0x40000000U (FPEXC_EN) */
-    uint32_t fpinst;        /* 0 */
-    uint32_t fpinst2;       /* 0 */
-    uint32_t pad[2];        /* 8-byte alignment pad so sizeof == 288 == 0x120 */
+    uint32_t magic; uint32_t size; uint64_t fpregs[32];
+    uint32_t fpscr; uint32_t fpexc; uint32_t fpinst; uint32_t fpinst2;
+    uint32_t pad[2];
 } a32_vfp_sigframe_t;
 
 _Static_assert(sizeof(a32_vfp_sigframe_t) == 0x120,
@@ -375,13 +370,7 @@ static void enqueue_async_signal(a32_ctx_t *ctx, int sig, const siginfo_t *info)
     __atomic_fetch_or(&ctx->pending_signals, 1ULL << (sig - 1), __ATOMIC_SEQ_CST);
 }
 
-/* User-sent vs kernel-fault discriminator for si_code.  Linux reports
- * user sources as <= 0 (SI_USER 0, QUEUE/TIMER/... negative) and faults
- * as small-positive; Darwin reports user sources as >= SI_USER 0x10001
- * (QUEUE/TIMER/... above) and faults as small-positive.  A sync trap
- * (SEGV/BUS/ILL/FPE/TRAP) is a genuine fault only for kernel codes;
- * user-sent instances (kill/tkill/tgkill/sigqueue) must enqueue for
- * guest delivery on both platforms. */
+/* si_code classifier: user-sent (enqueue) vs genuine fault (deliver). */
 static bool sig_code_is_user_sent(int sig, const siginfo_t *info)
 {
     if (sig >= 1 && sig <= 64 && g_preset_siginfo[sig].si_signo == sig) {
@@ -452,9 +441,7 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     bool in_block = a32_jit_lookup_host_pc(host_pc, &guest_pc, &itstate);
 
     if (!in_block) {
-        /* Genuine synchronous trap outside any translated guest block:
-         * terminate immediately instead of returning to the faulting host PC. */
-        _exit(128 + sig);
+        _exit(128 + sig); /* sync trap outside translated block: terminate. */
     }
 
     {
@@ -869,7 +856,7 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
     return 0;
 }
 
-/* Snapshot of genuinely ignored dispositions for the execve carry. */
+/* Ignored-disposition snapshot for execve carry. */
 uint64_t a32_signals_ignored_mask(void)
 {
     uint64_t mask = 0ULL;
@@ -881,9 +868,7 @@ uint64_t a32_signals_ignored_mask(void)
     return mask;
 }
 
-/* Post-exec restore: re-apply ignored dispositions carried across the
- * re-exec and pin host handlers so later deliveries pend as ignored
- * instead of taking the host default action. */
+/* Post-exec restore of ignored dispositions carried across re-exec. */
 void a32_signals_mark_ignored(uint64_t ign_mask)
 {
     for (int s = 1; s <= 64; s++) {

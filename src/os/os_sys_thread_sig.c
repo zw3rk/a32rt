@@ -213,11 +213,7 @@ bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count,
     return true;
 }
 
-/* Darwin futex WAIT emulation (no kernel futex waits on macOS).  Returns
- * true when the op is fully handled (regs[0] set); false falls through
- * to regs[0] = 0.  Guest (Linux) errnos throughout: EAGAIN 11 (Darwin
- * host 35), ETIMEDOUT 110, EINVAL 22 (same both sides).  No wait queue
- * yet: matched waits with a timeout sleep it out, then time out. */
+/* Darwin futex WAIT emulation (no kernel waits). Guest Linux errnos. */
 #if !defined(__linux__)
 bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
                        uint32_t a2, uint32_t a3, uint32_t a5, bool time64)
@@ -303,10 +299,34 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
 #endif
         return 1;
 
-    case ARM_NR_read:
+    case ARM_NR_read: {
+        uint64_t sfm = 0ULL; int sff = 0;
+        if (a32_sigfd_lookup((int)a0, &sfm, &sff)) {
+            FAIL_EINVAL_IF(a2 < 128U);
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, 128U, PROT_WRITE));
+            uint64_t pend = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & sfm;
+            while (pend == 0ULL) {
+                bool nb = ((sff & 0x800U) != 0);
+                if (!nb) { int fl = fcntl((int)a0, F_GETFL); if (fl >= 0 && (fl & O_NONBLOCK) != 0) nb = true; }
+                if (nb) FAIL_ERR(EAGAIN);
+                struct timespec ts = { 0, 5000000L };
+                (void)nanosleep(&ts, NULL);
+                pend = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & sfm;
+            }
+            int sig = __builtin_ctzll(pend) + 1;
+            __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (sig - 1)), __ATOMIC_SEQ_CST);
+            uint8_t ssi[128];
+            memset(ssi, 0, sizeof(ssi));
+            uint32_t sno = (uint32_t)sig;
+            memcpy(ssi, &sno, 4);
+            if (!guest_write(ctx, a1, ssi, 128U)) FAIL_ERR(EFAULT);
+            ctx->regs[0] = 128U;
+            break;
+        }
         FAIL_EFAULT_IF(a2 > 0U && a1 < 0x1000U);
         ctx->regs[0] = host_ret(read((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2));
         break;
+    }
 
     case ARM_NR_write:
         FAIL_EFAULT_IF(a2 > 0U && a1 < 0x1000U);
@@ -374,11 +394,10 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
     }
 
     case ARM_NR_close:
+        a32_sigfd_untrack((int)a0);
         if (g_dir_cookie_count > 0U) {
             for (size_t i = 0U; i < g_dir_cookie_count; i++) {
-                if (g_dir_cookies[i].fd == (int)a0) {
-                    g_dir_cookies[i].fd = -1;
-                }
+                if (g_dir_cookies[i].fd == (int)a0) g_dir_cookies[i].fd = -1;
             }
         }
         ctx->regs[0] = host_ret(close((int)a0));
@@ -593,13 +612,22 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
     }
 
     case ARM_NR_uname: {
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, sizeof(struct utsname), PROT_WRITE));
+        struct { char sysname[65]; char nodename[65]; char release[65]; char version[65]; char machine[65]; char domainname[65]; } gu;
+        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, sizeof(gu), PROT_WRITE));
         struct utsname u;
-        if (uname(&u) != 0) {
-            FAIL_ERR(errno);
-        }
-        snprintf(u.machine, sizeof(u.machine), "armv8l");
-        memcpy(a32_guest_ptr(ctx, a0), &u, sizeof(u));
+        if (uname(&u) != 0) FAIL_ERR(errno);
+        memset(&gu, 0, sizeof(gu));
+        snprintf(gu.sysname, sizeof(gu.sysname), "%s", u.sysname);
+        snprintf(gu.nodename, sizeof(gu.nodename), "%s", u.nodename);
+        snprintf(gu.release, sizeof(gu.release), "%s", u.release);
+        snprintf(gu.version, sizeof(gu.version), "%s", u.version);
+        snprintf(gu.machine, sizeof(gu.machine), "armv7l");
+#ifdef __APPLE__
+        snprintf(gu.domainname, sizeof(gu.domainname), "(none)");
+#else
+        snprintf(gu.domainname, sizeof(gu.domainname), "%s", u.domainname);
+#endif
+        if (!guest_write(ctx, a0, &gu, sizeof(gu))) FAIL_ERR(EFAULT);
         ctx->regs[0] = 0U;
         break;
     }
@@ -671,7 +699,6 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
 
     case ARM_NR_getcwd: {
         FAIL_EFAULT_IF(a0 < 0x1000U);
-        char *buf = (char *)a32_guest_ptr(ctx, a0);
         size_t sr_len = sysroot_prefix_len(ctx);
         char host_cwd[PATH_MAX];
         if (getcwd(host_cwd, sizeof(host_cwd)) == NULL) {
@@ -688,10 +715,9 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
             }
         }
         size_t len = strlen(guest_cwd);
-        if ((size_t)a1 < len + 1U) {
-            FAIL_ERR(ERANGE);
-        }
-        memcpy(buf, guest_cwd, len + 1U);
+        if ((size_t)a1 < len + 1U) FAIL_ERR(ERANGE);
+        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, (uint32_t)(len + 1U), PROT_WRITE));
+        if (!guest_write(ctx, a0, guest_cwd, (uint32_t)(len + 1U))) FAIL_ERR(EFAULT);
         ctx->regs[0] = (uint32_t)(len + 1U);
         break;
     }
@@ -776,9 +802,10 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
 
     case ARM_NR_getresuid32:
     case ARM_NR_getresgid32: {
-        FAIL_EFAULT_IF((a0 != 0U && !a32_guest_range_ok(ctx, a0, 4U, PROT_WRITE)) ||
-                       (a1 != 0U && !a32_guest_range_ok(ctx, a1, 4U, PROT_WRITE)) ||
-                       (a2 != 0U && !a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE)));
+        FAIL_EFAULT_IF(a0 == 0U || a1 == 0U || a2 == 0U ||
+                       !a32_guest_range_ok(ctx, a0, 4U, PROT_WRITE) ||
+                       !a32_guest_range_ok(ctx, a1, 4U, PROT_WRITE) ||
+                       !a32_guest_range_ok(ctx, a2, 4U, PROT_WRITE));
         uint32_t r = 0U, e = 0U, s = 0U;
 #if defined(__linux__)
         int rc = (nr == ARM_NR_getresuid32)
@@ -792,9 +819,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
         e = (nr == ARM_NR_getresuid32) ? (uint32_t)geteuid() : (uint32_t)getegid();
         s = e;
 #endif
-        if (a0) *(uint32_t *)a32_guest_ptr(ctx, a0) = r;
-        if (a1) *(uint32_t *)a32_guest_ptr(ctx, a1) = e;
-        if (a2) *(uint32_t *)a32_guest_ptr(ctx, a2) = s;
+        if (!guest_write(ctx, a0, &r, 4U) || !guest_write(ctx, a1, &e, 4U) || !guest_write(ctx, a2, &s, 4U)) FAIL_ERR(EFAULT);
         ctx->regs[0] = 0U;
         break;
     }

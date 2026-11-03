@@ -589,10 +589,42 @@ typedef struct child_thread_args {
     volatile int started;
 } child_thread_args_t;
 
+static inline int host_errno_to_linux(int err)
+{
+#if !defined(__APPLE__)
+    return err;
+#else
+    if (err <= 0) {
+        return err;
+    }
+    switch (err) {
+    case 11: return 35; case 35: return 11; case 36: return 115;
+    case 37: return 114; case 38: return 88; case 39: return 89;
+    case 40: return 90; case 41: return 91; case 42: return 92;
+    case 43: return 93; case 44: return 94; case 45: return 95;
+    case 46: return 96; case 47: return 97; case 48: return 98;
+    case 49: return 99; case 50: return 100; case 51: return 101;
+    case 52: return 102; case 53: return 103; case 54: return 104;
+    case 55: return 105; case 56: return 106; case 57: return 107;
+    case 58: return 108; case 59: return 109; case 60: return 110;
+    case 61: return 111; case 62: return 40; case 63: return 36;
+    case 64: return 112; case 65: return 113; case 66: return 39;
+    case 68: return 87; case 69: return 122; case 70: return 116;
+    case 71: return 66; case 77: return 37; case 78: return 38;
+    case 84: return 75; case 89: return 125; case 90: return 43;
+    case 91: return 42; case 92: return 84; case 94: return 74;
+    case 95: return 72; case 96: return 61; case 97: return 67;
+    case 98: return 63; case 99: return 60; case 100: return 71;
+    case 101: return 62; case 102: return 95; case 104: return 131;
+    case 105: return 130; default: return err;
+    }
+#endif
+}
+
 static inline uint32_t host_ret(ssize_t r)
 {
     if (r < 0) {
-        return (uint32_t)(-errno);
+        return (uint32_t)(-host_errno_to_linux(errno));
     }
     return (uint32_t)r;
 }
@@ -727,6 +759,10 @@ bool  a32_sys_futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
 int a32_sys_dispatch_sig_time(a32_ctx_t *ctx);
 int a32_sys_dispatch_sock(a32_ctx_t *ctx);
 int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx);
+void a32_signals_ensure_host_handler(int sig);
+void a32_sigfd_track(int fd, uint64_t mask, int flags);
+void a32_sigfd_untrack(int fd);
+bool a32_sigfd_lookup(int fd, uint64_t *mask_out, int *flags_out);
 
 #define map_dir_cookie             a32_sys_map_dir_cookie
 #define unmap_dir_cookie           a32_sys_unmap_dir_cookie
@@ -762,7 +798,7 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx);
 #define read_guest_strv            a32_sys_read_guest_strv
 #define futex_darwin_wait          a32_sys_futex_darwin_wait
 
-#define FAIL_ERR(err)        do { ctx->regs[0] = (uint32_t)(-(err)); return 0; } while (0)
+#define FAIL_ERR(err) do { int _e = (int)(err); ctx->regs[0] = (_e < 0) ? (uint32_t)_e : (uint32_t)(-host_errno_to_linux(_e)); return 0; } while (0)
 #define FAIL_EFAULT_IF(cond) do { if (cond) FAIL_ERR(EFAULT); } while (0)
 #define FAIL_EINVAL_IF(cond) do { if (cond) FAIL_ERR(EINVAL); } while (0)
 #define RESOLVE_AT(dirfd, va, buf, follow) do { \

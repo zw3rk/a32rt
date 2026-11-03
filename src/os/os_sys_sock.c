@@ -7,6 +7,37 @@
 
 #include "os/sys_priv.h"
 
+#define SIGFD_MAX 32
+static struct { int fd; uint64_t mask; int flags; bool used; } g_sigfd[32];
+void a32_sigfd_track(int fd, uint64_t mask, int flags)
+{
+    for (int i = 0; i < SIGFD_MAX; i++) {
+        if (g_sigfd[i].used && g_sigfd[i].fd == fd) {
+            g_sigfd[i].mask = mask; g_sigfd[i].flags = flags; return;
+        }
+    }
+    for (int i = 0; i < SIGFD_MAX; i++) {
+        if (!g_sigfd[i].used) { g_sigfd[i].used = true; g_sigfd[i].fd = fd; g_sigfd[i].mask = mask; g_sigfd[i].flags = flags; return; }
+    }
+}
+void a32_sigfd_untrack(int fd)
+{
+    for (int i = 0; i < SIGFD_MAX; i++) {
+        if (g_sigfd[i].used && g_sigfd[i].fd == fd) g_sigfd[i].used = false;
+    }
+}
+bool a32_sigfd_lookup(int fd, uint64_t *mask_out, int *flags_out)
+{
+    for (int i = 0; i < SIGFD_MAX; i++) {
+        if (g_sigfd[i].used && g_sigfd[i].fd == fd) {
+            if (mask_out) *mask_out = g_sigfd[i].mask;
+            if (flags_out) *flags_out = g_sigfd[i].flags;
+            return true;
+        }
+    }
+    return false;
+}
+
 int a32_sys_dispatch_sock(a32_ctx_t *ctx)
 {
     uint32_t nr = ctx->regs[7];
@@ -159,17 +190,19 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         }
         ctx->regs[0] = host_ret(r);
 #else
-        /* Darwin has no statx: emulate basic stats via fstatat.  glibc
-         * ld.so treats -ENOSYS from statx as fatal ("cannot stat shared
-         * object"), so a faithful fallback unblocks dynamic linking. */
+        /* Darwin statx fallback via fstatat (unblocks dynamic linking). */
         char resolved[PATH_MAX];
         bool follow = ((a2 & AT_SYMLINK_NOFOLLOW) == 0U);
         int dirfd = translate_at_fd(a0);
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a4, 256U, PROT_WRITE));
+        FAIL_EFAULT_IF(a1 == 0U);
         struct stat st;
-        if ((((uint32_t)a2) & 0x1000U) != 0U) {
-            /* AT_EMPTY_PATH: stat the fd itself (glibc fstat-via-statx). */
-            if (fstat(dirfd, &st) != 0) {
+        char first = 0;
+        FAIL_EFAULT_IF(!guest_read(ctx, &first, a1, 1U));
+        if (first == '\0' && (((uint32_t)a2) & 0x1000U) != 0U) {
+            if (dirfd == AT_FDCWD) {
+                if (stat(".", &st) != 0) FAIL_ERR(errno);
+            } else if (fstat(dirfd, &st) != 0) {
                 FAIL_ERR(errno);
             }
         } else {
@@ -181,9 +214,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         }
         uint8_t *stxb = (uint8_t *)a32_guest_ptr(ctx, a4);
         memset(stxb, 0, 256U);
-        /* Linux struct statx (LE): mask@0 blksize@4 attr@8 nlink@16
-         * uid@20 gid@24 mode@28 ino@32 size@40 blocks@48 attrmask@56
-         * atime@64 mtime@80 ctime@96 btime@112 rdev@128 dev@136. */
+        /* Linux statx (LE): atime@64 btime@80 ctime@96 mtime@112. */
         uint32_t stx_mask = ((uint32_t)a3) & 0xFFFU; /* BASIC_STATS|BTIME */
         uint32_t stx_uid = (uint32_t)st.st_uid;
         uint32_t stx_gid = (uint32_t)st.st_gid;
@@ -206,10 +237,10 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         memcpy(stxb + 32, &stx_ino, 8U);
         memcpy(stxb + 40, &stx_size, 8U);
         memcpy(stxb + 48, &stx_blocks, 8U);
-        int64_t secs[4] = { (int64_t)st.st_atimespec.tv_sec, (int64_t)st.st_mtimespec.tv_sec,
-                            (int64_t)st.st_ctimespec.tv_sec, (int64_t)st.st_birthtimespec.tv_sec };
-        uint32_t nsecs[4] = { (uint32_t)st.st_atimespec.tv_nsec, (uint32_t)st.st_mtimespec.tv_nsec,
-                              (uint32_t)st.st_ctimespec.tv_nsec, (uint32_t)st.st_birthtimespec.tv_nsec };
+        int64_t secs[4] = { (int64_t)st.st_atimespec.tv_sec, (int64_t)st.st_birthtimespec.tv_sec,
+                            (int64_t)st.st_ctimespec.tv_sec, (int64_t)st.st_mtimespec.tv_sec };
+        uint32_t nsecs[4] = { (uint32_t)st.st_atimespec.tv_nsec, (uint32_t)st.st_birthtimespec.tv_nsec,
+                              (uint32_t)st.st_ctimespec.tv_nsec, (uint32_t)st.st_mtimespec.tv_nsec };
         for (unsigned ti = 0U; ti < 4U; ti++) {
             memcpy(stxb + 64 + ti * 16, &secs[ti], 8U);
             memcpy(stxb + 72 + ti * 16, &nsecs[ti], 4U);
@@ -259,11 +290,17 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
 
     case ARM_NR_memfd_create: {
 #if defined(__linux__)
-        FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a0, 1U, PROT_READ));
         FAIL_EINVAL_IF((a1 & ~0xFC00001FU) != 0U || ((a1 & 4U) == 0U && (a1 & ~0x1FU) != 0U));
-        const char *uname_str = (const char *)a32_guest_ptr(ctx, a0);
-        FAIL_EINVAL_IF(strnlen(uname_str, 250U) >= 250U);
-        ctx->regs[0] = host_ret(syscall(SYS_memfd_create, uname_str, (unsigned int)a1));
+        char mname[250];
+        uint32_t mn = 0U;
+        for (; mn < 250U; mn++) {
+            char c = 0;
+            if (!guest_read(ctx, &c, a0 + mn, 1U)) FAIL_ERR(EFAULT);
+            mname[mn] = c;
+            if (c == '\0') break;
+        }
+        FAIL_EINVAL_IF(mn >= 250U);
+        ctx->regs[0] = host_ret(syscall(SYS_memfd_create, mname, (unsigned int)a1));
 #else
         FAIL_ERR(ENOSYS);
 #endif
@@ -279,16 +316,42 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         break;
 
     case ARM_NR_signalfd4: {
-#if defined(__linux__)
         uint64_t gmask = 0ULL;
         FAIL_EINVAL_IF(a2 != 8U);
         FAIL_EFAULT_IF(!guest_read(ctx, &gmask, a1, sizeof(gmask)));
-        sigset_t hmask;
-        memset(&hmask, 0, sizeof(hmask));
-        memcpy(&hmask, &gmask, sizeof(uint64_t));
-        ctx->regs[0] = host_ret(syscall(SYS_signalfd4, (int)a0, &hmask, (size_t)8, (int)a3));
+        for (int s = 1; s <= 64; s++) {
+            if ((gmask >> (s - 1)) & 1ULL) a32_signals_ensure_host_handler(s);
+        }
+#if defined(__linux__)
+        if ((int)a0 == -1) {
+            sigset_t hmask;
+            memset(&hmask, 0, sizeof(hmask));
+            memcpy(&hmask, &gmask, sizeof(uint64_t));
+            int hfd = (int)syscall(SYS_signalfd4, -1, &hmask, (size_t)8, (int)a3);
+            if (hfd < 0) FAIL_ERR(errno);
+            a32_sigfd_track(hfd, gmask, (int)a3);
+            ctx->regs[0] = (uint32_t)hfd;
+        } else {
+            uint64_t old = 0ULL; int ofl = 0;
+            bool known = a32_sigfd_lookup((int)a0, &old, &ofl);
+            sigset_t hmask;
+            memset(&hmask, 0, sizeof(hmask));
+            memcpy(&hmask, &gmask, sizeof(uint64_t));
+            int hfd = (int)syscall(SYS_signalfd4, (int)a0, &hmask, (size_t)8, (int)a3);
+            if (hfd < 0) FAIL_ERR(errno);
+            a32_sigfd_track(hfd, gmask, (int)a3);
+            (void)known; (void)old;
+            ctx->regs[0] = (uint32_t)hfd;
+        }
 #else
-        FAIL_ERR(ENOSYS);
+        int hfd = (int)a0;
+        if ((int)a0 == -1) {
+            hfd = open("/dev/null", O_RDONLY);
+            if (hfd < 0) FAIL_ERR(errno);
+            if ((a3 & 0x800U) != 0U) (void)fcntl(hfd, F_SETFL, O_NONBLOCK);
+        }
+        a32_sigfd_track(hfd, gmask, (int)a3);
+        ctx->regs[0] = (uint32_t)hfd;
 #endif
         break;
     }
@@ -492,39 +555,42 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         uint8_t *cbuf64 = cbuf_st;
         size_t cbuf_cap = sizeof(cbuf_st);
         uint8_t *cbuf_dyn = NULL;
-        if (gm->msg_control != 0U && gm->msg_controllen > 0U) {
+        uint8_t *csnap = NULL;
+        uint32_t ctl_len = gm->msg_controllen;
+        if (gm->msg_control != 0U && ctl_len > 0U) {
             if (nr == ARM_NR_sendmsg) {
-                const uint8_t *gctl = (const uint8_t *)a32_guest_ptr(ctx, gm->msg_control);
+                csnap = (uint8_t *)malloc(ctl_len);
+                if (csnap == NULL) FAIL_ERR(ENOBUFS);
+                memcpy(csnap, a32_guest_ptr(ctx, gm->msg_control), ctl_len);
+                const uint8_t *gctl = csnap;
                 uint32_t t32 = 0U;
                 size_t need64 = 0U;
-                while (t32 + 12U <= gm->msg_controllen) {
+                while (t32 + 12U <= ctl_len) {
                     uint32_t l32;
                     memcpy(&l32, gctl + t32, 4);
-                    FAIL_EINVAL_IF(l32 < 12U || l32 > gm->msg_controllen - t32);
+                    if (l32 < 12U || l32 > ctl_len - t32) { free(csnap); FAIL_ERR(EINVAL); }
                     need64 += CMSG_SPACE((size_t)(l32 - 12U));
                     t32 += (l32 + 3U) & ~3U;
                 }
-                if (need64 > (64U * 1024U)) {
-                    FAIL_ERR(ENOBUFS);
-                }
+                if (need64 > (64U * 1024U)) { free(csnap); FAIL_ERR(ENOBUFS); }
                 if (need64 > cbuf_cap) {
                     cbuf_dyn = (uint8_t *)malloc(need64);
-                    if (cbuf_dyn == NULL) {
-                        FAIL_ERR(ENOBUFS);
-                    }
+                    if (cbuf_dyn == NULL) { free(csnap); FAIL_ERR(ENOBUFS); }
                     cbuf64 = cbuf_dyn;
                     cbuf_cap = need64;
                 }
                 uint32_t off32 = 0U;
                 size_t off64 = 0U;
-                while (off32 + 12U <= gm->msg_controllen) {
+                while (off32 + 12U <= ctl_len) {
                     uint32_t len32;
                     int32_t level32, type32;
                     memcpy(&len32, gctl + off32, 4);
+                    if (len32 < 12U || len32 > ctl_len - off32) { free(csnap); FAIL_ERR(EINVAL); }
                     memcpy(&level32, gctl + off32 + 4U, 4);
                     memcpy(&type32, gctl + off32 + 8U, 4);
                     size_t payload_len = (size_t)(len32 - 12U);
                     size_t space64 = CMSG_SPACE(payload_len);
+                    if (off64 + space64 > cbuf_cap) { free(csnap); FAIL_ERR(ENOBUFS); }
                     struct cmsghdr *cm64 = (struct cmsghdr *)(void *)(cbuf64 + off64);
                     cm64->cmsg_len   = CMSG_LEN(payload_len);
                     cm64->cmsg_level = (int)level32;
@@ -548,6 +614,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                                          host_iov, 16U, &hiov);
         if (iov_rc < 0) {
             free(cbuf_dyn);
+            free(csnap);
             ctx->regs[0] = (uint32_t)iov_rc;
             break;
         }
@@ -614,6 +681,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
             free(hiov);
         }
         free(cbuf_dyn);
+        free(csnap);
         ctx->regs[0] = host_ret(r);
         break;
     }
