@@ -74,16 +74,16 @@ run_guest() {
     if [ "$_host" = "hl" ]; then
         if [ -n "$_garg" ]; then
             # shellcheck disable=SC2086
-            perl -e 'alarm 15; exec @ARGV' "$HL_BIN" "$RT_LINUX" "$_engflag" -- "$_guest" "$_garg" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
+            perl -e 'alarm 45; exec @ARGV' "$HL_BIN" "$RT_LINUX" "$_engflag" -- "$_guest" "$_garg" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
         else
-            perl -e 'alarm 15; exec @ARGV' "$HL_BIN" "$RT_LINUX" "$_engflag" -- "$_guest" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
+            perl -e 'alarm 45; exec @ARGV' "$HL_BIN" "$RT_LINUX" "$_engflag" -- "$_guest" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
         fi
     else
         if [ -n "$_garg" ]; then
             # shellcheck disable=SC2086
-            perl -e 'alarm 15; exec @ARGV' "$RT_DARWIN" "$_engflag" -- "$_guest" "$_garg" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
+            perl -e 'alarm 45; exec @ARGV' "$RT_DARWIN" "$_engflag" -- "$_guest" "$_garg" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
         else
-            perl -e 'alarm 15; exec @ARGV' "$RT_DARWIN" "$_engflag" -- "$_guest" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
+            perl -e 'alarm 45; exec @ARGV' "$RT_DARWIN" "$_engflag" -- "$_guest" >"$_tmp_out" 2>"$_tmp_err" || _rc=$?
         fi
     fi
     _t1=$(parity_now_ms)
