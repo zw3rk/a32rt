@@ -12,6 +12,8 @@
 #include "interp.h"
 #include "interp_priv.h"
 
+#include "interp/decode_priv.h"
+
 #include <stdint.h>
 
 bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted)
@@ -49,32 +51,39 @@ bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted)
         return true;
     }
     if ((insn & 0xFEB80090U) == 0xF2800010U) {
-        uint32_t imm8 = (((insn >> 24) & 1U) << 7) | (((insn >> 16) & 7U) << 4) | (insn & 0xFU);
-        unsigned cmode = (insn >> 8) & 0xFU;
-        unsigned op = (insn >> 5) & 1U;
+        uint8_t imm8 = (uint8_t)((((insn >> 24) & 1U) << 7) |
+                                 (((insn >> 16) & 7U) << 4) | (insn & 0xFU));
+        uint8_t cmode = (uint8_t)((insn >> 8) & 0xFU);
+        uint8_t op = (uint8_t)((insn >> 5) & 1U);
         bool is_q = ((insn >> 6) & 1U) != 0U;
         unsigned dd = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+        /* Full modified-immediate decode shared with the JIT (A32-R7-26):
+         * even cmodes < 8 and 12+ overwrite (VMOV/VMVN, inverted when
+         * op != 0 except the 0xE shifting-ones form), odd cmodes < 12
+         * read-modify-write (VORR/VBIC), 0xF/op 0 is an F32 immediate.
+         * Undecodable forms (0xF/op 1) are UNDEFINED, never zero. */
         uint64_t val64 = 0ULL;
-        if ((cmode & 1U) == 0U && cmode < 8U) {
-            uint32_t w = imm8 << ((cmode >> 1) * 8U);
-            if (op != 0U) {
-                w = ~w;
+        if (!neon_expand_imm(cmode, op, imm8, &val64)) {
+            i_undef(ctx);
+            return false;
+        }
+        if ((cmode & 1U) == 0U || cmode >= 12U) { /* VMOV or VMVN */
+            if (op != 0U && cmode != 14U) {
+                val64 = ~val64;
             }
-            val64 = ((uint64_t)w << 32) | w;
-        } else if (cmode == 0xEU && op == 0U) {
-            for (unsigned b = 0U; b < 8U; b++) {
-                val64 |= (uint64_t)imm8 << (b * 8U);
+            ctx->vfp_d[dd & 31U] = val64;
+            if (is_q) {
+                ctx->vfp_d[(dd + 1U) & 31U] = val64;
             }
-        } else if (cmode == 0xEU && op == 1U) {
-            for (unsigned b = 0U; b < 8U; b++) {
-                if (((imm8 >> b) & 1U) != 0U) {
-                    val64 |= 0xFFULL << (b * 8U);
+        } else { /* VORR or VBIC */
+            for (unsigned r = 0U; r < (is_q ? 2U : 1U); r++) {
+                unsigned d = (dd + r) & 31U;
+                if (op == 0U) {
+                    ctx->vfp_d[d] |= val64;
+                } else {
+                    ctx->vfp_d[d] &= ~val64;
                 }
             }
-        }
-        ctx->vfp_d[dd & 31U] = val64;
-        if (is_q) {
-            ctx->vfp_d[(dd + 1U) & 31U] = val64;
         }
         ctx->regs[15] = pc + 4U;
         return true;
@@ -90,10 +99,14 @@ bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted)
             if (size == 0U) {
                 v = __builtin_bswap64(v);
             } else if (size == 1U) {
-                v = ((uint64_t)__builtin_bswap16((uint16_t)(v >> 48))) |
-                    ((uint64_t)__builtin_bswap16((uint16_t)(v >> 32)) << 16) |
-                    ((uint64_t)__builtin_bswap16((uint16_t)(v >> 16)) << 32) |
-                    ((uint64_t)__builtin_bswap16((uint16_t)v) << 48);
+                /* VREV64.16 reverses the four halfword positions within
+                 * each doubleword without byte-swapping the halfwords
+                 * themselves (A32-R7-28). */
+                uint64_t h0 = (v >> 48) & 0xFFFFU;
+                uint64_t h1 = (v >> 32) & 0xFFFFU;
+                uint64_t h2 = (v >> 16) & 0xFFFFU;
+                uint64_t h3 = v & 0xFFFFU;
+                v = (h3 << 48) | (h2 << 32) | (h1 << 16) | h0;
             } else if (size == 2U) {
                 v = (v >> 32) | (v << 32);
             }

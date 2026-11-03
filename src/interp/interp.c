@@ -183,6 +183,15 @@ void i_undef(a32_ctx_t *ctx)
 }
 
 
+uint32_t i_fault(a32_ctx_t *ctx, uint32_t va, bool is_write)
+{
+    (void)is_write;
+    ctx->fault_addr = va;
+    ctx->exit_reason = A32_EXIT_FAULT;
+    return A32_EXIT_FAULT;
+}
+
+
 void i_set_pc_branch(a32_ctx_t *ctx, uint32_t target, bool interwork)
 {
     if (interwork) {

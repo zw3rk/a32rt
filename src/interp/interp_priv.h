@@ -33,6 +33,9 @@ bool i_load_u32(a32_ctx_t *ctx, uint32_t va, uint32_t *out);
 bool i_store_u32(a32_ctx_t *ctx, uint32_t va, uint32_t v);
 bool i_mem_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t prot);
 void i_undef(a32_ctx_t *ctx);
+/* Record a guest memory fault at va and return A32_EXIT_FAULT. is_write
+ * marks store faults for future fault-status reporting (A32-R7-6). */
+uint32_t i_fault(a32_ctx_t *ctx, uint32_t va, bool is_write);
 void i_set_pc_branch(a32_ctx_t *ctx, uint32_t target, bool interwork);
 uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc);
 uint32_t i_thumb_step(a32_ctx_t *ctx, uint32_t pc);

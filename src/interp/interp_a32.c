@@ -634,12 +634,12 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
             return A32_EXIT_FAULT;
         }
         hva = a32_vm32_hva(ctx, va);
+        /* Single-copy atomic exchange: a concurrent write landing between
+         * a separate load and store would be silently lost. */
         if (b_bit) {
-            tmp = __atomic_load_n((uint8_t *)hva, __ATOMIC_SEQ_CST);
-            __atomic_store_n((uint8_t *)hva, (uint8_t)ctx->regs[rm], __ATOMIC_SEQ_CST);
+            tmp = __atomic_exchange_n((uint8_t *)hva, (uint8_t)ctx->regs[rm], __ATOMIC_SEQ_CST);
         } else {
-            tmp = __atomic_load_n((uint32_t *)(void *)hva, __ATOMIC_SEQ_CST);
-            __atomic_store_n((uint32_t *)(void *)hva, ctx->regs[rm], __ATOMIC_SEQ_CST);
+            tmp = __atomic_exchange_n((uint32_t *)(void *)hva, ctx->regs[rm], __ATOMIC_SEQ_CST);
         }
         a32_vm32_copyout_invalidate(va, size);
         ctx->regs[rd] = tmp;

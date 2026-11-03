@@ -47,6 +47,82 @@ static inline unsigned neon_reg_m(uint32_t insn)
     return (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
 }
 
+/* NEON modified-immediate expansion shared by the JIT (interp_neon_mem.c)
+ * and the reference interpreter (interp_vfp_neon.c) so both agree on
+ * every cmode (A32-R7-26). Mirrors AdvSIMDExpandImm: cmodes 0-7 are
+ * 32-bit shifted by 8*cmode[2:1], 8-11 are 16-bit shifted replicated,
+ * 12/13 are shifting ones (0x00imm8FF / 0x00imm8FFFF... as 32-bit), 14
+ * is byte-replicate (op 0) or shifting ones (op 1), and 15/op 0 is an
+ * F32 immediate. Returns false for 15/op 1 (UNDEFINED). */
+static inline bool neon_expand_imm(uint8_t cmode, uint8_t op, uint8_t imm8, uint64_t *out_val64)
+{
+    uint32_t w = 0U;
+    if ((cmode & 0xEU) == 0U) { /* 000x: 32-bit 000000imm8 */
+        w = imm8;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 2U) { /* 001x: 32-bit 0000imm800 */
+        w = (uint32_t)imm8 << 8;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 4U) { /* 010x: 32-bit 00imm80000 */
+        w = (uint32_t)imm8 << 16;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 6U) { /* 011x: 32-bit imm8000000 */
+        w = (uint32_t)imm8 << 24;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 8U) { /* 100x: 16-bit 00imm8 */
+        uint32_t h = imm8;
+        w = (h << 16) | h;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if ((cmode & 0xEU) == 10U) { /* 101x: 16-bit imm800 */
+        uint32_t h = (uint32_t)imm8 << 8;
+        w = (h << 16) | h;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if (cmode == 12U) { /* 1100: 32-bit 0000imm8FF */
+        w = ((uint32_t)imm8 << 8) | 0xFFU;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if (cmode == 13U) { /* 1101: 32-bit 00imm8FFFF */
+        w = ((uint32_t)imm8 << 16) | 0xFFFFU;
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    if (cmode == 14U) { /* 1110 */
+        if (op == 0U) {
+            uint32_t b = imm8;
+            w = (b << 24) | (b << 16) | (b << 8) | b;
+            *out_val64 = ((uint64_t)w << 32) | w;
+            return true;
+        }
+        uint64_t val = 0ULL;
+        for (unsigned i = 0U; i < 8U; i++) {
+            if ((imm8 >> i) & 1U) {
+                val |= (0xFFULL << (i * 8U));
+            }
+        }
+        *out_val64 = val;
+        return true;
+    }
+    if (cmode == 15U && op == 0U) { /* 1111: float imm */
+        w = vfp_expand_imm_single(imm8);
+        *out_val64 = ((uint64_t)w << 32) | w;
+        return true;
+    }
+    return false;
+}
+
 static inline void vfp_ldr_ctx(a64_buf_t *b, bool is_double, unsigned vt, unsigned idx)
 {
     if (is_double) {
@@ -99,6 +175,30 @@ static inline void neon_emit_unary(a64_buf_t *b, bool is_q, unsigned d, unsigned
     neon_ldr_ctx(b, is_q, 1U, m);
     a64_emit(b, base_op | (is_q ? 0x40000000U : 0U) | (1U << 5) | 0U);
     neon_str_ctx(b, is_q, 0U, d);
+}
+
+/* NEON FP environment isolation (A32-R7-24): Advanced SIMD arithmetic
+ * always uses the Standard FPSCR (RMode=RN, FZ=1, DN=1, AHP from the
+ * guest FPSCR), never the scalar VFP rounding/flush controls the
+ * trampoline installed in host FPCR on block entry. Save the scalar
+ * host FPCR, install the standard value derived from ctx->fpscr, and
+ * restore it after the NEON FP op. Only NEON vector instructions sit
+ * between save and restore, so TMP1 is never clobbered (vector ops
+ * never write general registers). */
+static inline void neon_fp_fpcr_begin(a64_buf_t *b)
+{
+    a64_emit(b, 0xD53B4400U | A64_TMP1); /* MRS xTmp1, FPCR (save scalar) */
+    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+    a64_emit_mov_imm32(b, A64_TMP2, 0x04000000U); /* guest FPSCR.AHP mask */
+    a64_emit_and_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP2, A64_SHIFT_LSL, 0U);
+    a64_emit_mov_imm32(b, A64_TMP2, 0x03000000U); /* FZ | DN */
+    a64_emit_orr_reg_w(b, A64_TMP0, A64_TMP0, A64_TMP2, A64_SHIFT_LSL, 0U);
+    a64_emit(b, 0xD51B4400U | A64_TMP0); /* MSR FPCR, xTmp0 */
+}
+
+static inline void neon_fp_fpcr_end(a64_buf_t *b)
+{
+    a64_emit(b, 0xD51B4400U | A64_TMP1); /* MSR FPCR, xTmp1 (restore scalar) */
 }
 
 static inline void neon_emit_wb(a64_buf_t *b, unsigned rn, unsigned rm, uint16_t imm_bytes)

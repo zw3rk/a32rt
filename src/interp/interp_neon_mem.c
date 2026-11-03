@@ -7,75 +7,6 @@
 
 #include "interp/decode_priv.h"
 
-static bool neon_expand_imm(uint8_t cmode, uint8_t op, uint8_t imm8, uint64_t *out_val64)
-{
-    uint32_t w = 0U;
-    if ((cmode & 0xEU) == 0U) { /* 000x: 32-bit 000000imm8 */
-        w = imm8;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if ((cmode & 0xEU) == 2U) { /* 001x: 32-bit 0000imm800 */
-        w = (uint32_t)imm8 << 8;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if ((cmode & 0xEU) == 4U) { /* 010x: 32-bit 00imm80000 */
-        w = (uint32_t)imm8 << 16;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if ((cmode & 0xEU) == 6U) { /* 011x: 32-bit imm8000000 */
-        w = (uint32_t)imm8 << 24;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if ((cmode & 0xEU) == 8U) { /* 100x: 16-bit 00imm8 */
-        uint32_t h = imm8;
-        w = (h << 16) | h;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if ((cmode & 0xEU) == 10U) { /* 101x: 16-bit imm800 */
-        uint32_t h = (uint32_t)imm8 << 8;
-        w = (h << 16) | h;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if (cmode == 12U) { /* 1100: 32-bit 0000imm8FF */
-        w = ((uint32_t)imm8 << 8) | 0xFFU;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if (cmode == 13U) { /* 1101: 32-bit 00imm8FFFF */
-        w = ((uint32_t)imm8 << 16) | 0xFFFFU;
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    if (cmode == 14U) { /* 1110 */
-        if (op == 0U) {
-            uint32_t b = imm8;
-            w = (b << 24) | (b << 16) | (b << 8) | b;
-            *out_val64 = ((uint64_t)w << 32) | w;
-            return true;
-        }
-        uint64_t val = 0ULL;
-        for (unsigned i = 0U; i < 8U; i++) {
-            if ((imm8 >> i) & 1U) {
-                val |= (0xFFULL << (i * 8U));
-            }
-        }
-        *out_val64 = val;
-        return true;
-    }
-    if (cmode == 15U && op == 0U) { /* 1111: float imm */
-        w = vfp_expand_imm_single(imm8);
-        *out_val64 = ((uint64_t)w << 32) | w;
-        return true;
-    }
-    return false;
-}
-
 bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 {
     /* 1. VLD1 / VST1 / VLD2 / VST2 (0xF4...) */
@@ -519,17 +450,22 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 neon_emit_unary(b, is_q, d, m, base, false);
                 return true;
             }
-            /* Float compare-with-zero: VCGT (8), VCGE (9), VCEQ (10), VCLE (11), VCLT (12) #0 */
+            /* Float compare-with-zero: VCGT (8), VCGE (9), VCEQ (10), VCLE (11), VCLT (12) #0.
+             * Standard FPSCR: FZ affects FP inputs (A32-R7-24). */
             if (op5 >= 8U && op5 <= 12U && size == 2U) {
                 uint32_t base = ((op5 & 1U) ? 0x2EA00800U : 0x0EA00800U) |
                                 (((8U + (op5 >> 1)) & 0x1FU) << 12);
+                neon_fp_fpcr_begin(b);
                 neon_emit_unary(b, is_q, d, m, base, false);
+                neon_fp_fpcr_end(b);
                 return true;
             }
             /* VABS.F32 (op5 == 14), VNEG.F32 (op5 == 15) */
             if ((op5 == 14U || op5 == 15U) && size == 2U) {
                 uint32_t base = (op5 == 15U) ? 0x2EA0F800U : 0x0EA0F800U;
+                neon_fp_fpcr_begin(b);
                 neon_emit_unary(b, is_q, d, m, base, false);
+                neon_fp_fpcr_end(b);
                 return true;
             }
         }
@@ -595,8 +531,10 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 return true;
             }
 
-            /* VCVT.F16.F32 Dd, Qm (op5 == 12) and VCVT.F32.F16 Qd, Dm (op5 == 14) */
+            /* VCVT.F16.F32 Dd, Qm (op5 == 12) and VCVT.F32.F16 Qd, Dm (op5 == 14).
+             * Standard FPSCR around the FP conversion (A32-R7-24). */
             if (size == 1U && !is_q && (op5 == 12U || op5 == 14U)) {
+                neon_fp_fpcr_begin(b);
                 if (op5 == 12U) {
                     a64_emit_ldr_q_ctx(b, 1U, m >> 1);
                     a64_emit(b, 0x0E216800U | (1U << 5) | 0U);
@@ -606,12 +544,15 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     a64_emit(b, 0x0E217800U | (1U << 5) | 0U);
                     a64_emit_str_q_ctx(b, 0U, d >> 1);
                 }
+                neon_fp_fpcr_end(b);
                 return true;
             }
         }
 
         if (opc1 == 3U && size == 2U && op5 >= 8U && op5 <= 15U) {
-            /* VRECPE/VRSQRTE (8..11) and VCVT.F32<->S32/U32 (12..15) */
+            /* VRECPE/VRSQRTE (8..11) and VCVT.F32<->S32/U32 (12..15).
+             * Standard FPSCR around the FP op (A32-R7-24). */
+            neon_fp_fpcr_begin(b);
             uint32_t base = (op5 == 8U)  ? 0x0EA1C800U
                           : (op5 == 9U)  ? 0x2EA1C800U
                           : (op5 == 10U) ? 0x0EA1D800U
@@ -621,6 +562,7 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                           : (op5 == 14U) ? 0x0EA1B800U
                                          : 0x2EA1B800U;
             neon_emit_unary(b, is_q, d, m, base, false);
+            neon_fp_fpcr_end(b);
             return true;
         }
     }
@@ -678,13 +620,16 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         }
 
         if ((sh_op == 0xEU || sh_op == 0xFU) && l_sh == 0U && imm6 >= 32U) {
-            /* Vector fixed-point VCVT.F32.<S32/U32> (0xE) and VCVT.<S32/U32>.F32 (0xF) */
+            /* Vector fixed-point VCVT.F32.<S32/U32> (0xE) and VCVT.<S32/U32>.F32 (0xF).
+             * Standard FPSCR around the FP conversion (A32-R7-24). */
+            neon_fp_fpcr_begin(b);
             unsigned d = neon_reg_d(insn);
             unsigned m = neon_reg_m(insn);
             uint32_t base = (is_u ? 0x2F000000U : 0x0F000000U) |
                             ((sh_op == 0xFU) ? 0xFC00U : 0xE400U) |
                             (imm6 << 16);
             neon_emit_unary(b, is_q, d, m, base, false);
+            neon_fp_fpcr_end(b);
             return true;
         }
 

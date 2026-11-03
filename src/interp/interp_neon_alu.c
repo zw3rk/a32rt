@@ -149,7 +149,9 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
             } else {
                 bool vec_q = u_bit;
                 if ((op == 0x1U || op == 0x5U) && size == 2U) {
-                    /* Chained (unfused) VMLA.F32 / VMLS.F32 by scalar */
+                    /* Chained (unfused) VMLA.F32 / VMLS.F32 by scalar.
+                     * Standard FPSCR around the FP sequence (A32-R7-24). */
+                    neon_fp_fpcr_begin(b);
                     uint32_t fadd_op = vec_q ? 0x4E20D400U : 0x0E20D400U;
                     a64_emit_ldr_d_ctx(b, 2U, dm);
                     a64_emit(b, (vec_q ? 0x4E000400U : 0x0E000400U) |
@@ -177,6 +179,7 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                         a64_emit(b, fadd_op | (3U << 16) | (0U << 5) | 0U);
                         a64_emit_str_d_ctx(b, 0U, dd);
                     }
+                    neon_fp_fpcr_end(b);
                     return true;
                 }
                 if (op == 0x0U) { /* VMLA.I<16/32> */
@@ -195,6 +198,12 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                     sc_op  = (vec_q ? 0x6E20B400U : 0x2E20B400U) | (size << 22);
                 }
                 if (sc_op != 0U) {
+                    /* VMUL.F32 by scalar (op 0x9) runs under Standard
+                     * FPSCR; integer scalar ops ignore FPCR (A32-R7-24). */
+                    bool sc_fp = (op == 0x9U);
+                    if (sc_fp) {
+                        neon_fp_fpcr_begin(b);
+                    }
                     a64_emit_ldr_d_ctx(b, 2U, dm);
                     a64_emit(b, (vec_q ? 0x4E000400U : 0x0E000400U) |
                                 (imm5 << 16) | (2U << 5) | 2U); /* DUP v2, v2[lane] */
@@ -216,6 +225,9 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                         }
                         a64_emit(b, sc_op | (2U << 16) | (1U << 5) | 0U);
                         a64_emit_str_d_ctx(b, 0U, dd);
+                    }
+                    if (sc_fp) {
+                        neon_fp_fpcr_end(b);
                     }
                     return true;
                 }
@@ -418,8 +430,10 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
             a64_op = is_q ? 0x6E20DC00U : 0x2E20DC00U;
             matched = true;
         }
-        /* Chained (unfused) VMLA.F32 / VMLS.F32 (op == 0xD, !u_bit, b4, size == 0 or 2) */
+        /* Chained (unfused) VMLA.F32 / VMLS.F32 (op == 0xD, !u_bit, b4, size == 0 or 2).
+         * Standard FPSCR around the FP sequence (A32-R7-24). */
         else if (!u_bit && (size == 0U || size == 2U) && op == 0xDU && b4) {
+            neon_fp_fpcr_begin(b);
             uint32_t fadd_op = is_q ? 0x4E20D400U : 0x0E20D400U;
             if (is_q) {
                 unsigned qd = neon_reg_d(insn) >> 1;
@@ -448,6 +462,7 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                 a64_emit(b, fadd_op | (3U << 16) | (0U << 5) | 0U);
                 a64_emit_str_d_ctx(b, 0U, dd);
             }
+            neon_fp_fpcr_end(b);
             return true;
         }
         /* Fused VFMA.F32 (op == 0xC, !u_bit, b4, size == 0) */
@@ -581,6 +596,14 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
         }
 
         if (matched) {
+            /* FP vector ops (op 0xC fused MAC with bit4 set, 0xD, 0xE, 0xF)
+             * run under Standard FPSCR, not the scalar VFP controls in
+             * host FPCR (A32-R7-24). Integer SIMD ignores FPCR. */
+            bool fp_env = (op == 0xDU || op == 0xEU || op == 0xFU) ||
+                          (op == 0xCU && b4);
+            if (fp_env) {
+                neon_fp_fpcr_begin(b);
+            }
             uint32_t rn_rm = swap_rn_rm ? ((1U << 16) | (2U << 5))
                                         : ((2U << 16) | (1U << 5));
             if (is_q) {
@@ -605,6 +628,9 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                 }
                 a64_emit(b, a64_op | rn_rm | 0U);
                 a64_emit_str_d_ctx(b, 0U, dd);
+            }
+            if (fp_env) {
+                neon_fp_fpcr_end(b);
             }
             return true;
         }

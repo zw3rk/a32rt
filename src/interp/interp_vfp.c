@@ -451,10 +451,19 @@ static bool vfp_ldc_stc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulte
         return true;
     }
 
-    uint32_t base = (rn == 15U) ? (pc + 8U) : ctx->regs[rn];
+    /* Literal base is Align(PC + 4, 4) in Thumb mode and PC + 8 in ARM
+     * mode (A32-R7-18). */
+    bool is_thumb = (ctx->cpsr & A32_CPSR_T) != 0U;
+    uint32_t base = (rn == 15U) ? (is_thumb ? ((pc + 4U) & ~3U) : (pc + 8U)) : ctx->regs[rn];
     if (p && !w) {
         uint32_t off = imm8 * 4U;
         uint32_t ea = u ? (base + off) : (base - off);
+        /* VLDR/VSTR requires a word-aligned effective address (A32-R7-6). */
+        if ((ea & 3U) != 0U) {
+            i_fault(ctx, ea, !l);
+            *faulted = true;
+            return true;
+        }
         unsigned reg = vfp_idx(dbl, d_bit, vd_bits);
         if (l) {
             if (dbl) {

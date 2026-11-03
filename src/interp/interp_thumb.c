@@ -46,8 +46,11 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
     }
 
     /* BKPT is unconditional inside an IT block: it always traps, even when
-     * the current IT condition fails, and preserves pre-instruction IT. */
+     * the current IT condition fails, and preserves pre-instruction IT.
+     * Report the instruction PC explicitly like the ARM BKPT handler
+     * instead of relying on the regs[15] entry invariant. */
     if ((hw & 0xFF00U) == 0xBE00U) {
+        ctx->regs[15] = pc;
         ctx->exit_reason = A32_EXIT_BKPT;
         return A32_EXIT_BKPT;
     }
