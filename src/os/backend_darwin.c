@@ -115,9 +115,18 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
         {
             size_t hlen = end - start;
             uintptr_t off = (uintptr_t)hint_addr - start;
-            uint8_t *saved = (uint8_t *)malloc(hlen);
+            uint8_t *saved;
+            if (shared != 0) {
+                return -EINVAL;
+            }
+            saved = (uint8_t *)malloc(hlen);
             if (saved == NULL) {
                 return -ENOMEM;
+            }
+            if (mprotect((void *)start, hlen, PROT_READ | PROT_WRITE) != 0) {
+                int merr = errno;
+                free(saved);
+                return -merr;
             }
             memcpy(saved, (void *)start, hlen);
             res = mmap((void *)start, hlen, PROT_READ | PROT_WRITE,

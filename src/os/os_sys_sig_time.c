@@ -695,11 +695,31 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
             execve(self_exe, re_argv, re_envp);
         } else {
             /* Native child: strip transport entries instead of leaking
-             * stale execve-class state into a non-translator image. */
-            char *native_envp[520];
-            int npos = 0;
+             * stale execve-class state into a non-translator image.
+             * A32-R4-7: size native_envp dynamically from the
+             * environ count so large environments are never
+             * truncated by a fixed array. */
+            size_t nenv = 0U;
+            char **native_envp = NULL;
+            size_t npos = 0U;
             if (target_envp != NULL) {
-                for (int tpos = 0; target_envp[tpos] != NULL && npos < 519; tpos++) {
+                while (target_envp[nenv] != NULL) {
+                    nenv++;
+                }
+            }
+            native_envp = (char **)malloc((nenv + 1U) * sizeof(char *));
+            if (native_envp == NULL) {
+                if (saved_fd_flags >= 0 && (saved_fd_flags & FD_CLOEXEC) != 0) {
+                    int saved_err = ENOMEM;
+                    (void)fcntl(dirfd, F_SETFD, saved_fd_flags);
+                    errno = saved_err;
+                } else {
+                    errno = ENOMEM;
+                }
+                FAIL_ERR(errno);
+            }
+            if (target_envp != NULL) {
+                for (size_t tpos = 0U; target_envp[tpos] != NULL; tpos++) {
                     if (is_exec_sig_transport(target_envp[tpos])) {
                         continue;
                     }
@@ -708,6 +728,7 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
             }
             native_envp[npos] = NULL;
             execve(path, new_argv, native_envp);
+            free(native_envp);
         }
         if (saved_fd_flags >= 0 && (saved_fd_flags & FD_CLOEXEC) != 0) {
             int saved_err = errno;

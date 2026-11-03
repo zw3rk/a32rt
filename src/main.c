@@ -381,10 +381,14 @@ int main(int argc, char **argv, char **envp)
         return 1;
     }
 
-    /* A32-R4-7: consume the transport entries BEFORE constructing the
-     * guest stack environment, and build the stack from a filtered
-     * copy. Installing handlers this early is idempotent with the
-     * a32_signals_init() call below. */
+    /* A32-R4-7: install host handlers BEFORE applying the captured
+     * execve-class state so a32_signals_init() does not overwrite
+     * restored SIG_IGN dispositions; consume the transport entries
+     * BEFORE constructing the guest stack environment. */
+    a32_signals_set_thread_ctx(&ctx);
+    if (a32_signals_init(&ctx) != 0) {
+        return 1;
+    }
     exec_signal_restore(&ctx);
     char **clean_envp = filter_exec_sig_env(envp);
 
@@ -393,8 +397,7 @@ int main(int argc, char **argv, char **envp)
         return 1;
     }
 
-    a32_signals_set_thread_ctx(&ctx);
-    if (a32_signals_init(&ctx) != 0 || a32_jit_init(&ctx) != 0) {
+    if (a32_jit_init(&ctx) != 0) {
         return 1;
     }
 
