@@ -82,6 +82,8 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                     : pwrite((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, pos);
         if (nr == ARM_NR_pwrite64 && r > 0) {
             (void)a32_vmfile_sync_fd((int)a0);
+        } else if (nr == ARM_NR_pread64 && r > 0) {
+            a32_vm32_copyout_invalidate_exec(ctx, a1, (uint32_t)r);
         }
         ctx->regs[0] = host_ret(r);
         break;
@@ -459,8 +461,9 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
     case ARM_NR_recvfrom: {
         struct sockaddr *sa = (nr == ARM_NR_recvfrom && a4) ? a32_guest_ptr(ctx, a4) : NULL;
         socklen_t *salen    = (nr == ARM_NR_recvfrom && a5) ? (socklen_t *)a32_guest_ptr(ctx, a5) : NULL;
-        ctx->regs[0] = host_ret(recvfrom((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, (int)a3,
-                                         sa, salen));
+        ssize_t r = recvfrom((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, (int)a3, sa, salen);
+        if (r > 0) a32_vm32_copyout_invalidate_exec(ctx, a1, (uint32_t)r);
+        ctx->regs[0] = host_ret(r);
         break;
     }
 

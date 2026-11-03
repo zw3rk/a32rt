@@ -336,7 +336,11 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
             break;
         }
         FAIL_EFAULT_IF(a2 > 0U && a1 < 0x1000U);
-        ctx->regs[0] = host_ret(read((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2));
+        {
+            ssize_t rr = read((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2);
+            if (rr > 0) a32_vm32_copyout_invalidate_exec(ctx, a1, (uint32_t)rr);
+            ctx->regs[0] = host_ret(rr);
+        }
         break;
     }
 
