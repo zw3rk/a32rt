@@ -738,34 +738,19 @@ static int run_vfp_neon_tests(void)
         uint32_t zero = 0U;
         uint32_t s_out = 0U, s_neg_out = 0U, u_out = 0U, s_ok_out = 0U;
         uint32_t fpscr_s = 0U, fpscr_sn = 0U, fpscr_u = 0U, fpscr_ok = 0U;
-        __asm__ volatile(
-            "vmsr fpscr, %[zero]\n\t"
-            "vldr s0, %[big]\n\t"
-            "vcvt.s16.f32 s0, s0, #1\n\t"
-            "vmrs %[fpscr_s], fpscr\n\t"
-            "vmov %[s_out], s0\n\t"
-            "vmsr fpscr, %[zero]\n\t"
-            "vldr s0, %[neg]\n\t"
-            "vcvt.s16.f32 s0, s0, #1\n\t"
-            "vmrs %[fpscr_sn], fpscr\n\t"
-            "vmov %[s_neg_out], s0\n\t"
-            "vmsr fpscr, %[zero]\n\t"
-            "vldr s0, %[big]\n\t"
-            "vcvt.u16.f32 s0, s0, #1\n\t"
-            "vmrs %[fpscr_u], fpscr\n\t"
-            "vmov %[u_out], s0\n\t"
-            "vmsr fpscr, %[zero]\n\t"
-            "vldr s0, %[small]\n\t"
-            "vcvt.s16.f32 s0, s0, #1\n\t"
-            "vmrs %[fpscr_ok], fpscr\n\t"
-            "vmov %[s_ok_out], s0\n\t"
-            : [s_out] "=r"(s_out), [s_neg_out] "=r"(s_neg_out),
-              [u_out] "=r"(u_out), [s_ok_out] "=r"(s_ok_out),
-              [fpscr_s] "=r"(fpscr_s), [fpscr_sn] "=r"(fpscr_sn),
-              [fpscr_u] "=r"(fpscr_u), [fpscr_ok] "=r"(fpscr_ok)
-            : [big] "m"(big), [neg] "m"(neg), [small] "m"(small),
-              [zero] "r"(zero)
-            : "s0", "cc", "memory");
+#define VCVT_16_F32_STEP(mnem, in_v, out_v, out_fp)                            \
+    __asm__ volatile("vmsr fpscr, %[z]\n\t"                                    \
+                     "vldr s0, %[in]\n\t" mnem " s0, s0, #1\n\t"               \
+                     "vmrs %[fp], fpscr\n\t"                                   \
+                     "vmov %[out], s0\n\t"                                     \
+                     : [out] "=&r"(out_v), [fp] "=&r"(out_fp)                  \
+                     : [in] "m"(in_v), [z] "r"(zero)                           \
+                     : "s0", "cc", "memory")
+        VCVT_16_F32_STEP("vcvt.s16.f32", big, s_out, fpscr_s);
+        VCVT_16_F32_STEP("vcvt.s16.f32", neg, s_neg_out, fpscr_sn);
+        VCVT_16_F32_STEP("vcvt.u16.f32", big, u_out, fpscr_u);
+        VCVT_16_F32_STEP("vcvt.s16.f32", small, s_ok_out, fpscr_ok);
+#undef VCVT_16_F32_STEP
         if ((s_out & 0xFFFFU) != 0x7FFFU || (fpscr_s & 1U) == 0U) {
             return 38;
         }

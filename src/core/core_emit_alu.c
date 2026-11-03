@@ -484,7 +484,9 @@ static void vfp_flush_slot(a64_buf_t *b, unsigned slot, bool invalidate)
 {
     if ((b->vfp_slot_dirty & (1U << slot)) != 0U) {
         vfp_emit_raw_str(b, b->vfp_slot_kind[slot], 8U + slot, b->vfp_slot_reg[slot]);
-        b->vfp_slot_dirty &= ~(1U << slot);
+        if (invalidate || (!b->self_loop_vfp_active && b->cond_branch_depth == 0U)) {
+            b->vfp_slot_dirty &= ~(1U << slot);
+        }
     }
     if (invalidate) {
         b->vfp_slot_kind[slot] = A64_VFP_KIND_NONE;

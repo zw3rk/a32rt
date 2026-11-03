@@ -106,47 +106,40 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
             return 0;
         }
         /* Sub-page replacement (a 4 KiB guest range inside a larger
-         * host page): replacing the whole host page would detach the
-         * unaffected 4 KiB siblings from their backing, so snapshot
-         * the host page, install fresh storage, restore the siblings
-         * around the zeroed target, and keep the new pages private
-         * (shared replacements are always host-page-aligned by the
-         * gap rules in src/vm.c, so COPY is correct here).
-         * A32-R5-2: mixed shared/private sibling cases are rejected
-         * upstream in a32_vm_mmap_locked before reaching here. */
+         * host page): replacing a partial host page with MAP_FIXED
+         * would momentarily unmap and overwrite live 4 KiB siblings
+         * (e.g. an adjacent thread's stack). Full interior host pages
+         * have no siblings and get a fresh MAP_FIXED anonymous mapping;
+         * partial head/tail host pages are already private anonymous
+         * (A32-R5-2 rejects shared siblings upstream), so zeroing the
+         * target sub-pages in place preserves concurrent sibling state. */
         {
+            uintptr_t h_addr = (uintptr_t)hint_addr;
+            uintptr_t h_end = h_addr + len;
+            uintptr_t inner_start = (h_addr + hp - 1U) & ~(uintptr_t)(hp - 1U);
+            uintptr_t inner_end = h_end & ~(uintptr_t)(hp - 1U);
             size_t hlen = end - start;
-            uintptr_t off = (uintptr_t)hint_addr - start;
-            uint8_t *saved;
             if (shared != 0) {
                 return -EINVAL;
             }
-            saved = (uint8_t *)malloc(hlen);
-            if (saved == NULL) {
-                return -ENOMEM;
-            }
             if (mprotect((void *)start, hlen, PROT_READ | PROT_WRITE) != 0) {
-                int merr = errno;
-                free(saved);
-                return -merr;
+                return -errno;
             }
-            memcpy(saved, (void *)start, hlen);
-            res = mmap((void *)start, hlen, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (res == MAP_FAILED) {
-                int merr = errno;
-                free(saved);
-                return -merr;
+            if (inner_end > inner_start) {
+                res = mmap((void *)inner_start, inner_end - inner_start,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (res == MAP_FAILED) {
+                    return -errno;
+                }
             }
-            if (off > 0U) {
-                memcpy((void *)start, saved, off);
+            if (h_addr < inner_start) {
+                uintptr_t head_end = h_end < inner_start ? h_end : inner_start;
+                memset((void *)h_addr, 0, head_end - h_addr);
             }
-            if (off + len < hlen) {
-                memcpy((void *)(start + off + len), saved + off + len,
-                    hlen - off - len);
+            if (h_end > inner_end && inner_end >= inner_start) {
+                memset((void *)inner_end, 0, h_end - inner_end);
             }
-            memset((void *)(start + off), 0, len);
-            free(saved);
 #if defined(__APPLE__)
             if (minherit((void *)start, hlen, VM_INHERIT_COPY) != 0) {
                 return -errno;

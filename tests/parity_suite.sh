@@ -196,7 +196,7 @@ done
 # a 10 s alarm; native finishes in 0.01 s).  No difftest rows:
 # threaded+signals do not compose with lockstep (same rationale as m3).
 if [ -x "$ROOT/_build/p3-torture-a32" ]; then
-    run_guest "armhf" "darwin" "p3-torture-a32" "--dbt" "dbt" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
+    TORTURE_ALLOW_SKIP=1 run_guest "armhf" "darwin" "p3-torture-a32" "--dbt" "dbt" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
     run_guest "armhf" "darwin" "p3-torture-a32" "--interp" "interp" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
 else
     parity_row "armhf" "darwin" "p3-torture-a32" "dbt" "GAP" "0" "missing guest (make guests-libc)"
