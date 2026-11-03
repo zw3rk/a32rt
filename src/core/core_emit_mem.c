@@ -167,7 +167,11 @@ void a64_emit_guest_addr_x(a64_buf_t *b, unsigned dst_x, unsigned addr_w,
 static void emit_guest_mem(a64_buf_t *b, uint32_t opc, unsigned rt,
                            unsigned addr_w, bool is_store)
 {
-    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+    /* Flush even inside self-loops: a faulting access must observe
+     * current FP registers in ctx, since fault recovery cannot replay
+     * the loop's retained host SIMD state (A32-R7-5). Write-through keeps
+     * the slot mapping, so later iterations still avoid reloads. */
+    if (b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
     emit_site_record(b, opc, rt, addr_w, (uint32_t)b->count, is_store);
@@ -196,7 +200,7 @@ void a64_emit_guest_str_w(a64_buf_t *b, unsigned rt, unsigned addr_w)
 
 void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w)
 {
-    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+    if (b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
     a64_emit_guest_addr_x(b, A64_TMP2, addr_w, 8U, false);
@@ -209,7 +213,7 @@ void a64_emit_guest_ldrd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned add
 
 void a64_emit_guest_strd_w(a64_buf_t *b, unsigned rt, unsigned rt2, unsigned addr_w)
 {
-    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+    if (b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
     a64_emit_guest_addr_x(b, A64_TMP2, addr_w, 8U, true);

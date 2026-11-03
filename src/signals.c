@@ -305,11 +305,19 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
         ctx->altstack_flags         = A32_SS_DISABLE;
     }
 
+    /* Pack the architectural CPSR.IT bits from ctx->itstate so the handler
+     * observes and may replace the interrupted predication state through
+     * its ucontext (A32-R7-14). ITSTATE[7:2] -> CPSR[15:10], ITSTATE[1:0]
+     * -> CPSR[26:25]. */
+    uint32_t it = ctx->itstate & 0xFFU;
+    uint32_t arm_cpsr = (ctx->cpsr & ~A32_CPSR_IT_MASK) |
+        (((it & 0xFCU) << 8) | ((it & 0x03U) << 25));
+
     frame->uc.uc_mcontext.trap_no       = 0;
     frame->uc.uc_mcontext.error_code    = 0;
     frame->uc.uc_mcontext.oldmask       = (uint32_t)ctx->sig_mask;
     memcpy(&frame->uc.uc_mcontext.arm_r0, ctx->regs, sizeof(ctx->regs));
-    frame->uc.uc_mcontext.arm_cpsr      = ctx->cpsr;
+    frame->uc.uc_mcontext.arm_cpsr      = arm_cpsr;
     frame->uc.uc_mcontext.fault_address = ctx->fault_addr;
     frame->uc.uc_sigmask                = ctx->sig_mask;
 
@@ -461,6 +469,18 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         uint32_t pstate = (uint32_t)uc->uc_mcontext.pstate;
 #endif
         ctx->cpsr = (ctx->cpsr & ~A32_CPSR_NZCV_MASK) | (pstate & A32_CPSR_NZCV_MASK);
+
+        /* Merge native FPSR cumulative exception bits into the guest FPSCR
+         * before constructing the signal frame, mirroring the trampoline's
+         * block-exit merge. Otherwise FP work completed before a mid-block
+         * fault loses its exception flags on return from the handler
+         * (A32-R7-5). Same QC/IDC/IXC/UFC/OFC/DZC/IOC mask as JIT_RUN_BLOCK. */
+#if defined(__APPLE__)
+        uint32_t host_fpsr = uc->uc_mcontext->__ns.__fpsr;
+#else
+        uint32_t host_fpsr = (uint32_t)uc->uc_mcontext.fpsr;
+#endif
+        ctx->fpscr |= host_fpsr & 0x0800009FU;
 
         if ((sig == SIGSEGV || sig == SIGBUS) && info != NULL) {
             ctx->fault_addr = (uint32_t)((uintptr_t)info->si_addr - ctx->guest_base);
@@ -765,7 +785,14 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
 
     const a32_sigcontext_t *sc = &frame->uc.uc_mcontext;
     memcpy(ctx->regs, &sc->arm_r0, sizeof(ctx->regs));
-    ctx->cpsr     = sc->arm_cpsr;
+    /* Restore predication from the architectural CPSR.IT bits supplied in
+     * the user context and keep them out of the stored CPSR, which holds
+     * IT separately in ctx->itstate (A32-R7-14). */
+    uint32_t user_it = ((sc->arm_cpsr >> 8) & 0xFCU) | ((sc->arm_cpsr >> 25) & 0x03U);
+    if ((user_it & 0x0FU) == 0U || (user_it & 0xF0U) == 0xF0U) {
+        user_it = 0U;
+    }
+    ctx->cpsr     = sc->arm_cpsr & ~A32_CPSR_IT_MASK;
     ctx->sig_mask = frame->uc.uc_sigmask & ~A32_UNMASKABLE_SIGNALS;
     if (frame->magic == A32_SIGFRAME_MAGIC) {
         if (frame->saved_pad == 1U && (frame->saved_altstack_flags & 0x80000000U) != 0U) {
@@ -774,21 +801,9 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
             ctx->altstack_flags = frame->saved_altstack_flags;
         }
         ctx->fault_addr = frame->saved_fault;
-        uint32_t new_pc   = sc->arm_pc & ~1U;
-        uint32_t saved_pc = frame->saved_regs[15] & ~1U;
-        if (new_pc == saved_pc) {
-            ctx->itstate = frame->saved_itstate;
-        } else if (frame->saved_itstate != 0U &&
-                   (new_pc == saved_pc + 2U || new_pc == saved_pc + 4U)) {
-            uint32_t mask = (frame->saved_itstate << 1) & 0x1FU;
-            ctx->itstate = ((mask & 0x0FU) != 0U)
-                           ? ((frame->saved_itstate & 0xE0U) | mask)
-                           : 0U;
-        } else {
-            ctx->itstate = 0U;
-        }
+        ctx->itstate = user_it;
     } else {
-        ctx->itstate = 0U;
+        ctx->itstate = user_it;
     }
 
     const a32_vfp_sigframe_t *vfp = (const a32_vfp_sigframe_t *)(const void *)frame->uc.uc_regspace;

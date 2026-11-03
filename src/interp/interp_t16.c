@@ -475,7 +475,7 @@ bool a32_translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
         if (imm11 & 0x400) {
             imm11 |= (int32_t)0xFFFFF800U;
         }
-        uint32_t target = pc_val + (uint32_t)(imm11 << 1);
+        uint32_t target = pc_val + ((uint32_t)imm11 << 1);
         a64_emit_exit_branch_imm(b, target, false);
         if (is_uncond) {
             *out_ends_block = true;

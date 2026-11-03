@@ -45,6 +45,13 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
         return A32_EXIT_NONE;
     }
 
+    /* BKPT is unconditional inside an IT block: it always traps, even when
+     * the current IT condition fails, and preserves pre-instruction IT. */
+    if ((hw & 0xFF00U) == 0xBE00U) {
+        ctx->exit_reason = A32_EXIT_BKPT;
+        return A32_EXIT_BKPT;
+    }
+
     bool skip = false;
     if (use_it) {
         skip = !a32_interp_cond_passes(ctx->cpsr, cond);
@@ -62,35 +69,40 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
             ctx->exit_reason = A32_EXIT_SVC;
             goto adv_it_ret;
         }
-        if ((hw & 0xFF00U) == 0xBE00U) {
+        if (hw == 0xBF00U) {
+            /* Thumb NOP: successful completion, IT advances normally. */
             ctx->regs[15] = next;
-            ctx->exit_reason = A32_EXIT_BKPT;
-            goto adv_it_ret;
+            goto adv_it;
         }
-        if ((hw & 0xFF00U) == 0xDE00U || hw == 0xBF00U || hw == 0xBFA0U) {
-            ctx->regs[15] = next;
+        if ((hw & 0xFF00U) == 0xDE00U || hw == 0xBFA0U) {
             i_undef(ctx);
-            goto adv_it_ret;
+            goto trap_ret;
         }
         if ((hw >> 11) < 4U) {
             /* 000xx: LSL/LSR/ASR imm5, then ADD/SUB (register/imm3). */
             unsigned top = (hw >> 11) & 3U;
             unsigned rd = hw & 7U;
             if (top == 3U) {
-                unsigned sub = (hw >> 9) & 3U;
+                /* Bit 10 selects immediate (1) vs register (0); bit 9 selects
+                 * SUB (1) vs ADD (0). */
+                unsigned sel = (hw >> 9) & 3U;
                 unsigned rn = (hw >> 3) & 7U;
-                uint32_t op2 = ((sub & 1U) != 0U) ? (uint32_t)((hw >> 6) & 7U) :
+                bool is_imm = ((sel >> 1) & 1U) != 0U;
+                bool is_sub = (sel & 1U) != 0U;
+                uint32_t op2 = is_imm ? (uint32_t)((hw >> 6) & 7U) :
                     ctx->regs[(hw >> 6) & 7U];
                 bool c = false;
                 bool o = false;
                 uint32_t r;
-                if ((sub & 2U) != 0U) {
+                if (is_sub) {
                     r = i_add_carry(ctx->regs[rn], ~op2, 1U, &c, &o);
                 } else {
                     r = i_add_carry(ctx->regs[rn], op2, 0U, &c, &o);
                 }
                 ctx->regs[rd] = r;
-                i_set_nzcv(&ctx->cpsr, r, c, o);
+                if (!use_it) {
+                    i_set_nzcv(&ctx->cpsr, r, c, o);
+                }
             } else {
                 unsigned op = top;
                 unsigned rm = (hw >> 3) & 7U;
@@ -135,7 +147,9 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
             uint32_t imm = hw & 0xFFU;
             if (op == 0U) {
                 ctx->regs[rd] = imm;
-                i_set_nz(&ctx->cpsr, imm);
+                if (!use_it) {
+                    i_set_nz(&ctx->cpsr, imm);
+                }
             } else if (op == 1U) {
                 uint32_t a = ctx->regs[rd];
                 bool c = false;
@@ -148,15 +162,21 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 bool o = false;
                 uint32_t r = i_add_carry(ctx->regs[rd], imm, 0U, &c, &o);
                 ctx->regs[rd] = r;
-                i_set_nzcv(&ctx->cpsr, r, c, o);
+                if (!use_it) {
+                    i_set_nzcv(&ctx->cpsr, r, c, o);
+                }
             } else {
                 bool c = false;
                 bool o = false;
                 uint32_t r = i_add_carry(ctx->regs[rd], ~imm, 1U, &c, &o);
                 ctx->regs[rd] = r;
-                i_set_nzcv(&ctx->cpsr, r, c, o);
+                if (!use_it) {
+                    i_set_nzcv(&ctx->cpsr, r, c, o);
+                }
             }
-        } else if ((hw >> 12) == 0x4U) {
+        } else if ((hw & 0xF800U) == 0x4000U) {
+            /* 01000x: ALU ops / hi-reg ops / BX / BLX. The 01001x literal
+             * loads (0x4800-0x4FFF) decode separately below. */
             if (((hw >> 10) & 3U) == 0U) {
                 /* ALU ops on low regs. */
                 unsigned op = (hw >> 6) & 0xFU;
@@ -218,16 +238,22 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 if (w) {
                     ctx->regs[rd] = r;
                 }
-                if (op == 0x2U || op == 0x3U || op == 0x4U || op == 0x7U) {
-                    if ((b & 0xFFU) == 0U) {
-                        i_set_nz(&ctx->cpsr, r);
-                    } else {
-                        i_set_nzcv(&ctx->cpsr, r, c, (ctx->cpsr & A32_CPSR_V) != 0U);
-                    }
-                } else if (op == 0x5U || op == 0x6U || op == 0x9U || op == 0xAU || op == 0xBU) {
+                /* T16 ALU (T1) encodings suppress implicit flag writes inside
+                 * an IT block; explicit TST/CMP/CMN keep updating flags. */
+                if (op == 0x8U || op == 0xAU || op == 0xBU) {
                     i_set_nzcv(&ctx->cpsr, r, c, o);
-                } else {
-                    i_set_nz(&ctx->cpsr, r);
+                } else if (!use_it) {
+                    if (op == 0x2U || op == 0x3U || op == 0x4U || op == 0x7U) {
+                        if ((b & 0xFFU) == 0U) {
+                            i_set_nz(&ctx->cpsr, r);
+                        } else {
+                            i_set_nzcv(&ctx->cpsr, r, c, (ctx->cpsr & A32_CPSR_V) != 0U);
+                        }
+                    } else if (op == 0x5U || op == 0x6U || op == 0x9U) {
+                        i_set_nzcv(&ctx->cpsr, r, c, o);
+                    } else {
+                        i_set_nz(&ctx->cpsr, r);
+                    }
                 }
             } else {
                 /* Hi-reg ops / BX / BLX. */
@@ -236,7 +262,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 unsigned hs = (hw >> 6) & 1U;
                 unsigned rd = (hw & 7U) | (hd << 3);
                 unsigned rs = ((hw >> 3) & 7U) | (hs << 3);
-                uint32_t rv = (rs == 15U) ? ((pc + 4U) & ~3U) : ctx->regs[rs];
+                uint32_t rv = (rs == 15U) ? (pc + 4U) : ctx->regs[rs];
                 if (op == 3U) {
                     if (((hw >> 7) & 1U) != 0U) {
                         ctx->regs[14] = next | 1U;
@@ -244,7 +270,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     i_set_pc_branch(ctx, rv, true);
                     goto adv_it;
                 }
-                uint32_t dv = (rd == 15U) ? ((pc + 4U) & ~3U) : ctx->regs[rd];
+                uint32_t dv = (rd == 15U) ? (pc + 4U) : ctx->regs[rd];
                 uint32_t r = dv;
                 bool wback = true;
                 if (op == 0U) {
@@ -260,15 +286,13 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 }
                 if (rd == 15U) {
                     if (op == 0U || op == 2U) {
-                        i_set_pc_branch(ctx, r, (r & 1U) != 0U ? true : false);
-                        if ((r & 1U) == 0U) {
-                            ctx->cpsr &= ~A32_CPSR_T;
-                        }
+                        /* Thumb BranchWritePC: an even target stays in
+                         * Thumb state; never clear CPSR.T here. */
+                        i_set_pc_branch(ctx, r, false);
                         goto adv_it;
                     }
-                    ctx->regs[15] = next;
                     i_undef(ctx);
-                    goto adv_it_ret;
+                    goto trap_ret;
                 }
                 if (wback) {
                     ctx->regs[rd] = r;
@@ -283,10 +307,9 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 return A32_EXIT_FAULT;
             }
             ctx->regs[rt] = v;
-        } else if ((hw >> 12) == 0x5U || (hw >> 12) == 0x6U || (hw >> 12) == 0x7U || (hw >> 12) == 0x8U) {
-            /* Load/store word/byte/halfword, SP-relative, PUSH/POP-ish subset. */
-            if ((hw & 0xF000U) == 0x5000U) {
-                /* Register offset: STR/STRH/STRB/LDSB/LDR/LDRH/LDRB/LDSH. */
+        } else if ((hw >> 12) == 0x5U) {
+            /* Register offset (0101): STR/STRH/STRB/LDSB/LDR/LDRH/LDRB/LDSH. */
+            {
                 unsigned op = (hw >> 9) & 7U;
                 unsigned ro = (hw >> 6) & 7U;
                 unsigned rb = (hw >> 3) & 7U;
@@ -337,8 +360,10 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     }
                     ctx->regs[rt] = (uint32_t)(int32_t)hv;
                 }
-            } else if ((hw & 0xF800U) == 0x6000U || (hw & 0xF800U) == 0x6800U) {
-                /* STR/LDR/STRB/LDRB immediate. */
+            }
+        } else if ((hw >> 13) == 0x3U) {
+            /* Word/byte immediate offset (011x): STR/LDR/STRB/LDRB. */
+            {
                 bool l = ((hw >> 11) & 1U) != 0U;
                 bool byte = ((hw >> 12) & 1U) != 0U;
                 unsigned rt = hw & 7U;
@@ -370,8 +395,10 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                         }
                     }
                 }
-            } else if ((hw & 0xF800U) == 0x8000U) {
-                /* STRH/LDRH immediate. */
+            }
+        } else if ((hw >> 12) == 0x8U) {
+            /* Halfword immediate offset (1000): STRH/LDRH. */
+            {
                 bool l = ((hw >> 11) & 1U) != 0U;
                 unsigned rt = hw & 7U;
                 unsigned rb = (hw >> 3) & 7U;
@@ -388,8 +415,10 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                         return A32_EXIT_FAULT;
                     }
                 }
-            } else {
-                /* STR/LDR SP-relative. */
+            }
+        } else if ((hw >> 12) == 0x9U) {
+            /* SP-relative word transfer (1001): STR/LDR. */
+            {
                 bool l = ((hw >> 11) & 1U) != 0U;
                 unsigned rt = (hw >> 8) & 7U;
                 uint32_t ea = ctx->regs[13] + ((hw & 0xFFU) << 2);
@@ -419,7 +448,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
             if (list == 0U) {
                 ctx->regs[15] = next;
                 i_undef(ctx);
-                goto adv_it_ret;
+                goto trap_ret;
             }
             unsigned n = 0U;
             for (unsigned k = 0U; k < 8U; k++) {
@@ -429,6 +458,9 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
             }
             uint32_t addr = ctx->regs[rn];
             uint32_t cur = addr;
+            /* Retain Rn's value from its own list position (A32-R7-21);
+             * writeback is suppressed when Rn is in the list. */
+            uint32_t rn_val = 0U;
             for (unsigned r = 0U; r < 8U; r++) {
                 if (((list >> r) & 1U) == 0U) {
                     continue;
@@ -440,6 +472,8 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     }
                     if (r != rn) {
                         ctx->regs[r] = v;
+                    } else {
+                        rn_val = v;
                     }
                 } else {
                     if (!i_store_u32(ctx, cur, ctx->regs[r])) {
@@ -449,11 +483,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 cur += 4U;
             }
             if (l && ((list >> rn) & 1U) != 0U) {
-                uint32_t v = 0U;
-                if (!i_load_u32(ctx, addr + 4U * n - 4U, &v)) {
-                    return A32_EXIT_FAULT;
-                }
-                ctx->regs[rn] = v;
+                ctx->regs[rn] = rn_val;
             } else {
                 ctx->regs[rn] = addr + 4U * n;
             }
@@ -479,7 +509,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 } else {
                     ctx->regs[15] = next;
                     i_undef(ctx);
-                    goto adv_it_ret;
+                    goto trap_ret;
                 }
             } else {
                 if (op == 0U) {
@@ -567,7 +597,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
         } else {
             ctx->regs[15] = next;
             i_undef(ctx);
-            goto adv_it_ret;
+            goto trap_ret;
         }
     }
     ctx->regs[15] = next;
@@ -584,6 +614,10 @@ adv_it_ret:
         ctx->itstate = it_next(cur);
         a32_ctx_normalize_itstate(ctx, true);
     }
+    return ctx->exit_reason;
+trap_ret:
+    /* Retryable trap (UNDEF): preserve pre-instruction IT state and let
+     * the outer stepper restore the faulting PC (A32-R7-13). */
     return ctx->exit_reason;
 }
 
@@ -759,11 +793,14 @@ static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2
         ctx->regs[15] = next;
         return A32_EXIT_NONE;
     }
+    /* UDF.W (F7F0 A000): permanent undefined instruction. It must trap
+     * as UNDEF and never dispatch the syscall selected by r7 (A32-R7-1).
+     * The outer stepper restores the faulting PC; IT is preserved by the
+     * caller so retry uses the pre-instruction slot (A32-R7-13). */
     if (hw1 == 0xF7F0U && (hw2 & 0xFF00U) == 0xA000U) {
-        ctx->svc_imm = hw2 & 0xFFU;
         ctx->regs[15] = next;
-        ctx->exit_reason = A32_EXIT_SVC;
-        return A32_EXIT_SVC;
+        i_undef(ctx);
+        return A32_EXIT_UNDEF;
     }
     ctx->regs[15] = next;
     i_undef(ctx);
@@ -798,17 +835,13 @@ uint32_t i_thumb_step(a32_ctx_t *ctx, uint32_t pc)
     uint32_t rc = t32_step(ctx, pc, hw1, hw2);
     if (in_it && rc != A32_EXIT_SVC && rc != A32_EXIT_BKPT) {
         if (rc == A32_EXIT_NONE) {
-            uint8_t cur = (uint8_t)(ctx->itstate & 0xFFU);
-            /* t16 advanced itstate already only for 16-bit; do it here. */
-            if (ctx->regs[15] == pc + 4U) {
-                ctx->itstate = it_next(cur);
-                a32_ctx_normalize_itstate(ctx, true);
-            }
-        } else if (rc == A32_EXIT_UNDEF) {
+            /* Advance IT on completion independently of the branch
+             * destination; a taken branch still consumes its IT slot. */
             uint8_t cur = (uint8_t)(ctx->itstate & 0xFFU);
             ctx->itstate = it_next(cur);
             a32_ctx_normalize_itstate(ctx, true);
         }
+        /* UNDEF preserves pre-instruction IT so retry uses the same slot. */
     }
     return rc;
 }

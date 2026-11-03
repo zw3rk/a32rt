@@ -33,7 +33,7 @@ typedef struct {
     _Atomic(const a32_ctx_t *) owner;
     _Atomic uint32_t addr;
     _Atomic uint32_t size;
-    _Atomic uint32_t val;
+    _Atomic uint64_t val;
 } a32_ll_line_t;
 
 static a32_ll_line_t g_ll[A32_VM32_LL_LINES];
@@ -436,6 +436,11 @@ static void res_unlock(void)
     atomic_flag_clear_explicit(&g_res_lock, memory_order_release);
 }
 
+uint64_t a32_vm32_ll_epoch(uint32_t gva)
+{
+    return atomic_load(&g_ll[ll_index(gva & ~3U)].epoch);
+}
+
 void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     uint32_t val)
 {
@@ -444,6 +449,20 @@ void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     atomic_store(&g_ll[h].owner, ctx);
     atomic_store(&g_ll[h].addr, gva);
     atomic_store(&g_ll[h].size, (uint32_t)size);
+    atomic_store(&g_ll[h].val, (uint64_t)val);
+    if (ctx != NULL) {
+        ctx->ll_epoch_snap = atomic_load(&g_ll[h].epoch);
+    }
+    res_unlock();
+}
+
+void a32_vm32_ll_record64(a32_ctx_t *ctx, uint32_t gva, uint64_t val)
+{
+    uint32_t h = ll_index(gva & ~3U);
+    res_lock();
+    atomic_store(&g_ll[h].owner, ctx);
+    atomic_store(&g_ll[h].addr, gva);
+    atomic_store(&g_ll[h].size, 8U);
     atomic_store(&g_ll[h].val, val);
     if (ctx != NULL) {
         ctx->ll_epoch_snap = atomic_load(&g_ll[h].epoch);
@@ -534,4 +553,52 @@ consume:
     atomic_store(&g_ll[h].owner, NULL);
     res_unlock();
     return ok;
+}
+
+bool a32_vm32_sc_attempt64(a32_ctx_t *ctx, uint32_t gva, uint64_t val)
+{
+    uint32_t h = ll_index(gva & ~3U);
+    uint64_t snap;
+    uint64_t cur = 0ULL;
+    void *hva;
+    bool ok = false;
+    if (ctx == NULL) {
+        return false;
+    }
+    if ((gva & 7U) != 0U) {
+        return false;
+    }
+    res_lock();
+    if (atomic_load(&g_ll[h].owner) != ctx ||
+        atomic_load(&g_ll[h].addr) != gva ||
+        atomic_load(&g_ll[h].size) != 8U) {
+        goto consume64;
+    }
+    snap = atomic_load(&g_ll[h].epoch);
+    if (snap != ctx->ll_epoch_snap) {
+        goto consume64;
+    }
+    hva = (void *)((uintptr_t)ctx->guest_base + (uintptr_t)gva);
+    cur = __atomic_load_n((uint64_t *)(void *)hva, __ATOMIC_SEQ_CST);
+    if (cur != atomic_load(&g_ll[h].val) ||
+        snap != atomic_load(&g_ll[h].epoch)) {
+        goto consume64;
+    }
+    {
+        uint64_t e = cur;
+        ok = __atomic_compare_exchange_n((uint64_t *)(void *)hva, &e, val,
+            false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+consume64:
+    atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+    atomic_store(&g_ll[h].owner, NULL);
+    res_unlock();
+    return ok;
+}
+
+void a32_vm32_reservation_bump(uint32_t gva_aligned)
+{
+    uint32_t h = ll_index(gva_aligned & ~3U);
+    atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+    atomic_store(&g_ll[h].owner, NULL);
 }

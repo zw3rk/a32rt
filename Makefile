@@ -91,8 +91,10 @@ SRCS := src/main.c \
         src/gdb.c \
         src/interp/interp.c \
         src/interp/interp_a32.c \
+        src/interp/interp_a32_mem.c \
         src/interp/interp_thumb.c \
         src/interp/interp_vfp.c \
+        src/interp/interp_vfp_neon.c \
         src/dbt/difftest.c \
         src/vm/vm32.c \
         src/vm/vm_file.c \

@@ -151,16 +151,23 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
 #define A32_VM32_LL_LINES 1024U
 #define A32_VM32_LL_LINE_SHIFT 6U /* 64-byte lines */
 
+/* Current reservation-line epoch for gva (seqlock sampling for LDREX). */
+uint64_t a32_vm32_ll_epoch(uint32_t gva);
+
 /* Record an LDREX reservation: ctx ownership, address, size, and value
  * snapshot, plus the line epoch sampled with SEQ_CST. */
 void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     uint32_t val);
 
+/* 64-bit LDREXD/STREXD reservation operations (size is fixed at 8). */
+void a32_vm32_ll_record64(a32_ctx_t *ctx, uint32_t gva, uint64_t val);
+bool a32_vm32_sc_attempt64(a32_ctx_t *ctx, uint32_t gva, uint64_t val);
+
 /* Attempt STREX: verifies the local monitor (addr/size), the shared
  * owner/addr/epoch/value, then performs the store with a SEQ_CST atomic
  * CAS on HVA. True on success (Rd = 0), false on reservation loss
  * (Rd = 1). Either way the caller's reservation is consumed. Unaligned
- * addresses always fail (caller raises UNDEF). */
+ * addresses always fail (caller raises an alignment fault). */
 bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     uint32_t val);
 

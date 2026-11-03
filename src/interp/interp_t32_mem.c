@@ -530,6 +530,77 @@ static bool t32_insn_partially_updates_flags(const t32_insn_info_t *info)
     return false;
 }
 
+/* Synchronous-exit observation points for flag liveness (A32-R7-4):
+ * memory accesses, trap entrances and partially-decoded coprocessor
+ * classes whose handler observes the host NZCV state. Pure ALU and
+ * branch instructions are fully decoded for defined encodings and
+ * fault-free, so they are not observation points. */
+static bool t32_insn_may_fault(const t32_insn_info_t *info)
+{
+    uint16_t hw1 = info->hw1;
+    if (!info->is_32bit) {
+        if ((hw1 & 0xFF00U) == 0xDF00U) {
+            return true;
+        }
+        if ((hw1 & 0xFF00U) == 0xDE00U) {
+            return true;
+        }
+        if ((hw1 & 0xFF00U) == 0xBE00U) {
+            return true;
+        }
+        if ((hw1 >> 11) == 0x09U) {
+            return true;
+        }
+        if ((hw1 >> 12) == 0x5U) {
+            return true;
+        }
+        if ((hw1 >> 13) == 0x3U) {
+            return true;
+        }
+        if ((hw1 >> 12) == 0x8U) {
+            return true;
+        }
+        if ((hw1 >> 12) == 0x9U) {
+            return true;
+        }
+        if ((hw1 & 0xF000U) == 0xC000U) {
+            return true;
+        }
+        if ((hw1 & 0xFE00U) == 0xB400U) {
+            return true;
+        }
+        if ((hw1 & 0xFE00U) == 0xBC00U) {
+            return true;
+        }
+        return false;
+    }
+    /* EC-EF coprocessor / VFP / NEON, F3 misc and traps, F4-FF SIMD,
+     * memory and syscall-trap families: faultable or trap. F0/F1/F2 DP
+     * immediate, EA/EB DP register and FA/FB multiply/parallel groups are
+     * fully decoded for defined encodings and fault-free. */
+    uint8_t h1hi = (uint8_t)(hw1 >> 8);
+    if (h1hi >= 0xECU && h1hi < 0xF0U) {
+        return true;
+    }
+    if (h1hi >= 0xF3U) {
+        return true;
+    }
+    if (h1hi == 0xF2U && (info->hw2 & 0x8000U) != 0U) {
+        return true;
+    }
+    /* T32 LDMIA/STMIA/PUSH/POP (E8/E9). */
+    if ((hw1 & 0xF000U) == 0xE000U && (hw1 & 0x0E00U) == 0x0800U) {
+        return true;
+    }
+    /* T32 LDREX/STREX family. */
+    if ((hw1 & 0xFFF0U) == 0xEAC0U && (info->hw2 & 0x8010U) == 0U) {
+        return true;
+    }
+    /* Remaining 32-bit data processing and branches: fully decoded for
+     * defined encodings and fault-free, so not observation points. */
+    return false;
+}
+
 bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 {
     uint32_t pc = start_pc & ~1U;
@@ -658,7 +729,9 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         }
     }
 
-    /* Backward pass: determine NZCV flag liveness */
+    /* Backward pass: determine NZCV flag liveness. Synchronous exits
+     * observe host NZCV in the fault handler, so faultable instructions
+     * keep earlier flag writes live (A32-R7-4). */
     bool live = true;
     for (int i = (int)num_insns - 1; i >= 0; i--) {
         const t32_insn_info_t *info = &block_insns[i];
@@ -666,7 +739,8 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         if (t32_insn_overwrites_all_flags(info)) {
             live = false;
         } else if (info->is_it || info->itstate != 0U || t32_insn_reads_flags(info) ||
-                   (live && t32_insn_partially_updates_flags(info))) {
+                   (live && t32_insn_partially_updates_flags(info)) ||
+                   t32_insn_may_fault(info)) {
             live = true;
         }
     }

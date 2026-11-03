@@ -100,29 +100,33 @@ bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_v
             a64_emit_msr_cpsr_reg(b, A64_TMP0, (insn >> 16) & 0xFU);
             handled = true;
         } else if (op1 == 0U && ((insn & 0x0FB00FF0U) == 0x01000090U)) {
-            /* SWP / SWPB */
+            /* SWP / SWPB. The loaded value stays in a scratch register
+             * until the store succeeds, so a faulting swap never exposes
+             * a partial update in Rd (A32-R7-9). */
             bool b_bit = ((insn >> 22) & 1U) != 0U;
             unsigned rn = (insn >> 16) & 0xFU;
             unsigned rd = (insn >> 12) & 0xFU;
             unsigned rm = insn & 0xFU;
             unsigned src_raw = a32_load_reg(b, rm, pc_val, A64_TMP1);
             a64_emit_mov_w(b, A64_TMP1, src_raw);
-            unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
 
             /* Compute 64-bit host address in x22 = xG + uxtw(wRn) */
             a64_emit_guest_addr_x(b, A64_ADDR, rn, b_bit ? 1U : 4U, true);
 
             size_t loop_top = b->count;
             if (b_bit) {
-                a64_emit_ldxr_b(b, dst, A64_ADDR);
+                a64_emit_ldxr_b(b, A64_TMP0, A64_ADDR);
                 a64_emit_stxr_b(b, A64_TMP2, A64_TMP1, A64_ADDR);
             } else {
-                a64_emit_ldxr_w(b, dst, A64_ADDR);
+                a64_emit_ldxr_w(b, A64_TMP0, A64_ADDR);
                 a64_emit_stxr_w(b, A64_TMP2, A64_TMP1, A64_ADDR);
             }
             a64_emit(b, 0x35000000U |
                             ((((uint32_t)((int32_t)loop_top - (int32_t)b->count)) & 0x7FFFFU) << 5) |
                             A64_TMP2);
+            if (rd != 15U) {
+                a64_emit_mov_w(b, rd, A64_TMP0);
+            }
             handled = true;
         } else if (op1 == 0U && ((insn & 0x0F8000F0U) == 0x01800090U)) {
             /* Exclusives: LDREX / STREX / LDREXD / STREXD / LDREXB / STREXB / LDREXH / STREXH */

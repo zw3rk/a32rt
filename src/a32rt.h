@@ -25,6 +25,9 @@
 #define A32_CPSR_T (1U << 5)
 #define A32_CPSR_NZCV_MASK 0xF0000000U
 #define A32_CPSR_GE_MASK   0x000F0000U
+#define A32_CPSR_IT_72_MASK 0x0000FC00U /* CPSR[15:10] = ITSTATE[7:2] */
+#define A32_CPSR_IT_10_MASK 0x06000000U /* CPSR[26:25] = ITSTATE[1:0] */
+#define A32_CPSR_IT_MASK (A32_CPSR_IT_72_MASK | A32_CPSR_IT_10_MASK)
 
 /* Block exit reasons returned by a32_jit_run_block */
 #define A32_EXIT_NONE      0U
@@ -79,7 +82,7 @@ typedef struct a32_ctx {
     uint64_t guest_base;        /* Host base address G of [G, G+4GiB) window */
     uint32_t exit_reason;       /* A32_EXIT_* */
     uint32_t svc_imm;           /* SVC immediate */
-    uint32_t pad_it;            /* Reserved alignment slot */
+    uint32_t tls_tpidrurw;      /* CP15 c13 TPIDRURW (occupies former pad slot) */
     uint32_t fault_addr;        /* Faulting guest address */
     uint64_t vfp_d[32];         /* VFPv4-D32 / NEON registers (D0..D31 / S0..S31 / Q0..Q15) */
     uint32_t fpscr;             /* VFP/NEON Floating-Point Status and Control Register */
@@ -167,6 +170,7 @@ typedef struct a32_ctx {
 _Static_assert(offsetof(a32_ctx_t, regs) == 0, "regs must be at offset 0");
 _Static_assert(offsetof(a32_ctx_t, cpsr) == 64, "cpsr must be at offset 64");
 _Static_assert(offsetof(a32_ctx_t, tls_tp) == 68, "tls_tp must be at offset 68");
+_Static_assert(offsetof(a32_ctx_t, tls_tpidrurw) == 88, "tls_tpidrurw must be at offset 88");
 _Static_assert(offsetof(a32_ctx_t, guest_base) == 72, "guest_base must be at offset 72");
 _Static_assert(offsetof(a32_ctx_t, exit_reason) == 80, "exit_reason must be at offset 80");
 _Static_assert(offsetof(a32_ctx_t, svc_imm) == 84, "svc_imm must be at offset 84");

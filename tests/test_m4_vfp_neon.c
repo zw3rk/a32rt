@@ -730,6 +730,56 @@ static int run_vfp_neon_tests(void)
         }
     }
 
+    /* 16-bit float-to-fixed saturation sets FPSCR.IOC (A32-R7-31).
+     * fbits #1 doubles the input: 100000.0 overflows S16/U16 while
+     * 100.0 converts exactly, so only the saturating forms may set IOC. */
+    {
+        float big = 100000.0f, neg = -100000.0f, small = 100.0f;
+        uint32_t zero = 0U;
+        uint32_t s_out = 0U, s_neg_out = 0U, u_out = 0U, s_ok_out = 0U;
+        uint32_t fpscr_s = 0U, fpscr_sn = 0U, fpscr_u = 0U, fpscr_ok = 0U;
+        __asm__ volatile(
+            "vmsr fpscr, %[zero]\n\t"
+            "vldr s0, %[big]\n\t"
+            "vcvt.s16.f32 s0, s0, #1\n\t"
+            "vmrs %[fpscr_s], fpscr\n\t"
+            "vmov %[s_out], s0\n\t"
+            "vmsr fpscr, %[zero]\n\t"
+            "vldr s0, %[neg]\n\t"
+            "vcvt.s16.f32 s0, s0, #1\n\t"
+            "vmrs %[fpscr_sn], fpscr\n\t"
+            "vmov %[s_neg_out], s0\n\t"
+            "vmsr fpscr, %[zero]\n\t"
+            "vldr s0, %[big]\n\t"
+            "vcvt.u16.f32 s0, s0, #1\n\t"
+            "vmrs %[fpscr_u], fpscr\n\t"
+            "vmov %[u_out], s0\n\t"
+            "vmsr fpscr, %[zero]\n\t"
+            "vldr s0, %[small]\n\t"
+            "vcvt.s16.f32 s0, s0, #1\n\t"
+            "vmrs %[fpscr_ok], fpscr\n\t"
+            "vmov %[s_ok_out], s0\n\t"
+            : [s_out] "=r"(s_out), [s_neg_out] "=r"(s_neg_out),
+              [u_out] "=r"(u_out), [s_ok_out] "=r"(s_ok_out),
+              [fpscr_s] "=r"(fpscr_s), [fpscr_sn] "=r"(fpscr_sn),
+              [fpscr_u] "=r"(fpscr_u), [fpscr_ok] "=r"(fpscr_ok)
+            : [big] "m"(big), [neg] "m"(neg), [small] "m"(small),
+              [zero] "r"(zero)
+            : "s0", "cc", "memory");
+        if ((s_out & 0xFFFFU) != 0x7FFFU || (fpscr_s & 1U) == 0U) {
+            return 38;
+        }
+        if ((s_neg_out & 0xFFFFU) != 0x8000U || (fpscr_sn & 1U) == 0U) {
+            return 39;
+        }
+        if ((u_out & 0xFFFFU) != 0xFFFFU || (fpscr_u & 1U) == 0U) {
+            return 40;
+        }
+        if ((s_ok_out & 0xFFFFU) != 200U || (fpscr_ok & 1U) != 0U) {
+            return 41;
+        }
+    }
+
 
     {
         int rc = run_vfp_neon_part2();

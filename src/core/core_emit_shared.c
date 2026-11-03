@@ -482,12 +482,16 @@ bool a64_emit_cp15(a64_buf_t *b, uint32_t insn28)
 {
     unsigned rt = (insn28 >> 12) & 0xFU;
     uint32_t masked = insn28 & 0x0FFF0FFFU;
-    if (masked == 0x0E1D0F70U || masked == 0x0E1D0F50U) {
+    if (masked == 0x0E1D0F70U) {
         a64_emit_ldr_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, tls_tp));
         return true;
     }
+    if (masked == 0x0E1D0F50U) {
+        a64_emit_ldr_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, tls_tpidrurw));
+        return true;
+    }
     if (masked == 0x0E0D0F50U) {
-        a64_emit_str_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, tls_tp));
+        a64_emit_str_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, tls_tpidrurw));
         return true;
     }
     if (masked == 0x0E070FBAU) {
@@ -509,7 +513,9 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
                       bool l_bit, bool p_bit, bool u_bit, bool w_bit,
                       uint32_t pc_val, bool is_uncond, bool *out_ends_block)
 {
-    if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
+    /* Flush even inside self-loops so a faulting transfer observes current
+     * FP registers in ctx (A32-R7-5). */
+    if (b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
     }
 
@@ -536,24 +542,17 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
 
     /*
      * First/last-byte pre-validation: touch both ends of the transfer range
-     * before mutating any guest register, so an unmapped page (or a
-     * read-only page for stores) faults with clean architectural state
-     * instead of a partially-updated register file. Probes use scratch
-     * registers only (A64_TMP0, xzr) ahead of the transfer loop.
+     * before mutating any guest register, so an unmapped page faults with
+     * clean architectural state instead of a partially-updated register
+     * file. Probes are reads only and never modify guest memory: a
+     * read-modify-write probe could interleave with a peer store and
+     * expose a torn word assembled from neither architectural store
+     * (A32-R7-8).
      */
     if (count > 0U) {
-        if (l_bit) {
-            a64_emit_ldrb_imm_w(b, A64_ZR, A64_TMP2, 0U);
-            if (total_bytes > 1U) {
-                a64_emit_ldrb_imm_w(b, A64_ZR, A64_TMP2, total_bytes - 1U);
-            }
-        } else {
-            a64_emit_ldrb_imm_w(b, A64_TMP0, A64_TMP2, 0U);
-            a64_emit_strb_imm_w(b, A64_TMP0, A64_TMP2, 0U);
-            if (total_bytes > 1U) {
-                a64_emit_ldrb_imm_w(b, A64_TMP0, A64_TMP2, total_bytes - 1U);
-                a64_emit_strb_imm_w(b, A64_TMP0, A64_TMP2, total_bytes - 1U);
-            }
+        a64_emit_ldrb_imm_w(b, A64_ZR, A64_TMP2, 0U);
+        if (total_bytes > 1U) {
+            a64_emit_ldrb_imm_w(b, A64_ZR, A64_TMP2, total_bytes - 1U);
         }
     }
 

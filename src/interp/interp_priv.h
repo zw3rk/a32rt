@@ -4,8 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Internal to src/interp/. Defined in interp.c, used by interp_a32.c and
- * interp_thumb.c. Not part of the public difftest API (see interp.h).
+ * Internal to src/interp/. The i_* helpers are defined in interp.c and
+ * used by interp_a32.c and interp_thumb.c; i_a32_mem_step lives in
+ * interp_a32_mem.c and i_vfp_neon lives in interp_vfp_neon.c, both
+ * called from interp_a32.c / interp_vfp.c. Not part of the public
+ * difftest API (see interp.h).
  */
 
 #ifndef A32_INTERP_PRIV_H
@@ -33,5 +36,22 @@ void i_undef(a32_ctx_t *ctx);
 void i_set_pc_branch(a32_ctx_t *ctx, uint32_t target, bool interwork);
 uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc);
 uint32_t i_thumb_step(a32_ctx_t *ctx, uint32_t pc);
+/* Extra load/store + LDM/STM step (interp_a32_mem.c). Sets *claimed when
+ * insn is a memory-block encoding and returns its exit code. */
+uint32_t i_a32_mem_step(a32_ctx_t *ctx, uint32_t pc, uint32_t insn,
+    bool *claimed);
+/* NEON memory/VMOV-imm/VREV/VALU subset (interp_vfp_neon.c). */
+bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted);
+
+/* Narrow guest memory accessors shared by the VFP/NEON step files. */
+static inline bool mem_r(a32_ctx_t *ctx, uint32_t va, void *out, uint32_t len)
+{
+    return i_load_bytes(ctx, va, out, len);
+}
+
+static inline bool mem_w(a32_ctx_t *ctx, uint32_t va, const void *in, uint32_t len)
+{
+    return i_store_bytes(ctx, va, in, len);
+}
 
 #endif /* A32_INTERP_PRIV_H */

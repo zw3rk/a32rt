@@ -7,6 +7,20 @@
 
 #include "interp/decode_priv.h"
 
+/* OR FPSCR.IOC (bit 0) when the live NZCV flags select `cond` (A32-R7-31):
+ * 16-bit float-to-fixed saturation is an Invalid Operation. The LDR / MOV
+ * / ORR / CSEL / STR below leave NZCV untouched, so the caller's SUBS
+ * condition still selects. Clobbers TMP1/TMP2. */
+static void vfp_sat_set_ioc(a64_buf_t *b, unsigned cond)
+{
+    uint32_t fpscr_off = (uint32_t)offsetof(a32_ctx_t, fpscr);
+    a64_emit_ldr_imm_w(b, A64_TMP2, A64_XCTX, fpscr_off);
+    a64_emit_mov_imm32(b, A64_TMP1, 1U);
+    a64_emit_orr_reg_w(b, A64_TMP1, A64_TMP2, A64_TMP1, A64_SHIFT_LSL, 0U);
+    a64_emit_csel_w(b, A64_TMP2, A64_TMP1, A64_TMP2, cond);
+    a64_emit_str_imm_w(b, A64_TMP2, A64_XCTX, fpscr_off);
+}
+
 bool a32_decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 {
     unsigned cp_num = (insn >> 8) & 0xFU;
@@ -417,13 +431,16 @@ bool a32_decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                             a64_emit_mov_imm32(b, A64_TMP1, 0xFFFFU);
                             a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                             a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_HI);
+                            vfp_sat_set_ioc(b, A64_COND_HI);
                         } else {
                             a64_emit_mov_imm32(b, A64_TMP1, 0x7FFFU);
                             a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                             a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_GT);
+                            vfp_sat_set_ioc(b, A64_COND_GT);
                             a64_emit_mov_imm32(b, A64_TMP1, 0xFFFF8000U);
                             a64_emit_sub_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP1, A64_SHIFT_LSL, 0U);
                             a64_emit_csel_w(b, A64_TMP0, A64_TMP1, A64_TMP0, A64_COND_LT);
+                            vfp_sat_set_ioc(b, A64_COND_LT);
                         }
                         a64_emit_msr_nzcv(b, A64_TMP3);
                     }

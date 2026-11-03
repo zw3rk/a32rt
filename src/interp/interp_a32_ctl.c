@@ -148,6 +148,67 @@ static bool a32_insn_reads_flags(uint32_t insn)
 }
 
 /*
+ * Check if an instruction can take a synchronous exit (fault, UNDEF, SVC,
+ * BKPT) whose handler observes the host NZCV state. Such instructions are
+ * flag-observation points: flag writes before them must not be eliminated
+ * even when a later instruction overwrites the flags (A32-R7-4).
+ */
+static bool a32_insn_may_exit_sync(uint32_t insn)
+{
+    /* SVC / BKPT / UDF trap entrances. */
+    if ((insn & 0x0F000000U) == 0x0F000000U) {
+        return true;
+    }
+    if ((insn & 0x0FF000F0U) == 0x01200070U) {
+        return true;
+    }
+    if ((insn & 0x0FF000F0U) == 0x07F000F0U) {
+        return true;
+    }
+    /* SWP / SWPB (atomic swap may fault). */
+    if ((insn & 0x0FB00FF0U) == 0x01000090U) {
+        return true;
+    }
+    /* Exclusives (may fault on mapping or alignment). */
+    if ((insn & 0x0F8000F0U) == 0x01800090U) {
+        return true;
+    }
+    /* VFPv4-D32 / NEON / coprocessor (partial decode, may fault or UNDEF). */
+    if ((insn & 0x0E000000U) == 0x0C000000U) {
+        return true;
+    }
+    if ((insn & 0x0F000000U) == 0x0E000000U) {
+        /* Any CDP/MRC/MRC2/STC/LDC (handled VFP/NEON/CP15 or UNDEF). */
+        return true;
+    }
+    /* Unconditional space: VFP or UDF trap entrances. */
+    if (((insn >> 28) & 0xFU) == 0xFU) {
+        if ((insn & 0xFE000000U) == 0xF2000000U ||
+            (insn & 0xFF100000U) == 0xF4000000U ||
+            (insn & 0xFE000000U) == 0xFE000000U ||
+            (insn & 0x0FFFFFF0U) == 0x07F000F0U) {
+            return true;
+        }
+        return false;
+    }
+    unsigned op1 = (insn >> 25) & 7U;
+    /* Block transfer and single transfer (may fault). */
+    if (op1 == 4U) {
+        return true;
+    }
+    if (op1 == 2U || (op1 == 3U && ((insn & 0x10U) == 0U))) {
+        return true;
+    }
+    /* Media and extra load/store (partial decode, may fault or UNDEF). */
+    if (op1 == 3U) {
+        return true;
+    }
+    /* Data processing, multiply and misc ALU: fully decoded for defined
+     * encodings and fault-free, so not an observation point. */
+    return false;
+}
+
+/*
  * Check if an instruction unconditionally overwrites all 4 NZCV flags.
  */
 static bool a32_insn_overwrites_all_flags(uint32_t insn)
@@ -227,7 +288,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 imm24 |= (int32_t)0xFF000000U;
             }
             uint32_t h_bit = ((insn >> 24) & 1U) << 1;
-            uint32_t target = (pc_val + (uint32_t)(imm24 << 2) + h_bit) | 1U;
+            uint32_t target = (pc_val + ((uint32_t)imm24 << 2) + h_bit) | 1U;
             a64_emit_mov_pc32(b, 14U, pc + 4U);
             b->is_call = true;
             a64_emit_exit_branch_imm(b, target, true);
@@ -274,7 +335,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         if (imm24 & 0x00800000) {
             imm24 |= (int32_t)0xFF000000U;
         }
-        uint32_t target = pc_val + (uint32_t)(imm24 << 2);
+        uint32_t target = pc_val + ((uint32_t)imm24 << 2);
         if (link) {
             a64_emit_mov_pc32(b, 14U, pc + 4U);
             if (cond == A64_COND_AL) {
@@ -595,14 +656,17 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
             if (imm24 & 0x00800000) {
                 imm24 |= (int32_t)0xFF000000U;
             }
-            uint32_t target = insn_pc + 8U + (uint32_t)(imm24 << 2);
+            uint32_t target = insn_pc + 8U + ((uint32_t)imm24 << 2);
             if (target == pc) {
                 break;
             }
         }
     }
 
-    /* Liveness analysis: determine for each instruction whether NZCV flags output is live */
+    /* Liveness analysis: determine for each instruction whether NZCV flags output is live.
+     * Instructions that can take a synchronous exit observe the host NZCV
+     * state in the fault handler, so they keep earlier flag writes live
+     * even when a later instruction overwrites the flags (A32-R7-4). */
     bool live = true;
     for (int i = (int)num_insns - 1; i >= 0; i--) {
         uint32_t insn = block_insns[i];
@@ -610,7 +674,7 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         if (a32_insn_overwrites_all_flags(insn)) {
             live = false;
         }
-        if (a32_insn_reads_flags(insn)) {
+        if (a32_insn_reads_flags(insn) || a32_insn_may_exit_sync(insn)) {
             live = true;
         }
     }
