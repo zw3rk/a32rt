@@ -389,7 +389,8 @@ int a32_jit_run(a32_ctx_t *ctx)
             uint32_t next_pc = ctx->regs[15] & ~1U;
             if (cur_is_call && ctx->regs[14] != 0xFFFF0FA8U &&
                 lr_pc > cur_start && lr_pc == cur_end && next_pc != lr_pc) {
-                uint32_t ret_key = a32_make_key(lr_pc, is_thumb);
+                bool ret_thumb = (ctx->regs[14] & 1U) != 0U;
+                uint32_t ret_key = a32_make_key(lr_pc, ret_thumb);
                 uint32_t r_ibtc  = a32_ibtc_hash(ret_key, is_thumb);
                 uint32_t top     = ctx->ras_top;
                 a32_cache_entry_t *found_e    = NULL;

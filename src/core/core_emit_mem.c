@@ -9,6 +9,19 @@
 #include "dbt/aot/aot.h"
 
 extern uint32_t a32_jit_last_record_pc(void);
+extern uint32_t a32_jit_last_record_itstate(void);
+
+/* A2 Soft-TLB fault exits must preserve the pre-instruction ITSTATE so a
+ * faulting LDR/STR inside a Thumb IT block retains it for signal handling
+ * and retry, matching the UNDEF/BKPT/SVC exits. */
+static void emit_soft_tlb_fault_itstate(a64_buf_t *b, uint32_t itstate)
+{
+    if ((itstate & 0x0FU) != 0U) {
+        a64_emit_mov_imm32(b, A64_TMP0, itstate);
+        a64_emit_str_imm_w(b, A64_TMP0, A64_XCTX,
+            (uint32_t)offsetof(a32_ctx_t, itstate));
+    }
+}
 
 /* ---- Per-block AOT site staging (P2 #7) ---- */
 static a32_vm32_mem_site_t g_site_stage[A32_AOT_SITE_PER_BLOCK];
@@ -79,6 +92,7 @@ static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_spa
     uint16_t h2 = (uint16_t)((base >> 32) & 0xFFFFU);
     uint16_t h3 = (uint16_t)((base >> 48) & 0xFFFFU);
     uint32_t cur_pc = a32_jit_last_record_pc();
+    uint32_t itstate = a32_jit_last_record_itstate();
     uint32_t tag_off = is_store ? 16U : 0U;
 
     emit_movz_x(b, 21U, h0, 0U);
@@ -102,6 +116,7 @@ static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_spa
 
     if (byte_span <= 1U) {
         size_t cbz = a64_emit_cbz_w_placeholder(b, false, 23U);
+        emit_soft_tlb_fault_itstate(b, itstate);
         a64_emit_str_imm_w(b, addr_w, A64_XCTX,
             (uint32_t)offsetof(a32_ctx_t, fault_addr));
         a64_emit_mov_pc32(b, 15U, cur_pc);
@@ -131,6 +146,7 @@ static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_spa
         /* Second-page fault: fault_addr = addr_w + byte_span - 1 */
         a64_patch_cbz_w(b, cbz_wrap, b->count);
         a64_emit_add_imm_w(b, false, 23U, addr_w, (uint16_t)(byte_span - 1U), 0U);
+        emit_soft_tlb_fault_itstate(b, itstate);
         a64_emit_str_imm_w(b, 23U, A64_XCTX,
             (uint32_t)offsetof(a32_ctx_t, fault_addr));
         a64_emit_mov_pc32(b, 15U, cur_pc);
@@ -139,6 +155,7 @@ static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_spa
 
         /* First-page fault: fault_addr = addr_w */
         a64_patch_cbz_w(b, cbnz_miss0, b->count);
+        emit_soft_tlb_fault_itstate(b, itstate);
         a64_emit_str_imm_w(b, addr_w, A64_XCTX,
             (uint32_t)offsetof(a32_ctx_t, fault_addr));
         a64_emit_mov_pc32(b, 15U, cur_pc);

@@ -16,15 +16,22 @@
  * (AOT site tracking) without threading new parameters through the
  * frozen emitter headers. Translation runs under the JIT lock. */
 static uint32_t g_last_record_pc = 0U;
+static uint32_t g_last_record_itstate = 0U;
 
 uint32_t a32_jit_last_record_pc(void)
 {
     return g_last_record_pc;
 }
 
+uint32_t a32_jit_last_record_itstate(void)
+{
+    return g_last_record_itstate;
+}
+
 void a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t itstate)
 {
-    g_last_record_pc = guest_pc;
+    g_last_record_pc      = guest_pc;
+    g_last_record_itstate = itstate;
     if (g_stage_pc_map_count > 0U &&
         g_stage_pc_map[g_stage_pc_map_count - 1U].host_word_idx == host_word_idx) {
         g_stage_pc_map[g_stage_pc_map_count - 1U].guest_pc = guest_pc;

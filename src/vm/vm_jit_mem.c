@@ -82,6 +82,12 @@ static void flush_icache_range(a32_ctx_t *ctx, const void *start, size_t len)
     uintptr_t end  = (uintptr_t)start + len;
 
     if (ctx->has_host_info && (ctx->host_info.caps & A32H_CAP_ICACHE_TRAP_IALLU)) {
+        /* Clean dirty D-cache lines first: a trapped IC IVAU only invalidates
+         * I-cache and would otherwise fetch stale bytes. */
+        for (uintptr_t p = addr; p < end; p += 64U) {
+            __asm__ volatile("dc cvau, %0" : : "r"(p) : "memory");
+        }
+        __asm__ volatile("dsb ish" ::: "memory");
         /* Host (hl) invalidates entire I-cache on a single trapped IC IVAU */
         __asm__ volatile("ic ivau, %0\n\t"
                          "dsb ish\n\t"
