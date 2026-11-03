@@ -30,7 +30,7 @@
 /* Narrow arithmetic to separately-rounded operations: the host compiler
  * must not contract a * b + d into a fused multiply-add, otherwise VMLA
  * (non-fused) and VFMA (fused) become indistinguishable (A32-R7-29). */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#if defined(__clang__)
 #pragma STDC FP_CONTRACT OFF
 #endif
 

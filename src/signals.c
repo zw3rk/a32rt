@@ -472,15 +472,13 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
 #endif
         ctx->cpsr = (ctx->cpsr & ~A32_CPSR_NZCV_MASK) | (pstate & A32_CPSR_NZCV_MASK);
 
-        /* Merge native FPSR cumulative exception bits into the guest FPSCR
-         * before constructing the signal frame, mirroring the trampoline's
-         * block-exit merge. Otherwise FP work completed before a mid-block
-         * fault loses its exception flags on return from the handler
-         * (A32-R7-5). Same QC/IDC/IXC/UFC/OFC/DZC/IOC mask as JIT_RUN_BLOCK. */
+        /* Merge native FPSR cumulative exception bits into guest FPSCR
+         * before constructing the signal frame (A32-R7-5). */
 #if defined(__APPLE__)
         uint32_t host_fpsr = uc->uc_mcontext->__ns.__fpsr;
 #else
-        uint32_t host_fpsr = (uint32_t)uc->uc_mcontext.fpsr;
+        const uint32_t *fpctx = (const uint32_t *)uc->uc_mcontext.__reserved;
+        uint32_t host_fpsr = (fpctx[0] == 0x46508001U) ? fpctx[2] : 0U;
 #endif
         ctx->fpscr |= host_fpsr & 0x0800009FU;
 
