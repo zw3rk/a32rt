@@ -488,10 +488,33 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
             .msg_flags   = (int)gm->msg_flags,
         };
 
-        _Alignas(8) uint8_t cbuf64[1024] = { 0 };
+        _Alignas(8) uint8_t cbuf_st[1024] = { 0 };
+        uint8_t *cbuf64 = cbuf_st;
+        size_t cbuf_cap = sizeof(cbuf_st);
+        uint8_t *cbuf_dyn = NULL;
         if (gm->msg_control != 0U && gm->msg_controllen > 0U) {
             if (nr == ARM_NR_sendmsg) {
                 const uint8_t *gctl = (const uint8_t *)a32_guest_ptr(ctx, gm->msg_control);
+                uint32_t t32 = 0U;
+                size_t need64 = 0U;
+                while (t32 + 12U <= gm->msg_controllen) {
+                    uint32_t l32;
+                    memcpy(&l32, gctl + t32, 4);
+                    FAIL_EINVAL_IF(l32 < 12U || l32 > gm->msg_controllen - t32);
+                    need64 += CMSG_SPACE((size_t)(l32 - 12U));
+                    t32 += (l32 + 3U) & ~3U;
+                }
+                if (need64 > (64U * 1024U)) {
+                    FAIL_ERR(ENOBUFS);
+                }
+                if (need64 > cbuf_cap) {
+                    cbuf_dyn = (uint8_t *)malloc(need64);
+                    if (cbuf_dyn == NULL) {
+                        FAIL_ERR(ENOBUFS);
+                    }
+                    cbuf64 = cbuf_dyn;
+                    cbuf_cap = need64;
+                }
                 uint32_t off32 = 0U;
                 size_t off64 = 0U;
                 while (off32 + 12U <= gm->msg_controllen) {
@@ -500,12 +523,8 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                     memcpy(&len32, gctl + off32, 4);
                     memcpy(&level32, gctl + off32 + 4U, 4);
                     memcpy(&type32, gctl + off32 + 8U, 4);
-                    FAIL_EINVAL_IF(len32 < 12U || len32 > gm->msg_controllen - off32);
                     size_t payload_len = (size_t)(len32 - 12U);
                     size_t space64 = CMSG_SPACE(payload_len);
-                    if (off64 + space64 > sizeof(cbuf64)) {
-                        break;
-                    }
                     struct cmsghdr *cm64 = (struct cmsghdr *)(void *)(cbuf64 + off64);
                     cm64->cmsg_len   = CMSG_LEN(payload_len);
                     cm64->cmsg_level = (int)level32;
@@ -519,7 +538,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
             } else {
                 size_t cap64 = (size_t)gm->msg_controllen * 2U;
                 hm.msg_control    = cbuf64;
-                hm.msg_controllen = (cap64 > sizeof(cbuf64)) ? sizeof(cbuf64) : cap64;
+                hm.msg_controllen = (cap64 > cbuf_cap) ? cbuf_cap : cap64;
             }
         }
 
@@ -528,6 +547,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         int iov_rc = translate_guest_iov(ctx, gm->msg_iov, (int)gm->msg_iovlen,
                                          host_iov, 16U, &hiov);
         if (iov_rc < 0) {
+            free(cbuf_dyn);
             ctx->regs[0] = (uint32_t)iov_rc;
             break;
         }
@@ -536,10 +556,10 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
 
         ssize_t r = (nr == ARM_NR_sendmsg) ? sendmsg((int)a0, &hm, (int)a2)
                                            : recvmsg((int)a0, &hm, (int)a2);
-        if (r >= 0) {
+        if (r >= 0 && nr == ARM_NR_recvmsg) {
             gm->msg_namelen = (uint32_t)hm.msg_namelen;
             gm->msg_flags   = (uint32_t)hm.msg_flags;
-            if (nr == ARM_NR_recvmsg && gm->msg_control != 0U) {
+            if (gm->msg_control != 0U) {
                 uint8_t *gctl_out = (uint8_t *)a32_guest_ptr(ctx, gm->msg_control);
                 uint32_t off32 = 0U;
                 size_t off64 = 0U;
@@ -593,6 +613,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         if (hiov != host_iov) {
             free(hiov);
         }
+        free(cbuf_dyn);
         ctx->regs[0] = host_ret(r);
         break;
     }
@@ -604,10 +625,11 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         int nfds = (int)a0;
         FAIL_EINVAL_IF(nfds < 0);
         size_t fd_bytes32 = (((size_t)nfds + 31U) / 32U) * 4U;
-        uint32_t chk_bytes = (fd_bytes32 > 0U && fd_bytes32 <= 128U) ? (uint32_t)fd_bytes32 : 4U;
-        FAIL_EFAULT_IF((a1 != 0U && !a32_guest_range_ok(ctx, a1, chk_bytes, PROT_READ | PROT_WRITE)) ||
-                       (a2 != 0U && !a32_guest_range_ok(ctx, a2, chk_bytes, PROT_READ | PROT_WRITE)) ||
-                       (a3 != 0U && !a32_guest_range_ok(ctx, a3, chk_bytes, PROT_READ | PROT_WRITE)));
+        uint32_t fd_chk = (fd_bytes32 > 0x1000000U) ? 0U : (uint32_t)fd_bytes32;
+        FAIL_EINVAL_IF(fd_bytes32 > 0x1000000U);
+        FAIL_EFAULT_IF((a1 != 0U && fd_bytes32 > 0U && !a32_guest_range_ok(ctx, a1, fd_chk, PROT_READ | PROT_WRITE)) ||
+                       (a2 != 0U && fd_bytes32 > 0U && !a32_guest_range_ok(ctx, a2, fd_chk, PROT_READ | PROT_WRITE)) ||
+                       (a3 != 0U && fd_bytes32 > 0U && !a32_guest_range_ok(ctx, a3, fd_chk, PROT_READ | PROT_WRITE)));
         struct timespec host_ts;
         struct timespec *ts_ptr = NULL;
         bool time64 = (nr == ARM_NR_pselect6_time64);
@@ -653,6 +675,10 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         void *r_ptr = NULL;
         void *w_ptr = NULL;
         void *e_ptr = NULL;
+        uint8_t *r_dyn = NULL;
+        uint8_t *w_dyn = NULL;
+        uint8_t *e_dyn = NULL;
+        size_t host_bytes = (((size_t)nfds + 63U) / 64U) * 8U;
         if (nfds <= 1024) {
             if (a1 != 0U) {
                 memset(rset, 0, sizeof(rset));
@@ -670,9 +696,36 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                 e_ptr = eset;
             }
         } else {
-            r_ptr = (a1 != 0U) ? a32_guest_ptr(ctx, a1) : NULL;
-            w_ptr = (a2 != 0U) ? a32_guest_ptr(ctx, a2) : NULL;
-            e_ptr = (a3 != 0U) ? a32_guest_ptr(ctx, a3) : NULL;
+            if (a1 != 0U) {
+                r_dyn = (uint8_t *)malloc(host_bytes);
+                if (r_dyn == NULL) {
+                    FAIL_ERR(ENOMEM);
+                }
+                memset(r_dyn, 0, host_bytes);
+                memcpy(r_dyn, a32_guest_ptr(ctx, a1), fd_bytes32);
+                r_ptr = r_dyn;
+            }
+            if (a2 != 0U) {
+                w_dyn = (uint8_t *)malloc(host_bytes);
+                if (w_dyn == NULL) {
+                    free(r_dyn);
+                    FAIL_ERR(ENOMEM);
+                }
+                memset(w_dyn, 0, host_bytes);
+                memcpy(w_dyn, a32_guest_ptr(ctx, a2), fd_bytes32);
+                w_ptr = w_dyn;
+            }
+            if (a3 != 0U) {
+                e_dyn = (uint8_t *)malloc(host_bytes);
+                if (e_dyn == NULL) {
+                    free(r_dyn);
+                    free(w_dyn);
+                    FAIL_ERR(ENOMEM);
+                }
+                memset(e_dyn, 0, host_bytes);
+                memcpy(e_dyn, a32_guest_ptr(ctx, a3), fd_bytes32);
+                e_ptr = e_dyn;
+            }
         }
 
 #if defined(__linux__)
@@ -682,17 +735,32 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         long r = pselect(nfds, (fd_set *)r_ptr, (fd_set *)w_ptr, (fd_set *)e_ptr, ts_ptr, NULL);
 #endif
         int saved_errno = errno;
-        if (r >= 0 && nfds <= 1024) {
-            if (a1 != 0U) {
-                memcpy(a32_guest_ptr(ctx, a1), rset, fd_bytes32);
-            }
-            if (a2 != 0U) {
-                memcpy(a32_guest_ptr(ctx, a2), wset, fd_bytes32);
-            }
-            if (a3 != 0U) {
-                memcpy(a32_guest_ptr(ctx, a3), eset, fd_bytes32);
+        if (r >= 0) {
+            if (nfds <= 1024) {
+                if (a1 != 0U) {
+                    memcpy(a32_guest_ptr(ctx, a1), rset, fd_bytes32);
+                }
+                if (a2 != 0U) {
+                    memcpy(a32_guest_ptr(ctx, a2), wset, fd_bytes32);
+                }
+                if (a3 != 0U) {
+                    memcpy(a32_guest_ptr(ctx, a3), eset, fd_bytes32);
+                }
+            } else {
+                if (a1 != 0U) {
+                    memcpy(a32_guest_ptr(ctx, a1), r_dyn, fd_bytes32);
+                }
+                if (a2 != 0U) {
+                    memcpy(a32_guest_ptr(ctx, a2), w_dyn, fd_bytes32);
+                }
+                if (a3 != 0U) {
+                    memcpy(a32_guest_ptr(ctx, a3), e_dyn, fd_bytes32);
+                }
             }
         }
+        free(r_dyn);
+        free(w_dyn);
+        free(e_dyn);
         if (a4 != 0U && (r >= 0 || saved_errno == EINTR)) {
             uint32_t ts_sz = time64 ? (uint32_t)sizeof(arm_timespec64_t)
                                     : (uint32_t)sizeof(arm_timespec32_t);

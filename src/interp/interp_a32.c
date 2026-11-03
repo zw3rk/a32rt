@@ -161,8 +161,8 @@ static uint32_t a32_dp_step(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         if (((insn >> 8) & 0xFU) != 0U) {
             sh_carry = (op2 >> 31) & 1U;
         }
-    } else if (((insn >> 4) & 1U) != 0U && ((insn & 0x90U) != 0x90U || true)) {
-        /* Register-shifted or multiply encodings share this space. */
+    } else if (((insn >> 4) & 1U) != 0U) {
+        /* Bit4 set: register-shifted operand; multiply picked out inside. */
         if ((insn & 0x0E000090U) == 0x00000090U) {
             /* Multiply: MUL/MLA/MLS/UMAAL/UMULL/UMLAL/SMULL/SMLAL. */
             unsigned rn = insn & 0xFU;

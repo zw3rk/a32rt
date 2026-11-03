@@ -125,15 +125,19 @@ bool i_store_bytes(a32_ctx_t *ctx, uint32_t va, const void *in, uint32_t len)
         return false;
     }
     memcpy(a32_guest_ptr(ctx, va), in, len);
-    /* An ordinary store breaks LDREX reservations on every 64-byte line
-     * it touches, so a stale STREX fails instead of silently winning. */
-    {
-        uint64_t end = (uint64_t)va + (uint64_t)len;
-        uint64_t a = (uint64_t)(va & ~3U);
-        for (; a < end; a += 4U) {
-            a32_vm32_reservation_bump((uint32_t)a);
-        }
+    a32_vm32_copyout_invalidate(va, (size_t)len);
+    return true;
+}
+
+/* Instruction fetch: PROT_EXEC across all bytes (allows X-only pages). */
+static bool i_fetch_bytes(a32_ctx_t *ctx, uint32_t va, void *out, uint32_t len)
+{
+    if (!i_mem_ok(ctx, va, len, (uint32_t)PROT_EXEC)) {
+        ctx->fault_addr = va;
+        ctx->exit_reason = A32_EXIT_FAULT;
+        return false;
     }
+    memcpy(out, a32_guest_ptr(ctx, va), len);
     return true;
 }
 
@@ -141,7 +145,7 @@ bool i_store_bytes(a32_ctx_t *ctx, uint32_t va, const void *in, uint32_t len)
 bool i_fetch32(a32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     uint32_t v = 0U;
-    if (!i_load_bytes(ctx, va & ~3U, &v, 4U)) {
+    if (!i_fetch_bytes(ctx, va & ~3U, &v, 4U)) {
         return false;
     }
     *out = v;
@@ -152,7 +156,7 @@ bool i_fetch32(a32_ctx_t *ctx, uint32_t va, uint32_t *out)
 bool i_fetch16(a32_ctx_t *ctx, uint32_t va, uint16_t *out)
 {
     uint16_t v = 0U;
-    if (!i_load_bytes(ctx, va & ~1U, &v, 2U)) {
+    if (!i_fetch_bytes(ctx, va & ~1U, &v, 2U)) {
         return false;
     }
     *out = v;

@@ -133,40 +133,6 @@ static inline uint32_t ll_index(uint32_t gva_aligned)
     return (gva_aligned >> A32_VM32_LL_LINE_SHIFT) & (A32_VM32_LL_LINES - 1U);
 }
 
-bool a32_vm32_tlb_probe(uint32_t gva, bool is_store, uint32_t width,
-    uintptr_t *addend_out)
-{
-    uint32_t idx;
-    uint64_t tag;
-    if (width != 1U && width != 2U && width != 4U && width != 8U &&
-        width != 16U) {
-        return false;
-    }
-    if ((gva & (width - 1U)) != 0U) {
-        return false;
-    }
-    idx = tlb_index(gva);
-    tag = is_store
-        ? __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_ACQUIRE)
-        : __atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_ACQUIRE);
-    if (tag != (uint64_t)(gva & ~0xFFFU)) {
-        return false;
-    }
-    if (width > 1U && ((gva & 0xFFFU) + width - 1U) >> 12U != 0U) {
-        uint32_t idx2 = (idx + 1U) & (A32_VM32_TLB_SIZE - 1U);
-        uint64_t tag2 = is_store
-            ? __atomic_load_n(&g_tlb[idx2].write_tag, __ATOMIC_ACQUIRE)
-            : __atomic_load_n(&g_tlb[idx2].read_tag, __ATOMIC_ACQUIRE);
-        if (tag2 != (uint64_t)(((gva & ~0xFFFU) + 0x1000U) & 0xFFFFF000U)) {
-            return false;
-        }
-    }
-    if (addend_out != NULL) {
-        *addend_out = __atomic_load_n(&g_tlb[idx].addend, __ATOMIC_RELAXED);
-    }
-    return true;
-}
-
 void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     bool readable, bool writable)
 {
@@ -458,11 +424,23 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
 }
 
 /* ---- Shared LDREX/STREX reservation table ---- */
+static atomic_flag g_res_lock = ATOMIC_FLAG_INIT;
+static void res_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&g_res_lock,
+        memory_order_acquire)) {
+    }
+}
+static void res_unlock(void)
+{
+    atomic_flag_clear_explicit(&g_res_lock, memory_order_release);
+}
 
 void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     uint32_t val)
 {
     uint32_t h = ll_index(gva & ~3U);
+    res_lock();
     atomic_store(&g_ll[h].owner, ctx);
     atomic_store(&g_ll[h].addr, gva);
     atomic_store(&g_ll[h].size, (uint32_t)size);
@@ -470,13 +448,16 @@ void a32_vm32_ll_record(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     if (ctx != NULL) {
         ctx->ll_epoch_snap = atomic_load(&g_ll[h].epoch);
     }
+    res_unlock();
 }
 
 void a32_vm32_reservation_bump(uint32_t gva_aligned)
 {
     uint32_t h = ll_index(gva_aligned);
+    res_lock();
     atomic_fetch_add(&g_ll[h].epoch, 1ULL);
     atomic_store(&g_ll[h].owner, NULL);
+    res_unlock();
 }
 
 void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
@@ -490,12 +471,13 @@ void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
     if (end > 0x100000000ULL) {
         end = 0x100000000ULL;
     }
-    /* Every 64-byte bucket the write touches: ll_index() hashes each
-     * 64-byte line, so stepping by 64 covers the span exactly. */
-    line = (uint64_t)(gva & ~63U);
-    for (; line < end; line += 64U) {
-        a32_vm32_reservation_bump((uint32_t)line);
+    res_lock();
+    for (line = (uint64_t)(gva & ~63U); line < end; line += 64U) {
+        uint32_t h = ll_index((uint32_t)line);
+        atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+        atomic_store(&g_ll[h].owner, NULL);
     }
+    res_unlock();
 }
 
 bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
@@ -515,6 +497,7 @@ bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
     if ((gva & (size - 1U)) != 0U) {
         return false;
     }
+    res_lock();
     if (atomic_load(&g_ll[h].owner) != ctx ||
         atomic_load(&g_ll[h].addr) != gva ||
         atomic_load(&g_ll[h].size) != size) {
@@ -552,5 +535,6 @@ bool a32_vm32_sc_attempt(a32_ctx_t *ctx, uint32_t gva, unsigned size,
 consume:
     atomic_fetch_add(&g_ll[h].epoch, 1ULL);
     atomic_store(&g_ll[h].owner, NULL);
+    res_unlock();
     return ok;
 }

@@ -82,7 +82,7 @@ static int mremap_priv_lookup(uint32_t old_addr, uint32_t old_end,
  * pages carry real bytes, so the source and destination host protections
  * are temporarily widened for the copy unless the page was cut by EOF
  * truncation (A32-R3-3 follow-up 3). */
-static void mremap_copy_prefix(a32_ctx_t *ctx, uint32_t new_va,
+static int mremap_copy_prefix(a32_ctx_t *ctx, uint32_t new_va,
     uint32_t old_addr, uint32_t copy_len)
 {
     uint32_t off = 0U;
@@ -90,6 +90,7 @@ static void mremap_copy_prefix(a32_ctx_t *ctx, uint32_t new_va,
         uint32_t chunk = copy_len - off;
         void *src;
         void *dst;
+        int rc;
         if (chunk > 0x1000U) {
             chunk = 0x1000U;
         }
@@ -101,17 +102,22 @@ static void mremap_copy_prefix(a32_ctx_t *ctx, uint32_t new_va,
         dst = a32_guest_ptr(ctx, new_va + off);
         if (!a32_vm32_range_prot_ok(old_addr + off, chunk,
                 (uint32_t)PROT_READ)) {
-            (void)a32_backend_protect(src, chunk,
-                PROT_READ | PROT_WRITE);
+            rc = a32_backend_protect(src, chunk, PROT_READ | PROT_WRITE);
+            if (rc != 0) {
+                return rc;
+            }
         }
         if (!a32_vm32_range_prot_ok(new_va + off, chunk,
                 (uint32_t)PROT_WRITE)) {
-            (void)a32_backend_protect(dst, chunk,
-                PROT_READ | PROT_WRITE);
+            rc = a32_backend_protect(dst, chunk, PROT_READ | PROT_WRITE);
+            if (rc != 0) {
+                return rc;
+            }
         }
         memcpy(dst, src, chunk);
         off += chunk;
     }
+    return 0;
 }
 
 uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
@@ -270,15 +276,30 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         return new_va;
     }
 
-    if (!is_sh_file) {
-        if ((prot & 0x1U) == 0U) {
-            (void)a32_backend_protect(a32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
-        }
+    bool src_wide = !is_sh_file && (prot & 0x1U) == 0U;
+    int pre_rc = 0;
+    if (src_wide) {
+        pre_rc = a32_backend_protect(a32_guest_ptr(ctx, old_addr),
+            (size_t)old_aligned, PROT_READ);
+    }
+    if (pre_rc == 0 && !is_sh_file) {
         uint32_t copy_len = (uint32_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
-        mremap_copy_prefix(ctx, new_va, old_addr, copy_len);
-        if (prot != 0x3U) {
-            (void)a32_vm_protect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
+        pre_rc = mremap_copy_prefix(ctx, new_va, old_addr, copy_len);
+        if (pre_rc == 0 && prot != 0x3U) {
+            pre_rc = a32_vm_protect_locked(ctx, new_va,
+                (uint32_t)new_aligned, prot);
         }
+    }
+    if (pre_rc != 0) {
+        if (src_wide) {
+            (void)a32_backend_protect(a32_guest_ptr(ctx, old_addr),
+                (size_t)old_aligned, a32_host_prot(ctx, prot));
+        }
+        (void)a32_vm_unmap_locked(ctx, new_va, (uint32_t)new_aligned);
+        mremap_priv_release(&priv);
+        a32_vm_sync_to_ctx(ctx);
+        a32_vm_lock_release();
+        return (uint32_t)pre_rc;
     }
     mremap_priv_release(&priv);
     /* Roll back on retire failure (A32-R4-6): the new mapping is fully
@@ -288,6 +309,10 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         int unmap_rc = a32_vm_unmap_locked(ctx, old_addr,
             (uint32_t)old_aligned);
         if (unmap_rc != 0) {
+            if (src_wide) {
+                (void)a32_backend_protect(a32_guest_ptr(ctx, old_addr),
+                    (size_t)old_aligned, a32_host_prot(ctx, prot));
+            }
             (void)a32_vm_unmap_locked(ctx, new_va, (uint32_t)new_aligned);
             a32_vm_sync_to_ctx(ctx);
             a32_vm_lock_release();

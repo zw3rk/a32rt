@@ -94,12 +94,6 @@ typedef struct {
 _Static_assert(sizeof(a32_vm32_tlb_entry_t) == 32,
     "Soft-TLB entry must be 32 bytes");
 
-/* Fast-path probe: true on tag hit with N-byte alignment, addend out.
- * Instructions 1-6 of the emitted sequence have no PSTATE or x0/x1 side
- * effects, so a miss cleanly reaches the 2-insn per-site stub. */
-bool a32_vm32_tlb_probe(uint32_t gva, bool is_store, uint32_t width,
-    uintptr_t *addend_out);
-
 /* Slow path shared by every .L_tlb_miss_site_k stub (ctx, x1 = gva,
  * x0 = value, block id, 16-bit site index intact). Returns 0 and fills
  * hva_out on success, negative guest-signal code on fault. */

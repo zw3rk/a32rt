@@ -278,9 +278,7 @@ static void deliver_guest_signal(a32_ctx_t *ctx, int sig, guest_sigaction_t *act
     }
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, frame_va);
     memset(frame, 0, sizeof(*frame));
-    for (uint32_t off = 0U; off < (uint32_t)sizeof(a32_rt_sigframe_t); off += 4U) {
-        a32_vm32_reservation_bump(frame_va + off);
-    }
+    a32_vm32_copyout_invalidate(frame_va, sizeof(*frame));
 
     frame->retcode[0]    = 0xE3A070ADU; /* mov r7, #173 (ARM_NR_rt_sigreturn) */
     frame->retcode[1]    = 0xEF000000U; /* svc #0 */

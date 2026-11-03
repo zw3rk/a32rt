@@ -111,7 +111,9 @@ int a32_backend_map_anon(void *hint_addr, size_t len, int linux_prot,
          * the host page, install fresh storage, restore the siblings
          * around the zeroed target, and keep the new pages private
          * (shared replacements are always host-page-aligned by the
-         * gap rules in src/vm.c, so COPY is correct here). */
+         * gap rules in src/vm.c, so COPY is correct here).
+         * A32-R5-2: mixed shared/private sibling cases are rejected
+         * upstream in a32_vm_mmap_locked before reaching here. */
         {
             size_t hlen = end - start;
             uintptr_t off = (uintptr_t)hint_addr - start;

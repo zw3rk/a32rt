@@ -687,6 +687,21 @@ uint32_t a32_vm_mmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_
         a32_vmfile_check_replace(target_va, target_end, is_shared) != 0) {
         return (uint32_t)(-ENOMEM);
     }
+    /* A32-R5-2: private replace must not detach shared host-page siblings. */
+    {
+        size_t hp = a32_backend_page_size();
+        if (hp > 4096U && !is_shared) {
+            uint64_t ps[2] = { (uint64_t)target_va & ~(hp - 1U), ((uint64_t)target_end - 1U) & ~(hp - 1U) };
+            for (unsigned k = 0U; k < 2U; k++) {
+                uint64_t p = ps[k], s;
+                if ((uint64_t)target_va <= p && p + hp <= (uint64_t)target_end) continue;
+                for (s = p; s < p + hp; s += 4096U) {
+                    int f = -1; uint32_t o = 0U;
+                    if ((s < target_va || s + 4096U > target_end) && a32_vmfile_lookup_shared((uint32_t)s, &f, &o)) return (uint32_t)(-EINVAL);
+                }
+            }
+        }
+    }
     /* A32-R3-1: retire the previous mapping (regions, Soft-TLB, file
      * tracking) BEFORE installing the new host mapping, then publish the
      * new region and its backing together. Retiring first also frees the
