@@ -653,8 +653,8 @@ static inline int translate_open_flags(uint32_t guest_flags)
     if (guest_flags & 0x00000400U) f |= O_APPEND;
     if (guest_flags & 0x00000800U) f |= O_NONBLOCK;
     if (guest_flags & 0x00001000U) f |= O_DSYNC;
-    if (guest_flags & (0x00004000U | 0x00010000U)) f |= O_DIRECTORY;
-    if (guest_flags & (0x00008000U | 0x00020000U)) f |= O_NOFOLLOW;
+    if (guest_flags & 0x00004000U) f |= O_DIRECTORY;
+    if (guest_flags & 0x00008000U) f |= O_NOFOLLOW;
     if (guest_flags & 0x00080000U) f |= O_CLOEXEC;
     return f;
 #else
@@ -774,7 +774,7 @@ int   a32_sys_translate_guest_iov(a32_ctx_t *ctx, uint32_t iov_va, uint32_t iovc
                                   struct iovec **out_iov, uint32_t req_prot);
 bool  a32_sys_read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count, int *out_count);
 #if !defined(__linux__)
-bool  a32_sys_futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
+bool  a32_sys_futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t op,
                                 uint32_t a2, uint32_t a3, uint32_t a5, bool time64);
 #endif
 

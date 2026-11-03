@@ -225,9 +225,10 @@ bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count,
 
 /* Darwin futex WAIT emulation (no kernel waits). Guest Linux errnos. */
 #if !defined(__linux__)
-bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
+bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t op,
                        uint32_t a2, uint32_t a3, uint32_t a5, bool time64)
 {
+    uint32_t basic_op = op & 0x7FU;
     uint32_t *uaddr = (uint32_t *)a32_guest_ptr(ctx, a0);
     if (basic_op == 9U && a5 == 0U) {
         ctx->regs[0] = (uint32_t)-EINVAL;
@@ -253,18 +254,19 @@ bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t basic_op,
         long ds;
         long dn;
         if (read_guest_timespec(ctx, a3, time64, &end_m)) {
-            struct timespec rem;
-            (void)clock_gettime(CLOCK_MONOTONIC, &now_m);
-            ds = (long)(end_m.tv_sec - now_m.tv_sec);
-            dn = (long)(end_m.tv_nsec - now_m.tv_nsec);
-            if (dn < 0L) {
-                ds -= 1L;
-                dn += 1000000000L;
-            }
-            if (ds >= 0L) {
-                rem.tv_sec = (time_t)ds;
-                rem.tv_nsec = dn;
-                (void)nanosleep(&rem, NULL);
+            if (end_m.tv_sec < 0 || end_m.tv_nsec < 0 || end_m.tv_nsec >= 1000000000L) { ctx->regs[0] = (uint32_t)-EINVAL; return true; }
+            if (basic_op == 0U) {
+                (void)nanosleep(&end_m, NULL);
+            } else {
+                (void)clock_gettime((op & 0x100U) ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now_m);
+                ds = (long)(end_m.tv_sec - now_m.tv_sec);
+                dn = (long)(end_m.tv_nsec - now_m.tv_nsec);
+                if (dn < 0L) { ds -= 1L; dn += 1000000000L; }
+                if (ds >= 0L) {
+                    end_m.tv_sec = (time_t)ds;
+                    end_m.tv_nsec = dn;
+                    (void)nanosleep(&end_m, NULL);
+                }
             }
         }
     }
@@ -695,7 +697,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
         int dirfd        = is_at ? translate_at_fd(a0) : AT_FDCWD;
         uint32_t path_va = is_at ? a1 : a0;
         uint32_t mode    = is_at ? a2 : a1;
-        uint32_t gflags  = (nr == ARM_NR_faccessat2) ? a3 : 0U;
+        uint32_t gflags  = (nr == ARM_NR_faccessat2) ? a3 : ((nr == ARM_NR_faccessat && (a3 & ~(0x100U | 0x200U)) == 0U) ? a3 : 0U);
         FAIL_EINVAL_IF((is_at && (mode & ~7U) != 0U) ||
                        (gflags & ~(0x100U | 0x200U | 0x1000U)) != 0U);
         int hflags       = ((gflags & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0) |
@@ -713,7 +715,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
 #endif
             ctx->regs[0] = host_ret(rc);
         } else {
-            ctx->regs[0] = host_ret(faccessat(dirfd, resolved, (int)mode, 0));
+            ctx->regs[0] = host_ret(faccessat(dirfd, resolved, (int)mode, hflags));
         }
         break;
     }

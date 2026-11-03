@@ -829,7 +829,7 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
                                         (int)a1, a2, arg4, uaddr2, a5));
 #else
         (void)arg4; (void)uaddr2;
-        if (!futex_darwin_wait(ctx, a0, basic_op, a2, a3, a5, time64)) {
+        if (!futex_darwin_wait(ctx, a0, a1, a2, a3, a5, time64)) {
             ctx->regs[0] = 0U;
         }
 #endif
