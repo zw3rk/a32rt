@@ -8,7 +8,7 @@
 #include "os/sys_priv.h"
 
 #define SIGFD_MAX 32
-static struct { int fd; uint64_t mask; int flags; bool used; } g_sigfd[32];
+static struct { int fd; uint64_t mask; int flags; bool used; } g_sigfd[SIGFD_MAX];
 void a32_sigfd_track(int fd, uint64_t mask, int flags)
 {
     for (int i = 0; i < SIGFD_MAX; i++) {
@@ -332,15 +332,12 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
             a32_sigfd_track(hfd, gmask, (int)a3);
             ctx->regs[0] = (uint32_t)hfd;
         } else {
-            uint64_t old = 0ULL; int ofl = 0;
-            bool known = a32_sigfd_lookup((int)a0, &old, &ofl);
             sigset_t hmask;
             memset(&hmask, 0, sizeof(hmask));
             memcpy(&hmask, &gmask, sizeof(uint64_t));
             int hfd = (int)syscall(SYS_signalfd4, (int)a0, &hmask, (size_t)8, (int)a3);
             if (hfd < 0) FAIL_ERR(errno);
             a32_sigfd_track(hfd, gmask, (int)a3);
-            (void)known; (void)old;
             ctx->regs[0] = (uint32_t)hfd;
         }
 #else
@@ -537,18 +534,19 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a1, (uint32_t)sizeof(arm_msghdr32_t),
                                            (nr == ARM_NR_recvmsg) ? (PROT_READ | PROT_WRITE) : PROT_READ));
         arm_msghdr32_t *gm = (arm_msghdr32_t *)a32_guest_ptr(ctx, a1);
-        if (gm->msg_iovlen > 1024U) {
+        arm_msghdr32_t hdr = *gm;
+        if (hdr.msg_iovlen > 1024U) {
             FAIL_ERR(EMSGSIZE);
         }
-        FAIL_EINVAL_IF(nr == ARM_NR_sendmsg && gm->msg_controllen > 0U && gm->msg_controllen < 12U);
-        FAIL_EFAULT_IF((gm->msg_name != 0U && gm->msg_name < 0x1000U) ||
-                       (gm->msg_controllen != 0U &&
-                        !a32_guest_range_ok(ctx, gm->msg_control, gm->msg_controllen,
+        FAIL_EINVAL_IF(nr == ARM_NR_sendmsg && hdr.msg_controllen > 0U && hdr.msg_controllen < 12U);
+        FAIL_EFAULT_IF((hdr.msg_name != 0U && hdr.msg_name < 0x1000U) ||
+                       (hdr.msg_controllen != 0U &&
+                        !a32_guest_range_ok(ctx, hdr.msg_control, hdr.msg_controllen,
                                             (nr == ARM_NR_recvmsg) ? PROT_WRITE : PROT_READ)));
         struct msghdr hm = {
-            .msg_name    = (gm->msg_name != 0U) ? a32_guest_ptr(ctx, gm->msg_name) : NULL,
-            .msg_namelen = (socklen_t)gm->msg_namelen,
-            .msg_flags   = (int)gm->msg_flags,
+            .msg_name    = (hdr.msg_name != 0U) ? a32_guest_ptr(ctx, hdr.msg_name) : NULL,
+            .msg_namelen = (socklen_t)hdr.msg_namelen,
+            .msg_flags   = (int)hdr.msg_flags,
         };
 
         _Alignas(8) uint8_t cbuf_st[1024] = { 0 };
@@ -556,12 +554,12 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
         size_t cbuf_cap = sizeof(cbuf_st);
         uint8_t *cbuf_dyn = NULL;
         uint8_t *csnap = NULL;
-        uint32_t ctl_len = gm->msg_controllen;
-        if (gm->msg_control != 0U && ctl_len > 0U) {
+        uint32_t ctl_len = hdr.msg_controllen;
+        if (hdr.msg_control != 0U && ctl_len > 0U) {
             if (nr == ARM_NR_sendmsg) {
                 csnap = (uint8_t *)malloc(ctl_len);
                 if (csnap == NULL) FAIL_ERR(ENOBUFS);
-                memcpy(csnap, a32_guest_ptr(ctx, gm->msg_control), ctl_len);
+                memcpy(csnap, a32_guest_ptr(ctx, hdr.msg_control), ctl_len);
                 const uint8_t *gctl = csnap;
                 uint32_t t32 = 0U;
                 size_t need64 = 0U;
@@ -602,7 +600,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                 hm.msg_control    = (off64 > 0U) ? cbuf64 : NULL;
                 hm.msg_controllen = off64;
             } else {
-                size_t cap64 = (size_t)gm->msg_controllen * 2U;
+                size_t cap64 = (size_t)hdr.msg_controllen * 2U;
                 hm.msg_control    = cbuf64;
                 hm.msg_controllen = (cap64 > cbuf_cap) ? cbuf_cap : cap64;
             }
@@ -610,7 +608,7 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
 
         struct iovec host_iov[16];
         struct iovec *hiov = NULL;
-        int iov_rc = translate_guest_iov(ctx, gm->msg_iov, (int)gm->msg_iovlen,
+        int iov_rc = translate_guest_iov(ctx, hdr.msg_iov, (int)hdr.msg_iovlen,
                                          host_iov, 16U, &hiov);
         if (iov_rc < 0) {
             free(cbuf_dyn);
@@ -618,16 +616,16 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)iov_rc;
             break;
         }
-        hm.msg_iov    = (gm->msg_iovlen > 0U) ? hiov : NULL;
-        hm.msg_iovlen = (size_t)gm->msg_iovlen;
+        hm.msg_iov    = (hdr.msg_iovlen > 0U) ? hiov : NULL;
+        hm.msg_iovlen = (size_t)hdr.msg_iovlen;
 
         ssize_t r = (nr == ARM_NR_sendmsg) ? sendmsg((int)a0, &hm, (int)a2)
                                            : recvmsg((int)a0, &hm, (int)a2);
         if (r >= 0 && nr == ARM_NR_recvmsg) {
             gm->msg_namelen = (uint32_t)hm.msg_namelen;
             gm->msg_flags   = (uint32_t)hm.msg_flags;
-            if (gm->msg_control != 0U) {
-                uint8_t *gctl_out = (uint8_t *)a32_guest_ptr(ctx, gm->msg_control);
+            if (hdr.msg_control != 0U) {
+                uint8_t *gctl_out = (uint8_t *)a32_guest_ptr(ctx, hdr.msg_control);
                 uint32_t off32 = 0U;
                 size_t off64 = 0U;
                 bool ctrunc = false;
@@ -652,14 +650,14 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
                     }
                     uint32_t len32 = 12U + (uint32_t)payload_len;
                     uint32_t space32 = (len32 + 3U) & ~3U;
-                    if (!ctrunc && off32 + len32 <= gm->msg_controllen) {
+                    if (!ctrunc && off32 + len32 <= hdr.msg_controllen) {
                         int32_t level32 = (int32_t)cm64->cmsg_level;
                         int32_t type32  = (int32_t)cm64->cmsg_type;
                         memcpy(gctl_out + off32, &len32, 4);
                         memcpy(gctl_out + off32 + 4U, &level32, 4);
                         memcpy(gctl_out + off32 + 8U, &type32, 4);
                         memcpy(gctl_out + off32 + 12U, payload_src, payload_len);
-                        off32 += (off32 + space32 <= gm->msg_controllen) ? space32 : len32;
+                        off32 += (off32 + space32 <= hdr.msg_controllen) ? space32 : len32;
                     } else {
                         ctrunc = true;
                         if (cm64->cmsg_level == SOL_SOCKET &&

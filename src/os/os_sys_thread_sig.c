@@ -311,7 +311,9 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
                 if (nb) FAIL_ERR(EAGAIN);
                 struct timespec ts = { 0, 5000000L };
                 (void)nanosleep(&ts, NULL);
-                pend = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & sfm;
+                uint64_t all = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
+                if ((all & ~ctx->sig_mask & ~sfm) != 0ULL) FAIL_ERR(EINTR);
+                pend = all & sfm;
             }
             int sig = __builtin_ctzll(pend) + 1;
             __atomic_fetch_and(&ctx->pending_signals, ~(1ULL << (sig - 1)), __ATOMIC_SEQ_CST);

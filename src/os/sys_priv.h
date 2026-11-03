@@ -612,7 +612,7 @@ static inline int host_errno_to_linux(int err)
     case 68: return 87; case 69: return 122; case 70: return 116;
     case 71: return 66; case 77: return 37; case 78: return 38;
     case 84: return 75; case 89: return 125; case 90: return 43;
-    case 91: return 42; case 92: return 84; case 94: return 74;
+    case 91: return 42; case 92: return 84; case 93: return 61; case 94: return 74;
     case 95: return 72; case 96: return 61; case 97: return 67;
     case 98: return 63; case 99: return 60; case 100: return 71;
     case 101: return 62; case 102: return 95; case 104: return 131;

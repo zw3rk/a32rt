@@ -668,7 +668,8 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
         {
             errno = 0;
             int p = getpriority((int)a0, (id_t)a1);
-            ctx->regs[0] = (p == -1 && errno != 0) ? (uint32_t)(-errno) : (uint32_t)(20 - p);
+            if (p == -1 && errno != 0) FAIL_ERR(errno);
+            ctx->regs[0] = (uint32_t)(20 - p);
         }
 #endif
         break;
