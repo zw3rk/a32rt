@@ -70,6 +70,9 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         jit_lock_release();
         return NULL;
     }
+    /* A32-R13-8: drop the lock before translating; block compilation runs
+     * on thread-local staging and re-locks only to commit. */
+    jit_lock_release();
 
     uint32_t q_pcs[A32_JIT_LOOKAHEAD_MAX];
     unsigned q_head    = 0U;
@@ -81,24 +84,31 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
                              ? A32_JIT_LOOKAHEAD_MAX
                              : 1U;
 
-    static uint32_t stage_words[A32_AOT_MAX_WORDS];
+    /* A32-R13-8: per-thread staging so translation runs without jit_lock. */
+    static _Thread_local uint32_t stage_words[A32_AOT_MAX_WORDS];
     a32_cache_entry_t *first_entry = NULL;
 
     for (q_head = 0U; q_head < q_tail; q_head++) {
         uint32_t cur_b_pc  = q_pcs[q_head];
         uint32_t cur_b_key = a32_make_key(cur_b_pc, is_thumb);
+
+        /* Locked pre-checks; translation itself runs unlocked below. */
+        jit_lock_acquire();
         cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
 
         if (q_head > 0U) {
             if (a32_jit_find_ht_entry_locked(cur_b_key, cur_epoch) != NULL) {
+                jit_lock_release();
                 continue;
             }
             if (g_code_used + (A32_AOT_MAX_WORDS * sizeof(uint32_t)) > A32_CODE_CACHE_SIZE ||
                 g_side_table_count + MAX_STAGE_PC_MAP > A32_SIDE_TABLE_SIZE ||
                 a32_jit_find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
+                jit_lock_release();
                 break;
             }
             if (!range_is_readonly_exec(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
+                jit_lock_release();
                 continue;
             }
         } else if (!uncached && a32_jit_find_ht_slot_for_insert_locked(cur_b_key, cur_epoch, NULL) == NULL) {
@@ -106,8 +116,21 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
             cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
         }
 
+        if (!a32_jit_range_executable(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
+            ctx->fault_addr  = cur_b_pc;
+            ctx->exit_reason = A32_EXIT_FAULT;
+            jit_lock_release();
+            if (q_head == 0U) {
+                return NULL;
+            }
+            break;
+        }
+        uint32_t use_epoch = cur_epoch;
+        jit_lock_release();
+
+        /* Unlocked translation into thread-local staging. */
         uint32_t entry_itstate = (q_head == 0U && is_thumb) ? ctx->itstate : 0U;
-        g_stage_pc_map_count   = 0U;
+        a32_jit_stage_reset();
         a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
 
         a64_buf_t buf;
@@ -132,7 +155,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
             memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
             memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
 
-            g_stage_pc_map_count = 0U;
+            a32_jit_stage_reset();
             a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
             a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
             buf.guest_start_pc = cur_b_pc;
@@ -147,17 +170,49 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         if (buf.overflow) {
             if (q_head == 0U) {
                 fprintf(stderr, "a32rt: block buffer overflow at guest pc=0x%08x\n", pc);
-                jit_lock_release();
                 return NULL;
             }
             break;
         }
 
         size_t code_bytes = buf.count * sizeof(uint32_t);
+
+        /* Locked commit: re-verify the epoch and re-probe in case another
+         * thread compiled this block while we translated unlocked. */
+        jit_lock_acquire();
+        cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
+        if (cur_epoch != use_epoch &&
+            !a32_jit_range_executable(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
+            ctx->fault_addr  = cur_b_pc;
+            ctx->exit_reason = A32_EXIT_FAULT;
+            jit_lock_release();
+            if (q_head == 0U) {
+                return NULL;
+            }
+            break;
+        }
+        if (!uncached) {
+            a32_cache_entry_t *raced = a32_jit_find_ht_entry_locked(cur_b_key, cur_epoch);
+            if (raced != NULL) {
+                if (q_head == 0U) {
+                    first_entry = raced;
+                    if (out_snap != NULL) {
+                        out_snap->code         = atomic_load_explicit(&raced->host_code, memory_order_relaxed);
+                        out_snap->is_call      = atomic_load_explicit(&raced->is_call, memory_order_relaxed);
+                        out_snap->guest_pc     = atomic_load_explicit(&raced->guest_pc, memory_order_relaxed);
+                        out_snap->guest_end_pc = atomic_load_explicit(&raced->guest_end_pc, memory_order_relaxed);
+                        out_snap->code_bytes   = atomic_load_explicit(&raced->code_bytes, memory_order_relaxed);
+                        out_snap->epoch        = cur_epoch;
+                    }
+                }
+                jit_lock_release();
+                continue;
+            }
+        }
         uint8_t *dst = a32_jit_allocate_code_space_locked(ctx, code_bytes);
         if (dst == NULL) {
+            jit_lock_release();
             if (q_head == 0U) {
-                jit_lock_release();
                 return NULL;
             }
             break;
@@ -166,6 +221,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         memcpy(dst, stage_words, code_bytes);
         size_t side_start = 0U;
         size_t side_count = 0U;
+        a32_jit_stage_publish_locked();
         a32_jit_commit_side_table_locked(dst, code_bytes, cur_b_pc, entry_itstate,
                                          &side_start, &side_count);
 
@@ -238,8 +294,10 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
                 }
             }
         }
+        jit_lock_release();
     }
 
+    jit_lock_acquire();
     if (flush_now && g_batch_max > g_batch_min && a32_jit_flush_batch_locked(ctx) != 0) {
         jit_lock_release();
         return NULL;

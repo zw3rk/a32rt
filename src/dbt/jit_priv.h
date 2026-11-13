@@ -280,6 +280,8 @@ uint8_t *a32_jit_allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes);
 void a32_jit_commit_side_table_locked(const void *dst, size_t code_bytes,
                                       uint32_t block_guest_pc, uint32_t block_itstate,
                                       size_t *out_side_start, size_t *out_side_count);
+void a32_jit_stage_publish_locked(void);
+void a32_jit_stage_reset(void);
 void a32_jit_populate_ht_entry_locked(a32_cache_entry_t *entry, uint32_t key, const void *dst,
                                       uint32_t guest_pc, uint32_t guest_end_pc, uint32_t code_bytes,
                                       bool is_call, size_t side_start, size_t side_count,

@@ -181,52 +181,34 @@ bool a32_translate_t32_mem_insn(a64_buf_t *b, uint16_t hw1, uint16_t hw2,
             return false;
         }
 
-        bool p_bit = true;
-        bool u_bit = false;
-        bool w_bit = false;
-        uint16_t imm8 = 0U;
-
-        if (rn == 15U) {
-            /* Literal load [PC, #+/-imm12] */
-            uint16_t imm12 = (uint16_t)(hw2 & 0xFFFU);
-            uint32_t addr = u_imm12 ? (pc_align4 + imm12) : (pc_align4 - imm12);
-            a64_emit_mov_pc32(b, A64_ADDR, addr);
-        } else if (u_imm12) {
-            /* 12-bit unsigned offset [Rn, #imm12] */
-            uint16_t imm12 = (uint16_t)(hw2 & 0xFFFU);
-            a64_emit_add_imm_w(b, false, A64_ADDR, rn, imm12, 0U);
-        } else if ((hw2 & 0x0800U) == 0U) {
-            /* Shifted register offset [Rn, Rm, LSL #imm2] */
-            if ((hw2 & 0x0FC0U) != 0U) {
-                return false;
-            }
-            unsigned rm = hw2 & 0xFU;
-            unsigned shift = (hw2 >> 4) & 3U;
-            a64_emit_add_reg_w(b, false, A64_ADDR, rn, rm, A64_SHIFT_LSL, shift);
-        } else {
-            /* 8-bit pre/post/negative immediate [Rn, #+/-imm8] */
-            p_bit = ((hw2 >> 10) & 1U) != 0U;
-            u_bit = ((hw2 >> 9) & 1U) != 0U;
-            w_bit = ((hw2 >> 8) & 1U) != 0U;
-            if (!p_bit && !w_bit) {
-                return false;
-            }
-            if (rt == 15U && is_load && size != 2U && (hw2 & 0x0F00U) != 0x0C00U) {
-                return false;
-            }
-            imm8 = (uint16_t)(hw2 & 0xFFU);
-            if (p_bit) {
-                if (u_bit) {
-                    a64_emit_add_imm_w(b, false, A64_ADDR, rn, imm8, 0U);
-                } else {
-                    a64_emit_sub_imm_w(b, false, A64_ADDR, rn, imm8, 0U);
-                }
-            } else {
-                a64_emit_mov_w(b, A64_ADDR, rn);
-            }
+        /* Addressing mode via the shared T32 helper (A32-R13-10). */
+        t32_ls_dec_t ls = t32_decode_ls(rn, rt, u_imm12, size, is_load, sign_ext, hw2);
+        if (ls.undef) {
+            return false;
         }
 
-        if (rt == 15U && is_load && size != 2U) {
+        if (ls.kind == 0U) {
+            /* Literal load [PC, #+/-imm12] */
+            uint32_t addr = ls.up ? (pc_align4 + ls.imm) : (pc_align4 - ls.imm);
+            a64_emit_mov_pc32(b, A64_ADDR, addr);
+        } else if (ls.kind == 1U) {
+            /* 12-bit unsigned offset [Rn, #imm12] */
+            a64_emit_add_imm_w(b, false, A64_ADDR, rn, ls.imm, 0U);
+        } else if (ls.kind == 2U) {
+            /* Shifted register offset [Rn, Rm, LSL #imm2] */
+            a64_emit_add_reg_w(b, false, A64_ADDR, rn, ls.rm, A64_SHIFT_LSL, ls.shift);
+        } else if (ls.pre) {
+            /* 8-bit pre-indexed immediate [Rn, #+/-imm8] */
+            if (ls.up) {
+                a64_emit_add_imm_w(b, false, A64_ADDR, rn, ls.imm, 0U);
+            } else {
+                a64_emit_sub_imm_w(b, false, A64_ADDR, rn, ls.imm, 0U);
+            }
+        } else {
+            a64_emit_mov_w(b, A64_ADDR, rn);
+        }
+
+        if (ls.hint) {
             /* PLD / PLI hint */
             return true;
         }
@@ -258,13 +240,13 @@ bool a32_translate_t32_mem_insn(a64_buf_t *b, uint16_t hw1, uint16_t hw2,
             }
         }
 
-        if (!p_bit && (rn != rt || !is_load)) {
-            if (u_bit) {
-                a64_emit_add_imm_w(b, false, rn, rn, imm8, 0U);
+        if (!ls.pre && ls.wb) {
+            if (ls.up) {
+                a64_emit_add_imm_w(b, false, rn, rn, ls.imm, 0U);
             } else {
-                a64_emit_sub_imm_w(b, false, rn, rn, imm8, 0U);
+                a64_emit_sub_imm_w(b, false, rn, rn, ls.imm, 0U);
             }
-        } else if (p_bit && w_bit && (rn != rt || !is_load)) {
+        } else if (ls.wb) {
             a64_emit_mov_w(b, rn, A64_ADDR);
         }
 

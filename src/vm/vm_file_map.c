@@ -230,57 +230,6 @@ int a32_vmfile_map_commit(void *host_target, size_t len, int host_prot,
     return 0;
 }
 
-/* Borrow-free private lookup for mremap (A32-R3-3): returns an owned
- * duplicate of the backing descriptor covering gva, so the caller can
- * safely map from it after this function unlocks. */
-bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
-    uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
-    uint32_t *out_map_start, uint32_t *out_map_end)
-{
-    bool found = false;
-    int dup_fd = -1;
-    pthread_mutex_lock(&g_vmfile_lock);
-    for (unsigned i = 0U; i < A32_VMFILE_SLOTS; i++) {
-        if (g_fmaps[i].used && g_fmaps[i].dup_fd >= 0 &&
-            gva >= g_fmaps[i].start_gva && gva < g_fmaps[i].end_gva) {
-            dup_fd = fcntl(g_fmaps[i].dup_fd, F_DUPFD_CLOEXEC, 3);
-            if (dup_fd < 0) {
-                break;
-            }
-            if (out_dev != NULL) {
-                *out_dev = g_fmaps[i].dev;
-            }
-            if (out_ino != NULL) {
-                *out_ino = g_fmaps[i].ino;
-            }
-            if (out_file_offset != NULL) {
-                *out_file_offset = g_fmaps[i].file_offset;
-            }
-            if (out_map_start != NULL) {
-                *out_map_start = g_fmaps[i].start_gva;
-            }
-            if (out_map_end != NULL) {
-                *out_map_end = g_fmaps[i].end_gva;
-            }
-            found = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_vmfile_lock);
-    if (out_dup_fd != NULL) {
-        *out_dup_fd = dup_fd;
-    } else if (dup_fd >= 0) {
-        close(dup_fd);
-    }
-    if (!found && dup_fd >= 0) {
-        close(dup_fd);
-        if (out_dup_fd != NULL) {
-            *out_dup_fd = -1;
-        }
-    }
-    return found;
-}
-
 /* Fork-child reset (A32-R3-4): the surviving thread must not inherit a
  * mutex held by a vanished thread. */
 void a32_vmfile_fork_child_reset(void)

@@ -67,16 +67,18 @@ int a32_open_guest_ro(const a32_ctx_t *ctx, const char *guest_path)
     if (guest_path == NULL || guest_path[0] == '\0') {
         return -1;
     }
+    /* A32-R13-2: never fall back to opening the unresolved guest path
+     * on the host. With an empty sysroot the resolver copies guest_path
+     * into resolved, so the confined open below covers that case too. */
+    if (ctx == NULL) {
+        return open(guest_path, O_RDONLY | O_CLOEXEC);
+    }
     char resolved[PATH_MAX];
-    int fd = -1;
-    if (ctx != NULL &&
-        a32_resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved)) == 0) {
-        fd = open(resolved, O_RDONLY | O_CLOEXEC);
+    if (a32_resolve_guest_path(ctx, guest_path, resolved, sizeof(resolved)) != 0) {
+        errno = ENOENT;
+        return -1;
     }
-    if (fd < 0) {
-        fd = open(guest_path, O_RDONLY | O_CLOEXEC);
-    }
-    return fd;
+    return open(resolved, O_RDONLY | O_CLOEXEC);
 }
 
 static int pread_full(int fd, void *buf, size_t count, off_t offset)

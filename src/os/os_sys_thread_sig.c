@@ -337,7 +337,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
             ctx->regs[0] = 128U;
             break;
         }
-        FAIL_EFAULT_IF(a2 > 0U && a1 < 0x1000U);
+        FAIL_EFAULT_IF(a2 > 0U && !a32_guest_range_ok(ctx, a1, a2, PROT_WRITE));
         {
             ssize_t rr = read((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2);
             if (rr > 0) a32_vm32_copyout_invalidate_exec(ctx, a1, (uint32_t)rr);
@@ -347,7 +347,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
     }
 
     case ARM_NR_write:
-        FAIL_EFAULT_IF(a2 > 0U && a1 < 0x1000U);
+        FAIL_EFAULT_IF(a2 > 0U && !a32_guest_range_ok(ctx, a1, a2, PROT_READ));
         {
             ssize_t wr = write((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2);
             if (wr > 0) {
@@ -677,7 +677,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
         int flags        = (gflags & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0;
         FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, buf_va, sizeof(arm_stat64_t), PROT_WRITE));
         char resolved[PATH_MAX];
-        RESOLVE_AT(dirfd, path_va, resolved, (flags & AT_SYMLINK_NOFOLLOW) == 0);
+        RESOLVE_AT_CONFINED(dirfd, path_va, resolved, (flags & AT_SYMLINK_NOFOLLOW) == 0);
         if (strcmp(resolved, "/tmp") == 0) {
             flags &= ~AT_SYMLINK_NOFOLLOW;
         }
@@ -703,7 +703,7 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
         int hflags       = ((gflags & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0) |
                            ((gflags & 0x200U) ? AT_EACCESS : 0);
         char resolved[PATH_MAX];
-        RESOLVE_AT(dirfd, path_va, resolved, (hflags & AT_SYMLINK_NOFOLLOW) == 0);
+        RESOLVE_AT_CONFINED(dirfd, path_va, resolved, (hflags & AT_SYMLINK_NOFOLLOW) == 0);
         if (nr == ARM_NR_faccessat2) {
 #if defined(__linux__)
             long rc = syscall(SYS_faccessat2, dirfd, resolved, (int)mode, (int)gflags);

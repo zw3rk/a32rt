@@ -97,14 +97,13 @@ _Static_assert(sizeof(a32_vm32_tlb_entry_t) == 32,
 /* Slow path shared by every .L_tlb_miss_site_k stub (ctx, x1 = gva,
  * x0 = value, block id, 16-bit site index intact). Returns 0 and fills
  * hva_out on success, negative guest-signal code on fault. */
-int a32_vm32_tlb_miss(a32_ctx_t *ctx, uint32_t gva, bool is_store,
-    void **hva_out);
-
 /* Populate one 4 KiB translation after a mapping change. */
 void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     bool readable, bool writable);
 
-/* Range-selective invalidation (< 512 pages) else full clear. */
+/* Range-selective invalidation: per-page walk below A32_VM32_TLB_SIZE
+ * pages, else a full clear (the 1M-entry table makes a wider walk more
+ * expensive than invalidating everything). */
 void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva);
 void a32_vm32_tlb_invalidate_all(void);
 
@@ -113,16 +112,16 @@ void a32_vm32_tlb_invalidate_all(void);
  * regimes), or drop them after munmap/mremap. Called by src/vm.c.
  * The per-4 KiB guest permission record (R/W/X ground truth for the A2
  * host-page union in a32_vm32_protect) is maintained alongside. */
-void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
+int a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
     bool readable, bool writable, bool executable);
-void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva);
+int a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva);
 bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot);
 /* True when the 4 KiB page holding gva carries the EOF cut flag (pages
  * wholly beyond a truncated file size). Unlike range_prot_ok, this
  * distinguishes an explicit EOF cut from a plain PROT_NONE mapping, so
  * mremap can preserve PROT_NONE bytes instead of skipping them. */
 bool a32_vm32_page_eof_cut(uint32_t gva);
-void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut);
+int a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut);
 
 /* Soft-TLB base address for the A2 emitter/trampoline (x21). Set by
  * a32_vm32_init: &g_tlb[0] when regime == A2_SOFT_TLB, 0 (unused) in A1. */
@@ -251,9 +250,6 @@ int a32_vmfile_check_record(uint32_t start_gva, bool shared);
  * Call before retiring the old range. */
 int a32_vmfile_check_replace(uint32_t start_gva, uint32_t end_gva,
     bool shared);
-bool a32_vmfile_lookup_private(uint32_t gva, uint64_t *out_dev,
-    uint64_t *out_ino, uint64_t *out_file_offset, int *out_dup_fd,
-    uint32_t *out_map_start, uint32_t *out_map_end);
 /* Spanning private lookup (1 covered, 0 absent, negative errno on
  * descriptor-duplication failure) and adjacent-record coalescing for
  * repeated private mremap growth (A32-R4-1). */

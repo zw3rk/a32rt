@@ -100,7 +100,9 @@ SRCS := src/main.c \
         src/vm/vm_file.c \
         src/vm/vm_file_map.c \
         src/vm/vm_mremap.c \
+        src/vm/vm_window.c \
         src/dbt/aot/aot_sites.c \
+        src/os/backend_sync.c \
         $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S
 HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \

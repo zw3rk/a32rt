@@ -14,36 +14,59 @@
  * guest instruction, so the DBT memory emitters can recover the faulting
  * instruction PC (A2 Soft-TLB miss exit) and the per-block site base
  * (AOT site tracking) without threading new parameters through the
- * frozen emitter headers. Translation runs under the JIT lock. */
-static uint32_t g_last_record_pc = 0U;
-static uint32_t g_last_record_itstate = 0U;
+ * frozen emitter headers. Translation runs WITHOUT the JIT lock
+ * (A32-R13-8): staging is thread-local, and a32_jit_stage_publish_locked
+ * copies it into the shared commit buffers under the lock. */
+static _Thread_local uint32_t t_last_record_pc = 0U;
+static _Thread_local uint32_t t_last_record_itstate = 0U;
+static _Thread_local a32_pc_map_stage_t t_stage_pc_map[MAX_STAGE_PC_MAP];
+static _Thread_local size_t t_stage_pc_map_count = 0U;
 
 uint32_t a32_jit_last_record_pc(void)
 {
-    return g_last_record_pc;
+    return t_last_record_pc;
 }
 
 uint32_t a32_jit_last_record_itstate(void)
 {
-    return g_last_record_itstate;
+    return t_last_record_itstate;
 }
 
 void a32_jit_record_pc_map(uint32_t host_word_idx, uint32_t guest_pc, uint32_t itstate)
 {
-    g_last_record_pc      = guest_pc;
-    g_last_record_itstate = itstate;
-    if (g_stage_pc_map_count > 0U &&
-        g_stage_pc_map[g_stage_pc_map_count - 1U].host_word_idx == host_word_idx) {
-        g_stage_pc_map[g_stage_pc_map_count - 1U].guest_pc = guest_pc;
-        g_stage_pc_map[g_stage_pc_map_count - 1U].itstate  = itstate;
+    t_last_record_pc      = guest_pc;
+    t_last_record_itstate = itstate;
+    if (t_stage_pc_map_count > 0U &&
+        t_stage_pc_map[t_stage_pc_map_count - 1U].host_word_idx == host_word_idx) {
+        t_stage_pc_map[t_stage_pc_map_count - 1U].guest_pc = guest_pc;
+        t_stage_pc_map[t_stage_pc_map_count - 1U].itstate  = itstate;
         return;
     }
-    if (g_stage_pc_map_count < MAX_STAGE_PC_MAP) {
-        g_stage_pc_map[g_stage_pc_map_count].host_word_idx = host_word_idx;
-        g_stage_pc_map[g_stage_pc_map_count].guest_pc      = guest_pc;
-        g_stage_pc_map[g_stage_pc_map_count].itstate       = itstate;
-        g_stage_pc_map_count++;
+    if (t_stage_pc_map_count < MAX_STAGE_PC_MAP) {
+        t_stage_pc_map[t_stage_pc_map_count].host_word_idx = host_word_idx;
+        t_stage_pc_map[t_stage_pc_map_count].guest_pc      = guest_pc;
+        t_stage_pc_map[t_stage_pc_map_count].itstate       = itstate;
+        t_stage_pc_map_count++;
     }
+}
+
+/* Publish the calling thread's staging map into the shared commit buffers.
+ * Call with the JIT lock held, immediately before
+ * a32_jit_commit_side_table_locked. */
+void a32_jit_stage_publish_locked(void)
+{
+    size_t n = (t_stage_pc_map_count <= MAX_STAGE_PC_MAP)
+               ? t_stage_pc_map_count : MAX_STAGE_PC_MAP;
+    for (size_t i = 0U; i < n; i++) {
+        g_stage_pc_map[i] = t_stage_pc_map[i];
+    }
+    g_stage_pc_map_count = n;
+}
+
+/* Reset the calling thread's staging map before translating a block. */
+void a32_jit_stage_reset(void)
+{
+    t_stage_pc_map_count = 0U;
 }
 
 bool a32_jit_lookup_host_pc(uintptr_t host_pc, uint32_t *out_guest_pc, uint32_t *out_itstate)
@@ -488,7 +511,7 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
 
     memcpy(dst, words, code_bytes);
 
-    g_stage_pc_map_count = 0U;
+    a32_jit_stage_reset();
     a32_jit_record_pc_map(0U, aligned_pc, 0U);
     if (pc_map != NULL && pc_map_count > 0U) {
         for (size_t i = 0U; i < pc_map_count; i++) {
@@ -497,6 +520,7 @@ int a32_jit_install_aot_block(a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_
     }
     size_t side_start = 0U;
     size_t side_count = 0U;
+    a32_jit_stage_publish_locked();
     a32_jit_commit_side_table_locked(dst, code_bytes, aligned_pc, 0U, &side_start, &side_count);
 
     if (atomic_load_explicit(&g_multithreaded, memory_order_acquire) && g_batch_max > g_batch_min) {

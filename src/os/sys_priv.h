@@ -738,6 +738,7 @@ int         a32_sys_resolve_guest_path_at(const a32_ctx_t *ctx, int dirfd, uint3
 bool        a32_sys_is_proc_self_exe(const char *gpath, const char *resolved);
 const char *a32_sys_get_guest_exe_path(const a32_ctx_t *ctx);
 int         a32_sys_try_open_virtual_proc(a32_ctx_t *ctx, const char *gpath, const char *resolved);
+int         a32_sys_path_denied(const a32_ctx_t *ctx, const char *resolved);
 
 void  a32_sys_fill_arm_stat64(const a32_ctx_t *ctx, arm_stat64_t *dst, const struct stat *src);
 pid_t a32_sys_fork_with_guest_snapshot(a32_ctx_t *ctx, uint32_t child_sp);
@@ -826,6 +827,12 @@ bool a32_sigfd_lookup(int fd, uint64_t *mask_out, int *flags_out);
 #define RESOLVE_AT(dirfd, va, buf, follow) do { \
     int _rc = resolve_guest_path_at(ctx, (dirfd), (va), (buf), sizeof(buf), (follow)); \
     if (_rc < 0) { ctx->regs[0] = (uint32_t)_rc; return 0; } \
+} while (0)
+/* A32-R13-3: same resolution, then refuse a raw host /proc or /sys path
+ * that is not confined under the explicit sysroot. */
+#define RESOLVE_AT_CONFINED(dirfd, va, buf, follow) do { \
+    RESOLVE_AT(dirfd, va, buf, follow); \
+    if (a32_sys_path_denied(ctx, buf)) FAIL_ERR(ENOENT); \
 } while (0)
 
 #endif /* A32_SYS_PRIV_H */

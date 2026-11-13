@@ -31,6 +31,16 @@ void a32_vm_lock_release(void);
 void a32_vm_sync_from_ctx(a32_ctx_t *ctx);
 void a32_vm_sync_to_ctx(a32_ctx_t *ctx);
 
+/* Guest window globals owned by src/vm.c, shared with
+ * src/vm/vm_window.c (window probing lives there so src/vm.c stays
+ * under the 900-line limit). */
+extern a32_ctx_t   *g_vm_root_ctx;
+extern uint32_t     g_vm_brk_base;
+extern uint32_t     g_vm_brk_curr;
+extern uint32_t     g_vm_mmap_cursor;
+extern a32_region_t g_vm_regions[A32_MAX_REGIONS];
+extern size_t       g_vm_region_count;
+
 static inline uint64_t a32_vm_page_align_up(uint64_t v)
 {
     return (v + 0xFFFULL) & ~0xFFFULL;

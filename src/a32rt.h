@@ -260,13 +260,16 @@ static inline void a32_normalize_pc(a32_ctx_t *ctx)
 
 static inline int a32_host_prot(const a32_ctx_t *ctx, uint32_t guest_prot)
 {
+    /* A32-R13-1: a writable guest page is never host-executable, whether
+     * or not the host enforces W^X. Execute-only guest pages stay
+     * host-readable for instruction fetch. */
+    (void)ctx;
     uint32_t p = guest_prot & 0x7U;
     if ((p & 0x4U) != 0U) {
         p |= 0x1U; /* PROT_EXEC implies PROT_READ on host */
-        if (ctx != NULL && (ctx->host_info.caps & A32H_CAP_WX_ENFORCED) != 0ULL &&
-            (p & 0x2U) != 0U) {
-            p &= ~0x4U;
-        }
+    }
+    if ((p & 0x2U) != 0U) {
+        p &= ~0x4U;
     }
     return (int)p;
 }

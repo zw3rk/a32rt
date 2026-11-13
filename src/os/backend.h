@@ -73,7 +73,5 @@ typedef struct {
 int a32_backend_worker_sync_init(a32_worker_sync_t *ws);
 void a32_backend_worker_sync_destroy(a32_worker_sync_t *ws);
 void a32_backend_worker_notify_signal(a32_worker_sync_t *ws);
-/* Reserved preemption signal (SIGRTMIN+1 on Linux, SIGUSR2 on Darwin). */
-int a32_backend_preempt_worker(uint64_t host_tid);
 
 #endif /* A32RT_OS_BACKEND_H */

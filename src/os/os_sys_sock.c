@@ -450,18 +450,46 @@ int a32_sys_dispatch_sock(a32_ctx_t *ctx)
 
     case ARM_NR_send:
     case ARM_NR_sendto: {
-        const struct sockaddr *sa = (nr == ARM_NR_sendto && a4) ? a32_guest_ptr(ctx, a4) : NULL;
-        socklen_t salen           = (nr == ARM_NR_sendto) ? (socklen_t)a5 : 0U;
-        ctx->regs[0] = host_ret(sendto((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, (int)a3,
-                                       sa, salen));
+        /* A32-R13-4: buffer and address must sit in the guest window. */
+        FAIL_EFAULT_IF(a2 != 0U && !a32_guest_range_ok(ctx, a1, a2, PROT_READ));
+        const struct sockaddr *sa = NULL;
+        socklen_t salen           = 0U;
+        if (nr == ARM_NR_sendto && a4 != 0U) {
+            FAIL_EINVAL_IF((int32_t)a5 < 0);
+            FAIL_EFAULT_IF(a5 != 0U && !a32_guest_range_ok(ctx, a4, a5, PROT_READ));
+            sa    = a32_guest_ptr(ctx, a4);
+            salen = (socklen_t)a5;
+        }
+        ctx->regs[0] = host_ret(sendto((int)a0, a2 ? a32_guest_ptr(ctx, a1) : NULL,
+                                       (size_t)a2, (int)a3, sa, salen));
         break;
     }
 
     case ARM_NR_recv:
     case ARM_NR_recvfrom: {
-        struct sockaddr *sa = (nr == ARM_NR_recvfrom && a4) ? a32_guest_ptr(ctx, a4) : NULL;
-        socklen_t *salen    = (nr == ARM_NR_recvfrom && a5) ? (socklen_t *)a32_guest_ptr(ctx, a5) : NULL;
-        ssize_t r = recvfrom((int)a0, a32_guest_ptr(ctx, a1), (size_t)a2, (int)a3, sa, salen);
+        /* A32-R13-4: buffer, address and length cell stay in-window. */
+        FAIL_EFAULT_IF(a2 != 0U && !a32_guest_range_ok(ctx, a1, a2, PROT_WRITE));
+        struct sockaddr *sa = NULL;
+        socklen_t *sp = NULL, hlen = 0U;
+        if (nr == ARM_NR_recvfrom && a4 != 0U) {
+            socklen_t glen = 0U;
+            FAIL_EFAULT_IF(a5 == 0U ||
+                           !a32_guest_range_ok(ctx, a5, sizeof(socklen_t),
+                                               PROT_READ | PROT_WRITE));
+            memcpy(&glen, a32_guest_ptr(ctx, a5), sizeof(glen));
+            FAIL_EINVAL_IF((int32_t)glen < 0);
+            FAIL_EFAULT_IF(glen != 0U &&
+                           !a32_guest_range_ok(ctx, a4, (uint32_t)glen, PROT_WRITE));
+            sa   = a32_guest_ptr(ctx, a4);
+            hlen = glen;
+            sp   = &hlen;
+        }
+        ssize_t r = recvfrom((int)a0, a2 ? a32_guest_ptr(ctx, a1) : NULL,
+                             (size_t)a2, (int)a3, sa, sp);
+        if (r >= 0 && sp != NULL) {
+            socklen_t back = hlen;
+            memcpy(a32_guest_ptr(ctx, a5), &back, sizeof(back));
+        }
         if (r > 0) a32_vm32_copyout_invalidate_exec(ctx, a1, (uint32_t)r);
         ctx->regs[0] = host_ret(r);
         break;

@@ -313,6 +313,9 @@ int a32_sys_dispatch_fs_arm(a32_ctx_t *ctx)
             ctx->regs[0] = (uint32_t)copylen;
             break;
         }
+        /* A32-R13-3: synthesized entries are handled above; anything else
+         * under host /proc or /sys is refused here. */
+        if (a32_sys_path_denied(ctx, resolved)) FAIL_ERR(ENOENT);
         ctx->regs[0] = host_ret(readlinkat(dirfd, resolved,
                                            (char *)a32_guest_ptr(ctx, buf_va), (size_t)bufsiz));
         break;

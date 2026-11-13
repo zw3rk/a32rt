@@ -69,16 +69,13 @@ static void vpath_pop_dir(char *vpath)
 
 static bool is_passthrough_vpath(const char *sysroot_clean, const char *vpath)
 {
-    if (strcmp(vpath, "/tmp") == 0       ||
-        strncmp(vpath, "/proc/", 6) == 0 ||
-        strncmp(vpath, "/sys/", 5) == 0  ||
-        strncmp(vpath, "/dev/", 5) == 0) {
+    /* A32-R13-3: only /tmp may escape the sysroot. /proc, /sys and /dev
+     * always resolve under sysroot_clean when a sysroot is set, so guest
+     * /proc, /sys and /dev paths can never name raw host paths. */
+    if (strcmp(vpath, "/tmp") == 0) {
         return true;
     }
-    if (strcmp(vpath, "/proc") == 0 ||
-        strcmp(vpath, "/sys") == 0  ||
-        strcmp(vpath, "/dev") == 0  ||
-        strncmp(vpath, "/tmp/", 5) == 0) {
+    if (strncmp(vpath, "/tmp/", 5) == 0) {
         char sr_cand[PATH_MAX];
         int n = snprintf(sr_cand, sizeof(sr_cand), "%s%s", sysroot_clean, vpath);
         struct stat st;
@@ -86,7 +83,7 @@ static bool is_passthrough_vpath(const char *sysroot_clean, const char *vpath)
             if (lstat(sr_cand, &st) == 0) {
                 return false;
             }
-            if (strncmp(vpath, "/tmp/", 5) == 0 && lstat(vpath, &st) != 0) {
+            if (lstat(vpath, &st) != 0) {
                 char *slash = strrchr(sr_cand, '/');
                 if (slash != NULL && (size_t)(slash - sr_cand) > strlen(sysroot_clean) + 4U) {
                     *slash = '\0';
@@ -300,14 +297,6 @@ int resolve_guest_path_str_at(const a32_ctx_t *ctx, int dirfd, const char *guest
             vpath[vlen + 1U + comp_len] = '\0';
         }
 
-        if (strncmp(vpath, "/proc/", 6) == 0 ||
-            strncmp(vpath, "/sys/", 5) == 0  ||
-            strncmp(vpath, "/dev/", 5) == 0) {
-            int np = is_last ? snprintf(buf, size, "%s", vpath)
-                             : snprintf(buf, size, "%s/%s", vpath, after);
-            return (np >= 0 && (size_t)np < size) ? 0 : -1;
-        }
-
         if ((!is_last || follow_final) && strcmp(vpath, "/tmp") != 0) {
             char host_cand[PATH_MAX];
             int nh = is_passthrough_vpath(sysroot_clean, vpath)
@@ -509,6 +498,8 @@ static const char *skip_proc_prefix(const char *path)
     return p;
 }
 
+static int clean_guest_vpath(const char *path, char *out, size_t size);
+
 bool is_proc_self_exe(const char *gpath, const char *resolved)
 {
     const char *leaf = skip_proc_prefix(gpath);
@@ -516,6 +507,17 @@ bool is_proc_self_exe(const char *gpath, const char *resolved)
         leaf = skip_proc_prefix(resolved);
     }
     if (!leaf || strncmp(leaf, "self/", 5) != 0) {
+        /* Canonical spellings (A32-R13-3): /proc/./self/exe, //proc//... */
+        char clean[PATH_MAX];
+        if (gpath != NULL && clean_guest_vpath(gpath, clean, sizeof(clean)) == 0 &&
+            strcmp(clean, "/proc/self/exe") == 0) {
+            return true;
+        }
+        if (resolved != NULL &&
+            clean_guest_vpath(resolved, clean, sizeof(clean)) == 0 &&
+            strcmp(clean, "/proc/self/exe") == 0) {
+            return true;
+        }
         return false;
     }
     const char *sub = leaf + 5;
@@ -540,8 +542,130 @@ const char *get_guest_exe_path(const a32_ctx_t *ctx)
     return ep;
 }
 
+/* Canonicalize an absolute guest path for host-special checks (A32-R13-3):
+ * collapse runs of '/', drop '/.', pop for '/..'. Relative paths and
+ * truncation fail. */
+static int clean_guest_vpath(const char *path, char *out, size_t size)
+{
+    size_t len = 0U;
+    size_t r = 0U;
+    size_t w = 0U;
+    if (path == NULL || path[0] != '/' || out == NULL || size == 0U) {
+        return -1;
+    }
+    while (len < PATH_MAX && path[len] != '\0') {
+        len++;
+    }
+    while (r < len) {
+        size_t start;
+        size_t clen;
+        while (r < len && path[r] == '/') {
+            r++;
+        }
+        if (r >= len) {
+            break;
+        }
+        start = r;
+        while (r < len && path[r] != '/') {
+            r++;
+        }
+        clen = r - start;
+        if (clen == 1U && path[start] == '.') {
+            continue;
+        }
+        if (clen == 2U && path[start] == '.' && path[start + 1U] == '.') {
+            while (w > 0U && out[w - 1U] != '/') {
+                w--;
+            }
+            if (w > 1U) {
+                w--;
+            }
+            continue;
+        }
+        if (w + 1U + clen >= size) {
+            return -1;
+        }
+        out[w] = '/';
+        memcpy(out + w + 1U, path + start, clen);
+        w += 1U + clen;
+    }
+    if (w == 0U) {
+        out[w++] = '/';
+    }
+    out[w] = '\0';
+    return 0;
+}
+
+/* True when a resolved host path sits under the explicit sysroot. */
+static bool under_sysroot_clean(const a32_ctx_t *ctx, const char *resolved)
+{
+    size_t sr_len = sysroot_prefix_len(ctx);
+    return sr_len > 0U && strncmp(resolved, ctx->sysroot, sr_len) == 0 &&
+        (resolved[sr_len] == '/' || resolved[sr_len] == '\0');
+}
+
+static bool special_host_prefix(const char *clean)
+{
+    return strcmp(clean, "/proc") == 0 || strncmp(clean, "/proc/", 6) == 0 ||
+        strcmp(clean, "/sys") == 0 || strncmp(clean, "/sys/", 5) == 0;
+}
+
+int a32_sys_path_denied(const a32_ctx_t *ctx, const char *resolved)
+{
+    /* A32-R13-3: a resolved host path naming /proc or /sys outside the
+     * explicit sysroot must never reach the host. */
+    char clean[PATH_MAX];
+    if (resolved == NULL || resolved[0] == '\0') {
+        return 0;
+    }
+    if (under_sysroot_clean(ctx, resolved)) {
+        return 0;
+    }
+    if (clean_guest_vpath(resolved, clean, sizeof(clean)) != 0) {
+        return 0;
+    }
+    return special_host_prefix(clean) ? -ENOENT : 0;
+}
+
 int try_open_virtual_proc(a32_ctx_t *ctx, const char *gpath, const char *resolved)
 {
+    /* Match synthesized entries on the canonical guest path (A32-R13-3)
+     * so spellings like /proc/./self/maps cannot slip to the host, and
+     * never hand raw host /proc or /sys to the guest. */
+    char clean[PATH_MAX];
+    if (clean_guest_vpath(gpath, clean, sizeof(clean)) == 0) {
+        if (strcmp(clean, "/proc/cpuinfo") == 0) {
+            return create_proc_cpuinfo();
+        }
+        if (strncmp(clean, "/proc/self/", 11) == 0) {
+            const char *sub = clean + 11;
+            if (strcmp(sub, "maps") == 0) {
+                return create_proc_maps(ctx);
+            }
+            if (strcmp(sub, "cmdline") == 0) {
+                return create_proc_cmdline(ctx);
+            }
+            if (strcmp(sub, "auxv") == 0) {
+                return create_proc_auxv(ctx);
+            }
+            if (strcmp(sub, "exe") == 0) {
+                const char *ep = get_guest_exe_path(ctx);
+                char exe_res[PATH_MAX];
+                if (a32_resolve_guest_path(ctx, ep, exe_res, sizeof(exe_res)) < 0) {
+                    return -ENOENT;
+                }
+                int fd = open(exe_res, O_RDONLY | O_CLOEXEC);
+                return (fd >= 0) ? fd : -errno;
+            }
+        }
+        if (special_host_prefix(clean)) {
+            /* Unknown /proc (or bare /proc, /sys): only an explicit
+             * sysroot file may back it; otherwise there is no file. */
+            return under_sysroot_clean(ctx, resolved) ? VIRTUAL_PROC_NOT_MATCHED : -ENOENT;
+        }
+        return VIRTUAL_PROC_NOT_MATCHED;
+    }
+    /* Legacy relative forms (e.g. openat into /proc/self). */
     const char *leaf = skip_proc_prefix(gpath);
     if (!leaf) {
         leaf = skip_proc_prefix(resolved);

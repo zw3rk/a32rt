@@ -233,4 +233,80 @@ bool a32_decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc);
 bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc);
 bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn);
 
+/* Shared T32 single-transfer addressing-mode decode (A32-R13-10): the DBT
+ * lowering (interp_t32_mem.c) and the reference interpreter
+ * (interp_thumb.c) must agree on literal, imm12, shifted-register and
+ * imm8 pre/post encodings, PLD/PLI hints, UNDEF forms, and rn == rt load
+ * writeback suppression. Both sides decode through this helper and only
+ * differ in actuation (emit vs execute). */
+typedef struct {
+    uint8_t  kind;  /* 0 literal, 1 imm12, 2 shifted-reg, 3 imm8 pre/post */
+    bool     undef; /* encoding is UNDEF / unhandled */
+    bool     hint;  /* PLD/PLI: valid encoding, no transfer */
+    bool     up;    /* add (true) or subtract (false) the offset */
+    bool     pre;   /* pre-indexed (true) or post-indexed (false) */
+    bool     wb;    /* writeback applies (rn == rt suppression folded in) */
+    uint16_t imm;   /* imm12 or imm8 */
+    uint8_t  rm;
+    uint8_t  shift;
+} t32_ls_dec_t;
+
+static inline t32_ls_dec_t t32_decode_ls(unsigned rn, unsigned rt,
+    bool u_imm12, unsigned size, bool is_load, bool sign_ext, uint16_t hw2)
+{
+    t32_ls_dec_t d;
+    d.kind = 0U;
+    d.undef = false;
+    d.hint = false;
+    d.up = u_imm12;
+    d.pre = true;
+    d.wb = false;
+    d.imm = 0U;
+    d.rm = 0U;
+    d.shift = 0U;
+    if (size > 2U || (size == 2U && sign_ext)) {
+        d.undef = true;
+        return d;
+    }
+    if (!is_load && (sign_ext || rt == 15U || rn == 15U)) {
+        d.undef = true;
+        return d;
+    }
+    if (rn == 15U) {
+        d.kind = 0U;
+        d.imm = (uint16_t)(hw2 & 0xFFFU);
+    } else if (u_imm12) {
+        d.kind = 1U;
+        d.imm = (uint16_t)(hw2 & 0xFFFU);
+    } else if ((hw2 & 0x0800U) == 0U) {
+        if ((hw2 & 0x0FC0U) != 0U) {
+            d.undef = true;
+            return d;
+        }
+        d.kind = 2U;
+        d.rm = (uint8_t)(hw2 & 0xFU);
+        d.shift = (uint8_t)((hw2 >> 4) & 3U);
+    } else {
+        bool p_bit = ((hw2 >> 10) & 1U) != 0U;
+        bool w_bit = ((hw2 >> 8) & 1U) != 0U;
+        if (!p_bit && !w_bit) {
+            d.undef = true;
+            return d;
+        }
+        if (rt == 15U && is_load && size != 2U && (hw2 & 0x0F00U) != 0x0C00U) {
+            d.undef = true;
+            return d;
+        }
+        d.kind = 3U;
+        d.pre = p_bit;
+        d.up = ((hw2 >> 9) & 1U) != 0U;
+        d.imm = (uint16_t)(hw2 & 0xFFU);
+        d.wb = (!p_bit || w_bit) && (rn != rt || !is_load);
+    }
+    if (rt == 15U && is_load && size != 2U) {
+        d.hint = true;
+    }
+    return d;
+}
+
 #endif /* A32RT_DECODE_PRIV_H */

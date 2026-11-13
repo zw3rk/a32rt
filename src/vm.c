@@ -29,12 +29,13 @@
 #define A32_WINDOW_SIZE         0x100000000ULL
 
 static _Atomic uint32_t g_vm_lock = 0U;
-static a32_ctx_t       *g_vm_root_ctx = NULL;
-static uint32_t         g_vm_brk_base = 0U;
-static uint32_t         g_vm_brk_curr = 0U;
-static uint32_t         g_vm_mmap_cursor = A32_MMAP_BASE_32;
-static a32_region_t     g_vm_regions[A32_MAX_REGIONS];
-static size_t           g_vm_region_count = 0U;
+/* Window globals shared with src/vm/vm_window.c (see vm_priv.h). */
+a32_ctx_t   *g_vm_root_ctx = NULL;
+uint32_t     g_vm_brk_base = 0U;
+uint32_t     g_vm_brk_curr = 0U;
+uint32_t     g_vm_mmap_cursor = A32_MMAP_BASE_32;
+a32_region_t g_vm_regions[A32_MAX_REGIONS];
+size_t       g_vm_region_count = 0U;
 
 void a32_vm_lock_acquire(void)
 {
@@ -246,7 +247,9 @@ static int vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
     }
     /* Wave U3 A32-4: drop Soft-TLB translations for the unmapped span
      * (file tracking retired above, before any VMA mutation). */
-    a32_vm32_sync_unmap(unmap_start, unmap_end);
+    if (a32_vm32_sync_unmap(unmap_start, unmap_end) != 0) {
+        return -EIO;
+    }
     return 0;
 }
 
@@ -273,9 +276,11 @@ int a32_vm_record_region_locked(uint32_t start, uint32_t end,
     vm_coalesce_regions_locked();
     /* Wave U3 A32-4: publish the Soft-TLB translation alongside the region
      * record so Regime A2 stays coherent without a second walk. */
-    if (rc == 0) {
+    if (rc == 0 &&
         a32_vm32_sync_region(start, end, (prot & 0x1U) != 0U,
-            (prot & 0x2U) != 0U, (prot & 0x4U) != 0U);
+            (prot & 0x2U) != 0U, (prot & 0x4U) != 0U) != 0) {
+        /* A32-R13-6: the caller tears down the half-installed mapping. */
+        return -EIO;
     }
     return rc;
 }
@@ -358,8 +363,10 @@ static int vm_mprotect_regions_locked(uint32_t mp_start, uint32_t mp_end, uint32
     vm_coalesce_regions_locked();
     /* Wave U3 A32-4: re-publish the Soft-TLB translation under the new
      * protections so Regime A2 faults match the guest view. */
-    a32_vm32_sync_region(mp_start, mp_end, (prot & 0x1U) != 0U,
-        (prot & 0x2U) != 0U, (prot & 0x4U) != 0U);
+    if (a32_vm32_sync_region(mp_start, mp_end, (prot & 0x1U) != 0U,
+            (prot & 0x2U) != 0U, (prot & 0x4U) != 0U) != 0) {
+        return -EIO;
+    }
     return 0;
 }
 
@@ -453,83 +460,6 @@ static int vm_find_free_gap_locked(uint64_t aligned_len, uint64_t align, uint32_
     return 0;
 }
 
-static int try_reserve_window(uint64_t base)
-{
-    if ((base & (A32_PAGE_SIZE - 1ULL)) != 0ULL || base > UINT64_MAX - A32_WINDOW_SIZE) {
-        return -1;
-    }
-    uint64_t map_start = (base == 0ULL) ? (uint64_t)A32_LOW_GUARD_SIZE : base;
-    uint64_t map_len   = (base == 0ULL) ? (A32_WINDOW_SIZE - (uint64_t)A32_LOW_GUARD_SIZE) : A32_WINDOW_SIZE;
-    void *out = NULL;
-    if (a32_backend_map_anon((void *)(uintptr_t)map_start, (size_t)map_len, 0, 1, 0, 0, &out) != 0 ||
-        (uint64_t)(uintptr_t)out != map_start) {
-        if (out != NULL && (uint64_t)(uintptr_t)out != map_start) {
-            (void)a32_backend_unmap(out, (size_t)map_len);
-        }
-        return -1;
-    }
-    return 0;
-}
-
-int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
-{
-    if (!ctx) {
-        return -1;
-    }
-    uint64_t base = requested_window;
-    bool     has_explicit = (requested_window != UINT64_MAX);
-    if (!has_explicit) {
-        const char *env_win = getenv("A32RT_WINDOW");
-        if (env_win && env_win[0] != '\0') {
-            char *endp = NULL;
-            errno = 0;
-            unsigned long long val = strtoull(env_win, &endp, 0);
-            if (strchr(env_win, '-') != NULL || errno == ERANGE || !endp ||
-                endp == env_win || *endp != '\0' || (uint64_t)val == UINT64_MAX) {
-                fprintf(stderr, "a32rt: invalid A32RT_WINDOW '%s'\n", env_win);
-                return -1;
-            }
-            base = (uint64_t)val;
-            has_explicit = true;
-        }
-    }
-    if (has_explicit) {
-        if (try_reserve_window(base) != 0) {
-            fprintf(stderr, "a32rt: failed to reserve guest window at 0x%llx\n", (unsigned long long)base);
-            return -1;
-        }
-        ctx->guest_base = base;
-    } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
-               try_reserve_window(ctx->host_info.window_hint) == 0) {
-        ctx->guest_base = ctx->host_info.window_hint;
-    } else if (try_reserve_window(0ULL) == 0) {
-        ctx->guest_base = 0ULL;
-    } else {
-        bool found = false;
-        for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
-            if (try_reserve_window(cand) == 0) {
-                ctx->guest_base = cand;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            fprintf(stderr, "a32rt: unable to find free 4 GiB guest window\n");
-            return -1;
-        }
-    }
-    a32_vm_lock_acquire();
-    g_vm_root_ctx     = ctx;
-    g_vm_brk_base     = 0U;
-    g_vm_brk_curr     = 0U;
-    g_vm_mmap_cursor  = A32_MMAP_BASE_32;
-    g_vm_region_count = 0U;
-    ctx->mmap_cursor  = A32_MMAP_BASE_32;
-    ctx->region_count = 0U;
-    a32_vm_lock_release();
-    return 0;
-}
-
 int a32_vm_record_region(a32_ctx_t *ctx, uint32_t start, uint32_t end,
                          uint32_t prot, uint32_t flags, const char *name)
 {
@@ -610,8 +540,18 @@ uint32_t a32_vm_brk(a32_ctx_t *ctx, uint32_t new_brk)
             a32_vm_lock_release();
             return curr;
         }
-        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
-        (void)vm_reserve_prot_none(ctx, new_page, len);
+        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window.
+         * A32-R13-16: on failure restore the retired VMA (the retire freed
+         * its slot) and keep the old break instead of stranding live pages
+         * untracked. */
+        if (vm_reserve_prot_none(ctx, new_page, len) != 0) {
+            (void)a32_vm_record_region_locked(new_page, old_page,
+                (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            a32_vm_lock_release();
+            return curr;
+        }
     }
 
     g_vm_brk_curr = new_brk;

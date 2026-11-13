@@ -11,6 +11,7 @@
 #include "vm/vm32.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -342,6 +343,7 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
+    bool exec_in_sysroot = false;
     if (ctx.sysroot != NULL && ctx.sysroot[0] != '\0') {
         const char *stripped = strip_sysroot_prefix(exec_path, ctx.sysroot);
         if (stripped == NULL && raw_sysroot != ctx.sysroot) {
@@ -349,12 +351,25 @@ int main(int argc, char **argv, char **envp)
         }
         if (stripped != NULL) {
             exec_path = stripped;
+            exec_in_sysroot = true;
         }
         while (exec_path[0] == '/' && exec_path[1] == '/') {
             exec_path++;
         }
         if (guest_argv == &argv[i]) {
             argv[i] = (char *)exec_path;
+        }
+    }
+    if (exec_fd < 0 && !exec_in_sysroot && exec_path[0] == '/') {
+        /* A32-R13-2: a host-absolute executable outside the sysroot is
+         * operator input, so open it directly instead of forcing it
+         * through the confined guest resolver (which has no host
+         * fallback). Guest-derived paths below still resolve strictly
+         * under the sysroot. */
+        exec_fd = open(exec_path, O_RDONLY | O_CLOEXEC);
+        if (exec_fd < 0) {
+            fprintf(stderr, "a32rt: cannot open '%s': %s\n", exec_path, strerror(errno));
+            return 1;
         }
     }
 
@@ -426,7 +441,7 @@ int main(int argc, char **argv, char **envp)
     if (exec_mode == A32_EXEC_DIFFTEST) {
         return a32_difftest_run_compare(&ctx, 0ULL, NULL);
     }
-    int rc = a32_jit_run(&ctx);
+    int rc = a32_difftest_run_dbt(&ctx, NULL);
     if (ctx.auto_aot && !ctx.aot_loaded && ctx.blocks_compiled > 0U) {
         (void)a32_aot_save_cache(&ctx, exec_path);
     }

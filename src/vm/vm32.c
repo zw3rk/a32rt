@@ -187,6 +187,10 @@ void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
     uint64_t end = ((uint64_t)end_gva + 0xFFFULL) & ~0xFFFULL;
     uint64_t pages = (end > start) ? ((end - start) >> 12U) : 0ULL;
     uint64_t i;
+    if (pages >= A32_VM32_TLB_SIZE) {
+        a32_vm32_tlb_invalidate_all();
+        return;
+    }
     for (i = 0ULL; i < pages; i++) {
         uint32_t idx = tlb_index((uint32_t)(start + (i << 12U)));
         __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
@@ -210,40 +214,7 @@ void a32_vm32_tlb_invalidate_all(void)
     }
 }
 
-int a32_vm32_tlb_miss(a32_ctx_t *ctx, uint32_t gva, bool is_store,
-    void **hva_out)
-{
-    uint32_t idx;
-    uint64_t tag;
-    uintptr_t base;
-    (void)ctx;
-    if (hva_out == NULL) {
-        return -EINVAL;
-    }
-    idx = tlb_index(gva);
-    tag = is_store
-        ? __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_ACQUIRE)
-        : __atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_ACQUIRE);
-    if (tag != (uint64_t)(gva & ~0xFFFU)) {
-        uint8_t bits = __atomic_load_n(&g_prot[gva >> 12U], __ATOMIC_ACQUIRE);
-        if ((bits & A32_PROT_EOF_CUT) != 0U) {
-            return -EFAULT;
-        }
-        bool ok = is_store ? ((bits & 2U) != 0U) : ((bits & 1U) != 0U);
-        base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
-        if (!ok || base == 0U) {
-            return -EFAULT;
-        }
-        a32_vm32_tlb_fill(gva & ~0xFFFU,
-            base + (uintptr_t)(gva & ~0xFFFU),
-            (bits & 1U) != 0U, (bits & 2U) != 0U);
-    }
-    *hva_out = (void *)(__atomic_load_n(&g_tlb[idx].addend, __ATOMIC_RELAXED) +
-        (uintptr_t)gva);
-    return 0;
-}
-
-static void vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
+static int vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
 {
     size_t host_page;
     uint32_t hp_start;
@@ -251,7 +222,7 @@ static void vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
     uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
     if (g_regime != A32_VM32_REGIME_A2_SOFT_TLB || base == 0U ||
         end_gva <= start_gva) {
-        return;
+        return 0;
     }
     host_page = a32_backend_page_size();
     if (host_page != 16384U && host_page != 65536U) {
@@ -273,24 +244,28 @@ static void vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
                 break;
             }
         }
-        (void)a32_backend_protect((void *)(base + (uintptr_t)hp),
-            host_page, (int)(union_prot & 0x7U));
+        int hp_rc = a32_backend_protect((void *)(base + (uintptr_t)hp),
+            host_page, a32_host_prot(NULL, union_prot));
+        if (hp_rc != 0) {
+            return hp_rc;
+        }
         if (hp + (uint32_t)host_page < hp) {
             break;
         }
     }
+    return 0;
 }
 
 /* Publish translations for [start_gva, end_gva) after a successful
  * mmap/mprotect (host base == arena base + page in both regimes). */
-void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
+int a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
     bool readable, bool writable, bool executable)
 {
     uint32_t page;
     uint8_t bits;
     uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
     if (base == 0U) {
-        return;
+        return 0;
     }
     bits = (uint8_t)(((readable ? 1U : 0U) | (writable ? 2U : 0U)) |
         (executable ? 4U : 0U));
@@ -303,11 +278,11 @@ void a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
             break;
         }
     }
-    vm32_sync_host_pages_a2(start_gva & ~0xFFFU, (end_gva + 0xFFFU) & ~0xFFFU);
+    return vm32_sync_host_pages_a2(start_gva & ~0xFFFU, (end_gva + 0xFFFU) & ~0xFFFU);
 }
 
 /* Drop translations for [start_gva, end_gva) after munmap/mremap. */
-void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
+int a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
 {
     uint32_t start = start_gva & ~0xFFFU;
     uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
@@ -328,7 +303,7 @@ void a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
     }
     /* Dropping translations recycles the range: fail stale STREX (A32-R9-7). */
     vm32_bump_spanned(start, (uint64_t)end - (uint64_t)start);
-    vm32_sync_host_pages_a2(start, end);
+    return vm32_sync_host_pages_a2(start, end);
 }
 
 bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot)
@@ -362,11 +337,11 @@ bool a32_vm32_page_eof_cut(uint32_t gva)
         __ATOMIC_ACQUIRE) & A32_PROT_EOF_CUT) != 0U;
 }
 
-void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
+int a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
 {
     uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
     if (base == 0U || len == 0U) {
-        return;
+        return 0;
     }
     uint64_t s = (uint64_t)(gva & ~0xFFFU);
     uint64_t e = ((uint64_t)gva + (uint64_t)len + 0xFFFULL) & ~0xFFFULL;
@@ -382,24 +357,29 @@ void a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
         uint8_t eff = (uint8_t)(old_b & 0x7U);
         uint8_t new_b = cut ? (uint8_t)(eff | A32_PROT_EOF_CUT) : eff;
         __atomic_store_n(&g_prot[idx], new_b, __ATOMIC_RELEASE);
+        if (g_regime == A32_VM32_REGIME_A1_DIRECT) {
+            int want = cut ? 0 : a32_host_prot(NULL, eff);
+            int rc = a32_backend_protect((void *)(base + (uintptr_t)page),
+                0x1000U, want);
+            if (rc != 0) {
+                /* A32-R13-7: restore this page's metadata (the TLB was
+                 * not touched yet) so no page keeps cut metadata with
+                 * stale host permissions. */
+                __atomic_store_n(&g_prot[idx], old_b, __ATOMIC_RELEASE);
+                return rc;
+            }
+        }
         if (cut) {
             __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
                 __ATOMIC_RELEASE);
             __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
                 __ATOMIC_RELEASE);
-            if (g_regime == A32_VM32_REGIME_A1_DIRECT) {
-                (void)a32_backend_protect((void *)(base + (uintptr_t)page),
-                    0x1000U, 0);
-            }
         } else {
             a32_vm32_tlb_fill(page, base + (uintptr_t)page,
                 (eff & 1U) != 0U, (eff & 2U) != 0U);
-            if (g_regime == A32_VM32_REGIME_A1_DIRECT) {
-                (void)a32_backend_protect((void *)(base + (uintptr_t)page),
-                    0x1000U, (int)eff);
-            }
         }
     }
+    return 0;
 }
 
 /* Regime-aware mprotect (see vm32.h). A1 forwards guest-sized ranges
@@ -520,10 +500,20 @@ void a32_vm32_copyout_invalidate(uint32_t gva, size_t len)
     /* already holds g_res_lock; the table entries are _Atomic anyway. */
     locked = !atomic_flag_test_and_set_explicit(&g_res_lock,
         memory_order_acquire);
-    for (line = (uint64_t)(gva & ~63U); line < end; line += 64U) {
-        uint32_t h = ll_index((uint32_t)line);
-        atomic_fetch_add(&g_ll[h].epoch, 1ULL);
-        atomic_store(&g_ll[h].owner, NULL);
+    /* A32-R13-9: the 1024-entry table repeats every 1024 lines, so a span
+     * covering the full 64 KiB hash stride bumps each bucket once instead
+     * of rescanning the same buckets up to 67M times. */
+    if (((end - (uint64_t)(gva & ~63U)) + 63ULL) >> 6U >= A32_VM32_LL_LINES) {
+        for (uint32_t h = 0U; h < A32_VM32_LL_LINES; h++) {
+            atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+            atomic_store(&g_ll[h].owner, NULL);
+        }
+    } else {
+        for (line = (uint64_t)(gva & ~63U); line < end; line += 64U) {
+            uint32_t h = ll_index((uint32_t)line);
+            atomic_fetch_add(&g_ll[h].epoch, 1ULL);
+            atomic_store(&g_ll[h].owner, NULL);
+        }
     }
     if (locked) {
         res_unlock();

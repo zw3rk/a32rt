@@ -264,13 +264,14 @@ static a32_vmfile_inode_t *inode_intern_locked(uint64_t dev, uint64_t ino)
  * region path afterward. Deliberately never clears: fresh pages carry no
  * stale cuts (the retire step dropped them), and clearing would PROT_NONE
  * pages the populate step is about to fill. */
-static void vmfile_enforce_eof_locked(uint32_t start_gva, uint32_t len,
+static int vmfile_enforce_eof_locked(uint32_t start_gva, uint32_t len,
     uint64_t file_offset, uint64_t file_size)
 {
     uint32_t keep = a32_vmfile_eof_keep(len, file_offset, file_size);
     if ((uint64_t)keep < (uint64_t)len) {
-        a32_vm32_set_eof_cut(start_gva + keep, len - keep, true);
+        return a32_vm32_set_eof_cut(start_gva + keep, len - keep, true);
     }
+    return 0;
 }
 
 int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
@@ -305,8 +306,8 @@ int a32_vmfile_populate_private(void *hva, int host_fd, uint64_t file_offset,
                 (uint64_t)st.st_ino, sgva, sgva + (uint32_t)len,
                 file_offset, host_fd);
             if (rec_rc == 0) {
-                vmfile_enforce_eof_locked(sgva, (uint32_t)len, file_offset,
-                    (uint64_t)st.st_size);
+                rec_rc = vmfile_enforce_eof_locked(sgva, (uint32_t)len,
+                    file_offset, (uint64_t)st.st_size);
             }
         }
         pthread_mutex_unlock(&g_vmfile_lock);
@@ -429,8 +430,12 @@ static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
                     ? (cut_off - g_fmaps[i].file_offset) : 0ULL;
                 uint32_t inv_start = g_fmaps[i].start_gva + (uint32_t)inv_off;
                 if (g_fmaps[i].end_gva > inv_start) {
-                    a32_vm32_set_eof_cut(inv_start,
+                    int cut_rc = a32_vm32_set_eof_cut(inv_start,
                         g_fmaps[i].end_gva - inv_start, true);
+                    if (cut_rc != 0) {
+                        pthread_mutex_unlock(&g_vmfile_lock);
+                        return cut_rc;
+                    }
                 }
             }
         }
@@ -451,7 +456,11 @@ static int vmfile_sync_size(uint64_t dev, uint64_t ino, uint64_t new_size)
                 if (u_end_off > u_start_off) {
                     uint32_t ugva = g_fmaps[i].start_gva + (uint32_t)u_start_off;
                     uint32_t ulen = (uint32_t)(u_end_off - u_start_off);
-                    a32_vm32_set_eof_cut(ugva, ulen, false);
+                    int ucut_rc = a32_vm32_set_eof_cut(ugva, ulen, false);
+                    if (ucut_rc != 0) {
+                        pthread_mutex_unlock(&g_vmfile_lock);
+                        return ucut_rc;
+                    }
                     if (arena != 0U && g_fmaps[i].dup_fd >= 0 &&
                         a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
                         memset((void *)(arena + (uintptr_t)ugva), 0, ulen);

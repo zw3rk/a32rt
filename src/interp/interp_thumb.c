@@ -7,6 +7,7 @@
 
 #include "interp.h"
 #include "interp_priv.h"
+#include "interp/decode_priv.h"
 
 #include <string.h>
 #include <sys/mman.h>
@@ -460,6 +461,18 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 }
             }
             uint32_t addr = ctx->regs[rn];
+            /* A32-R18-1: validate the whole word span before the first
+             * transfer so a far-end fault leaves registers and guest
+             * memory untouched (interp_a32_mem.c does the same). */
+            {
+                uint64_t span_end = (uint64_t)addr + (uint64_t)n * 4U;
+                uint32_t span_prot = l ? (uint32_t)PROT_READ : (uint32_t)PROT_WRITE;
+                if (span_end > 0x100000000ULL || !i_mem_ok(ctx, addr, n * 4U, span_prot)) {
+                    ctx->fault_addr = addr;
+                    ctx->exit_reason = A32_EXIT_FAULT;
+                    return A32_EXIT_FAULT;
+                }
+            }
             uint32_t cur = addr;
             /* Retain Rn's value from its own list position (A32-R7-21);
              * writeback is suppressed when Rn is in the list. */
@@ -542,6 +555,17 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     n++;
                 }
                 uint32_t addr = sp - 4U * n;
+                /* A32-R18-1: validate the whole word span before the
+                 * first transfer so a far-end fault commits nothing. */
+                {
+                    uint64_t span_end = (uint64_t)addr + (uint64_t)n * 4U;
+                    if (span_end > 0x100000000ULL ||
+                        !i_mem_ok(ctx, addr, n * 4U, (uint32_t)PROT_WRITE)) {
+                        ctx->fault_addr = addr;
+                        ctx->exit_reason = A32_EXIT_FAULT;
+                        return A32_EXIT_FAULT;
+                    }
+                }
                 uint32_t cur = addr;
                 for (unsigned r = 0U; r < 8U; r++) {
                     if (((list >> r) & 1U) == 0U) {
@@ -559,6 +583,26 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 }
                 ctx->regs[13] = addr;
             } else {
+                /* A32-R18-1: validate the whole word span (registers plus
+                 * the stacked LR/PC) before the first transfer. */
+                {
+                    unsigned total = 0U;
+                    for (unsigned k = 0U; k < 8U; k++) {
+                        if ((list >> k) & 1U) {
+                            total++;
+                        }
+                    }
+                    if (((hw >> 8) & 1U) != 0U) {
+                        total++;
+                    }
+                    uint64_t span_end = (uint64_t)sp + (uint64_t)total * 4U;
+                    if (span_end > 0x100000000ULL ||
+                        !i_mem_ok(ctx, sp, total * 4U, (uint32_t)PROT_READ)) {
+                        ctx->fault_addr = sp;
+                        ctx->exit_reason = A32_EXIT_FAULT;
+                        return A32_EXIT_FAULT;
+                    }
+                }
                 uint32_t cur = sp;
                 for (unsigned r = 0U; r < 8U; r++) {
                     if (((list >> r) & 1U) == 0U) {
@@ -582,7 +626,21 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                 }
                 ctx->regs[13] = cur;
             }
-        } else if ((hw & 0xF600U) == 0xB000U) {
+        } else if ((hw & 0xF500U) == 0xB100U) {
+            /* CBZ / CBNZ Rn, label: branch iff (Rn == 0) == !CBNZ. */
+            unsigned rn = hw & 7U;
+            bool op_nz = ((hw >> 11) & 1U) != 0U;
+            uint32_t imm = (((hw >> 9) & 1U) << 6) | (((hw >> 3) & 0x1FU) << 1);
+            if (use_it) {
+                ctx->regs[15] = next;
+                i_undef(ctx);
+                goto trap_ret;
+            }
+            if ((ctx->regs[rn] == 0U) != op_nz) {
+                i_set_pc_branch(ctx, (pc + 4U) + imm, false);
+                goto adv_it;
+            }
+        } else if ((hw & 0xFF00U) == 0xB000U) {
             /* ADD/SUB SP immediate. */
             int32_t adj = (int32_t)((hw & 0x7FU) << 2);
             if (((hw >> 7) & 1U) != 0U) {
@@ -699,48 +757,31 @@ static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2
             return A32_EXIT_UNDEF;
         }
 
-        uint32_t ea = 0U;
-        uint32_t wb_val = 0U;
-        bool do_wb = false;
-
-        if (rn == 15U) {
-            uint32_t base = (pc + 4U) & ~3U;
-            uint32_t imm12 = (uint32_t)(hw2 & 0xFFFU);
-            ea = u_imm12 ? (base + imm12) : (base - imm12);
-        } else if (u_imm12) {
-            uint32_t imm12 = (uint32_t)(hw2 & 0xFFFU);
-            ea = ctx->regs[rn] + imm12;
-        } else if ((hw2 & 0x0800U) == 0U) {
-            if ((hw2 & 0x0FC0U) != 0U) {
-                ctx->regs[15] = next;
-                i_undef(ctx);
-                return A32_EXIT_UNDEF;
-            }
-            unsigned rm = hw2 & 0xFU;
-            unsigned shift = (hw2 >> 4) & 3U;
-            ea = ctx->regs[rn] + (ctx->regs[rm] << shift);
-        } else {
-            bool p_bit = ((hw2 >> 10) & 1U) != 0U;
-            bool u_bit = ((hw2 >> 9) & 1U) != 0U;
-            bool w_bit = ((hw2 >> 8) & 1U) != 0U;
-            if (!p_bit && !w_bit) {
-                ctx->regs[15] = next;
-                i_undef(ctx);
-                return A32_EXIT_UNDEF;
-            }
-            if (rt == 15U && is_load && size != 2U && (hw2 & 0x0F00U) != 0x0C00U) {
-                ctx->regs[15] = next;
-                i_undef(ctx);
-                return A32_EXIT_UNDEF;
-            }
-            uint32_t imm8 = (uint32_t)(hw2 & 0xFFU);
-            uint32_t base = ctx->regs[rn];
-            wb_val = u_bit ? (base + imm8) : (base - imm8);
-            ea = p_bit ? wb_val : base;
-            do_wb = (!p_bit || w_bit) && (rn != rt || !is_load);
+        /* Addressing mode via the shared T32 helper (A32-R13-10). */
+        t32_ls_dec_t ls = t32_decode_ls(rn, rt, u_imm12, size, is_load, sign_ext, hw2);
+        if (ls.undef) {
+            ctx->regs[15] = next;
+            i_undef(ctx);
+            return A32_EXIT_UNDEF;
         }
 
-        if (rt == 15U && is_load && size != 2U) {
+        uint32_t ea = 0U;
+        uint32_t wb_val = 0U;
+        if (ls.kind == 0U) {
+            uint32_t base = (pc + 4U) & ~3U;
+            ea = ls.up ? (base + ls.imm) : (base - ls.imm);
+        } else if (ls.kind == 1U) {
+            ea = ctx->regs[rn] + ls.imm;
+        } else if (ls.kind == 2U) {
+            ea = ctx->regs[rn] + (ctx->regs[ls.rm] << ls.shift);
+        } else {
+            uint32_t base = ctx->regs[rn];
+            wb_val = ls.up ? (base + ls.imm) : (base - ls.imm);
+            ea = ls.pre ? wb_val : base;
+        }
+        bool do_wb = ls.wb;
+
+        if (ls.hint) {
             /* PLD / PLI hint */
             ctx->regs[15] = next;
             return A32_EXIT_NONE;
