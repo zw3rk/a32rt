@@ -104,22 +104,38 @@ static bool g_write(a32_ctx_t *ctx, uint32_t va, const void *src, size_t len)
 static int g_cstr(a32_ctx_t *ctx, uint32_t va, char *out, size_t cap)
 {
     size_t pos = 0U;
+    uint32_t cur = va;
     if (cap == 0U || out == NULL) {
         return -D_EINVAL;
     }
     for (;;) {
-        char c;
+        uint32_t rem = 0x1000U - (cur & 0xFFFU);
+        const char *blk;
+        size_t want;
+        const char *hit;
         if (pos + 1U >= cap) {
             return -D_ENAMETOOLONG;
         }
-        if (!a32_guest_range_ok(ctx, va + (uint32_t)pos, 1U, (uint32_t)PROT_READ)) {
+        if (!a32_guest_range_ok(ctx, cur, rem, (uint32_t)PROT_READ)) {
             return -D_EFAULT;
         }
-        c = ((const char *)a32_guest_ptr(ctx, va + (uint32_t)pos))[0];
-        out[pos++] = c;
-        if (c == 0) {
-            return (int)(pos - 1U);
+        blk = (const char *)a32_guest_ptr(ctx, cur);
+        want = cap - pos - 1U;
+        if (want > rem) {
+            want = rem;
         }
+        hit = (const char *)memchr(blk, 0, want);
+        if (hit != NULL) {
+            size_t k = (size_t)(hit - blk);
+            memcpy(out + pos, blk, k + 1U);
+            return (int)(pos + k);
+        }
+        if (pos + rem >= cap) {
+            return -D_ENAMETOOLONG;
+        }
+        memcpy(out + pos, blk, rem);
+        pos += rem;
+        cur += rem;
     }
 }
 
@@ -134,6 +150,7 @@ static int do_fork_child(a32_ctx_t *ctx, const sigset_t *saved)
 {
     a32_vm_fork_child_reset();
     a32_vmfile_fork_child_reset();
+    a32_ios_kq_atfork_reset();
     a32_vm32_ll_clear_owner(ctx);
     ctx->host_tid = 0;
     ctx->is_thread_clone = false;
@@ -229,14 +246,9 @@ static int do_wait4(a32_ctx_t *ctx, const uint32_t *args)
 
 /* ---- Exit & exec ---- */
 
-/* a32_ctx_t carries no exit_code/halted fields, so a guest exit terminates
- * the host process with the guest status (cf. ios_threads_stubs ios_bye). */
 static int do_exit(a32_ctx_t *ctx, const uint32_t *args)
 {
-    int code = (int)args[0];
-    (void)ctx;
-    fflush(NULL);
-    _exit(code);
+    a32_ios_exit_teardown(ctx, (int)args[0]);
     return 0;
 }
 
@@ -456,19 +468,29 @@ static int do_getrusage(a32_ctx_t *ctx, const uint32_t *args)
     return 0;
 }
 
-/* Darwin orders MEMLOCK/NPROC/NOFILE as 6/7/8; Linux as 8/6/7. */
+/* Darwin numbers: CPU 0, FSIZE 1, DATA 2, STACK 3, CORE 4, AS 5,
+ * RSS/MEMLOCK 6, NPROC 7, NOFILE 8. Linux permutes AS/RSS/NPROC/NOFILE,
+ * so translate via <sys/resource.h> symbols instead of hardcoding. */
 static int rl_host(int d)
 {
-    if (d == 6) {
-        return 8;
-    }
-    if (d == 7) {
-        return 6;
-    }
-    if (d == 8) {
-        return 7;
-    }
+#if defined(__APPLE__)
     return d;
+#elif defined(__linux__)
+    switch (d) {
+    case 0: return RLIMIT_CPU;
+    case 1: return RLIMIT_FSIZE;
+    case 2: return RLIMIT_DATA;
+    case 3: return RLIMIT_STACK;
+    case 4: return RLIMIT_CORE;
+    case 5: return RLIMIT_AS;
+    case 6: return RLIMIT_MEMLOCK;
+    case 7: return RLIMIT_NPROC;
+    case 8: return RLIMIT_NOFILE;
+    default: return d;
+    }
+#else
+    return d;
+#endif
 }
 
 static int do_getrlimit(a32_ctx_t *ctx, const uint32_t *args)
@@ -620,7 +642,6 @@ static int sysc_emit(a32_ctx_t *ctx, const sysc_t *e, uint32_t op, uint32_t olp)
     uint8_t buf[64];
     uint32_t need;
     uint32_t avail = 0U;
-    uint32_t n;
     if (e->kind == 0U) {
         need = (uint32_t)strlen(e->s) + 1U;
         if (need > sizeof(buf)) {
@@ -646,8 +667,15 @@ static int sysc_emit(a32_ctx_t *ctx, const sysc_t *e, uint32_t op, uint32_t olp)
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return 0;
     }
-    n = (need < avail) ? need : avail;
-    if (n > 0U) { P_WR(op, buf, n); }
+    if (avail < need) {
+        /* Darwin sysctl(3): short buffer copies what fits, reports the
+         * required length, and fails with ENOMEM. */
+        if (avail > 0U) { P_WR(op, buf, avail); }
+        P_WR(olp, &need, 4U);
+        a32_ios_bsd_err(ctx, D_ENOMEM);
+        return 0;
+    }
+    P_WR(op, buf, need);
     P_WR(olp, &need, 4U);
     a32_ios_bsd_ok(ctx, 0U, 0U, false);
     return 0;
@@ -692,7 +720,15 @@ static int do_sysctl(a32_ctx_t *ctx, const uint32_t *args)
         if (ne == NULL || ne->m0 < 0) { P_DIE(D_ENOENT); }
         om[0] = ne->m0;
         om[1] = ne->m1;
-        if (args[2] != 0U && avail >= 8U) { P_WR(args[2], om, sizeof(om)); }
+        if (args[2] != 0U) {
+            if (avail < need) {
+                if (avail > 0U) { P_WR(args[2], om, avail); }
+                P_WR(args[3], &need, 4U);
+                a32_ios_bsd_err(ctx, D_ENOMEM);
+                return 0;
+            }
+            P_WR(args[2], om, sizeof(om));
+        }
         P_WR(args[3], &need, 4U);
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return 0;
