@@ -106,28 +106,24 @@ typedef struct ios_trie_hit {
     uint32_t flags;
     uint64_t arg0;
     uint64_t arg1;
-    char import_name[256];
+    char import_name[512];
 } ios_trie_hit_t;
 
 static bool ios_trie_str(const uint8_t *buf, size_t size, size_t *pos,
-                         char *dst, size_t dstsz, size_t *out_len)
+                         const char **out_edge, size_t *out_len)
 {
     size_t start = *pos;
-    size_t len = 0;
+    size_t len;
     while (*pos < size && buf[*pos] != 0u) {
         (*pos)++;
-        len++;
     }
     if (*pos >= size) {
         return false;
     }
-    (*pos)++;
-    if (len >= dstsz) {
-        len = dstsz - 1u;
-    }
-    memcpy(dst, buf + start, len);
-    dst[len] = '\0';
+    len = *pos - start;
+    *out_edge = (const char *)(buf + start);
     *out_len = len;
+    (*pos)++;
     return true;
 }
 
@@ -136,7 +132,6 @@ static bool ios_trie_walk(const uint8_t *b, size_t n, const char *name,
 {
     size_t pos = 0;
     const char *rem = name;
-    char edge[256];
     unsigned hops = 0;
     hit->hit = false;
     if (n == 0u) {
@@ -165,15 +160,19 @@ static bool ios_trie_walk(const uint8_t *b, size_t n, const char *name,
             hit->flags = (uint32_t)flags;
             if ((flags & IOS_EXPORT_REEXPORT) != 0u) {
                 uint64_t ord = 0;
+                const char *edge = NULL;
                 size_t ilen = 0;
                 if (!a32_ios_rd_uleb(b, n, &pos, &ord)) {
                     return false;
                 }
-                if (!ios_trie_str(b, n, &pos, hit->import_name,
-                                  sizeof hit->import_name, &ilen)) {
+                if (!ios_trie_str(b, n, &pos, &edge, &ilen)) {
                     return false;
                 }
-                (void)ilen;
+                if (ilen >= sizeof hit->import_name) {
+                    return false;
+                }
+                memcpy(hit->import_name, edge, ilen);
+                hit->import_name[ilen] = '\0';
                 hit->arg0 = ord;
                 hit->hit = true;
                 return true;
@@ -205,8 +204,9 @@ static bool ios_trie_walk(const uint8_t *b, size_t n, const char *name,
         }
         for (i = 0; i < nchild; i++) {
             size_t elen = 0;
+            const char *edge = NULL;
             uint64_t coff = 0;
-            if (!ios_trie_str(b, n, &pos, edge, sizeof edge, &elen)) {
+            if (!ios_trie_str(b, n, &pos, &edge, &elen)) {
                 return false;
             }
             if (elen == 0u) {
@@ -216,7 +216,7 @@ static bool ios_trie_walk(const uint8_t *b, size_t n, const char *name,
                 return false;
             }
             if (!advanced && elen <= rem_len &&
-                memcmp(edge, rem, elen) == 0 && coff < n) {
+                strncmp(rem, edge, elen) == 0 && coff < n) {
                 rem += elen;
                 pos = (size_t)coff;
                 advanced = true;
@@ -373,7 +373,9 @@ uint32_t a32_ios_resolve_in(a32_ctx_t *ctx, a32_ios_image_t *images,
                     return a32_ios_resolve_in(ctx, images, image_count,
                         (size_t)dep_idx, next, depth + 1u, out_found);
                 }
-                if ((hit.flags & IOS_EXPORT_STUB_RESOLVER) != 0u) {
+                if ((hit.flags & 0x3u) == 0x2u) {
+                    addr = (uint32_t)hit.arg0;
+                } else if ((hit.flags & IOS_EXPORT_STUB_RESOLVER) != 0u) {
                     addr = img->mh_va + (uint32_t)hit.arg0;
                 } else {
                     addr = img->mh_va + (uint32_t)hit.arg0;

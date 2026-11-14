@@ -41,9 +41,7 @@ static uint32_t ios_rd_le32(const uint8_t *p)
 static void ios_copy_str(char *dst, size_t dstsz, const char *src)
 {
     size_t n = strlen(src);
-    if (n >= dstsz) {
-        n = dstsz - 1u;
-    }
+    if (n >= dstsz) { n = dstsz - 1u; }
     memcpy(dst, src, n);
     dst[n] = '\0';
 }
@@ -54,9 +52,7 @@ static bool ios_join3(char *dst, size_t dstsz, const char *a, const char *b,
     size_t na = strlen(a);
     size_t nb = strlen(b);
     size_t nc = strlen(c);
-    if (na + nb + nc + 1u > dstsz) {
-        return false;
-    }
+    if (na + nb + nc + 1u > dstsz) { return false; }
     memcpy(dst, a, na);
     memcpy(dst + na, b, nb);
     memcpy(dst + na + nb, c, nc + 1u);
@@ -72,9 +68,7 @@ static void ios_dirname(const char *p, char *out, size_t outsz)
         ios_copy_str(out, outsz, "/");
     } else {
         size_t n = (size_t)(s - p);
-        if (n >= outsz) {
-            n = outsz - 1u;
-        }
+        if (n >= outsz) { n = outsz - 1u; }
         memcpy(out, p, n);
         out[n] = '\0';
     }
@@ -95,16 +89,12 @@ static bool ios_is_system_dylib(const char *dep)
     static const char dylib_suffix[] = ".dylib";
     size_t k;
     for (k = 0; k < sizeof exact / sizeof exact[0]; k++) {
-        if (strcmp(dep, exact[k]) == 0) {
-            return true;
-        }
+        if (strcmp(dep, exact[k]) == 0) { return true; }
     }
     if (strncmp(dep, sys_prefix, sizeof sys_prefix - 1u) == 0) {
         size_t n = strlen(dep);
         size_t s = sizeof dylib_suffix - 1u;
-        if (n >= s && strcmp(dep + n - s, dylib_suffix) == 0) {
-            return true;
-        }
+        if (n >= s && strcmp(dep + n - s, dylib_suffix) == 0) { return true; }
     }
     return false;
 }
@@ -113,9 +103,7 @@ static const char *ios_host_env(const a32_ctx_t *ctx, const char *name)
 {
     size_t nl;
     size_t i;
-    if (ctx == NULL || ctx->host_envp == NULL || name == NULL) {
-        return NULL;
-    }
+    if (ctx == NULL || ctx->host_envp == NULL || name == NULL) { return NULL; }
     nl = strlen(name);
     for (i = 0; ctx->host_envp[i] != NULL; i++) {
         if (strncmp(ctx->host_envp[i], name, nl) == 0 &&
@@ -148,9 +136,7 @@ static int ios_try_load_candidate(a32_ctx_t *ctx, a32_ios_image_t *images,
         if (images[i].is_synthetic) {
             continue;
         }
-        if (strcmp(images[i].path, cand) == 0) {
-            return (int)i;
-        }
+        if (strcmp(images[i].path, cand) == 0) { return (int)i; }
         if (images[i].install_name[0] != '\0' &&
             strcmp(images[i].install_name, cand) == 0) {
             return (int)i;
@@ -164,9 +150,7 @@ static int ios_try_load_candidate(a32_ctx_t *ctx, a32_ios_image_t *images,
     if (fd < 0) {
         fd = open(cand, O_RDONLY | O_CLOEXEC);
     }
-    if (fd < 0) {
-        return -2;
-    }
+    if (fd < 0) { return -2; }
     if (fstat(fd, &st) != 0 || st.st_size <= 0) {
         close(fd);
         return -2;
@@ -215,9 +199,7 @@ static int ios_try_candidate(a32_ctx_t *ctx, a32_ios_image_t *images,
                              a32_ios_parsed_t *parsed, size_t *count,
                              uint32_t *dylib_bump, const char *cand)
 {
-    if (cand[0] == '\0') {
-        return -2;
-    }
+    if (cand[0] == '\0') { return -2; }
     return ios_try_load_candidate(ctx, images, parsed, count, dylib_bump, cand);
 }
 
@@ -227,9 +209,7 @@ static int ios_try_path_list(a32_ctx_t *ctx, a32_ios_image_t *images,
 {
     char dirs[IOS_PATH_MAX];
     size_t dl, p = 0;
-    if (list == NULL || list[0] == '\0' || base[0] == '\0') {
-        return -2;
-    }
+    if (list == NULL || list[0] == '\0' || base[0] == '\0') { return -2; }
     dl = strlen(list);
     if (dl >= sizeof dirs) {
         dl = sizeof dirs - 1u;
@@ -251,9 +231,7 @@ static int ios_try_path_list(a32_ctx_t *ctx, a32_ios_image_t *images,
             cand[dn] = '/';
             memcpy(cand + dn + 1u, base, bn + 1u);
             r = ios_try_candidate(ctx, images, parsed, count, dylib_bump, cand);
-            if (r != -2) {
-                return r;
-            }
+            if (r != -2) { return r; }
         }
         p = q + 1u;
     }
@@ -277,16 +255,12 @@ static int ios_resolve_dep(a32_ctx_t *ctx, a32_ios_image_t *images,
     if (dyld_path != NULL) {
         dlr = ios_try_path_list(ctx, images, parsed, count, dylib_bump,
                                 dyld_path, ios_dep_basename(dep));
-        if (dlr != -2) {
-            return dlr;
-        }
+        if (dlr != -2) { return dlr; }
     }
     if (strncmp(dep, exe_prefix, sizeof exe_prefix - 1u) == 0) {
         const char *rest = dep + sizeof exe_prefix - 1u;
         int r;
-        if (!ios_join3(cand, sizeof cand, exec_dir, "/", rest)) {
-            return -2;
-        }
+        if (!ios_join3(cand, sizeof cand, exec_dir, "/", rest)) { return -2; }
         r = ios_try_candidate(ctx, images, parsed, count, dylib_bump, cand);
         return r;
     }
@@ -294,9 +268,7 @@ static int ios_resolve_dep(a32_ctx_t *ctx, a32_ios_image_t *images,
         const char *rest = dep + sizeof ld_prefix - 1u;
         int r;
         ios_dirname(images[cur].path, loader_dir, sizeof loader_dir);
-        if (!ios_join3(cand, sizeof cand, loader_dir, "/", rest)) {
-            return -2;
-        }
+        if (!ios_join3(cand, sizeof cand, loader_dir, "/", rest)) { return -2; }
         r = ios_try_candidate(ctx, images, parsed, count, dylib_bump, cand);
         return r;
     }
@@ -333,9 +305,7 @@ static int ios_resolve_dep(a32_ctx_t *ctx, a32_ios_image_t *images,
                 }
                 lr = ios_try_candidate(ctx, images, parsed, count, dylib_bump,
                                        cand);
-                if (lr != -2) {
-                    return lr;
-                }
+                if (lr != -2) { return lr; }
             }
         }
         {
@@ -344,18 +314,14 @@ static int ios_resolve_dep(a32_ctx_t *ctx, a32_ios_image_t *images,
                 int fr = ios_try_path_list(ctx, images, parsed, count,
                                            dylib_bump, fb,
                                            ios_dep_basename(dep));
-                if (fr != -2) {
-                    return fr;
-                }
+                if (fr != -2) { return fr; }
             }
         }
         return -2;
     }
     {
         int r = ios_try_candidate(ctx, images, parsed, count, dylib_bump, dep);
-        if (r != -2) {
-            return r;
-        }
+        if (r != -2) { return r; }
         {
             const char *fb = ios_host_env(ctx, "DYLD_FALLBACK_LIBRARY_PATH");
             if (fb != NULL) {
@@ -376,9 +342,7 @@ static bool ios_seg_has(const a32_ios_image_t *img, uint32_t va, uint32_t sz,
     size_t k;
     uint64_t end = (uint64_t)va + (uint64_t)sz;
     uint32_t key = va & ~1U;
-    if (sz == 0u || end > 0x100000000ULL) {
-        return false;
-    }
+    if (sz == 0u || end > 0x100000000ULL) { return false; }
     for (k = 0; k < img->seg_count; k++) {
         uint32_t start, send;
         if (img->segs[k].is_pagezero || img->segs[k].vmsize == 0u) {
@@ -390,12 +354,8 @@ static bool ios_seg_has(const a32_ios_image_t *img, uint32_t va, uint32_t sz,
         start = a32_page_down(img->segs[k].vmaddr);
         send = start + img->segs[k].vmsize;
         if (single_range) {
-            if (va >= start && end <= (uint64_t)send) {
-                return true;
-            }
-        } else if (key >= start && key < send) {
-            return true;
-        }
+            if (va >= start && end <= (uint64_t)send) { return true; }
+        } else if (key >= start && key < send) { return true; }
     }
     return false;
 }
@@ -408,6 +368,23 @@ static bool ios_exec_contains(const a32_ios_image_t *img, uint32_t va)
 {
     return ios_seg_has(img, va, 4U, 4U, false);
 }
+static void ios_init_visit(const a32_ios_image_t *images, size_t count,
+    size_t idx, size_t *order, size_t *norder, bool *visited)
+{
+    size_t d;
+    if (idx >= count || visited[idx]) {
+        return;
+    }
+    visited[idx] = true;
+    for (d = 0; d < images[idx].dep_count; d++) {
+        int dep = images[idx].dep_image_idx[d];
+        if (dep >= 0 && (size_t)dep < count) {
+            ios_init_visit(images, count, (size_t)dep, order, norder, visited);
+        }
+    }
+    order[(*norder)++] = idx;
+}
+
 static int ios_collect_inits(a32_ctx_t *ctx, a32_ios_image_t *images,
                              size_t count)
 {
@@ -415,12 +392,15 @@ static int ios_collect_inits(a32_ctx_t *ctx, a32_ios_image_t *images,
     size_t norder = 0;
     size_t oi;
     size_t idx;
+    bool visited[A32_IOS_MAX_IMAGES] = { false };
     ctx->ios_init_count = 0;
-    for (idx = count; idx > 1u; idx--) {
-        order[norder++] = idx - 1u;
-    }
     if (count > 0u) {
-        order[norder++] = 0;
+        ios_init_visit(images, count, 0, order, &norder, visited);
+    }
+    for (idx = 0; idx < count; idx++) {
+        if (!visited[idx]) {
+            ios_init_visit(images, count, idx, order, &norder, visited);
+        }
     }
     for (oi = 0; oi < norder; oi++) {
         a32_ios_image_t *img = &images[order[oi]];
@@ -532,7 +512,7 @@ static int ios_apply_prot(a32_ctx_t *ctx, a32_ios_image_t *images, size_t count)
                 continue;
             }
             start = a32_page_down(img->segs[k].vmaddr);
-            end = a32_page_up(img->segs[k].vmaddr + img->segs[k].vmsize);
+            end = start + img->segs[k].vmsize;
             if (a32_vm_mprotect(ctx, start, end - start,
                                 img->segs[k].initprot & 0x7u) != 0) {
                 fprintf(stderr, "a32rt: %s: failed to seal %.16s: %s\n", img->path,
@@ -741,7 +721,8 @@ static int ios_load_inner(a32_ctx_t *ctx, int exec_fd, const char *path,
                     fprintf(stderr, "a32rt: dyld has no entry thread state\n");
                     return -1;
                 }
-                dyld_entry = ios_thread_entry(parsed[1].tstate[15],
+                dyld_entry = ios_thread_entry(parsed[1].tstate[15] +
+                                              images[1].slide,
                                               parsed[1].tcpsr);
                 for (j = 0; j < 13u; j++) {
                     ctx->regs[j] = parsed[1].tstate[j];
@@ -846,7 +827,7 @@ static int ios_load_inner(a32_ctx_t *ctx, int exec_fd, const char *path,
         if (!ios_exec_contains(&images[0], slid_pc)) {
             return -1;
         }
-        entry = ios_thread_entry(parsed[0].tstate[15], parsed[0].tcpsr);
+        entry = ios_thread_entry(slid_pc, parsed[0].tcpsr);
         ctx->ios_main_va = entry;
         if (ctx->ios_init_count > 0u) {
             ctx->ios_has_crt0 = true;
