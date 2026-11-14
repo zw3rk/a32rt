@@ -379,13 +379,29 @@ int main(int argc, char **argv, char **envp)
 
     a32_host_probe(&ctx);
 
+    /* A32-R4-7: install host handlers BEFORE applying the captured
+     * execve-class state so a32_signals_init() does not overwrite
+     * restored SIG_IGN dispositions; consume the transport entries
+     * BEFORE constructing the guest stack environment and BEFORE
+     * loading Mach-O images so DYLD_*_LIBRARY_PATH from host_envp
+     * is visible to the iOS loader. */
+    a32_signals_set_thread_ctx(&ctx);
+    if (a32_signals_init(&ctx) != 0) {
+        return 1;
+    }
+    exec_signal_restore(&ctx);
+    char **clean_envp = filter_exec_sig_env(envp);
+    ctx.host_envp = clean_envp;
+
     if (a32_vm_init(&ctx, requested_window) != 0) {
+        free(ctx.ios_fn_starts);
         return 1;
     }
 
     /* Wave U3 A32-4: record the Two-Regime selection (A1 direct window on
      * H == 4096, A2 Soft-TLB arena above) for the reserved window. */
     if (a32_vm32_init(&ctx) != 0) {
+        free(ctx.ios_fn_starts);
         return 1;
     }
 
@@ -393,6 +409,7 @@ int main(int argc, char **argv, char **envp)
     if (ctx.is_ios) {
         if (a32_ios_load(&ctx, exec_fd, exec_path, &elf_info) != 0 ||
             a32_ios_commpage_setup(&ctx) != 0) {
+            free(ctx.ios_fn_starts);
             return 1;
         }
     } else {
@@ -402,31 +419,24 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
-    /* A32-R4-7: install host handlers BEFORE applying the captured
-     * execve-class state so a32_signals_init() does not overwrite
-     * restored SIG_IGN dispositions; consume the transport entries
-     * BEFORE constructing the guest stack environment. */
-    a32_signals_set_thread_ctx(&ctx);
-    if (a32_signals_init(&ctx) != 0) {
-        return 1;
-    }
-    exec_signal_restore(&ctx);
-    char **clean_envp = filter_exec_sig_env(envp);
-
     uint32_t initial_sp = 0U;
     int stack_rc = ctx.is_ios
         ? a32_ios_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp)
         : a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp);
     if (stack_rc != 0) {
+        free(ctx.ios_fn_starts);
         return 1;
     }
 
     if (a32_jit_init(&ctx) != 0) {
+        free(ctx.ios_fn_starts);
         return 1;
     }
 
     if (ctx.aot_mode) {
-        return a32_aot_generate(&ctx, &elf_info, exec_path);
+        int arc = a32_aot_generate(&ctx, &elf_info, exec_path);
+        free(ctx.ios_fn_starts);
+        return arc;
     }
     ctx.aot_loaded = (a32_aot_load_cache(&ctx, exec_path) == 0);
 
@@ -445,14 +455,19 @@ int main(int argc, char **argv, char **envp)
     a32_difftest_set_dbt_step(a32_dbt_single_step);
 
     if (exec_mode == A32_EXEC_INTERP) {
-        return a32_difftest_run_interp(&ctx, 0ULL, NULL);
+        int irc = a32_difftest_run_interp(&ctx, 0ULL, NULL);
+        free(ctx.ios_fn_starts);
+        return irc;
     }
     if (exec_mode == A32_EXEC_DIFFTEST) {
-        return a32_difftest_run_compare(&ctx, 0ULL, NULL);
+        int drc = a32_difftest_run_compare(&ctx, 0ULL, NULL);
+        free(ctx.ios_fn_starts);
+        return drc;
     }
     int rc = a32_difftest_run_dbt(&ctx, NULL);
     if (ctx.auto_aot && !ctx.aot_loaded && ctx.blocks_compiled > 0U) {
         (void)a32_aot_save_cache(&ctx, exec_path);
     }
+    free(ctx.ios_fn_starts);
     return rc;
 }

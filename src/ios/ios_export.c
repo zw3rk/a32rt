@@ -228,30 +228,84 @@ static bool ios_trie_walk(const uint8_t *b, size_t n, const char *name,
     }
 }
 
+/* ---- Per-image cached blobs (A32-IOS-P5) ---- */
+
+static uint8_t *ios_get_export(a32_ios_image_t *img)
+{
+    if (img->cached_export != NULL) {
+        return img->cached_export;
+    }
+    if (!img->has_dyld_info || img->dyld_info.export_size == 0u) {
+        return NULL;
+    }
+    img->cached_export = a32_ios_read_blob(img, img->dyld_info.export_off,
+        img->dyld_info.export_size);
+    return img->cached_export;
+}
+
+static uint8_t *ios_get_symtab(a32_ios_image_t *img)
+{
+    uint64_t sym_bytes;
+    if (img->cached_symtab != NULL) {
+        return img->cached_symtab;
+    }
+    if (!img->has_symtab || img->symtab.nsyms == 0u) {
+        return NULL;
+    }
+    sym_bytes = (uint64_t)img->symtab.nsyms * (uint64_t)sizeof(ios_nlist32_t);
+    if (sym_bytes > img->slice_size || sym_bytes > 0x10000000ULL ||
+        sym_bytes > 0xFFFFFFFFULL) {
+        return NULL;
+    }
+    img->cached_symtab = a32_ios_read_blob(img, img->symtab.symoff,
+        (uint32_t)sym_bytes);
+    return img->cached_symtab;
+}
+
+static uint8_t *ios_get_strtab(a32_ios_image_t *img)
+{
+    if (img->cached_strtab != NULL) {
+        return img->cached_strtab;
+    }
+    if (!img->has_symtab || img->symtab.strsize == 0u) {
+        return NULL;
+    }
+    img->cached_strtab = a32_ios_read_blob(img, img->symtab.stroff,
+        img->symtab.strsize);
+    return img->cached_strtab;
+}
+
+void a32_ios_free_image_caches(a32_ios_image_t *images, size_t image_count)
+{
+    size_t i;
+    if (images == NULL) {
+        return;
+    }
+    for (i = 0; i < image_count; i++) {
+        free(images[i].cached_export);
+        images[i].cached_export = NULL;
+        free(images[i].cached_symtab);
+        images[i].cached_symtab = NULL;
+        free(images[i].cached_strtab);
+        images[i].cached_strtab = NULL;
+    }
+}
+
 /* ---- Symbol resolution ---- */
 
-static uint32_t ios_symtab_lookup(const a32_ios_image_t *img,
+static uint32_t ios_symtab_lookup(a32_ios_image_t *img,
                                   const char *sym_name, bool *found)
 {
-    uint8_t *syms = NULL;
-    uint8_t *strs = NULL;
+    uint8_t *syms;
+    uint8_t *strs;
     uint32_t i;
     *found = false;
     if (!img->has_symtab || img->symtab.nsyms == 0u) {
         return 0;
     }
-    {
-        uint64_t sym_bytes =
-            (uint64_t)img->symtab.nsyms * (uint64_t)sizeof(ios_nlist32_t);
-        if (sym_bytes > img->slice_size || sym_bytes > 0x10000000ULL) {
-            return 0;
-        }
-        syms = a32_ios_read_blob(img, img->symtab.symoff, (uint32_t)sym_bytes);
-    }
-    strs = a32_ios_read_blob(img, img->symtab.stroff, img->symtab.strsize);
+    syms = ios_get_symtab(img);
+    strs = ios_get_strtab(img);
     if (syms == NULL || strs == NULL) {
-        free(syms);
-        free(strs);
         return 0;
     }
     for (i = 0; i < img->symtab.nsyms; i++) {
@@ -275,13 +329,9 @@ static uint32_t ios_symtab_lookup(const a32_ios_image_t *img,
             continue;
         }
         *found = true;
-        free(syms);
-        free(strs);
         return (n_value + img->slide) |
                (((n_desc & IOS_N_ARM_THUMB_DEF) != 0u) ? 1u : 0u);
     }
-    free(syms);
-    free(strs);
     return 0;
 }
 
@@ -303,28 +353,25 @@ uint32_t a32_ios_resolve_in(a32_ctx_t *ctx, a32_ios_image_t *images,
         return a32_ios_lookup_synth_sym(ctx, sym_name, out_found);
     }
     if (img->has_dyld_info && img->dyld_info.export_size > 0u) {
-        blob = a32_ios_read_blob(img, img->dyld_info.export_off,
-                             img->dyld_info.export_size);
+        blob = ios_get_export(img);
         if (blob != NULL) {
             bool ok = ios_trie_walk(blob, img->dyld_info.export_size, sym_name,
                                     &hit);
-            free(blob);
-            blob = NULL;
             if (ok && hit.hit) {
                 if ((hit.flags & IOS_EXPORT_REEXPORT) != 0u) {
                     uint64_t ord = hit.arg0;
                     const char *next = hit.import_name[0] != '\0'
                                            ? hit.import_name
                                            : sym_name;
-                    if (ord == 0u || ord > (uint64_t)img->dep_count) {
-                        return 0;
+                    int dep_idx = -1;
+                    if (ord != 0u && ord <= (uint64_t)img->dep_count) {
+                        dep_idx = img->dep_image_idx[ord - 1u];
                     }
-                    if (img->dep_image_idx[ord - 1u] < 0) {
-                        return 0;
+                    if (dep_idx < 0) {
+                        return a32_ios_lookup_synth_sym(ctx, next, out_found);
                     }
                     return a32_ios_resolve_in(ctx, images, image_count,
-                                          (size_t)img->dep_image_idx[ord - 1u],
-                                          next, depth + 1u, out_found);
+                        (size_t)dep_idx, next, depth + 1u, out_found);
                 }
                 if ((hit.flags & IOS_EXPORT_STUB_RESOLVER) != 0u) {
                     addr = img->mh_va + (uint32_t)hit.arg0;
