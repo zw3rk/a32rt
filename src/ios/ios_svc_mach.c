@@ -48,6 +48,7 @@
 #define MACH_SEND_INVALID_DEST 0x10000003U
 #define MACH_SEND_INVALID_DATA 0x10000002U
 #define MACH_SEND_INVALID_SIZE 0x10000008U
+#define MACH_SEND_NO_BUFFER 0x1000000dU
 #define MACH_RCV_INVALID_NAME 0x10004002U
 #define MACH_RCV_TIMED_OUT 0x10004003U
 #define MACH_RCV_TOO_LARGE 0x10004004U
@@ -111,22 +112,9 @@ static bool mach_write(a32_ctx_t *ctx, uint32_t va, const void *src, uint32_t le
     }
     return true;
 }
-static bool mach_read_u32(const a32_ctx_t *ctx, uint32_t va, uint32_t *out)
-{
-    uint32_t v = 0U;
-    if (!mach_read(ctx, &v, va, 4U)) { return false; }
-    *out = v;
-    return true;
-}
 static bool mach_write_u32(a32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
     return mach_write(ctx, va, &v, 4U);
-}
-static bool mach_stack_u32(const a32_ctx_t *ctx, uint32_t off, uint32_t *out)
-{
-    uint32_t sp = ctx->regs[13];
-    if (off > 0xFFFFFFFFU - sp) { return false; }
-    return mach_read_u32(ctx, sp + off, out);
 }
 static bool mach_sig_pending(const a32_ctx_t *ctx) { return (__atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) & ~ctx->sig_mask) != 0ULL; }
 static void mach_step_ts(struct timespec *ts) { struct timespec n; (void)clock_gettime(CLOCK_REALTIME, &n); n.tv_nsec += 25000000L; if (n.tv_nsec >= 1000000000L) { n.tv_sec += 1; n.tv_nsec -= 1000000000L; } *ts = n; }
@@ -234,26 +222,44 @@ static void mach_ensure_thread_port(a32_ctx_t *ctx, uint32_t *out_name)
     if (out_name != NULL) { *out_name = got; }
 }
 
-/* Caller must hold g_mach_lock. Enqueues a copy, dropping the oldest
- * message when the ring is full. */
+uint32_t a32_ios_mach_thread_self_port(a32_ctx_t *ctx)
+{
+    uint32_t nm = 0U;
+    if (ctx == NULL) { return 0U; }
+    mach_ensure_init();
+    mach_ensure_thread_port(ctx, &nm);
+    return nm;
+}
+
+static void mach_trap_port_destruct(a32_ctx_t *ctx)
+{
+    uint32_t name = ctx->regs[1];
+    int idx;
+    pthread_mutex_lock(&g_mach_lock);
+    idx = mach_find_locked(name);
+    if (idx >= 0) { if (g_ports[idx].refs > 0U) { g_ports[idx].refs--; }
+        if (g_ports[idx].refs == 0U) { mach_drop_queue_locked(idx); g_ports[idx].gen++; g_ports[idx].used = false; }
+        pthread_cond_broadcast(&g_ports[idx].cond); }
+    pthread_mutex_unlock(&g_mach_lock);
+    ctx->regs[0] = MACH_KERN_SUCCESS;
+}
+
+/* Caller must hold g_mach_lock. Enqueues a copy; returns -2 without
+ * storing anything when the ring is full (MACH_SEND_NO_BUFFER). */
 static int mach_enqueue_locked(int idx, const uint8_t *msg, uint32_t len)
 {
     uint8_t *copy = NULL;
     if (idx < 0 || msg == NULL || len == 0U || len > MACH_MSG_MAX) {
         return -1;
     }
+    if (g_ports[idx].qcount >= MACH_QUEUE_DEPTH) {
+        return -2;
+    }
     copy = (uint8_t *)malloc(len);
     if (copy == NULL) {
         return -1;
     }
     memcpy(copy, msg, len);
-    if (g_ports[idx].qcount >= MACH_QUEUE_DEPTH) {
-        unsigned h = g_ports[idx].qhead;
-        free(g_ports[idx].queue[h]);
-        g_ports[idx].queue[h] = NULL;
-        g_ports[idx].qhead = (h + 1U) % MACH_QUEUE_DEPTH;
-        g_ports[idx].qcount--;
-    }
     g_ports[idx].queue[g_ports[idx].qtail] = copy;
     g_ports[idx].qsize[g_ports[idx].qtail] = len;
     g_ports[idx].qtail = (g_ports[idx].qtail + 1U) % MACH_QUEUE_DEPTH;
@@ -437,7 +443,9 @@ static void mach_trap_vm_map(a32_ctx_t *ctx)
     bool anywhere;
     /* All 32-bit guest VAs have bits 32..63 clear, so mask_hi is satisfied. */
     (void)mask_hi;
-    if (!mach_stack_u32(ctx, 16U, &prot)) { ctx->regs[0] = MACH_KERN_INVALID_ADDRESS; return; }
+    /* XNU 32-bit ARM `_kernel_trap_6to9`: args 4..7 arrive in r4,r5,r6,r8
+     * (r7 is the frame pointer), so cur_protection is regs[8], not [sp]. */
+    prot = ctx->regs[8];
     if (!mach_rw_ok(ctx, addr_va, 8U) ||
         !mach_read(ctx, &hint, addr_va, 8U)) {
         ctx->regs[0] = MACH_KERN_INVALID_ADDRESS;
@@ -698,13 +706,27 @@ static uint32_t mach_build_reply(const mach_hdr_t *req, const uint8_t *raw,
     rh.local = 0U;
     rh.voucher = 0U;
     rh.id = req->id + 100U;
+    if (extra == 4U) {
+        /* MIG reply carrying a port right: complex message, 40 bytes:
+         * header(24) + body(count=1)(4) + port descriptor(12). */
+        uint32_t sp = (flavor == 4U) ? MACH_PORT_BOOTSTRAP : 0U;
+        uint32_t n = 1U, z = 0U;
+        uint16_t pz = 0U;
+        rh.bits |= 0x80000000U;
+        rh.size = 40U;
+        memcpy(rep, &rh, 24U);
+        memcpy(rep + 24U, &n, 4U);
+        memcpy(rep + 28U, &sp, 4U);
+        memcpy(rep + 32U, &z, 4U);
+        memcpy(rep + 36U, &pz, 2U);
+        rep[38] = 17U;
+        rep[39] = 0U;
+        return rh.size;
+    }
     memcpy(rep, &rh, 24U);
     memcpy(rep + 24U, ndr, 8U);
     memcpy(rep + 32U, &ret, 4U);
-    if (extra == 4U) {
-        uint32_t sp = (flavor == 4U) ? MACH_PORT_BOOTSTRAP : 0U;
-        memcpy(rep + 36U, &sp, 4U);
-    } else if (extra == 24U) {
+    if (extra == 24U) {
         static const uint32_t info[5] = { 4U, 4U, 0x20000000U, 12U, 9U };
         uint32_t cnt = 5U;
         memcpy(rep + 36U, &cnt, 4U);
@@ -717,9 +739,10 @@ static void mach_msg_trap(a32_ctx_t *ctx, bool overw) {
     uint32_t rs = ctx->regs[3], rn = ctx->regs[4], to = ctx->regs[5];
     uint32_t nt = ctx->regs[6], rv = mv;
     uint8_t tmp[MACH_MSG_MAX]; uint8_t rep[64]; mach_hdr_t h;
-    uint32_t rl = 0U; int di = -1, si = -1;
+    uint32_t rl = 0U; int di = -1, si = -1, eq = 0;
     (void)nt;
-    if (overw) { uint32_t sv = 0U; if (!mach_stack_u32(ctx, 16U, &sv)) { ctx->regs[0] = MACH_KERN_INVALID_ADDRESS; return; } rv = sv; }
+    /* `_kernel_trap_6to9`: the 8th arg (rcv_msg) arrives in r8, not [sp]. */
+    if (overw) { rv = ctx->regs[8]; }
     if (rv == 0U) { rv = mv; }
     if ((op & MACH_SEND_MSG) != 0U) {
         if (ss < 24U || ss > MACH_MSG_MAX || !mach_r_ok(ctx, mv, ss)) {
@@ -743,8 +766,9 @@ static void mach_msg_trap(a32_ctx_t *ctx, bool overw) {
             }
             memcpy(fwd, tmp, h.size);
             fh->remote = h.local; fh->local = h.remote;
-            (void)mach_enqueue_locked(si, fwd, h.size);
+            eq = mach_enqueue_locked(si, fwd, h.size);
             pthread_mutex_unlock(&g_mach_lock);
+            if (eq == -2) { ctx->regs[0] = MACH_SEND_NO_BUFFER; return; }
         }
     }
     if ((op & MACH_RCV_MSG) == 0U) { ctx->regs[0] = MACH_MSG_SUCCESS; return; }
@@ -801,7 +825,7 @@ static uint64_t mach_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 int a32_ios_dispatch_mach_or_arm_trap(a32_ctx_t *ctx, uint32_t raw_r12) {
-    int32_t s; int neg; uint32_t tn;
+    int32_t s; int neg;
     if (ctx == NULL) { return -1; }
     mach_ensure_init();
     if (raw_r12 >= 0x80000000U && raw_r12 <= 0x80000003U) { mach_arm_trap(ctx, raw_r12); return 0; }
@@ -818,15 +842,16 @@ int a32_ios_dispatch_mach_or_arm_trap(a32_ctx_t *ctx, uint32_t raw_r12) {
     case 18: mach_trap_port_deallocate(ctx); return 0;
     case 19: mach_trap_port_mod_refs(ctx); return 0;
     case 24: mach_trap_port_construct(ctx); return 0;
-    case 20: case 21: case 22: case 23: case 25: case 40:
+    case 20: case 21: case 22: case 23: case 40:
         mach_trap_port_stub(ctx, ctx->regs[1]); return 0;
+    case 25: mach_trap_port_destruct(ctx); return 0;
     case 26: {
         uint32_t nm = 0U; int ix;
         pthread_mutex_lock(&g_mach_lock); ix = mach_alloc_slot_locked(MACH_KIND_USER_QUEUE, 0U, &nm);
         pthread_mutex_unlock(&g_mach_lock);
         ctx->regs[0] = (ix >= 0) ? nm : MACH_KERN_RESOURCE_SHORTAGE; return 0;
     }
-    case 27: mach_ensure_thread_port(ctx, &tn); ctx->regs[0] = tn; return 0;
+    case 27: ctx->regs[0] = a32_ios_mach_thread_self_port(ctx); return 0;
     case 28: ctx->regs[0] = MACH_PORT_TASK_SELF; return 0;
     case 29: ctx->regs[0] = MACH_PORT_HOST_SELF; return 0;
     case 31: mach_msg_trap(ctx, false); return 0;

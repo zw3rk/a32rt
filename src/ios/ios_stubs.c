@@ -139,10 +139,14 @@ uint32_t a32_ios_lookup_synth_sym(a32_ctx_t *ctx, const char *sym_name,
     bool *out_found)
 {
     size_t i;
+    uint32_t ev;
+    bool ef = false;
     if (out_found != NULL)
         *out_found = false;
     if (ctx == NULL || sym_name == NULL)
         return 0U;
+    ev = a32_ios_lookup_synth_ext(ctx, sym_name, &ef);
+    if (ef) { if (out_found != NULL) *out_found = true; return ev; }
     for (i = 0U; i < sizeof(kData) / sizeof(kData[0]); i++) {
         if (strcmp(sym_name, kData[i].name) == 0) {
             if (out_found != NULL)
@@ -294,7 +298,6 @@ static void stub_strmem(a32_ctx_t *c, uint32_t id)
     case 29U: { const void *p = gmem(c, a0, a2, RD), *q = gmem(c, a1, a2, RD); if (a2 != 0U && (p == NULL || q == NULL)) { serr(c, DE_INVAL); return; } c->regs[0] = (uint32_t)(int32_t)memcmp(p, q, (size_t)a2); return; }
     case 30U: d = gmem(c, a0, a1, WR); if (d == NULL) { serr(c, DE_INVAL); return; } memset(d, 0, (size_t)a1); a32_vm32_copyout_invalidate_exec(c, a0, a1); return;
     case 35U: x = gstr(c, a0); c->regs[0] = (uint32_t)(int32_t)((x == NULL) ? 0L : strtol(x, NULL, 10)); return;
-    case 36U: case 37U: x = gstr(c, a0); { unsigned long v = (x == NULL) ? 0UL : strtoul(x, NULL, (int)a2); c->regs[0] = (id == 36U) ? (uint32_t)(int32_t)(long)v : (uint32_t)v; } return;
     default: c->regs[0] = 0xFFFFFFFFU; return;
     }
 }
@@ -302,6 +305,12 @@ typedef uint32_t (*fetch_fn)(a32_ctx_t *, uint32_t, unsigned);
 static uint32_t fetch_rs(a32_ctx_t *c, uint32_t sp, unsigned i) { uint32_t v = 0U;
     if (i < 3U) return c->regs[1 + i];
     (void)guest_read(c, &v, sp + (i - 3U) * 4U, 4U); return v; }
+static uint32_t fetch_rs2(a32_ctx_t *c, uint32_t sp, unsigned i) { uint32_t v = 0U;
+    if (i < 2U) return c->regs[2 + i];
+    (void)guest_read(c, &v, sp + (i - 2U) * 4U, 4U); return v; }
+static uint32_t fetch_rs3(a32_ctx_t *c, uint32_t sp, unsigned i) { uint32_t v = 0U;
+    if (i < 1U) return c->regs[3 + i];
+    (void)guest_read(c, &v, sp + (i - 1U) * 4U, 4U); return v; }
 static uint32_t fetch_ap(a32_ctx_t *c, uint32_t ap, unsigned i) { uint32_t v = 0U;
     (void)guest_read(c, &v, ap + i * 4U, 4U); return v; }
 static int pfmt1(a32_ctx_t *c, char *out, size_t ocap, size_t *o, size_t *tot,
@@ -309,7 +318,7 @@ static int pfmt1(a32_ctx_t *c, char *out, size_t ocap, size_t *o, size_t *tot,
 {
     char hfmt[32], tmp[256];
     size_t hl = 0U;
-    int width = -1, prec = -1, is_ll = 0, w = 0;
+    int width = -4097, prec = -1, is_ll = 0, w = 0, left = 0, zero = 0, pad = 0;
     char conv;
     const char *f0 = *fp;
     hfmt[hl++] = '%';
@@ -344,24 +353,27 @@ static int pfmt1(a32_ctx_t *c, char *out, size_t ocap, size_t *o, size_t *tot,
     if (conv == '\0')
         return -1;
     *fp = f0 + 1;
+    if (conv != 's' && prec > 200) prec = 200;
+    { size_t j = 1U, k = 1U; for (; j < hl; j++) { if (hfmt[j] == '-') left = 1; else if (hfmt[j] == '0') zero = 1; else hfmt[k++] = hfmt[j]; } hl = k; }
+    if (width < 0 && width != -4097) { left = 1; width = -width; }
     if (hl + 16U < sizeof(hfmt)) {
-        if (width >= 0)
-            hl += (size_t)snprintf(hfmt + hl, sizeof(hfmt) - hl, "%d", width);
         if (prec >= 0)
             hl += (size_t)snprintf(hfmt + hl, sizeof(hfmt) - hl, ".%d", prec);
-        if (is_ll) {
-            hfmt[hl++] = 'l';
-            hfmt[hl++] = 'l';
-        }
-        hfmt[hl++] = conv;
-        hfmt[hl] = '\0';
-    } else {
-        hfmt[1] = conv;
-        hfmt[2] = '\0';
-    }
+        if (is_ll) { hfmt[hl++] = 'l'; hfmt[hl++] = 'l'; }
+        hfmt[hl++] = conv; hfmt[hl] = '\0';
+    } else { hfmt[1] = conv; hfmt[2] = '\0'; }
     if (conv == 's') {
         const char *s = gstr(c, f(c, base, (*ai)++));
-        w = snprintf(tmp, sizeof(tmp), hfmt, (s == NULL) ? "(null)" : s);
+        size_t sl, pn, k2; int pd = 0;
+        if (s == NULL) s = "(null)";
+        sl = strlen(s); pn = sl;
+        if (prec >= 0 && (size_t)prec < pn) pn = (size_t)prec;
+        if (width > (int)pn) pd = width - (int)pn;
+        *tot += pn + (size_t)pd;
+        if (!left) for (k2 = 0U; k2 < (size_t)pd && *o + 1U < ocap; k2++) out[(*o)++] = ' ';
+        for (k2 = 0U; k2 < pn; k2++) { if (*o + 1U < ocap) out[(*o)++] = s[k2]; }
+        if (left) for (k2 = 0U; k2 < (size_t)pd && *o + 1U < ocap; k2++) out[(*o)++] = ' ';
+        return 0;
     } else if (conv == 'c') {
         w = snprintf(tmp, sizeof(tmp), hfmt, (int)f(c, base, (*ai)++));
     } else if (conv == 'p') {
@@ -377,11 +389,21 @@ static int pfmt1(a32_ctx_t *c, char *out, size_t ocap, size_t *o, size_t *tot,
     } else {
         w = snprintf(tmp, sizeof(tmp), "%%(%c)", conv);
     }
-    if (w > 0) {
-        size_t k;
-        *tot += (size_t)w;
-        for (k = 0U; k < (size_t)w && *o + 1U < ocap; k++)
-            out[(*o)++] = tmp[k];
+    if (w < 0) w = 0;
+    if ((size_t)w >= sizeof(tmp)) w = (int)(sizeof(tmp) - 1U);
+    pad = (width > w) ? (width - w) : 0; *tot += (size_t)(w + pad);
+    if (!left && pad > 0 && zero && prec < 0 && (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o' || conv == 'p')) {
+        size_t pre = 0U, k = 0U;
+        if (w > 0 && (tmp[0] == '-' || tmp[0] == '+' || tmp[0] == ' ')) pre = 1U;
+        if ((size_t)w > pre + 1U && tmp[pre] == '0' && (tmp[pre + 1U] == 'x' || tmp[pre + 1U] == 'X')) pre += 2U;
+        for (k = 0U; k < pre && *o + 1U < ocap; k++) out[(*o)++] = tmp[k];
+        for (k = 0U; k < (size_t)pad && *o + 1U < ocap; k++) out[(*o)++] = '0';
+        for (k = pre; k < (size_t)w && *o + 1U < ocap; k++) out[(*o)++] = tmp[k];
+    } else {
+        size_t k = 0U;
+        if (!left) for (k = 0U; k < (size_t)pad && *o + 1U < ocap; k++) out[(*o)++] = ' ';
+        for (k = 0U; k < (size_t)w && *o + 1U < ocap; k++) out[(*o)++] = tmp[k];
+        if (left) for (k = 0U; k < (size_t)pad && *o + 1U < ocap; k++) out[(*o)++] = ' ';
     }
     return 0;
 }
@@ -454,6 +476,8 @@ static void qsort_step(a32_ctx_t *c, gcall_t *g)
         i++;
     }
 qdone:
+    if (g->b > 1U && g->c != 0U && a32_jit_range_executable(c, g->a, g->b * g->c))
+        a32_vm32_copyout_invalidate_exec(c, g->a, g->b * g->c);
     c->regs[0] = 0U; free(g->tmp); g->tmp = NULL; g->active = false; }
 static void qsort_resume(a32_ctx_t *c, gcall_t *g)
 {
@@ -465,7 +489,6 @@ static void qsort_resume(a32_ctx_t *c, gcall_t *g)
         void *p1 = a32_guest_ptr(c, base + (j - 1U) * sz);
         void *p2 = a32_guest_ptr(c, base + j * sz);
         memcpy(tmp, p1, (size_t)sz); memcpy(p1, p2, (size_t)sz); memcpy(p2, tmp, (size_t)sz);
-        a32_vm32_copyout_invalidate_exec(c, base, g->b * sz);
         g->e = i; g->f = j - 1U;
     } else { g->e = i + 1U; g->f = 0U; }
     qsort_step(c, g);
@@ -589,6 +612,24 @@ static void stub_file(a32_ctx_t *c, uint32_t id)
         c->regs[0] = (fd < 0) ? 0xFFFFFFFFU : 0U;
     }
 }
+static void sn_direct(a32_ctx_t *c, const char *fmt, uint32_t dst, uint32_t cap,
+    fetch_fn f, uint32_t base)
+{
+    char zc = '\0';
+    int n;
+    if (cap == 0U) {
+        n = pfmt(c, &zc, 0U, fmt, f, base, 0U);
+    } else {
+        char *d;
+        uint32_t wn;
+        if (!a32_guest_range_ok(c, dst, cap, (uint32_t)WR)) { serr(c, DE_INVAL); return; }
+        d = (char *)a32_guest_ptr(c, dst);
+        n = pfmt(c, d, (size_t)cap, fmt, f, base, 0U);
+        wn = (n < 0) ? 0U : (uint32_t)n;
+        a32_vm32_copyout_invalidate_exec(c, dst, (wn + 1U <= cap) ? wn + 1U : cap);
+    }
+    c->regs[0] = (uint32_t)n;
+}
 static void stub_printf(a32_ctx_t *c, uint32_t id)
 {
     char buf[2048];
@@ -613,84 +654,30 @@ static void stub_printf(a32_ctx_t *c, uint32_t id)
             serr(c, DE_INVAL);
             return;
         }
-        {
-            uint32_t sv1 = c->regs[1], sv2 = c->regs[2], sv3 = c->regs[3];
-            c->regs[1] = c->regs[2];
-            c->regs[2] = c->regs[3];
-            n = pfmt(c, buf, sizeof(buf), fmt, fetch_rs, c->regs[13], 1U);
-            c->regs[1] = sv1;
-            (void)sv1;
-            c->regs[2] = sv2;
-            c->regs[3] = sv3;
-        }
+        n = pfmt(c, buf, sizeof(buf), fmt, fetch_rs2, c->regs[13], 0U);
         if (n > 0)
             (void)write(fd, buf, (size_t)((n < 2048) ? n : 2047));
         c->regs[0] = (uint32_t)n;
         return;
     }
     if (id == 50U) {
-        void *d = gmem(c, c->regs[0], c->regs[1], WR);
         fmt = gstr(c, c->regs[2]);
-        if (c->regs[1] == 0U || d == NULL || fmt == NULL) {
-            serr(c, DE_INVAL);
-            return;
-        }
-        {
-            uint32_t sv1 = c->regs[1], sv2 = c->regs[2];
-            c->regs[1] = c->regs[3];
-            n = pfmt(c, buf, sizeof(buf), fmt, fetch_rs, c->regs[13], 2U);
-            c->regs[1] = sv1;
-            c->regs[2] = sv2;
-        }
-        {
-            size_t cp = (size_t)n;
-            if (cp >= (size_t)c->regs[1])
-                cp = (size_t)c->regs[1] - 1U;
-            memcpy(d, buf, cp);
-            ((char *)d)[cp] = '\0';
-            a32_vm32_copyout_invalidate_exec(c, c->regs[0], (uint32_t)(cp + 1U));
-        }
-        c->regs[0] = (uint32_t)n;
+        if (fmt == NULL) { serr(c, DE_INVAL); return; }
+        sn_direct(c, fmt, c->regs[0], c->regs[1], fetch_rs3, c->regs[13]);
         return;
     }
     if (id == 51U) {
         uint32_t sp = c->regs[13], fva = 0U;
-        void *d = gmem(c, c->regs[0], c->regs[1], WR);
         (void)guest_read(c, &fva, sp, 4U);
         fmt = gstr(c, fva);
-        if (c->regs[1] == 0U || d == NULL || fmt == NULL) {
-            serr(c, DE_INVAL);
-            return;
-        }
-        n = pfmt(c, buf, sizeof(buf), fmt, fetch_ap, sp + 4U, 0U);
-        {
-            size_t cp = (size_t)n;
-            if (cp >= (size_t)c->regs[1])
-                cp = (size_t)c->regs[1] - 1U;
-            memcpy(d, buf, cp);
-            ((char *)d)[cp] = '\0';
-            a32_vm32_copyout_invalidate_exec(c, c->regs[0], (uint32_t)(cp + 1U));
-        }
-        c->regs[0] = (uint32_t)n;
+        if (fmt == NULL) { serr(c, DE_INVAL); return; }
+        sn_direct(c, fmt, c->regs[0], c->regs[1], fetch_ap, sp + 4U);
         return;
     }
     {
-        void *d = gmem(c, c->regs[0], c->regs[1], WR);
         fmt = gstr(c, c->regs[2]);
-        if (c->regs[1] == 0U || d == NULL || fmt == NULL) {
-            serr(c, DE_INVAL);
-            return;
-        }
-        n = pfmt(c, buf, sizeof(buf), fmt, fetch_ap, c->regs[3], 0U);
-        {
-            size_t cp = (size_t)n;
-            if (cp >= (size_t)c->regs[1])
-                cp = (size_t)c->regs[1] - 1U;
-            memcpy(d, buf, cp);
-            ((char *)d)[cp] = '\0';
-            a32_vm32_copyout_invalidate_exec(c, c->regs[0], (uint32_t)(cp + 1U));
-        }
-        c->regs[0] = (uint32_t)n;
+        if (fmt == NULL) { serr(c, DE_INVAL); return; }
+        sn_direct(c, fmt, c->regs[0], c->regs[1], fetch_ap, c->regs[3]);
     }
 }
 /* 53..87 POSIX/Mach/signal + svc #0x81 dispatch (compact). */
@@ -708,7 +695,7 @@ static int xl_ofl(uint32_t g) { int h = (int)(g & 3U);
 static uint32_t sld(a32_ctx_t *c, uint32_t o) { uint32_t v = 0U, va = c->regs[13] + o;
     if (va >= c->regs[13] && a32_guest_range_ok(c, va, 4U, (uint32_t)RD)) memcpy(&v, a32_guest_ptr(c, va), 4);
     return v; }
-static void sigerr(a32_ctx_t *c, int r) { int32_t e = (int32_t)(-r); (void)guest_write(c, c->ios_errno_va, &e, 4U); c->regs[0] = 0xFFFFFFFFU; }
+static void sigerr(a32_ctx_t *c, int r) { int32_t e = (int32_t)(r < 0 ? -r : r); (void)guest_write(c, c->ios_errno_va, &e, 4U); c->regs[0] = 0xFFFFFFFFU; }
 static void fst64(const struct stat *h, ios_stat64_t *o) { memset(o, 0, sizeof(*o));
     o->st_dev = (int32_t)h->st_dev; o->st_mode = (uint16_t)h->st_mode;
     o->st_nlink = (uint16_t)h->st_nlink; o->st_ino = (uint64_t)h->st_ino;
@@ -782,10 +769,17 @@ static void doposix(a32_ctx_t *c, uint32_t id) { uint32_t r0 = c->regs[0], r1 = 
             memcpy(a32_guest_ptr(c, r0), w, 8); a32_vm32_copyout_invalidate_exec(c, r0, 8U); }
         c->regs[0] = 0U;
     } else if (id == 71U) { (void)usleep((useconds_t)r0); c->regs[0] = 0U;
-    } else if (id == 72U) { struct timespec q, m; int32_t g[2];
+    } else if (id == 72U) { struct timespec q, m; int32_t g[2], e = 4;
         if (!a32_guest_range_ok(c, r0, 8U, (uint32_t)RD)) { serr(c, DE_INVAL); return; }
         memcpy(g, a32_guest_ptr(c, r0), 8); q.tv_sec = (time_t)g[0]; q.tv_nsec = (long)g[1];
-        if (nanosleep(&q, r1 ? &m : NULL) != 0 && errno != EINTR) { serr(c, errno); return; }
+        m.tv_sec = 0; m.tv_nsec = 0;
+        if (nanosleep(&q, &m) != 0) {
+            if (errno != EINTR) { serr(c, errno); return; }
+            if (r1 != 0U && a32_guest_range_ok(c, r1, 8U, (uint32_t)WR)) { int32_t o[2];
+                o[0] = (int32_t)m.tv_sec; o[1] = (int32_t)m.tv_nsec;
+                memcpy(a32_guest_ptr(c, r1), o, 8); a32_vm32_copyout_invalidate_exec(c, r1, 8U); }
+            (void)guest_write(c, c->ios_errno_va, &e, 4U); c->regs[0] = 0xFFFFFFFFU; return;
+        }
         if (r1 && a32_guest_range_ok(c, r1, 8U, (uint32_t)WR)) { int32_t o[2];
             o[0] = (int32_t)m.tv_sec; o[1] = (int32_t)m.tv_nsec;
             memcpy(a32_guest_ptr(c, r1), o, 8); a32_vm32_copyout_invalidate_exec(c, r1, 8U); }
@@ -831,7 +825,7 @@ static void doposix(a32_ctx_t *c, uint32_t id) { uint32_t r0 = c->regs[0], r1 = 
         if (!a32_guest_range_ok(c, r0, 8U, (uint32_t)WR)) { serr(c, DE_INVAL); return; }
         memcpy(a32_guest_ptr(c, r0), w, 8); a32_vm32_copyout_invalidate_exec(c, r0, 8U); c->regs[0] = 0U;
     } else if (id <= 81U) c->regs[0] = (id == 80U) ? 0x103U : 0x107U;
-    else if (id == 82U) c->regs[0] = 0x203U + ((uint32_t)(get_host_tid(c) & 0xFF) * 4U);
+    else if (id == 82U) c->regs[0] = a32_ios_mach_thread_self_port(c);
     else if (id == 83U) {
         if (r1 && !a32_guest_range_ok(c, r0, r1, (uint32_t)RD)) { serr(c, DE_INVAL); return; }
         a32_vm32_copyout_invalidate_exec(c, r0, (size_t)r1); c->regs[0] = 0U;
@@ -850,14 +844,16 @@ static void doposix(a32_ctx_t *c, uint32_t id) { uint32_t r0 = c->regs[0], r1 = 
     } else if (id == 87U) { int rc = a32_ios_sys_pthread_kill(c, 0U, (int)(int32_t)r0);
         if (rc) sigerr(c, rc); else c->regs[0] = 0U; a32_ios_signals_check_pending(c);
     } else serr(c, DE_INVAL); }
-int a32_ios_handle_stub_svc(a32_ctx_t *ctx) { uint32_t id, r0; bool hd = false;
+int a32_ios_handle_stub_svc(a32_ctx_t *ctx) { uint32_t id, r0; bool hd = false, xh = false;
     if (ctx == NULL) return 0;
     id = ctx->regs[12]; r0 = ctx->regs[0];
+    if (a32_ios_handle_stub_ext(ctx, id, &xh) == 0 && xh) return 0;
     if (id == 0xFDU) { qsort_resume(ctx, gc_self()); return 0; } if (id <= 1U) { ctx->regs[0] = 0U; return 0; }
-    if (id == 2U || id == 4U || id == 6U) { ios_bye(134U); return 0; }
+    if (id == 2U || id == 4U) { ios_bye(134U); return 0; }
+    if (id == 6U) { ctx->exit_reason = 0U; (void)a32_ios_sys_pthread_kill(ctx, 0U, 6);
+        if (ctx->exit_reason == (uint32_t)A32_EXIT_BRANCH) return 0;
+        a32_ios_exit_teardown(ctx, 134); return 0; }
     if (id == 3U) { ctx->regs[0] = ctx->ios_errno_va; return 0; }
-    if (id == 5U || id == 7U) { ios_bye(r0); return 0; }
-    if (id == 8U || id == 9U) { ctx->regs[0] = 0U; return 0; }
     if (id <= 14U) {
         if (id == 10U) { uint32_t p = gmalloc(ctx, r0); if (!p) serr(ctx, DE_NOMEM); else ctx->regs[0] = p;
         } else if (id == 11U) { uint64_t n = (uint64_t)ctx->regs[0] * (uint64_t)ctx->regs[1]; uint32_t p;

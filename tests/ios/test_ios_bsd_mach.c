@@ -334,6 +334,327 @@ static int check_mach(void)
     return 0;
 }
 
+extern int *__error(void);
+extern void *fopen(const char *__path, const char *__mode);
+extern int fclose(void *__fp);
+extern int fprintf(void *__fp, const char *__fmt, ...);
+extern int atexit(void (*__fn)(void));
+extern long strtol(const char *__s, char **__end, int __base);
+extern unsigned long strtoul(const char *__s, char **__end, int __base);
+
+/* Volatile callees force real libSystem calls so the native leaf
+ * stubs (not clang-folded constants) are exercised. */
+static size_t (* volatile v_strlen)(const char *) = strlen;
+static int (* volatile v_strcmp)(const char *, const char *) = strcmp;
+static int (* volatile v_strncmp)(const char *, const char *, size_t) = strncmp;
+static int (* volatile v_memcmp)(const void *, const void *, size_t) = memcmp;
+static void *(* volatile v_memset)(void *, int, size_t) = memset;
+static void *(* volatile v_memcpy)(void *, const void *, size_t) = memcpy;
+static void *(* volatile v_memmove)(void *, const void *, size_t) = memmove;
+
+static int check_fprintf(void)
+{
+    char path[64];
+    void *f = 0;
+    int pid = getpid();
+    int n = 0;
+    char back[16];
+    int i = 0;
+    int fd = 0;
+    snprintf(path, sizeof(path), "/tmp/a32rt_ios_fprintf_%d", pid);
+    f = fopen(path, "w");
+    if (f == 0) {
+        printf("FAIL fprintf fopen\n");
+        return 1;
+    }
+    n = fprintf(f, "%s %d\n", "ok", 42);
+    if (n != 6) {
+        printf("FAIL fprintf ret %d\n", n);
+        fclose(f);
+        return 1;
+    }
+    if (fclose(f) != 0) {
+        printf("FAIL fprintf fclose\n");
+        return 1;
+    }
+    for (i = 0; i < (int)sizeof(back); i++) {
+        back[i] = 0;
+    }
+    fd = open(path, IOS_O_RDONLY);
+    if (fd < 0) {
+        printf("FAIL fprintf reopen\n");
+        return 1;
+    }
+    n = read(fd, back, 6);
+    close(fd);
+    unlink(path);
+    if (n != 6 || memcmp(back, "ok 42\n", 6) != 0) {
+        printf("FAIL fprintf body\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int check_snprintf(void)
+{
+    char big[5000];
+    char small[8];
+    int n = 0;
+    n = snprintf(big, sizeof(big), "%500d", 7);
+    if (n != 500) {
+        printf("FAIL snprintf 500 %d\n", n);
+        return 1;
+    }
+    if (big[0] != ' ' || big[499] != '7' || strlen(big) != 500U) {
+        printf("FAIL snprintf 500 body\n");
+        return 1;
+    }
+    n = snprintf(small, sizeof(small), "%s", "hello world");
+    if (n != 11) {
+        printf("FAIL snprintf str %d\n", n);
+        return 1;
+    }
+    if (strcmp(small, "hello w") != 0) {
+        printf("FAIL snprintf trunc\n");
+        return 1;
+    }
+    n = snprintf(big, 0U, "hi %d", 5);
+    if (n != 4) {
+        printf("FAIL snprintf zero %d\n", n);
+        return 1;
+    }
+    return 0;
+}
+
+static int check_strto(void)
+{
+    const char *s = " -12345xyz";
+    char *end = 0;
+    long v = 0L;
+    unsigned long uv = 0UL;
+    int *err = __error();
+    *err = 0;
+    v = strtol(s, &end, 10);
+    if (v != -12345L) {
+        printf("FAIL strtol val %ld\n", v);
+        return 1;
+    }
+    if (end == 0 || (end - s) != 7 || *end != 'x') {
+        printf("FAIL strtol end\n");
+        return 1;
+    }
+    *err = 0;
+    v = strtol("99999999999", 0, 10);
+    if (v != 2147483647L) {
+        printf("FAIL strtol clamp %ld\n", v);
+        return 1;
+    }
+    if (*err != 34) {
+        printf("FAIL strtol errno %d\n", *err);
+        return 1;
+    }
+    uv = strtoul("4294967295", 0, 10);
+    if (uv != 4294967295UL) {
+        printf("FAIL strtoul max %lu\n", uv);
+        return 1;
+    }
+    v = strtol("-42", 0, 10);
+    if (v != -42L) {
+        printf("FAIL strtol neg %ld\n", v);
+        return 1;
+    }
+    end = 0;
+    uv = strtoul("77 bottles", &end, 10);
+    if (uv != 77UL || end == 0 || *end != ' ') {
+        printf("FAIL strtoul end\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int check_div64(void)
+{
+    volatile int64_t a = 1000000000007LL, b = 3333333LL;
+    volatile int64_t q = 0, m = 0, z = 0;
+    volatile int64_t mn = (-9223372036854775807LL - 1LL), neg1 = -1LL;
+    volatile uint64_t ua = 18446744073709551615ULL, ub = 7ULL;
+    volatile uint64_t uq = 0U, um = 0U;
+    volatile int x = 1000003, y = 7;
+    q = a / b;
+    m = a % b;
+    if (q != 300000LL || m != 100007LL) {
+        printf("FAIL divdi\n");
+        return 1;
+    }
+    q = mn / neg1;
+    if (q != mn) {
+        printf("FAIL divdi min\n");
+        return 1;
+    }
+    q = a / z;
+    if (q != 0) {
+        printf("FAIL divdi zdiv\n");
+        return 1;
+    }
+    m = a % z;
+    if (m != 0) {
+        printf("FAIL moddi zdiv\n");
+        return 1;
+    }
+    uq = ua / ub;
+    um = ua % ub;
+    if (uq != 2635249153387078802ULL || um != 1ULL) {
+        printf("FAIL udivdi\n");
+        return 1;
+    }
+    if (x / y != 142857 || x % y != 4) {
+        printf("FAIL divsi\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int check_leaf(void)
+{
+    char d[32];
+    char hs[6];
+    unsigned i = 0U;
+    unsigned n5 = 5U, n8 = 8U, n10 = 10U, n3 = 3U, n2 = 2U;
+    hs[0] = 'h';
+    hs[1] = 'e';
+    hs[2] = 'l';
+    hs[3] = 'l';
+    hs[4] = 'o';
+    hs[5] = '\0';
+    for (i = 0U; i < sizeof(d); i++) {
+        d[i] = (char)0xA5;
+    }
+    if (v_strlen(hs) != 5U) {
+        printf("FAIL leaf strlen\n");
+        return 1;
+    }
+    if (v_strcmp("abc", "abd") >= 0 || v_strcmp("abd", "abc") <= 0 ||
+        v_strcmp("abc", "abc") != 0) {
+        printf("FAIL leaf strcmp\n");
+        return 1;
+    }
+    if (v_strncmp("abc", "abd", n2) != 0 ||
+        v_strncmp("abc", "abd", n3) >= 0) {
+        printf("FAIL leaf strncmp\n");
+        return 1;
+    }
+    if (v_memcmp("abc", "abd", n3) >= 0 ||
+        v_memcmp("abc", "abc", n3) != 0) {
+        printf("FAIL leaf memcmp\n");
+        return 1;
+    }
+    if (v_memset(d, 0x5A, n8) != d || d[0] != 0x5A || d[7] != 0x5A ||
+        d[8] != (char)0xA5) {
+        printf("FAIL leaf memset\n");
+        return 1;
+    }
+    for (i = 0U; i < 10U; i++) {
+        d[i] = 0;
+    }
+    if (v_memcpy(d, "0123456789", n10) != d ||
+        v_memcmp(d, "0123456789", n10) != 0) {
+        printf("FAIL leaf memcpy\n");
+        return 1;
+    }
+    if (v_memmove(d + 2, d, n5) != d + 2 ||
+        v_memcmp(d, "0101234789", n10) != 0) {
+        printf("FAIL leaf fwd\n");
+        return 1;
+    }
+    for (i = 0U; i < 10U; i++) {
+        d[i] = (char)('0' + (int)i);
+    }
+    if (v_memmove(d, d + 2, n5) != d ||
+        v_memcmp(d, "2345656789", n10) != 0) {
+        printf("FAIL leaf back\n");
+        return 1;
+    }
+    if (v_memcmp(d, "2345656789", 0U) != 0) {
+        printf("FAIL leaf zero\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int check_mach_thread_self(void)
+{
+    uint32_t p1 = (uint32_t)mach_thread_self();
+    uint32_t p2 = ios_trap0((uint32_t)IOS_TRAP_MACH_THREAD_SELF);
+    if (p1 == 0U || p1 != p2) {
+        printf("FAIL thread_self %u %u\n", p1, p2);
+        return 1;
+    }
+    return 0;
+}
+
+static int check_special_port(void)
+{
+    ios_mach_port_t reply = ios_trap0((uint32_t)IOS_TRAP_MACH_REPLY_PORT);
+    uint32_t rq[16];
+    const uint8_t *rb = 0;
+    uint32_t i = 0U;
+    ios_kern_return_t kr = 0;
+    for (i = 0U; i < 16U; i++) {
+        rq[i] = 0U;
+    }
+    if (reply == 0U) {
+        printf("FAIL special reply\n");
+        return 1;
+    }
+    rq[0] = 0x00001313U;
+    rq[1] = 36U;
+    rq[2] = 0x103U;
+    rq[3] = reply;
+    rq[4] = 0U;
+    rq[5] = 3409U;
+    rq[6] = 0U;
+    rq[7] = 0U;
+    rq[8] = 2U;
+    kr = mach_msg7((ios_mach_msg_header_t *)rq,
+        (uint32_t)(MACH_SEND_MSG | MACH_RCV_MSG), 36U, 64U, reply, 0U, 0U);
+    if (kr != 0) {
+        printf("FAIL special msg\n");
+        return 1;
+    }
+    rb = (const uint8_t *)rq;
+    if (rq[1] != 40U || (rq[0] & 0x80000000U) == 0U || rq[6] != 1U ||
+        rq[7] != 0U || rb[38] != 17U) {
+        printf("FAIL special reply shape\n");
+        return 1;
+    }
+    return 0;
+}
+
+static volatile unsigned g_ax_mask = 0U;
+
+static void ax_hc(void)
+{
+    g_ax_mask |= 4U;
+}
+
+static void ax_hb(void)
+{
+    if ((g_ax_mask & 5U) != 5U) {
+        puts("FAIL atexit B");
+        _exit(11);
+    }
+    g_ax_mask |= 2U;
+}
+
+static void ax_ha(void)
+{
+    if (g_ax_mask != 7U) {
+        puts("FAIL atexit A");
+        _exit(12);
+    }
+    printf("PASS test_ios_bsd_mach\n");
+}
+
 int main(int argc, char **argv, char **envp, char **apple)
 {
     char stack_buf[64];
@@ -355,8 +676,33 @@ int main(int argc, char **argv, char **envp, char **apple)
     if (check_mach() != 0) {
         return 1;
     }
+    if (check_fprintf() != 0) {
+        return 1;
+    }
+    if (check_snprintf() != 0) {
+        return 1;
+    }
+    if (check_strto() != 0) {
+        return 1;
+    }
+    if (check_div64() != 0) {
+        return 1;
+    }
+    if (check_leaf() != 0) {
+        return 1;
+    }
+    if (check_mach_thread_self() != 0) {
+        return 1;
+    }
+    if (check_special_port() != 0) {
+        return 1;
+    }
     /* Exercise the ARM icache trap on our own stack buffer. */
     sys_icache_invalidate(stack_buf, sizeof(stack_buf));
-    printf("PASS test_ios_bsd_mach\n");
-    return 0;
+    if (atexit(ax_ha) != 0 || atexit(ax_hb) != 0 || atexit(ax_hc) != 0) {
+        printf("FAIL atexit reg\n");
+        return 1;
+    }
+    g_ax_mask = 1U;
+    exit(0);
 }
