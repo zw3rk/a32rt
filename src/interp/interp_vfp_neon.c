@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #if defined(__clang__)
 #pragma STDC FP_CONTRACT OFF
@@ -332,7 +335,7 @@ neon_after_vrev:;
             }
         } else if (!u_bit && (size == 0U || size == 2U) && op == 0xDU && b4) {
             for (unsigned k = 0U; k < lanes; k++) {
-                float p = av[k] * bv[k];
+                float p = neon_f32_finish(av[k] * bv[k]);
                 float r = (size == 0U) ? (dv[k] + p) : (dv[k] - p);
                 rv[k] = neon_f32_finish(r);
             }
@@ -431,11 +434,17 @@ neon_after_vrev:;
             }
         } else if (!u_bit && size == 0U && op == 0xFU && b4) {
             for (unsigned k = 0U; k < lanes; k++) {
-                rv[k] = neon_f32_finish(2.0f - av[k] * bv[k]);
+                float p = ((isinf(av[k]) && bv[k] == 0.0f) || (av[k] == 0.0f && isinf(bv[k])))
+                              ? 0.0f
+                              : neon_f32_finish(av[k] * bv[k]);
+                rv[k] = neon_f32_finish(2.0f - p);
             }
         } else if (!u_bit && size == 2U && op == 0xFU && b4) {
             for (unsigned k = 0U; k < lanes; k++) {
-                rv[k] = neon_f32_finish((3.0f - av[k] * bv[k]) * 0.5f);
+                float p = ((isinf(av[k]) && bv[k] == 0.0f) || (av[k] == 0.0f && isinf(bv[k])))
+                              ? 0.0f
+                              : neon_f32_finish(av[k] * bv[k]);
+                rv[k] = neon_f32_finish((3.0f - p) * 0.5f);
             }
         } else if (u_bit && !is_q && size == 0U && op == 0xFU && !b4) {
             float p0 = av[0] > av[1] ? av[0] : av[1];
@@ -605,26 +614,7 @@ neon_after_vrev:;
             for (unsigned k = 0U; k < lanes; k++) {
                 uint64_t vw = ctx->vfp_d[(db_m + (k >> 1)) & 31U];
                 uint32_t w = (uint32_t)(vw >> ((k & 1U) * 32U));
-                float f = 0.0f;
-                memcpy(&f, &w, 4U);
-                f = neon_f32_canon_in(f);
-                float r;
-                if (op5 == 14U) {
-                    uint32_t fw = neon_f32_bits(f);
-                    if (((fw & 0x7F800000U) == 0x7F800000U) && ((fw & 0x007FFFFFU) != 0U)) {
-                        r = neon_bits_f32(0x7FC00000U);
-                    } else {
-                        r = neon_f32_finish((float)fabs((double)f));
-                    }
-                } else {
-                    uint32_t fw = neon_f32_bits(f);
-                    if (((fw & 0x7F800000U) == 0x7F800000U) && ((fw & 0x007FFFFFU) != 0U)) {
-                        r = neon_bits_f32(0x7FC00000U);
-                    } else {
-                        r = neon_f32_finish(-f);
-                    }
-                }
-                uint32_t rw = neon_f32_bits(r);
+                uint32_t rw = (op5 == 14U) ? (w & 0x7FFFFFFFU) : (w ^ 0x80000000U);
                 uint64_t cur = ctx->vfp_d[(db_d + (k >> 1)) & 31U];
                 if ((k & 1U) == 0U) {
                     cur = (cur & 0xFFFFFFFF00000000ULL) | rw;
@@ -641,27 +631,13 @@ neon_after_vrev:;
                 uint64_t vw = ctx->vfp_d[(db_m + (k >> 1)) & 31U];
                 uint32_t w = (uint32_t)(vw >> ((k & 1U) * 32U));
                 if (op5 == 8U || op5 == 9U) {
-                    float f = 0.0f;
-                    memcpy(&f, &w, 4U);
-                    f = neon_f32_canon_in(f);
-                    float r;
-                    if (op5 == 8U) {
-                        r = (f == 0.0f) ? neon_bits_f32(0x7F800000U) : 1.0f / f;
-                        if (f == 0.0f) {
-                            uint32_t fw = neon_f32_bits(f);
-                            r = neon_bits_f32((fw & 0x80000000U) ? 0xFF800000U : 0x7F800000U);
-                        }
-                    } else {
-                        r = (f == 0.0f) ? neon_bits_f32(0x7F800000U) : 1.0f / (float)sqrt((double)f);
-                        if (f == 0.0f) {
-                            uint32_t fw = neon_f32_bits(f);
-                            r = neon_bits_f32((fw & 0x80000000U) ? 0xFF800000U : 0x7F800000U);
-                        } else if (f < 0.0f) {
-                            r = neon_bits_f32(0x7FC00000U);
-                        }
-                    }
-                    r = neon_f32_finish(r);
-                    uint32_t rw = neon_f32_bits(r);
+                    uint32_t rw;
+#if defined(__aarch64__)
+                    rw = (op5 == 8U) ? vget_lane_u32(vrecpe_u32(vdup_n_u32(w)), 0)
+                                     : vget_lane_u32(vrsqrte_u32(vdup_n_u32(w)), 0);
+#else
+                    rw = (w < 0x80000000U) ? 0xFFFFFFFFU : 0x80000000U;
+#endif
                     uint64_t cur = ctx->vfp_d[(db_d + (k >> 1)) & 31U];
                     if ((k & 1U) == 0U) {
                         cur = (cur & 0xFFFFFFFF00000000ULL) | rw;
@@ -673,18 +649,15 @@ neon_after_vrev:;
                     float f = 0.0f;
                     memcpy(&f, &w, 4U);
                     f = neon_f32_canon_in(f);
-                    float a = 0.0f;
-                    uint64_t va = ctx->vfp_d[(db_d + (k >> 1)) & 31U];
-                    uint32_t aw = (uint32_t)(va >> ((k & 1U) * 32U));
-                    memcpy(&a, &aw, 4U);
-                    a = neon_f32_canon_in(a);
-                    float rr;
-                    if (op5 == 10U) {
-                        rr = neon_f32_finish(2.0f - a * f);
-                    } else {
-                        rr = neon_f32_finish((3.0f - a * f) * 0.5f);
-                    }
-                    uint32_t rw = neon_f32_bits(rr);
+                    float r;
+#if defined(__aarch64__)
+                    r = (op5 == 10U) ? vget_lane_f32(vrecpe_f32(vdup_n_f32(f)), 0)
+                                     : vget_lane_f32(vrsqrte_f32(vdup_n_f32(f)), 0);
+#else
+                    r = (op5 == 10U) ? (1.0f / f) : (1.0f / (float)sqrt((double)f));
+#endif
+                    r = neon_f32_finish(r);
+                    uint32_t rw = neon_f32_bits(r);
                     uint64_t cur = ctx->vfp_d[(db_d + (k >> 1)) & 31U];
                     if ((k & 1U) == 0U) {
                         cur = (cur & 0xFFFFFFFF00000000ULL) | rw;
@@ -782,7 +755,7 @@ neon_after_vrev:;
                         float d = 0.0f;
                         memcpy(&d, &dw, 4U);
                         d = neon_f32_canon_in(d);
-                        float p = a * sc;
+                        float p = neon_f32_finish(a * sc);
                         r = (op == 0x1U) ? neon_f32_finish(d + p) :
                             neon_f32_finish(d - p);
                     }
