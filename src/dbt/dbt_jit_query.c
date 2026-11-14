@@ -8,6 +8,9 @@
 #define _GNU_SOURCE
 #include "dbt/jit_priv.h"
 
+/* Staged site publish/discard helpers (src/core/core_emit_mem.c). */
+extern void a32_emit_sites_reset_block(uint32_t guest_start_pc);
+
 static bool range_is_readonly_exec(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
 {
     if (ctx == NULL || len == 0U || addr + len < addr) {
@@ -128,67 +131,105 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         uint32_t use_epoch = cur_epoch;
         jit_lock_release();
 
-        /* Unlocked translation into thread-local staging. */
-        uint32_t entry_itstate = (q_head == 0U && is_thumb) ? ctx->itstate : 0U;
-        a32_jit_stage_reset();
-        a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
-
+        /* A32-IOS-D4: lockless translation with epoch retry. A concurrent
+         * munmap/mprotect/SMC invalidation during translation leaves the
+         * staged bytes stale: drop the lock and retry under the new epoch
+         * (bounded), then compile once more with the lock held as the
+         * guaranteed forward-progress fallback (invalidation takes the
+         * lock, so no epoch change can interleave). Staging is per-thread
+         * (stage_words, site stage, pc-map stage), so retries never touch
+         * another thread's in-flight block. */
         a64_buf_t buf;
-        a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
-        buf.guest_start_pc = cur_b_pc;
-        if (uncached) {
-            buf.vfp_preheader_ineligible = true;
-        }
-
-        if (is_thumb) {
-            a32_translate_t32_block(ctx, &buf, cur_b_pc);
-        } else {
-            a32_translate_a32_block(ctx, &buf, cur_b_pc);
-        }
-
-        if (!uncached && !buf.overflow && buf.has_self_loop &&
-            !buf.vfp_preheader_ineligible && buf.vfp_preheader_count > 0U) {
-            uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
-            uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
-            unsigned saved_count   = buf.vfp_preheader_count;
-            uint32_t saved_written = buf.vfp_preheader_written;
-            memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
-            memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
-
+        size_t code_bytes = 0U;
+        bool hold_lock   = false;
+        bool queue_done  = false;
+        uint32_t entry_itstate = (q_head == 0U && is_thumb) ? ctx->itstate : 0U;
+        for (unsigned attempt = 0U;; attempt++) {
+            if (attempt > 0U) {
+                a32_emit_sites_reset_block(cur_b_pc);
+            }
+            /* Translation into thread-local staging. */
             a32_jit_stage_reset();
             a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
+
             a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
             buf.guest_start_pc = cur_b_pc;
-            a64_buf_start_self_loop(&buf, saved_kinds, saved_regs, saved_count, saved_written);
+            if (uncached) {
+                buf.vfp_preheader_ineligible = true;
+            }
+
             if (is_thumb) {
                 a32_translate_t32_block(ctx, &buf, cur_b_pc);
             } else {
                 a32_translate_a32_block(ctx, &buf, cur_b_pc);
             }
-        }
 
-        if (buf.overflow) {
-            if (q_head == 0U) {
-                fprintf(stderr, "a32rt: block buffer overflow at guest pc=0x%08x\n", pc);
-                return NULL;
+            if (!uncached && !buf.overflow && buf.has_self_loop &&
+                !buf.vfp_preheader_ineligible && buf.vfp_preheader_count > 0U) {
+                uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
+                uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
+                unsigned saved_count   = buf.vfp_preheader_count;
+                uint32_t saved_written = buf.vfp_preheader_written;
+                bool pass1_neon_only = buf.saw_neon_fp && !buf.saw_scalar_vfp;
+                memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
+                memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
+
+                a32_jit_stage_reset();
+                a32_emit_sites_reset_block(cur_b_pc);
+                a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
+                a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
+                buf.guest_start_pc = cur_b_pc;
+                a64_buf_start_self_loop(&buf, saved_kinds, saved_regs, saved_count,
+                                        saved_written, pass1_neon_only);
+                if (is_thumb) {
+                    a32_translate_t32_block(ctx, &buf, cur_b_pc);
+                } else {
+                    a32_translate_a32_block(ctx, &buf, cur_b_pc);
+                }
             }
-            break;
-        }
 
-        size_t code_bytes = buf.count * sizeof(uint32_t);
+            if (buf.overflow) {
+                if (hold_lock) {
+                    jit_lock_release();
+                }
+                if (q_head == 0U) {
+                    fprintf(stderr, "a32rt: block buffer overflow at guest pc=0x%08x\n", pc);
+                    return NULL;
+                }
+                queue_done = true;
+                break;
+            }
 
-        /* Locked commit: re-verify the epoch and re-probe in case another
-         * thread compiled this block while we translated unlocked. */
-        jit_lock_acquire();
-        cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
-        if (cur_epoch != use_epoch &&
-            !a32_jit_range_executable(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
-            ctx->fault_addr  = cur_b_pc;
-            ctx->exit_reason = A32_EXIT_FAULT;
+            code_bytes = buf.count * sizeof(uint32_t);
+
+            /* Locked commit pre-check: re-verify the epoch in case another
+             * thread invalidated (or compiled this block) mid-translation. */
+            if (!hold_lock) {
+                jit_lock_acquire();
+            }
+            cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
+            if (cur_epoch == use_epoch) {
+                break;
+            }
+            if (!a32_jit_range_executable(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
+                ctx->fault_addr  = cur_b_pc;
+                ctx->exit_reason = A32_EXIT_FAULT;
+                jit_lock_release();
+                if (q_head == 0U) {
+                    return NULL;
+                }
+                queue_done = true;
+                break;
+            }
+            if (attempt >= 3U) {
+                hold_lock = true;
+                use_epoch = cur_epoch;
+                continue;
+            }
             jit_lock_release();
-            if (q_head == 0U) {
-                return NULL;
-            }
+            use_epoch = cur_epoch;
+        }
+        if (queue_done) {
             break;
         }
         if (!uncached) {

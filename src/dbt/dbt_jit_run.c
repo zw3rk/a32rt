@@ -146,15 +146,38 @@ static void try_chain_entries(a32_cache_entry_t *prev_entry, uint32_t prev_key,
 
 static int handle_guest_fault(a32_ctx_t *ctx)
 {
-    if (ctx->gdb_enabled && a32_gdb_handle_stop(ctx, SIGSEGV) == 0) {
+    /* A32-IOS-D19: a fault may land mid-block while NEON Standard FPSCR
+     * is active; reset host FPCR so C/signal code runs IEEE-754 clean. */
+#if defined(__aarch64__)
+    {
+        uint64_t fpcr_v;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr_v));
+        if (fpcr_v != 0ULL) {
+            __asm__ volatile("msr fpcr, xzr");
+        }
+    }
+#endif
+    /* A32-IOS-D19: XNU delivers SIGBUS for protection violations inside a
+     * valid mapping (except __PAGEZERO) and SIGSEGV for unmapped VAs. */
+    uint32_t fault_va = ctx->fault_addr;
+    int sig = SIGSEGV;
+    if (ctx->is_ios) {
+        bool mapped = a32_guest_range_ok(ctx, fault_va, 1U, 0);
+        if (mapped && fault_va >= a32_min_va(ctx)) {
+            sig = SIGBUS;
+        } else {
+            sig = SIGSEGV;
+        }
+    }
+    if (ctx->gdb_enabled && a32_gdb_handle_stop(ctx, sig) == 0) {
         return 0;
     }
-    if (a32_signals_deliver_sync(ctx, SIGSEGV, ctx->fault_addr)) {
+    if (a32_signals_deliver_sync(ctx, sig, ctx->fault_addr)) {
         a32_signals_check_pending(ctx);
         return 0;
     }
     fprintf(stderr, "a32rt: guest fault at 0x%08x\n", ctx->fault_addr);
-    return 128 + SIGSEGV;
+    return 128 + sig;
 }
 
 int a32_jit_run(a32_ctx_t *ctx)
@@ -525,6 +548,22 @@ int a32_jit_run(a32_ctx_t *ctx)
                     }
                     return step_fault_rc;
                 }
+                /* A32-IOS-D19: the interpreter re-step hit a breakpoint:
+                 * handle it exactly like a block A32_EXIT_BKPT exit
+                 * (SIGTRAP delivery, not SIGILL). regs[15] already holds
+                 * the breakpoint PC, matching the block-exit record. */
+                if (step_rc == A32_EXIT_BKPT) {
+                    prev_entry = NULL;
+                    if (ctx->gdb_enabled) {
+                        uint32_t pre_stop_pc = ctx->regs[15];
+                        a32_gdb_handle_stop(ctx, SIGTRAP);
+                        gdb_stopped_at_pc = (ctx->regs[15] == pre_stop_pc);
+                        gdb_stopped_pc    = pre_stop_pc;
+                    } else if (!a32_signals_deliver_sync(ctx, SIGTRAP, ctx->regs[15])) {
+                        raise(SIGTRAP);
+                    }
+                    break;
+                }
                 ctx->regs[15] = saved_pc;
                 ctx->cpsr     = saved_cpsr;
                 ctx->itstate  = saved_itstate;
@@ -589,6 +628,11 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
     }
     ctx->blocks_executed++;
     ctx->sync_sig_delivered = false;
+    /* A32-IOS-D19: APRR write-protect MAP_JIT pages before executing, or
+     * --difftest faults the moment it touches translated code. */
+#if defined(__APPLE__)
+    pthread_jit_write_protect_np(1);
+#endif
     reason = a32_jit_run_block(ctx, code, (void *)&g_dummy_entry,
         &g_cache_epoch);
     a32_jit_exec_leave();
@@ -596,6 +640,14 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
         ctx->regs[15] &= is_thumb ? ~1U : ~3U;
     } else if (reason == A32_EXIT_INTERWORK) {
         a32_set_pc_interwork(ctx, ctx->regs[15]);
+    } else if (reason == A32_EXIT_BKPT) {
+        /* A32-IOS-D19: single-stepped breakpoint behaves exactly like a
+         * block A32_EXIT_BKPT exit instead of an unhandled stop. */
+        if (ctx->gdb_enabled) {
+            (void)a32_gdb_handle_stop(ctx, SIGTRAP);
+        } else if (!a32_signals_deliver_sync(ctx, SIGTRAP, ctx->regs[15])) {
+            raise(SIGTRAP);
+        }
     }
     ctx->exit_reason = reason;
     return reason;

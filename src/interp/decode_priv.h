@@ -177,28 +177,56 @@ static inline void neon_emit_unary(a64_buf_t *b, bool is_q, unsigned d, unsigned
     neon_str_ctx(b, is_q, 0U, d);
 }
 
-/* NEON FP environment isolation (A32-R7-24): Advanced SIMD arithmetic
- * always uses the Standard FPSCR (RMode=RN, FZ=1, DN=1, AHP from the
- * guest FPSCR), never the scalar VFP rounding/flush controls the
- * trampoline installed in host FPCR on block entry. Save the scalar
- * host FPCR, install the standard value derived from ctx->fpscr, and
- * restore it after the NEON FP op. Only NEON vector instructions sit
- * between save and restore, so TMP1 is never clobbered (vector ops
- * never write general registers). */
+/* NEON FP environment isolation (A32-R7-24, A32-IOS-P1): Advanced SIMD
+ * arithmetic always uses the Standard FPSCR (RMode=RN, FZ=1, DN=1, AHP
+ * from the guest FPSCR), never the scalar VFP rounding/flush controls
+ * the trampoline installed in host FPCR on block entry. The install is
+ * coalesced per block: the first NEON FP op at cond_branch_depth == 0
+ * installs Standard FPSCR once (fpcr_neon_active = true) and later ops
+ * emit nothing; the scalar restore is emitted only before scalar VFP
+ * ops, conditional skip boundaries, and block/side exits. Inside a
+ * conditional skip region the pair stays balanced per op without
+ * touching the flag. Only NEON vector instructions sit between install
+ * and restore, so TMP1/TMP2 are never clobbered (vector ops never write
+ * general registers). */
 static inline void neon_fp_fpcr_begin(a64_buf_t *b)
 {
-    a64_emit(b, 0xD53B4400U | A64_TMP1); /* MRS xTmp1, FPCR (save scalar) */
-    a64_emit_ldr_imm_w(b, A64_TMP0, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
-    a64_emit_mov_imm32(b, A64_TMP2, 0x04000000U); /* guest FPSCR.AHP mask */
-    a64_emit_and_reg_w(b, false, A64_TMP0, A64_TMP0, A64_TMP2, A64_SHIFT_LSL, 0U);
-    a64_emit_mov_imm32(b, A64_TMP2, 0x03000000U); /* FZ | DN */
-    a64_emit_orr_reg_w(b, A64_TMP0, A64_TMP0, A64_TMP2, A64_SHIFT_LSL, 0U);
-    a64_emit(b, 0xD51B4400U | A64_TMP0); /* MSR FPCR, xTmp0 */
+    b->saw_neon_fp = true;
+    if (b->cond_branch_depth > 0U) {
+        if (!b->fpcr_neon_active) {
+            a64_emit_fpcr_install_neon(b);
+        }
+        return;
+    }
+    if (!b->fpcr_neon_active) {
+        a64_emit_fpcr_install_neon(b);
+        b->fpcr_neon_active = true;
+    }
 }
 
 static inline void neon_fp_fpcr_end(a64_buf_t *b)
 {
-    a64_emit(b, 0xD51B4400U | A64_TMP1); /* MSR FPCR, xTmp1 (restore scalar) */
+    if (b->cond_branch_depth > 0U && !b->fpcr_neon_active) {
+        a64_emit_fpcr_restore_scalar(b);
+    }
+}
+
+/* Scalar VFP data-processing observes the scalar FPSCR rounding/flush
+ * controls, never the NEON Standard FPSCR (A32-IOS-P1). Call at entry to
+ * scalar VFP data-processing (and after VMSR FPSCR): restore scalar
+ * FPCR when NEON Standard FPSCR is active, clearing the flag outside
+ * conditional skip regions (inside, the flag stays set so fallthrough
+ * keeps Standard FPSCR; the pre-placeholder flush guarantees the flag
+ * is clear on region entry unless hoisted for a pure-NEON self-loop). */
+static inline void vfp_scalar_fpcr_sync(a64_buf_t *b)
+{
+    b->saw_scalar_vfp = true;
+    if (b->fpcr_neon_active) {
+        a64_emit_fpcr_restore_scalar(b);
+        if (b->cond_branch_depth == 0U) {
+            b->fpcr_neon_active = false;
+        }
+    }
 }
 
 static inline void neon_emit_wb(a64_buf_t *b, unsigned rn, unsigned rm, uint16_t imm_bytes)

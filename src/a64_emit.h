@@ -99,6 +99,10 @@ typedef struct a64_buf {
     size_t    loop_body_offset;
     uint32_t  exit_slot_pcs[A64_MAX_EXIT_SLOTS];
     unsigned  exit_slot_count;
+    bool      fpcr_neon_active;    /* host FPCR holds NEON Standard FPSCR */
+    bool      saw_neon_fp;         /* block emitted >= 1 NEON FP op */
+    bool      saw_scalar_vfp;      /* block emitted >= 1 scalar VFP op */
+    bool      preheader_neon_fpcr; /* pass-2 self-loop hoisted NEON FPCR into preheader */
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
@@ -108,7 +112,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     b->cap   = cap;
 }
 
-void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs, unsigned count, uint32_t written_mask);
+void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs, unsigned count, uint32_t written_mask, bool neon_fpcr_hoist);
 void a64_vfp_cache_flush(a64_buf_t *b, bool invalidate);
 void a64_vfp_emit_exit_flush(a64_buf_t *b);
 
@@ -327,6 +331,29 @@ void a64_emit_clrex(a64_buf_t *b);
 void a64_emit_dmb_ish(a64_buf_t *b);
 void a64_emit_dsb_ish(a64_buf_t *b);
 void a64_emit_isb(a64_buf_t *b);
+
+/* NEON Standard FPSCR install / scalar restore shared by the DBT FPCR
+ * coalescing protocol (A32-IOS-P1): Standard FPSCR is FZ=1, DN=1,
+ * RMode=RN with AHP taken from ctx->fpscr; the scalar restore keeps only
+ * the scalar rounding/flush controls (0x07c00000). Both sequences clobber
+ * TMP1/TMP2, which never hold live guest state around FP ops. */
+static inline void a64_emit_fpcr_install_neon(a64_buf_t *b)
+{
+    a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+    a64_emit_mov_imm32(b, A64_TMP2, 0x04000000U);
+    a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
+    a64_emit_mov_imm32(b, A64_TMP2, 0x03000000U);
+    a64_emit_orr_reg_w(b, A64_TMP1, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
+    a64_emit(b, 0xD51B4400U | A64_TMP1); /* MSR FPCR, xTmp1 */
+}
+
+static inline void a64_emit_fpcr_restore_scalar(a64_buf_t *b)
+{
+    a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+    a64_emit_mov_imm32(b, A64_TMP2, 0x07C00000U);
+    a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
+    a64_emit(b, 0xD51B4400U | A64_TMP1); /* MSR FPCR, xTmp1 */
+}
 
 /* Branches & block exits */
 size_t a64_emit_b_cond_placeholder(a64_buf_t *b, unsigned cond);
