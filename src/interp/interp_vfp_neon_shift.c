@@ -11,6 +11,10 @@
  */
 #include "interp.h"
 #include "interp_priv.h"
+
+#include <fenv.h>
+#include <math.h>
+#include <string.h>
 /* FPSCR.QC: cumulative saturation flag set by VQSHL*, VQSHLU and VQSHRN*. */
 #define NI_FPSCR_QC (1U << 27)
 static uint64_t sh_mask(unsigned b)
@@ -182,6 +186,65 @@ bool i_vfp_neon_shift(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             out = sh_put(out, i, dst_bits, trunc);
         }
         ctx->vfp_d[dd & 31U] = out;
+        ctx->regs[15] = pc + 4U;
+        return true;
+    }
+    if ((sh_op == 0xEU || sh_op == 0xFU) && (l_sh == 0U) && (imm6 >= 32U)) {
+        unsigned fbits = 64U - imm6;
+        unsigned nregs = is_q ? 2U : 1U;
+        uint64_t srcs[2];
+        if (is_q && (((dd & 1U) != 0U) || ((dm & 1U) != 0U))) {
+            return false;
+        }
+        srcs[0] = ctx->vfp_d[dm & 31U];
+        srcs[1] = ctx->vfp_d[(dm + 1U) & 31U];
+        for (unsigned k = 0U; k < nregs; k++) {
+            uint64_t out = 0ULL;
+            for (unsigned i = 0U; i < 2U; i++) {
+                uint32_t sl = (uint32_t)sh_get(srcs[k], i, 32U);
+                uint32_t rl = 0U;
+                if (sh_op == 0xEU) {
+                    double iv = is_u ? (double)sl : (double)(int32_t)sl;
+                    fenv_t env;
+                    (void)feholdexcept(&env);
+                    (void)fesetround(FE_TONEAREST);
+                    float f = (float)ldexp(iv, -(int)fbits);
+                    if (fetestexcept(FE_INEXACT) != 0) {
+                        ctx->fpscr |= (1U << 4);
+                    }
+                    (void)fesetenv(&env);
+                    memcpy(&rl, &f, 4U);
+                    if ((rl & 0x7F800000U) == 0U && (rl & 0x7FFFFFFFU) != 0U) {
+                        rl &= 0x80000000U;
+                    }
+                } else {
+                    if ((sl & 0x7F800000U) == 0U && (sl & 0x7FFFFFFFU) != 0U) {
+                        sl &= 0x80000000U;
+                        ctx->fpscr |= (1U << 7);
+                    }
+                    if ((sl & 0x7F800000U) == 0x7F800000U && (sl & 0x7FFFFFU) != 0U) {
+                        ctx->fpscr |= 1U;
+                        rl = 0U;
+                    } else {
+                        float f = 0.0f;
+                        memcpy(&f, &sl, 4U);
+                        double sc = ldexp((double)f, (int)fbits);
+                        double tr = trunc(sc);
+                        if (is_u) {
+                            if (sc < 0.0) { ctx->fpscr |= 1U; rl = 0U; }
+                            else if (tr >= 4294967296.0) { ctx->fpscr |= 1U; rl = 0xFFFFFFFFU; }
+                            else { if (tr != sc) { ctx->fpscr |= (1U << 4); } rl = (uint32_t)tr; }
+                        } else {
+                            if (tr > 2147483647.0) { ctx->fpscr |= 1U; rl = 0x7FFFFFFFU; }
+                            else if (tr < -2147483648.0) { ctx->fpscr |= 1U; rl = 0x80000000U; }
+                            else { if (tr != sc) { ctx->fpscr |= (1U << 4); } rl = (uint32_t)(int32_t)tr; }
+                        }
+                    }
+                }
+                out = sh_put(out, i, 32U, rl);
+            }
+            ctx->vfp_d[(dd + k) & 31U] = out;
+        }
         ctx->regs[15] = pc + 4U;
         return true;
     }

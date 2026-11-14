@@ -3,6 +3,10 @@
 // NEON integer long, widening, narrowing, and scalar operations.
 #include "interp.h"
 #include "interp_priv.h"
+
+#include <fenv.h>
+#include <math.h>
+#include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
 #ifndef NI_FPSCR_QC
@@ -57,10 +61,92 @@ static uint16_t ni_p8(uint8_t a, uint8_t b)
 	}
 	return r;
 }
+static uint32_t ni_f16_to_f32(uint16_t h, bool dn)
+{
+	uint32_t s = (uint32_t)(h & 0x8000U) << 16;
+	unsigned e = (h >> 10) & 0x1FU;
+	uint32_t m = h & 0x03FFU;
+	if (e == 0U) {
+		if (m == 0U) { return s; }
+		e = 1U;
+		while ((m & 0x0400U) == 0U) { m <<= 1; e--; }
+		m &= 0x03FFU;
+		return s | ((e + 112U) << 23) | (m << 13);
+	}
+	if (e == 31U) {
+		if (m == 0U) { return s | 0x7F800000U; }
+		return dn ? 0x7FC00000U : (s | 0x7FC00000U | (m << 13));
+	}
+	return s | ((e + 112U) << 23) | (m << 13);
+}
+static uint16_t ni_f32_to_f16(uint32_t f, bool dn)
+{
+	uint16_t s = (uint16_t)((f >> 16) & 0x8000U);
+	int e = (int)((f >> 23) & 0xFFU);
+	uint32_t m = f & 0x7FFFFFU;
+	if (e == 0) { return s; }
+	if (e == 255) {
+		if (m == 0U) { return (uint16_t)(s | 0x7C00U); }
+		return dn ? 0x7E00U : (uint16_t)(s | 0x7E00U | (m >> 13));
+	}
+	int he = e - 112;
+	if (he >= 31) { return (uint16_t)(s | 0x7C00U); }
+	uint32_t sig = m | 0x800000U;
+	if (he <= 0) {
+		if (he < -10) { return s; }
+		unsigned sh = (unsigned)(14 - he);
+		uint32_t q = sig >> sh;
+		uint32_t rem = sig & ((1U << sh) - 1U);
+		uint32_t half = 1U << (sh - 1U);
+		if (rem > half || (rem == half && (q & 1U) != 0U)) { q++; }
+		return (uint16_t)(s + q);
+	}
+	uint32_t q = (sig >> 13) & 0x3FFU;
+	uint32_t rem = sig & 0x1FFFU;
+	uint16_t res = (uint16_t)(s | ((uint16_t)he << 10) | (uint16_t)q);
+	if (rem > 0x1000U || (rem == 0x1000U && (q & 1U) != 0U)) { res++; }
+	return res;
+}
 bool i_vfp_neon_long(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
 {
 	bool u_bit; unsigned size, op; bool is_q; unsigned dd, dn, dm;
 	unsigned nbits, wbits;
+	if ((insn & 0xFFB00010U) == 0xF3B00000U) {
+		unsigned m_sz = (insn >> 18) & 3U;
+		unsigned m_opc1 = (insn >> 16) & 3U;
+		unsigned m_op5 = (insn >> 7) & 31U;
+		bool m_q = ((insn >> 6) & 1U) != 0U;
+		unsigned m_d = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
+		unsigned m_m = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
+		if (m_opc1 == 2U && m_sz == 1U && !m_q && (m_op5 == 12U || m_op5 == 14U)) {
+			if (m_op5 == 12U) {
+				if ((m_m & 1U) != 0U) { return false; }
+				uint64_t q0 = ctx->vfp_d[m_m & 31U];
+				uint64_t q1 = ctx->vfp_d[(m_m + 1U) & 31U];
+				uint64_t out = 0ULL;
+				for (unsigned i = 0U; i < 4U; i++) {
+					uint32_t fw = (uint32_t)((i < 2U) ? (q0 >> (i * 32U)) : (q1 >> ((i - 2U) * 32U)));
+					if ((fw & 0x7F800000U) == 0U) { fw &= 0x80000000U; }
+					out |= (uint64_t)ni_f32_to_f16(fw, true) << (i * 16U);
+				}
+				ctx->vfp_d[m_d & 31U] = out;
+			} else {
+				if ((m_d & 1U) != 0U) { return false; }
+				uint64_t dw = ctx->vfp_d[m_m & 31U];
+				uint64_t o0 = 0ULL, o1 = 0ULL;
+				for (unsigned i = 0U; i < 4U; i++) {
+					uint32_t fw = ni_f16_to_f32((uint16_t)(dw >> (i * 16U)), true);
+					if (i < 2U) { o0 |= (uint64_t)fw << (i * 32U); }
+					else { o1 |= (uint64_t)fw << ((i - 2U) * 32U); }
+				}
+				ctx->vfp_d[m_d & 31U] = o0;
+				ctx->vfp_d[(m_d + 1U) & 31U] = o1;
+			}
+			ctx->regs[15] = pc + 4U;
+			return true;
+		}
+		return false;
+	}
 	if ((insn & 0xFE800010U) != 0xF2800000U) { return false; }
 	u_bit = ((insn >> 24) & 1U) != 0U; size = (insn >> 20) & 3U;
 	op = (insn >> 8) & 0xFU; is_q = ((insn >> 6) & 1U) != 0U;
@@ -289,4 +375,122 @@ bool i_vfp_neon_long(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
 		return false;
 	}
 	return false;
+}
+
+bool i_vfp_fxcvt(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
+{
+	bool dbl = (((insn >> 8) & 0xFU) == 11U);
+	unsigned opc2 = (insn >> 16) & 0xFU;
+	bool d_bit = ((insn >> 22) & 1U) != 0U;
+	unsigned vd_b = (insn >> 12) & 0xFU;
+	bool n_bit = ((insn >> 7) & 1U) != 0U;
+	bool m_bit = ((insn >> 5) & 1U) != 0U;
+	unsigned vm_b = insn & 0xFU;
+	if (!dbl && (opc2 == 2U || opc2 == 3U)) {
+		unsigned sd = (vd_b << 1) | (d_bit ? 1U : 0U);
+		unsigned sm = (vm_b << 1) | (m_bit ? 1U : 0U);
+		uint32_t *sw = (uint32_t *)(void *)ctx->vfp_d;
+		bool dn = ((ctx->fpscr >> 25) & 1U) != 0U;
+		if (opc2 == 2U) {
+			uint16_t h = (uint16_t)((sw[sm] >> (n_bit ? 16U : 0U)) & 0xFFFFU);
+			sw[sd] = ni_f16_to_f32(h, dn);
+		} else {
+			uint32_t fw = sw[sm];
+			if (((ctx->fpscr >> 24) & 1U) != 0U && (fw & 0x7F800000U) == 0U) {
+				fw &= 0x80000000U;
+			}
+			uint16_t h = ni_f32_to_f16(fw, dn);
+			sw[sd] = n_bit ? ((sw[sd] & 0x0000FFFFU) | ((uint32_t)h << 16))
+			               : ((sw[sd] & 0xFFFF0000U) | (uint32_t)h);
+		}
+		ctx->regs[15] = pc + 4U;
+		return true;
+	}
+	if (opc2 != 10U && opc2 != 11U && opc2 != 14U && opc2 != 15U) {
+		return false;
+	}
+	bool to_fixed = (opc2 >= 14U);
+	bool is_unsigned = ((opc2 & 1U) != 0U);
+	unsigned int_bits = n_bit ? 32U : 16U;
+	unsigned imm5_raw = (vm_b << 1) | (m_bit ? 1U : 0U);
+	if (imm5_raw >= int_bits) {
+		return false;
+	}
+	unsigned fbits = int_bits - imm5_raw;
+	unsigned d_idx = dbl ? ((d_bit ? 16U : 0U) | vd_b) : ((vd_b << 1) | (d_bit ? 1U : 0U));
+	uint32_t *s_words = (uint32_t *)(void *)ctx->vfp_d;
+
+	if (!to_fixed) {
+		uint32_t raw = dbl ? (uint32_t)ctx->vfp_d[d_idx] : s_words[d_idx];
+		double iv;
+		if (!n_bit) {
+			iv = is_unsigned ? (double)(raw & 0xFFFFU) : (double)(int16_t)(uint16_t)raw;
+		} else {
+			iv = is_unsigned ? (double)raw : (double)(int32_t)raw;
+		}
+		fenv_t env;
+		(void)feholdexcept(&env);
+		unsigned rm = (ctx->fpscr >> 22) & 3U;
+		(void)fesetround(rm == 0U ? FE_TONEAREST : rm == 1U ? FE_UPWARD : rm == 2U ? FE_DOWNWARD : FE_TOWARDZERO);
+		if (dbl) {
+			double out_d = ldexp(iv, -(int)fbits);
+			if (fetestexcept(FE_INEXACT) != 0) { ctx->fpscr |= (1U << 4); }
+			memcpy(&ctx->vfp_d[d_idx], &out_d, 8U);
+		} else {
+			float out_f = (float)ldexp(iv, -(int)fbits);
+			if (fetestexcept(FE_INEXACT) != 0) { ctx->fpscr |= (1U << 4); }
+			memcpy(&s_words[d_idx], &out_f, 4U);
+		}
+		(void)fesetenv(&env);
+		ctx->regs[15] = pc + 4U;
+		return true;
+	}
+
+	double v;
+	if (dbl) {
+		memcpy(&v, &ctx->vfp_d[d_idx], 8U);
+		uint64_t bw = ctx->vfp_d[d_idx];
+		if ((ctx->fpscr & (1U << 24)) != 0U && ((bw & 0x7FF0000000000000ULL) == 0ULL) && ((bw & 0x000FFFFFFFFFFFFFULL) != 0ULL)) {
+			ctx->fpscr |= (1U << 7);
+			v = (bw >> 63) ? -0.0 : 0.0;
+		}
+	} else {
+		float fv = 0.0f;
+		uint32_t bw = s_words[d_idx];
+		memcpy(&fv, &bw, 4U);
+		if ((ctx->fpscr & (1U << 24)) != 0U && ((bw & 0x7F800000U) == 0U) && ((bw & 0x007FFFFFU) != 0U)) {
+			ctx->fpscr |= (1U << 7);
+			fv = (bw >> 31) ? -0.0f : 0.0f;
+		}
+		v = (double)fv;
+	}
+
+	uint32_t out32 = 0U;
+	if (isnan(v)) {
+		ctx->fpscr |= 1U;
+		out32 = 0U;
+	} else {
+		double sv = isfinite(v) ? ldexp(v, (int)fbits) : v;
+		double tr = isfinite(sv) ? trunc(sv) : sv;
+		double hi = is_unsigned ? (double)((int_bits == 32U) ? 0xFFFFFFFFULL : 0xFFFFULL)
+		                        : (double)((1ULL << (int_bits - 1U)) - 1ULL);
+		double lo = is_unsigned ? 0.0 : -(double)(1ULL << (int_bits - 1U));
+		if (!isfinite(sv) || tr > hi) {
+			ctx->fpscr |= 1U;
+			out32 = (uint32_t)(is_unsigned ? (uint64_t)hi : (uint64_t)(int64_t)hi);
+		} else if (tr < lo) {
+			ctx->fpscr |= 1U;
+			out32 = is_unsigned ? 0U : (uint32_t)(int32_t)(int64_t)lo;
+		} else {
+			if (tr != sv) { ctx->fpscr |= (1U << 4); }
+			out32 = is_unsigned ? (uint32_t)(uint64_t)tr : (uint32_t)(int32_t)(int64_t)tr;
+		}
+	}
+	if (dbl) {
+		ctx->vfp_d[d_idx] = is_unsigned ? (uint64_t)out32 : (uint64_t)(int64_t)(int32_t)out32;
+	} else {
+		s_words[d_idx] = out32;
+	}
+	ctx->regs[15] = pc + 4U;
+	return true;
 }

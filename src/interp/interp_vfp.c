@@ -751,7 +751,7 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             ctx->regs[15] = pc + 4U;
             return true;
         }
-        return false;
+        return i_vfp_fxcvt(ctx, pc, insn);
     }
 
     if (opc1 <= 3U || (opc1 == 8U && !op_bit) || opc1 == 9U || opc1 == 10U) {

@@ -592,7 +592,7 @@ void a64_vfp_emit_exit_flush(a64_buf_t *b)
 void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs,
                              unsigned count, uint32_t written_mask, bool neon_fpcr_hoist)
 {
-    b->self_loop_vfp_active = true;
+    b->self_loop_vfp_active = (count > 0U);
     /* A32-IOS-P1: pure-NEON self-loops install Standard FPSCR once in the
      * preheader (before loop_body_offset); the loop body then runs with
      * fpcr_neon_active set and emits zero MSR FPCR instructions. */

@@ -501,52 +501,80 @@ static bool x_misc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         return false;
     }
     unsigned op5 = (insn >> 7) & 31U;
+    if (opc1 == 1U) {
+        if ((op5 <= 4U || op5 == 6U || op5 == 7U) && size < 3U) {
+            unsigned per = is_q ? x_per_d(size) * 2U : x_per_d(size);
+            for (unsigned k = 0U; k < per; k++) {
+                unsigned dd = is_q ? ((d & ~1U) + (k >= x_per_d(size) ? 1U : 0U)) & 31U : d & 31U;
+                unsigned kk = is_q ? (k >= x_per_d(size) ? k - x_per_d(size) : k) : k;
+                uint64_t sv = ctx->vfp_d[(is_q ? ((m & ~1U) + (k >= x_per_d(size) ? 1U : 0U)) : m) & 31U];
+                uint64_t u = x_glane(sv, kk, size);
+                int64_t e = (size == 0U) ? (int64_t)(int8_t)(uint8_t)u :
+                    (size == 1U) ? (int64_t)(int16_t)(uint16_t)u : (int64_t)(int32_t)(uint32_t)u;
+                uint64_t r = (op5 == 6U) ? ((e < 0) ? -(uint64_t)e : (uint64_t)e) :
+                    (op5 == 7U) ? -(uint64_t)e :
+                    (((op5 == 0U) ? (e > 0) : (op5 == 1U) ? (e >= 0) :
+                      (op5 == 2U) ? (e == 0) : (op5 == 3U) ? (e <= 0) : (e < 0)) ? ~0ULL : 0ULL);
+                ctx->vfp_d[dd] = x_plane(ctx->vfp_d[dd], kk, size, r);
+            }
+            ctx->regs[15] = pc + 4U;
+            return true;
+        }
+        if (op5 >= 8U && op5 <= 12U && size == 2U) {
+            unsigned per = is_q ? 4U : 2U;
+            for (unsigned k = 0U; k < per; k++) {
+                unsigned dd = is_q ? ((d & ~1U) + (k >= 2U ? 1U : 0U)) & 31U : d & 31U;
+                unsigned kk = is_q ? (k >= 2U ? k - 2U : k) : k;
+                uint64_t sv = ctx->vfp_d[(is_q ? ((m & ~1U) + (k >= 2U ? 1U : 0U)) : m) & 31U];
+                uint32_t fw = (uint32_t)x_glane(sv, kk, 2U);
+                if ((fw & 0x7F800000U) == 0U) {
+                    fw &= 0x80000000U;
+                }
+                float f = 0.0f;
+                memcpy(&f, &fw, 4U);
+                bool c = (op5 == 8U) ? (f > 0.0f) : (op5 == 9U) ? (f >= 0.0f) :
+                    (op5 == 10U) ? (f == 0.0f) : (op5 == 11U) ? (f <= 0.0f) : (f < 0.0f);
+                ctx->vfp_d[dd] = x_plane(ctx->vfp_d[dd], kk, 2U, c ? 0xFFFFFFFFULL : 0ULL);
+            }
+            ctx->regs[15] = pc + 4U;
+            return true;
+        }
+        return false;
+    }
     if (opc1 != 0U) {
         return false;
     }
-    if ((op5 == 4U || op5 == 5U) && size < 3U) {
-        bool su = (op5 == 5U);
+    if ((op5 == 4U || op5 == 5U || op5 == 12U || op5 == 13U) && size < 3U) {
+        bool acc = (op5 >= 12U);
+        bool su = (op5 & 1U) != 0U;
         unsigned per = is_q ? x_per_d(size) * 2U : x_per_d(size);
         unsigned out_n = per / 2U;
+        uint64_t s0 = is_q ? ctx->vfp_d[(m & ~1U) & 31U] : ctx->vfp_d[m & 31U];
+        uint64_t s1 = is_q ? ctx->vfp_d[((m & ~1U) + 1U) & 31U] : 0ULL;
+        uint64_t d0 = acc ? ctx->vfp_d[(is_q ? (d & ~1U) : d) & 31U] : 0ULL;
+        uint64_t d1 = (acc && is_q) ? ctx->vfp_d[((d & ~1U) + 1U) & 31U] : 0ULL;
         for (unsigned k = 0U; k < out_n; k++) {
-            uint64_t s0 = is_q ? ctx->vfp_d[(m & ~1U) & 31U] : ctx->vfp_d[m & 31U];
-            uint64_t s1 = is_q ? ctx->vfp_d[((m & ~1U) + 1U) & 31U] : 0ULL;
             unsigned nk0 = 2U * k;
             unsigned nk1 = 2U * k + 1U;
-            uint64_t v0 = (!is_q) ? x_glane(s0, nk0, size) :
-                ((nk0 < x_per_d(size)) ? x_glane(s0, nk0, size) : x_glane(s1, nk0 - x_per_d(size), size));
-            uint64_t v1 = (!is_q) ? x_glane(s0, nk1, size) :
-                ((nk1 < x_per_d(size)) ? x_glane(s0, nk1, size) : x_glane(s1, nk1 - x_per_d(size), size));
+            uint64_t v0 = (nk0 < x_per_d(size)) ? x_glane(s0, nk0, size) : x_glane(s1, nk0 - x_per_d(size), size);
+            uint64_t v1 = (nk1 < x_per_d(size)) ? x_glane(s0, nk1, size) : x_glane(s1, nk1 - x_per_d(size), size);
             int64_t a = su ? (int64_t)v0 : ((size == 0U) ? (int64_t)(int8_t)(uint8_t)v0 :
                 (size == 1U) ? (int64_t)(int16_t)(uint16_t)v0 : (int64_t)(int32_t)(uint32_t)v0);
             int64_t b = su ? (int64_t)v1 : ((size == 0U) ? (int64_t)(int8_t)(uint8_t)v1 :
                 (size == 1U) ? (int64_t)(int16_t)(uint16_t)v1 : (int64_t)(int32_t)(uint32_t)v1);
-            uint64_t out = (uint64_t)(a + b);
-            if (!is_q) {
-                uint64_t cur = (k == 0U) ? 0ULL : ctx->vfp_d[d & 31U];
-                if (size == 0U) {
-                    cur = (k == 0U) ? (out & 0xFFFFULL) : (cur & ~(0xFFFFULL << (k * 16U))) | ((out & 0xFFFFULL) << (k * 16U));
-                } else if (size == 1U) {
-                    cur = (k == 0U) ? (cur & 0xFFFFFFFF00000000ULL) | (out & 0xFFFFFFFFULL) :
-                        (cur & 0xFFFFFFFFULL) | ((out & 0xFFFFFFFFULL) << 32);
-                } else {
-                    cur = out;
-                }
-                ctx->vfp_d[d & 31U] = cur;
+            bool hi = is_q && (k >= out_n / 2U);
+            unsigned kk = hi ? (k - out_n / 2U) : k;
+            uint64_t prev = acc ? x_glane(hi ? d1 : d0, kk, size + 1U) : 0ULL;
+            uint64_t out = prev + (uint64_t)(a + b);
+            if (hi) {
+                d1 = x_plane(d1, kk, size + 1U, out);
             } else {
-                unsigned dd = ((d & ~1U) + (k >= out_n / 2U ? 1U : 0U)) & 31U;
-                unsigned kk = (k >= out_n / 2U) ? k - out_n / 2U : k;
-                uint64_t cur = (kk == 0U) ? 0ULL : ctx->vfp_d[dd];
-                if (size == 0U) {
-                    cur = (kk == 0U) ? (out & 0xFFFFULL) : (cur & ~(0xFFFFULL << (kk * 16U))) | ((out & 0xFFFFULL) << (kk * 16U));
-                } else if (size == 1U) {
-                    cur = (kk == 0U) ? (cur & 0xFFFFFFFF00000000ULL) | (out & 0xFFFFFFFFULL) :
-                        (cur & 0xFFFFFFFFULL) | ((out & 0xFFFFFFFFULL) << 32);
-                } else {
-                    cur = out;
-                }
-                ctx->vfp_d[dd] = cur;
+                d0 = x_plane(d0, kk, size + 1U, out);
             }
+        }
+        ctx->vfp_d[(is_q ? (d & ~1U) : d) & 31U] = d0;
+        if (is_q) {
+            ctx->vfp_d[((d & ~1U) + 1U) & 31U] = d1;
         }
         ctx->regs[15] = pc + 4U;
         return true;
@@ -573,7 +601,7 @@ static bool x_misc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             } else {
                 unsigned top = (size == 0U) ? ((u >> 7) & 1U) : (size == 1U) ? ((u >> 15) & 1U) : ((u >> 31) & 1U);
                 r = 0U;
-                for (unsigned b = 0U; b < bits; b++) {
+                for (unsigned b = 1U; b < bits; b++) {
                     unsigned bit = (size == 0U) ? ((u >> (7U - b)) & 1U) : (size == 1U) ? ((u >> (15U - b)) & 1U) : ((u >> (31U - b)) & 1U);
                     if (bit != top) {
                         break;
@@ -617,42 +645,6 @@ static bool x_misc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             cur &= ~(0xFFULL << (kk * 8U));
             cur |= (~v & 0xFFULL) << (kk * 8U);
             ctx->vfp_d[dd] = cur;
-        }
-        ctx->regs[15] = pc + 4U;
-        return true;
-    }
-    if ((op5 == 12U || op5 == 13U) && size < 3U) {
-        bool su = (op5 == 13U);
-        unsigned per = is_q ? x_per_d(size) * 2U : x_per_d(size);
-        for (unsigned k = 0U; k < per; k++) {
-            unsigned sdd = is_q ? ((d & ~1U) + (k >= x_per_d(size) ? 1U : 0U)) & 31U : d & 31U;
-            unsigned skk = is_q ? (k >= x_per_d(size) ? k - x_per_d(size) : k) : k;
-            uint64_t sv = ctx->vfp_d[(is_q ? ((m & ~1U) + (k >= x_per_d(size) ? 1U : 0U)) : m) & 31U];
-            uint64_t u = x_glane(sv, skk, size);
-            int64_t e = su ? (int64_t)u : ((size == 0U) ? (int64_t)(int8_t)(uint8_t)u :
-                (size == 1U) ? (int64_t)(int16_t)(uint16_t)u : (int64_t)(int32_t)(uint32_t)u);
-            uint64_t dv = ctx->vfp_d[sdd];
-            int64_t cur = (size == 0U) ? (int64_t)(int16_t)(dv >> (skk * 16U)) :
-                (size == 1U) ? ((skk == 0U) ? (int64_t)(int32_t)(uint32_t)dv : (int64_t)(int32_t)(uint32_t)(dv >> 32)) : (int64_t)dv;
-            int64_t s = cur + e;
-            if (size == 0U) {
-                s = x_sat_s(s, 16);
-            } else if (size == 1U) {
-                s = x_sat_s(s, 32);
-            }
-            if (size == 0U) {
-                dv &= ~(0xFFFFULL << (skk * 16U));
-                dv |= ((uint64_t)(uint16_t)s) << (skk * 16U);
-            } else if (size == 1U) {
-                if (skk == 0U) {
-                    dv = (dv & 0xFFFFFFFF00000000ULL) | (uint32_t)s;
-                } else {
-                    dv = (dv & 0xFFFFFFFFULL) | ((uint64_t)(uint32_t)s << 32);
-                }
-            } else {
-                dv = (uint64_t)s;
-            }
-            ctx->vfp_d[sdd] = dv;
         }
         ctx->regs[15] = pc + 4U;
         return true;
@@ -790,7 +782,7 @@ static bool x_alu(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
     if (size > 2U && !(op == 0x0U && b4)) {
         return false;
     }
-    if (!u && op == 0x9U && b4 && size < 3U) {
+    if (op == 0x9U && b4 && (u ? (size == 0U) : (size < 3U))) {
         for (unsigned k = 0U; k < per; k++) {
             unsigned d0 = is_q ? ((dd & ~1U) + (k >= x_per_d(size) ? 1U : 0U)) & 31U : dd & 31U;
             unsigned k0 = is_q ? (k >= x_per_d(size) ? k - x_per_d(size) : k) : k;
@@ -798,7 +790,11 @@ static bool x_alu(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             uint64_t sv1 = ctx->vfp_d[(is_q ? ((dm & ~1U) + (k >= x_per_d(size) ? 1U : 0U)) : dm) & 31U];
             uint64_t a = x_glane(sv0, k0, size);
             uint64_t b = x_glane(sv1, k0, size);
-            uint64_t r = (size == 0U) ? (uint64_t)(uint8_t)((uint8_t)a * (uint8_t)b) :
+            uint8_t p = 0U;
+            for (unsigned i = 0U; u && i < 8U; i++) {
+                if (((b >> i) & 1U) != 0U) { p ^= (uint8_t)(a << i); }
+            }
+            uint64_t r = u ? (uint64_t)p : (size == 0U) ? (uint64_t)(uint8_t)((uint8_t)a * (uint8_t)b) :
                 (size == 1U) ? (uint64_t)(uint16_t)((uint16_t)a * (uint16_t)b) :
                 (uint64_t)(uint32_t)((uint32_t)a * (uint32_t)b);
             uint64_t cur = ctx->vfp_d[d0];

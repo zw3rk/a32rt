@@ -684,9 +684,11 @@ void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc)
         /* [8] b loop_body_offset (direct PC-relative branch inside block!) */
         int32_t back_disp = (int32_t)b->loop_body_offset - (int32_t)b->count;
         a64_emit(b, 0x14000000U | ((uint32_t)back_disp & 0x03FFFFFFU));
-        /* [9] .Lbail: flush VFP if self_loop_vfp_active, then return to trampoline */
+        /* [9] .Lbail: flush VFP / restore hoisted FPCR, then return to trampoline */
         if (b->self_loop_vfp_active) {
             a64_vfp_emit_exit_flush(b);
+        } else if (b->preheader_neon_fpcr && b->fpcr_neon_active) {
+            a64_emit_fpcr_restore_scalar(b);
         }
         a64_emit_mov_pc32(b, A64_TMP0, target_pc);
         a64_emit_movz_w(b, A64_TMP1, A32_EXIT_BRANCH, 0U);

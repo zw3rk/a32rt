@@ -223,14 +223,14 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
                 a32_translate_a32_block(ctx, &buf, cur_b_pc);
             }
 
+            bool can_promote_regs = !buf.vfp_preheader_ineligible && (buf.vfp_preheader_count > 0U);
+            bool pass1_neon_only  = buf.saw_neon_fp && !buf.saw_scalar_vfp;
             if (!uncached && !buf.overflow && buf.has_self_loop &&
-                !buf.vfp_preheader_ineligible &&
-                (buf.vfp_preheader_count > 0U || (buf.saw_neon_fp && !buf.saw_scalar_vfp))) {
+                (can_promote_regs || pass1_neon_only)) {
                 uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
                 uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
-                unsigned saved_count   = buf.vfp_preheader_count;
-                uint32_t saved_written = buf.vfp_preheader_written;
-                bool pass1_neon_only = buf.saw_neon_fp && !buf.saw_scalar_vfp;
+                unsigned saved_count   = can_promote_regs ? buf.vfp_preheader_count : 0U;
+                uint32_t saved_written = can_promote_regs ? buf.vfp_preheader_written : 0U;
                 if (saved_count > 0U) {
                     memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
                     memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
