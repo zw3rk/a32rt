@@ -41,7 +41,7 @@
 /* Darwin AT flag constants (stable XNU ABI, valid on both hosts). */
 #define IOS_AT_REMOVEDIR 0x0080U
 #define IOS_AT_SYMLINK_NOFOLLOW 0x0020U
-#define IOS_AT_SYMLINK_FOLLOW 0x0020U
+#define IOS_AT_SYMLINK_FOLLOW 0x0040U
 #define IOS_AT_EACCESS 0x0010U
 
 #define IOS_BSD_PATH_MAX 4096U
@@ -58,24 +58,40 @@ static bool ios_wr_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len)
 static int ios_cstr(a32_ctx_t *ctx, uint32_t gva, char *out, size_t cap)
 {
     size_t n = 0U;
+    uint32_t cur = gva;
     if (cap == 0U) {
         return -14;
     }
-    while (n + 1U < cap) {
-        const char *hva;
-        if (!a32_guest_range_ok(ctx, gva + (uint32_t)n, 1U,
-                (uint32_t)PROT_READ)) {
+    for (;;) {
+        uint32_t rem = 0x1000U - (cur & 0xFFFU);
+        const char *blk;
+        size_t want;
+        const char *hit;
+        if (n + 1U >= cap) {
+            out[cap - 1U] = '\0';
+            return -63;
+        }
+        if (!a32_guest_range_ok(ctx, cur, rem, (uint32_t)PROT_READ)) {
             return -14;
         }
-        hva = (const char *)a32_guest_ptr(ctx, gva);
-        out[n] = hva[n];
-        if (hva[n] == '\0') {
+        blk = (const char *)a32_guest_ptr(ctx, cur);
+        want = cap - n - 1U;
+        if (want > rem) {
+            want = rem;
+        }
+        hit = (const char *)memchr(blk, 0, want);
+        if (hit != NULL) {
+            memcpy(out + n, blk, (size_t)(hit - blk) + 1U);
             return 0;
         }
-        n++;
+        if (n + rem >= cap) {
+            out[cap - 1U] = '\0';
+            return -63;
+        }
+        memcpy(out + n, blk, rem);
+        n += rem;
+        cur += rem;
     }
-    out[cap - 1U] = '\0';
-    return -63;
 }
 
 /* Resolve a guest path VA to an absolute host path (negative Darwin errno). */
@@ -221,96 +237,73 @@ static void ios_do_fstat(a32_ctx_t *ctx, uint32_t fd, uint32_t buf_va,
     ios_emit_stat(ctx, &hs, buf_va, is64);
 }
 
-/* ---- statfs / fstatfs (best-effort Darwin 32-bit prefix layout) ---- */
+/* ---- statfs64 / fstatfs64 / getfsstat64 (exact 2168-byte XNU layout) ---- */
 
-typedef struct __attribute__((packed, aligned(4))) ios_statfs32 {
-    int16_t f_otype;
-    int16_t f_oflags;
-    int64_t f_bsize;
-    int64_t f_iosize;
-    int64_t f_blocks;
-    int64_t f_bfree;
-    int64_t f_bavail;
-    int64_t f_files;
-    int64_t f_ffree;
-    int32_t f_fsid[2];
-    uint32_t f_owner;
-    int32_t f_flags;
-    char f_fstypename[16];
-    char f_mntonname[32];
-    char f_mntfromname[32];
-} ios_statfs32_t;
+typedef struct __attribute__((packed, aligned(4))) ios_statfs64 {
+    uint32_t f_bsize;         /* 0 */
+    int32_t  f_iosize;        /* 4 */
+    uint64_t f_blocks;        /* 8 */
+    uint64_t f_bfree;         /* 16 */
+    uint64_t f_bavail;        /* 24 */
+    uint64_t f_files;         /* 32 */
+    uint64_t f_ffree;         /* 40 */
+    uint32_t f_fsid[2];       /* 48 */
+    uint32_t f_owner;         /* 56 */
+    uint32_t f_type;          /* 60 */
+    uint32_t f_flags;         /* 64 */
+    uint32_t f_fssubtype;     /* 68 */
+    char     f_fstypename[16];    /* 72 */
+    char     f_mntonname[1024];   /* 88 */
+    char     f_mntfromname[1024]; /* 1112 */
+    uint32_t f_reserved[8];   /* 2136 */
+} ios_statfs64_t;
 
-static void ios_do_statfs(a32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
-    bool is_fd, int fd)
+_Static_assert(sizeof(ios_statfs64_t) == 2168,
+    "ios_statfs64_t must be 2168 bytes");
+
+/* Fill one statfs64 entry from a path (NULL when is_fd) or an open fd. */
+static void ios_statfs_one(a32_ctx_t *ctx, uint32_t buf_va,
+    bool is_fd, int fd, const char *path)
 {
-    ios_statfs32_t o;
+    ios_statfs64_t o;
 #if defined(__linux__)
     struct statfs hs;
-    int rc;
-#else
-    struct statfs hs;
-    int rc;
-#endif
-    if (!ios_wr_ok(ctx, buf_va, (uint32_t)sizeof(o))) {
-        a32_ios_bsd_err(ctx, 14);
+    int rc = is_fd ? fstatfs(fd, &hs) : statfs(path, &hs);
+    if (rc != 0) {
+        ios_fail(ctx);
         return;
     }
     memset(&o, 0, sizeof(o));
-#if defined(__linux__)
-    if (is_fd) {
-        rc = fstatfs(fd, &hs);
-    } else {
-        char host[IOS_BSD_PATH_MAX];
-        int rr = ios_resolve(ctx, path_va, host, sizeof(host));
-        if (rr != 0) {
-            a32_ios_bsd_err(ctx, -rr);
-            return;
-        }
-        rc = statfs(host, &hs);
-    }
-    if (rc != 0) {
-        ios_fail(ctx);
-        return;
-    }
-    o.f_bsize = (int64_t)hs.f_bsize;
-    o.f_blocks = (int64_t)hs.f_blocks;
-    o.f_bfree = (int64_t)hs.f_bfree;
-    o.f_bavail = (int64_t)hs.f_bavail;
-    o.f_files = (int64_t)hs.f_files;
-    o.f_ffree = (int64_t)hs.f_ffree;
-    {
-        size_t fn = sizeof(hs.f_fsid) < sizeof(o.f_fsid) ?
-            sizeof(hs.f_fsid) : sizeof(o.f_fsid);
-        memcpy(o.f_fsid, &hs.f_fsid, fn);
-    }
-    o.f_flags = (int32_t)hs.f_flags;
-    o.f_iosize = o.f_bsize;
+    o.f_bsize = (uint32_t)hs.f_bsize;
+    o.f_iosize = (int32_t)hs.f_frsize;
+    o.f_blocks = (uint64_t)hs.f_blocks;
+    o.f_bfree = (uint64_t)hs.f_bfree;
+    o.f_bavail = (uint64_t)hs.f_bavail;
+    o.f_files = (uint64_t)hs.f_files;
+    o.f_ffree = (uint64_t)hs.f_ffree;
+    memcpy(o.f_fsid, &hs.f_fsid, sizeof(o.f_fsid));
+    o.f_flags = (uint32_t)hs.f_flags;
 #else
-    if (is_fd) {
-        rc = fstatfs(fd, &hs);
-    } else {
-        char host[IOS_BSD_PATH_MAX];
-        int rr = ios_resolve(ctx, path_va, host, sizeof(host));
-        if (rr != 0) {
-            a32_ios_bsd_err(ctx, -rr);
-            return;
-        }
-        rc = statfs(host, &hs);
-    }
+    struct statfs hs;
+    int rc = is_fd ? fstatfs(fd, &hs) : statfs(path, &hs);
     if (rc != 0) {
         ios_fail(ctx);
         return;
     }
-    o.f_bsize = hs.f_bsize;
-    o.f_iosize = hs.f_iosize;
-    o.f_blocks = hs.f_blocks;
-    o.f_bfree = hs.f_bfree;
-    o.f_bavail = hs.f_bavail;
-    o.f_files = (int64_t)hs.f_files;
-    o.f_ffree = (int64_t)hs.f_ffree;
-    o.f_owner = hs.f_owner;
-    o.f_flags = (int32_t)hs.f_flags;
+    memset(&o, 0, sizeof(o));
+    o.f_bsize = (uint32_t)hs.f_bsize;
+    o.f_iosize = (int32_t)hs.f_iosize;
+    o.f_blocks = (uint64_t)hs.f_blocks;
+    o.f_bfree = (uint64_t)hs.f_bfree;
+    o.f_bavail = (uint64_t)hs.f_bavail;
+    o.f_files = (uint64_t)hs.f_files;
+    o.f_ffree = (uint64_t)hs.f_ffree;
+    o.f_fsid[0] = (uint32_t)hs.f_fsid.val[0];
+    o.f_fsid[1] = (uint32_t)hs.f_fsid.val[1];
+    o.f_owner = (uint32_t)hs.f_owner;
+    o.f_type = (uint32_t)hs.f_type;
+    o.f_flags = (uint32_t)hs.f_flags;
+    o.f_fssubtype = (uint32_t)hs.f_fssubtype;
     memcpy(o.f_fstypename, hs.f_fstypename, sizeof(o.f_fstypename));
     memcpy(o.f_mntonname, hs.f_mntonname, sizeof(o.f_mntonname));
     memcpy(o.f_mntfromname, hs.f_mntfromname, sizeof(o.f_mntfromname));
@@ -318,6 +311,48 @@ static void ios_do_statfs(a32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
     memcpy(a32_guest_ptr(ctx, buf_va), &o, sizeof(o));
     a32_vm32_copyout_invalidate_exec(ctx, buf_va, (uint32_t)sizeof(o));
     a32_ios_bsd_ok(ctx, 0U, 0U, false);
+}
+
+static void ios_do_statfs(a32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
+    bool is_fd, int fd)
+{
+    char host[IOS_BSD_PATH_MAX];
+    if (!ios_wr_ok(ctx, buf_va, (uint32_t)sizeof(ios_statfs64_t))) {
+        a32_ios_bsd_err(ctx, 14);
+        return;
+    }
+    if (!is_fd) {
+        int rr = ios_resolve(ctx, path_va, host, sizeof(host));
+        if (rr != 0) {
+            a32_ios_bsd_err(ctx, -rr);
+            return;
+        }
+    } else {
+        host[0] = '\0';
+    }
+    ios_statfs_one(ctx, buf_va, is_fd, fd, host);
+}
+
+/* getfsstat64: single-entry table for the sysroot; count query when buf == 0. */
+static void ios_do_getfsstat(a32_ctx_t *ctx, uint32_t buf_va, uint32_t size)
+{
+    char host[IOS_BSD_PATH_MAX];
+    if (buf_va == 0U) {
+        a32_ios_bsd_ok(ctx, 1U, 0U, false);
+        return;
+    }
+    if (size < (uint32_t)sizeof(ios_statfs64_t)) {
+        a32_ios_bsd_err(ctx, 22);
+        return;
+    }
+    if (!ios_wr_ok(ctx, buf_va, (uint32_t)sizeof(ios_statfs64_t))) {
+        a32_ios_bsd_err(ctx, 14);
+        return;
+    }
+    if (a32_resolve_guest_path(ctx, "/", host, sizeof(host)) != 0) {
+        snprintf(host, sizeof(host), "/");
+    }
+    ios_statfs_one(ctx, buf_va, false, 0, host);
 }
 
 /* ---- *at plumbing (Darwin -> host flag/fd translation) ---- */
@@ -363,21 +398,35 @@ static void ios_do_fstatat(a32_ctx_t *ctx, uint32_t fd, uint32_t path_va,
     ios_emit_stat(ctx, &hs, buf_va, true);
 }
 
-/* ---- getdirentries64 (344): 24B header + name padded to 8B ---- */
+/* ---- getdirentries64 (344): 21B header + name padded to 4B ----
+ *
+ * 32-bit Darwin struct dirent: d_ino (8B @0), d_seekoff (8B @8),
+ * d_reclen (u16 @16), d_namlen (u16 @18), d_type (u8 @20),
+ * d_name[] @21. basep is an *output*: the kernel writes the updated
+ * directory offset there; the fd's own offset selects the start. */
 
 static void ios_do_getdirentries64(a32_ctx_t *ctx, uint32_t fd,
     uint32_t buf_va, uint32_t nbytes, uint32_t pos_va)
 {
     uint8_t *dst;
     uint32_t off = 0U;
-    uint32_t pos = 0U;
     int dfd;
     DIR *dp;
-    if (!ios_wr_ok(ctx, buf_va, nbytes) || !ios_wr_ok(ctx, pos_va, 4U)) {
+    long cur;
+    uint64_t npos;
+    if (nbytes > 0U && !ios_wr_ok(ctx, buf_va, nbytes)) {
         a32_ios_bsd_err(ctx, 14);
         return;
     }
-    memcpy(&pos, a32_guest_ptr(ctx, pos_va), 4U);
+    if (pos_va != 0U && !ios_wr_ok(ctx, pos_va, 8U)) {
+        a32_ios_bsd_err(ctx, 14);
+        return;
+    }
+    cur = lseek((int)(int32_t)fd, 0, SEEK_CUR);
+    if (cur < 0) {
+        ios_fail(ctx);
+        return;
+    }
     dfd = dup((int)(int32_t)fd);
     if (dfd < 0) {
         ios_fail(ctx);
@@ -389,12 +438,11 @@ static void ios_do_getdirentries64(a32_ctx_t *ctx, uint32_t fd,
         ios_fail(ctx);
         return;
     }
-    dst = (uint8_t *)a32_guest_ptr(ctx, buf_va);
-    seekdir(dp, (long)pos);
+    dst = nbytes == 0U ? NULL : (uint8_t *)a32_guest_ptr(ctx, buf_va);
     for (;;) {
         struct dirent *e;
         size_t nl;
-        uint32_t rl, rn;
+        uint32_t rn;
         long prev = telldir(dp);
         uint64_t v64;
         uint16_t v16;
@@ -402,8 +450,7 @@ static void ios_do_getdirentries64(a32_ctx_t *ctx, uint32_t fd,
             break;
         }
         nl = strlen(e->d_name);
-        rl = (uint32_t)((nl + 1U + 7U) & ~7U);
-        rn = 24U + rl;
+        rn = (uint32_t)((21U + nl + 1U + 3U) & ~3U);
         if (rn > nbytes - off) {
             seekdir(dp, prev);
             break;
@@ -417,18 +464,20 @@ static void ios_do_getdirentries64(a32_ctx_t *ctx, uint32_t fd,
         v16 = (uint16_t)nl;
         memcpy(dst + off + 18U, &v16, 2U);
         dst[off + 20U] = (uint8_t)e->d_type;
-        dst[off + 21U] = 0U;
-        dst[off + 22U] = 0U;
-        dst[off + 23U] = 0U;
-        memcpy(dst + off + 24U, e->d_name, nl + 1U);
-        memset(dst + off + 24U + nl + 1U, 0, rl - (uint32_t)nl - 1U);
+        memcpy(dst + off + 21U, e->d_name, nl + 1U);
+        memset(dst + off + 21U + nl + 1U, 0, rn - 21U - (uint32_t)nl - 1U);
         off += rn;
     }
-    pos = (uint32_t)telldir(dp);
-    memcpy(a32_guest_ptr(ctx, pos_va), &pos, 4U);
+    npos = (uint64_t)telldir(dp);
     closedir(dp);
-    a32_vm32_copyout_invalidate_exec(ctx, buf_va, off);
-    a32_vm32_copyout_invalidate_exec(ctx, pos_va, 4U);
+    (void)lseek((int)(int32_t)fd, (off_t)npos, SEEK_SET);
+    if (pos_va != 0U) {
+        memcpy(a32_guest_ptr(ctx, pos_va), &npos, 8U);
+        a32_vm32_copyout_invalidate_exec(ctx, pos_va, 8U);
+    }
+    if (off > 0U) {
+        a32_vm32_copyout_invalidate_exec(ctx, buf_va, off);
+    }
     a32_ios_bsd_ok(ctx, off, 0U, false);
 }
 
@@ -789,6 +838,7 @@ int a32_ios_dispatch_bsd_fs(a32_ctx_t *ctx, uint32_t bsd_nr,
     case 469U: ios_do_fstatat(ctx, args[0], args[1], args[2], args[3]); break;
     case 157U: case 345U: ios_do_statfs(ctx, args[0], args[1], false, 0); break;
     case 158U: case 346U: ios_do_statfs(ctx, 0U, args[1], true, (int)(int32_t)args[0]); break;
+    case 347U: ios_do_getfsstat(ctx, args[0], args[1]); break;
     case 344U: ios_do_getdirentries64(ctx, args[0], args[1], args[2], args[3]); break;
     case 9U: ios_do_link(ctx, args[0], args[1]); break;
     case 471U: ios_do_linkat(ctx, args); break;

@@ -1,12 +1,13 @@
 /*
- * src/ios/ios_svc_bsd_sock.c — 32-bit iOS XNU BSD sockets + kqueue
+ * src/ios/ios_svc_bsd_sock.c — 32-bit iOS XNU BSD sockets + VM advice
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Curated C11, host-portable (macOS arm64 AND aarch64-linux-musl).
- * BSD sockets + portable user-space kqueue (real host pipe fds,
- * poll() for READ/WRITE, CLOCK_MONOTONIC for TIMER).
+ * BSD sockets (+ SCM_RIGHTS marshaling) and the munmap / mprotect /
+ * madvise / mincore / msync VM helpers; kqueue lives in
+ * ios_svc_bsd_kevent.c.
  */
 
 #if !defined(__APPLE__)
@@ -17,22 +18,19 @@
 
 #include "a32rt.h"
 #include "ios/ios.h"
+#include "os/backend.h"
 #include "vm/vm32.h"
 
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include <time.h>
 #include <unistd.h>
 
 /* Darwin ABI constants (stable XNU ABI, valid on both hosts). */
@@ -50,15 +48,16 @@
 #define D_SO_ERROR 0x1007U
 #define D_SO_TYPE 0x1008U
 #define D_SO_NOSIGPIPE 0x1022U
-#define D_EV_READ -1
-#define D_EV_WRITE -2
-#define D_EV_TIMER -7
-#define D_EV_ADD 0x0001U
-#define D_EV_DELETE 0x0002U
-#define D_EV_DISABLE 0x0008U
-#define D_EV_ONESHOT 0x0010U
-#define D_EV_ERROR 0x4000U
-#define D_EV_EOF 0x8000U
+#define D_MSG_OOB 0x0001U
+#define D_MSG_PEEK 0x0002U
+#define D_MSG_DONTROUTE 0x0004U
+#define D_MSG_EOR 0x0008U
+#define D_MSG_TRUNC 0x0010U
+#define D_MSG_CTRUNC 0x0020U
+#define D_MSG_WAITALL 0x0040U
+#define D_MSG_DONTWAIT 0x0080U
+#define D_MSG_NOSIGNAL 0x80000U
+#define D_SCM_RIGHTS 0x01U
 #define D_EBADF 9
 #define D_EFAULT 14
 #define D_EINVAL 22
@@ -68,9 +67,6 @@
 #define SK_IOV_MAX 64U
 #define SK_BUF_MAX 128U
 #define SK_CTL_MAX 256U
-#define SK_KQ_MAX 8U
-#define SK_KNOTE_MAX 32U
-#define SK_EV_CAP 256U
 
 static bool a32_vm32_access_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len,
     uint32_t prot)
@@ -122,22 +118,58 @@ static int sk_opt_g2h(uint32_t level, uint32_t name, bool *noop)
     }
 }
 
-static int sk_flags_g2h(uint32_t f) /* Darwin send/recv flags -> host */
+/* Darwin msg flags -> host. Darwin MSG_DONTWAIT is 0x80 (Linux: 0x40)
+ * and Darwin MSG_NOSIGNAL is 0x80000; map every bit explicitly. */
+static int sk_flags_g2h(uint32_t f)
 {
-    int h = (int)(f & 0x7U); /* OOB / PEEK / DONTROUTE match */
+    int h = 0;
+    if ((f & D_MSG_OOB) != 0U) { h |= MSG_OOB; }
+    if ((f & D_MSG_PEEK) != 0U) { h |= MSG_PEEK; }
+    if ((f & D_MSG_DONTROUTE) != 0U) { h |= MSG_DONTROUTE; }
 #ifdef MSG_EOR
-    if ((f & 0x08U) != 0U) { h |= MSG_EOR; }
+    if ((f & D_MSG_EOR) != 0U) { h |= MSG_EOR; }
 #endif
 #ifdef MSG_TRUNC
-    if ((f & 0x10U) != 0U) { h |= MSG_TRUNC; }
+    if ((f & D_MSG_TRUNC) != 0U) { h |= MSG_TRUNC; }
 #endif
 #ifdef MSG_CTRUNC
-    if ((f & 0x20U) != 0U) { h |= MSG_CTRUNC; }
+    if ((f & D_MSG_CTRUNC) != 0U) { h |= MSG_CTRUNC; }
 #endif
 #ifdef MSG_WAITALL
-    if ((f & 0x40U) != 0U) { h |= MSG_WAITALL; }
+    if ((f & D_MSG_WAITALL) != 0U) { h |= MSG_WAITALL; }
+#endif
+#ifdef MSG_DONTWAIT
+    if ((f & D_MSG_DONTWAIT) != 0U) { h |= MSG_DONTWAIT; }
+#endif
+#ifdef MSG_NOSIGNAL
+    if ((f & D_MSG_NOSIGNAL) != 0U) { h |= MSG_NOSIGNAL; }
 #endif
     return h;
+}
+
+/* Host msg_flags -> Darwin (for recvmsg msg_flags writeback). */
+static uint32_t sk_flags_h2g(int f)
+{
+    uint32_t d = 0U;
+    if ((f & MSG_OOB) != 0) { d |= D_MSG_OOB; }
+    if ((f & MSG_PEEK) != 0) { d |= D_MSG_PEEK; }
+    if ((f & MSG_DONTROUTE) != 0) { d |= D_MSG_DONTROUTE; }
+#ifdef MSG_EOR
+    if ((f & MSG_EOR) != 0) { d |= D_MSG_EOR; }
+#endif
+#ifdef MSG_TRUNC
+    if ((f & MSG_TRUNC) != 0) { d |= D_MSG_TRUNC; }
+#endif
+#ifdef MSG_CTRUNC
+    if ((f & MSG_CTRUNC) != 0) { d |= D_MSG_CTRUNC; }
+#endif
+#ifdef MSG_WAITALL
+    if ((f & MSG_WAITALL) != 0) { d |= D_MSG_WAITALL; }
+#endif
+#ifdef MSG_DONTWAIT
+    if ((f & MSG_DONTWAIT) != 0) { d |= D_MSG_DONTWAIT; }
+#endif
+    return d;
 }
 
 /* BSD sockaddr {u8 len, u8 family, ...} -> Linux {u16 family, ...}. */
@@ -313,57 +345,101 @@ typedef struct __attribute__((packed, aligned(4))) sk_msg32 {
     int32_t msg_flags;
 } sk_msg32_t;
 
+/* Guest (12B, 4-byte aligned cmsghdr) -> host control buffer.
+ * The host cmsghdr is 12B on macOS but 16B on Linux, so the host side
+ * is built only with CMSG_SPACE / CMSG_LEN / CMSG_FIRSTHDR /
+ * CMSG_NXTHDR / CMSG_DATA. `out` must be CMSG-aligned (callers pass a
+ * union with struct cmsghdr). */
 static int sk_ctl_g2h(a32_ctx_t *ctx, uint32_t gva, uint32_t glen,
-    uint8_t *out, uint32_t *out_len)
+    void *out, uint32_t *out_len)
 {
-    uint32_t gp = gva, end = gva + glen, hp = 0U, cl;
-    int32_t lv, tp;
-    uint64_t hlen;
-    if (glen > SK_CTL_MAX || !a32_vm32_access_ok(ctx, gva, glen, (uint32_t)PROT_READ)) {
+    struct msghdr mhdr;
+    struct cmsghdr *hc;
+    uint32_t gp = gva, end = gva + glen;
+    size_t used = 0U;
+    if (glen > SK_CTL_MAX ||
+            !a32_vm32_access_ok(ctx, gva, glen, (uint32_t)PROT_READ)) {
         return glen > SK_CTL_MAX ? -D_EINVAL : -D_EFAULT;
     }
+    memset(&mhdr, 0, sizeof(mhdr));
+    mhdr.msg_control = out;
+    mhdr.msg_controllen = SK_CTL_MAX;
+    hc = CMSG_FIRSTHDR(&mhdr);
+    if (hc == NULL) {
+        return -D_EINVAL;
+    }
     while (gp + 12U <= end) {
+        uint32_t cl;
+        int32_t lv, tp;
+        uint32_t dlen;
         memcpy(&cl, a32_guest_ptr(ctx, gp), 4);
         memcpy(&lv, a32_guest_ptr(ctx, gp + 4U), 4);
         memcpy(&tp, a32_guest_ptr(ctx, gp + 8U), 4);
         if (cl < 12U || gp + cl > end) { break; }
-        hlen = (uint64_t)((16U + (cl - 12U) + 7U) & ~7U); /* cmsg 8-align */
-        if (hp + hlen > SK_CTL_MAX) { break; }
+        dlen = cl - 12U;
+        if (used + CMSG_SPACE(dlen) > SK_CTL_MAX) { break; }
         lv = (lv == (int32_t)D_SOL_SOCKET) ? SOL_SOCKET : lv;
-        memcpy(out + hp, &hlen, 8);
-        memcpy(out + hp + 8U, &lv, 4);
-        memcpy(out + hp + 12U, &tp, 4);
-        memcpy(out + hp + 16U, a32_guest_ptr(ctx, gp + 12U), cl - 12U);
-        hp += (uint32_t)hlen;
+        tp = (lv == SOL_SOCKET && tp == (int32_t)D_SCM_RIGHTS) ? SCM_RIGHTS : tp;
+        hc->cmsg_len = CMSG_LEN(dlen);
+        hc->cmsg_level = lv;
+        hc->cmsg_type = tp;
+        if (dlen > 0U) {
+            memcpy(CMSG_DATA(hc), a32_guest_ptr(ctx, gp + 12U), dlen);
+        }
+        used = (size_t)((uint8_t *)hc - (uint8_t *)out) + CMSG_SPACE(dlen);
         gp += (cl + 3U) & ~3U;
+        if (gp + 12U <= end) {
+            hc = CMSG_NXTHDR(&mhdr, hc);
+            if (hc == NULL) { break; }
+        }
     }
-    *out_len = hp;
+    *out_len = (uint32_t)used;
     return 0;
 }
 
-static int sk_ctl_h2g(a32_ctx_t *ctx, const uint8_t *in, uint32_t ilen,
+/* Host control buffer -> guest (12B cmsghdr, 4-byte aligned). Iterates
+ * with CMSG_FIRSTHDR / CMSG_NXTHDR so both the 12B macOS and the 16B
+ * Linux host cmsghdr are decoded correctly. */
+static int sk_ctl_h2g(a32_ctx_t *ctx, const void *in, uint32_t ilen,
     uint32_t gva, uint32_t gmax)
 {
-    uint32_t ip = 0U, gp = 0U, gl;
-    int32_t lv, tp;
-    uint64_t hl;
-    uint8_t *gd;
-    if (!a32_vm32_access_ok(ctx, gva, gmax, (uint32_t)PROT_WRITE)) { return -D_EFAULT; }
-    while (ip + 16U <= ilen) {
-        memcpy(&hl, in + ip, 8);
-        memcpy(&lv, in + ip + 8U, 4);
-        memcpy(&tp, in + ip + 12U, 4);
-        if (hl < 16U || ip + hl > ilen) { break; }
-        gl = 12U + (uint32_t)hl - 16U;
+    struct msghdr mhdr;
+    struct cmsghdr *hc;
+    const uint8_t *base = (const uint8_t *)in;
+    uint32_t gp = 0U;
+    if (!a32_vm32_access_ok(ctx, gva, gmax, (uint32_t)PROT_WRITE)) {
+        return -D_EFAULT;
+    }
+    memset(&mhdr, 0, sizeof(mhdr));
+    mhdr.msg_control = (void *)base;
+    mhdr.msg_controllen = ilen;
+    for (hc = CMSG_FIRSTHDR(&mhdr); hc != NULL;
+            hc = CMSG_NXTHDR(&mhdr, hc)) {
+        size_t hlen = hc->cmsg_len;
+        uint32_t dlen;
+        int32_t lv, tp;
+        uint32_t gl;
+        uint8_t *gd;
+        if (hlen < CMSG_LEN(0U) ||
+                (const uint8_t *)hc + hlen > base + ilen) {
+            break;
+        }
+        dlen = (uint32_t)(hlen - CMSG_LEN(0U));
+        lv = hc->cmsg_level;
+        tp = hc->cmsg_type;
+        gl = 12U + dlen;
         if (gp + gl > gmax) { break; } /* MSG_CTRUNC */
         gd = (uint8_t *)a32_guest_ptr(ctx, gva + gp);
         lv = (lv == SOL_SOCKET) ? (int32_t)D_SOL_SOCKET : lv;
+        tp = (lv == (int32_t)D_SOL_SOCKET && tp == SCM_RIGHTS) ?
+            (int32_t)D_SCM_RIGHTS : tp;
         memcpy(gd, &gl, 4);
         memcpy(gd + 4U, &lv, 4);
         memcpy(gd + 8U, &tp, 4);
-        memcpy(gd + 12U, in + ip + 16U, gl - 12U);
+        if (dlen > 0U) {
+            memcpy(gd + 12U, CMSG_DATA(hc), dlen);
+        }
         gp += (gl + 3U) & ~3U;
-        ip += (((uint32_t)hl + 7U) & ~7U); /* cmsg 8-align */
     }
     if (gp > 0U) { a32_vm32_copyout_invalidate_exec(ctx, gva, gp); }
     return (int)gp;
@@ -397,7 +473,10 @@ static void sk_do_send(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
     struct sockaddr_storage hs;
     struct msghdr mh;
     struct iovec hv[SK_IOV_MAX];
-    uint8_t ctl[SK_CTL_MAX];
+    union {
+        struct cmsghdr align;
+        uint8_t raw[SK_CTL_MAX];
+    } ctl_u;
     uint32_t gb[SK_IOV_MAX], gl[SK_IOV_MAX];
     uint32_t hlen = 0U, ctllen = 0U;
     int flags, n = 1, rc;
@@ -428,7 +507,8 @@ static void sk_do_send(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
         if (rc != 0) { a32_ios_bsd_err(ctx, -rc); return; }
     }
     if (m.msg_control != 0U && m.msg_controllen != 0U) {
-        rc = sk_ctl_g2h(ctx, m.msg_control, m.msg_controllen, ctl, &ctllen);
+        rc = sk_ctl_g2h(ctx, m.msg_control, m.msg_controllen, ctl_u.raw,
+            &ctllen);
         if (rc != 0) { a32_ios_bsd_err(ctx, -rc); return; }
     }
 #if defined(__linux__)
@@ -439,7 +519,7 @@ static void sk_do_send(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
     mh.msg_namelen = (socklen_t)hlen;
     mh.msg_iov = hv;
     mh.msg_iovlen = (size_t)n;
-    mh.msg_control = ctllen == 0U ? NULL : (void *)ctl;
+    mh.msg_control = ctllen == 0U ? NULL : (void *)ctl_u.raw;
     mh.msg_controllen = (size_t)ctllen;
     r = sendmsg((int)(int32_t)a[0], &mh, flags);
     if (r < 0) { sk_fail(ctx); return; }
@@ -453,7 +533,10 @@ static void sk_do_recv(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
     struct sockaddr_storage hs;
     struct msghdr mh;
     struct iovec hv[SK_IOV_MAX];
-    uint8_t ctl[SK_CTL_MAX];
+    union {
+        struct cmsghdr align;
+        uint8_t raw[SK_CTL_MAX];
+    } ctl_u;
     uint32_t gb[SK_IOV_MAX], gl[SK_IOV_MAX];
     int flags, n = 1, rc;
     int32_t i;
@@ -489,14 +572,21 @@ static void sk_do_recv(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
     mh.msg_namelen = m.msg_name == 0U ? 0 : (socklen_t)sizeof(hs);
     mh.msg_iov = hv;
     mh.msg_iovlen = (size_t)n;
-    mh.msg_control = (m.msg_control == 0U || m.msg_controllen == 0U) ? NULL : (void *)ctl;
-    mh.msg_controllen = (m.msg_control == 0U || m.msg_controllen == 0U) ? 0 : sizeof(ctl);
+    mh.msg_control = (m.msg_control == 0U || m.msg_controllen == 0U) ? NULL :
+        (void *)ctl_u.raw;
+    mh.msg_controllen = (m.msg_control == 0U || m.msg_controllen == 0U) ? 0 :
+        sizeof(ctl_u.raw);
     r = recvmsg((int)(int32_t)a[0], &mh, flags);
     if (r < 0) { sk_fail(ctx); return; }
     for (i = 0; i < n; i++) {
         a32_vm32_copyout_invalidate_exec(ctx, gb[(uint32_t)i], gl[(uint32_t)i]);
     }
     if (is_msg) {
+        if (a32_vm32_access_ok(ctx, a[1] + 24U, 4U, (uint32_t)PROT_WRITE)) {
+            uint32_t df = sk_flags_h2g(mh.msg_flags);
+            memcpy(a32_guest_ptr(ctx, a[1] + 24U), &df, 4);
+            a32_vm32_copyout_invalidate_exec(ctx, a[1] + 24U, 4U);
+        }
         if (m.msg_name != 0U && mh.msg_name != NULL) {
             rc = sk_sa_h2g(ctx, (const struct sockaddr *)&hs, (uint32_t)mh.msg_namelen,
                 m.msg_name, m.msg_namelen);
@@ -505,8 +595,8 @@ static void sk_do_recv(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
             }
         }
         if (m.msg_control != 0U && mh.msg_control != NULL) {
-            rc = sk_ctl_h2g(ctx, ctl, (uint32_t)mh.msg_controllen, m.msg_control,
-                m.msg_controllen);
+            rc = sk_ctl_h2g(ctx, ctl_u.raw, (uint32_t)mh.msg_controllen,
+                m.msg_control, m.msg_controllen);
             if (rc >= 0 && a32_vm32_access_ok(ctx, a[1] + 20U, 4U, (uint32_t)PROT_WRITE)) {
                 sk_st32(ctx, a[1] + 20U, (uint32_t)rc);
             }
@@ -546,275 +636,138 @@ static void sk_do_getaddr(a32_ctx_t *ctx, const uint32_t *a, unsigned which)
     a32_ios_bsd_ok(ctx, 0U, 0U, false);
 }
 
-/* Portable kqueue: 8 kqueues x 32 knotes, real host pipe fds. */
-typedef struct {
-    bool used; bool oneshot; bool disabled;
-    int16_t filter; /* D_EV_READ / D_EV_WRITE / D_EV_TIMER */
-    uint32_t ident; /* fd for READ/WRITE, timer id for TIMER */
-    uint32_t fflags; uint64_t udata; uint64_t deadline_ns; uint64_t period_ns;
-} sk_knote_t;
-typedef struct {
-    bool used; int rfd; int wfd; /* rfd is the kqueue fd itself */
-    sk_knote_t notes[SK_KNOTE_MAX];
-} sk_kq_t;
+/* ---- munmap / mprotect / madvise / mincore / msync (BSD 73/74/75/78/65) ----
+ *
+ * Called from ios_svc_bsd.c. Guest ranges are validated before any host
+ * address derived from ctx->guest_base is passed to the host. */
 
-static sk_kq_t g_kq[SK_KQ_MAX]; /* +1 pipe-backed fd per kqueue */
-static pthread_mutex_t g_kq_mu = PTHREAD_MUTEX_INITIALIZER;
-
-static uint64_t sk_now_ns(void)
+static bool ios_vm_range_ok(a32_ctx_t *ctx, uint32_t addr, uint32_t len,
+    int *err)
 {
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-static sk_kq_t *sk_kq_alloc(void) /* reclaims pipes closed behind us */
-{
-    uint32_t i;
-    for (i = 0U; i < SK_KQ_MAX; i++) {
-        if (!g_kq[i].used) { return &g_kq[i]; }
-        if (fcntl(g_kq[i].rfd, F_GETFD) < 0 && errno == EBADF) {
-            (void)close(g_kq[i].wfd);
-            memset(&g_kq[i], 0, sizeof(g_kq[i]));
-            return &g_kq[i];
-        }
-    }
-    return NULL;
-}
-
-void a32_ios_kq_close(int fd)
-{
-    uint32_t i;
-    if (fd < 0) {
-        return;
-    }
-    (void)pthread_mutex_lock(&g_kq_mu);
-    for (i = 0U; i < SK_KQ_MAX; i++) {
-        if (g_kq[i].used && g_kq[i].rfd == fd) {
-            if (g_kq[i].wfd >= 0 && g_kq[i].wfd != fd) {
-                (void)close(g_kq[i].wfd);
-            }
-            memset(&g_kq[i], 0, sizeof(g_kq[i]));
-        }
-    }
-    (void)pthread_mutex_unlock(&g_kq_mu);
-}
-
-static void sk_knote_change(sk_kq_t *kq, int16_t filter, uint16_t flags,
-    uint32_t fflags, int32_t data, uint32_t ident, uint64_t udata)
-{
-    sk_knote_t *kn = NULL;
-    sk_knote_t *slot = NULL;
-    uint32_t i;
-    uint64_t period;
-    if (filter != (int16_t)D_EV_READ && filter != (int16_t)D_EV_WRITE &&
-            filter != (int16_t)D_EV_TIMER) { return; }
-    for (i = 0U; i < SK_KNOTE_MAX; i++) {
-        if (kq->notes[i].used) {
-            if (kq->notes[i].filter == filter && kq->notes[i].ident == ident) {
-                kn = &kq->notes[i];
-                break;
-            }
-        } else if (slot == NULL) {
-            slot = &kq->notes[i];
-        }
-    }
-    if ((flags & D_EV_DELETE) != 0U) {
-        if (kn != NULL) { memset(kn, 0, sizeof(*kn)); }
-        return;
-    }
-    if ((flags & D_EV_ADD) == 0U) {
-        if (kn != NULL) { kn->disabled = (flags & D_EV_DISABLE) != 0U; }
-        return;
-    }
-    if (kn == NULL) {
-        if (slot == NULL) { return; }
-        kn = slot;
-        memset(kn, 0, sizeof(*kn));
-        kn->used = true;
-        kn->filter = filter;
-        kn->ident = ident;
-    }
-    kn->fflags = fflags;
-    kn->udata = udata;
-    kn->disabled = (flags & D_EV_DISABLE) != 0U;
-    kn->oneshot = (flags & D_EV_ONESHOT) != 0U; /* one-shot or periodic */
-    if (filter != (int16_t)D_EV_TIMER) { return; }
-    period = data <= 0 ? 0U : (uint64_t)data;
-    period *= ((fflags & 1U) != 0U) ? 1000000000ULL : 1000000ULL; /* s vs ms */
-    kn->period_ns = ((flags & D_EV_ONESHOT) != 0U) ? 0U : period;
-    kn->deadline_ns = sk_now_ns() + period;
-}
-
-static bool sk_knote_ready(const sk_knote_t *kn, int32_t *data, bool *eof)
-{
-    struct pollfd pfd = { (int)kn->ident,
-        (short)(kn->filter == (int16_t)D_EV_READ ? POLLIN : POLLOUT), 0 };
-    *eof = false;
-    *data = 1;
-    if (kn->filter == (int16_t)D_EV_TIMER) { return sk_now_ns() >= kn->deadline_ns; }
-    if (poll(&pfd, 1, 0) < 0 || (pfd.revents & (POLLNVAL | POLLHUP | POLLERR)) != 0) {
-        *eof = true;
+    if (len == 0U) {
         return true;
     }
-    if ((pfd.revents & pfd.events) == 0) { return false; }
-    if (kn->filter == (int16_t)D_EV_READ) {
-        int n = 0;
-        if (ioctl((int)kn->ident, FIONREAD, &n) == 0 && n > 0) { *data = (int32_t)n; }
+    if (addr < a32_min_va(ctx) ||
+            (uint64_t)addr + (uint64_t)len > (uint64_t)A32_IOS_HIGH_MIN_VA) {
+        *err = 22;
+        return false;
+    }
+    if (!a32_guest_range_ok(ctx, addr, len, (uint32_t)PROT_READ)) {
+        *err = 12;
+        return false;
     }
     return true;
 }
 
-/* 20-byte kevent / 48-byte kevent64 (4-byte aligned, packed). */
-typedef struct __attribute__((packed, aligned(4))) {
-    uint32_t ident; int16_t filter; uint16_t flags; uint32_t fflags;
-    int32_t data; uint32_t udata;
-} sk_ev32_t;
-typedef struct __attribute__((packed, aligned(4))) {
-    uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags;
-    int64_t data; uint64_t udata; uint64_t ext[2];
-} sk_ev64_t;
-
-_Static_assert(sizeof(sk_ev32_t) == 20, "kevent must be 20 bytes");
-_Static_assert(sizeof(sk_ev64_t) == 48, "kevent64 must be 48 bytes");
-
-static void sk_emit(a32_ctx_t *ctx, uint32_t base, uint32_t idx, bool is64,
-    uint64_t ident, int16_t filter, uint16_t flags, uint32_t fflags,
-    int64_t data, uint64_t udata)
+void a32_ios_bsd_vm_simple(a32_ctx_t *ctx, uint32_t bsd, const uint32_t *a)
 {
-    if (!is64) {
-        sk_ev32_t v = { (uint32_t)ident, filter, flags, fflags, (int32_t)data,
-            (uint32_t)udata };
-        memcpy(a32_guest_ptr(ctx, base + idx * 20U), &v, 20);
-        return;
-    }
-    sk_ev64_t v = { ident, filter, flags, fflags, data, udata, { 0U, 0U } };
-    memcpy(a32_guest_ptr(ctx, base + idx * 48U), &v, 48);
-}
-
-/* Shared kevent/kevent64 scan; is64 selects the 48-byte struct. */
-static void sk_do_kevent(a32_ctx_t *ctx, int kd, uint32_t chl, int nch,
-    uint32_t evl, int nev, uint64_t timeout_ns, bool is64)
-{
-    sk_kq_t *kq = NULL;
-    uint32_t i, nout = 0U, sz = is64 ? 48U : 20U;
-    uint32_t o_ff = is64 ? 12U : 8U;
-    struct pollfd pfds[SK_KNOTE_MAX];
-    struct timespec ts;
-    nfds_t nfds = 0U;
-    int wait_ms;
-    (void)pthread_mutex_lock(&g_kq_mu);
-    for (i = 0U; i < SK_KQ_MAX; i++) {
-        if (g_kq[i].used && g_kq[i].rfd == kd) { kq = &g_kq[i]; break; }
-    }
-    if (kq == NULL) { (void)pthread_mutex_unlock(&g_kq_mu); a32_ios_bsd_err(ctx, D_EBADF); return; }
-    if (nch < 0 || nev < 0 || (uint32_t)nch > SK_EV_CAP || (uint32_t)nev > SK_EV_CAP) {
-        (void)pthread_mutex_unlock(&g_kq_mu);
-        a32_ios_bsd_err(ctx, D_EINVAL);
-        return;
-    }
-    if ((nch > 0 && !a32_vm32_access_ok(ctx, chl, (uint32_t)nch * sz, (uint32_t)PROT_READ)) ||
-            (nev > 0 && !a32_vm32_access_ok(ctx, evl, (uint32_t)nev * sz, (uint32_t)PROT_WRITE))) {
-        (void)pthread_mutex_unlock(&g_kq_mu);
-        a32_ios_bsd_err(ctx, D_EFAULT);
-        return;
-    }
-    for (i = 0U; i < (uint32_t)nch; i++) {
-        const uint8_t *e = (const uint8_t *)a32_guest_ptr(ctx, chl + i * sz);
-        uint64_t ident, udata;
-        int64_t data;
-        int16_t filter;
-        uint16_t flags;
-        uint32_t fflags, v32;
-        int32_t d32;
-        if (is64) {
-            memcpy(&ident, e, 8);
-            memcpy(&filter, e + 8U, 2);
-            memcpy(&flags, e + 10U, 2);
-            memcpy(&fflags, e + o_ff, 4);
-            memcpy(&data, e + 16U, 8);
-            memcpy(&udata, e + 24U, 8);
+    if (bsd == 73U) {
+        int rc = a32_vm_munmap(ctx, a[0], a[1]);
+        if (rc != 0) {
+            a32_ios_bsd_err(ctx, a32_ios_host_to_darwin_errno(-rc));
+            return;
+        }
+        a32_ios_bsd_ok(ctx, 0U, 0U, false);
+    } else if (bsd == 74U) {
+        int rc = a32_vm_mprotect(ctx, a[0], a[1], a[2] & 7U);
+        if (rc != 0) {
+            a32_ios_bsd_err(ctx, a32_ios_host_to_darwin_errno(-rc));
+            return;
+        }
+        a32_ios_bsd_ok(ctx, 0U, 0U, false);
+    } else if (bsd == 75U) {
+        uint32_t adv = a[3];
+        int verr = 22;
+        size_t hp;
+        uint32_t lo, hi;
+        if (!ios_vm_range_ok(ctx, a[0], a[1], &verr)) {
+            a32_ios_bsd_err(ctx, verr);
+        } else if (a[1] == 0U) {
+            a32_ios_bsd_ok(ctx, 0U, 0U, false);
+        } else if (adv == 4U || adv == 5U || adv == 6U || adv == 7U ||
+                adv == 8U || adv == 9U) {
+            /* Darwin free/discard hints only advise the pager; unlike
+             * Linux MADV_DONTNEED they never zero pages. Treat valid
+             * ranges as a no-op instead of discarding guest memory. */
+            a32_ios_bsd_ok(ctx, 0U, 0U, false);
+        } else if (adv > 3U) {
+            a32_ios_bsd_err(ctx, 22);
         } else {
-            memcpy(&v32, e, 4);
-            ident = v32;
-            memcpy(&filter, e + 4U, 2);
-            memcpy(&flags, e + 6U, 2);
-            memcpy(&fflags, e + o_ff, 4);
-            memcpy(&d32, e + 12U, 4);
-            data = d32;
-            memcpy(&v32, e + 16U, 4);
-            udata = v32;
+            /* Round inward to host pages so 4 KiB guest ranges on
+             * 16 KiB hosts never fail with EINVAL. */
+            hp = a32_backend_page_size();
+            lo = (uint32_t)(((uint64_t)a[0] + (uint64_t)hp - 1ULL) &
+                ~((uint64_t)hp - 1ULL));
+            hi = (uint32_t)(((uint64_t)a[0] + (uint64_t)a[1]) &
+                ~((uint64_t)hp - 1ULL));
+            if (lo >= hi) {
+                a32_ios_bsd_ok(ctx, 0U, 0U, false);
+            } else if (madvise(a32_guest_ptr(ctx, lo), (size_t)(hi - lo),
+                    (int)adv) != 0) {
+                sk_fail(ctx);
+            } else {
+                a32_ios_bsd_ok(ctx, 0U, 0U, false);
+            }
         }
-        sk_knote_change(kq, filter, flags, fflags,
-            data > 0x7FFFFFFFLL ? 0x7FFFFFFF : (int32_t)data, (uint32_t)ident, udata);
-    }
-    if (nev == 0) { (void)pthread_mutex_unlock(&g_kq_mu); a32_ios_bsd_ok(ctx, 0U, 0U, false); return; }
-    for (i = 0U; i < SK_KNOTE_MAX; i++) {
-        if (kq->notes[i].used && !kq->notes[i].disabled &&
-                kq->notes[i].filter != (int16_t)D_EV_TIMER) {
-            pfds[nfds].fd = (int)kq->notes[i].ident;
-            pfds[nfds].events = POLLIN | POLLOUT;
-            pfds[nfds].revents = 0;
-            nfds++;
+    } else if (bsd == 78U) {
+        uint64_t v64 = ((uint64_t)a[1] + 4095ULL) / 4096ULL;
+        int verr = 22;
+        if (a[1] == 0U ||
+            (uint64_t)a[0] + (uint64_t)a[1] > 0x100000000ULL ||
+            v64 > 0x100000ULL || (a[0] & 4095U) != 0U ||
+            !ios_vm_range_ok(ctx, a[0], a[1], &verr) ||
+            !a32_guest_range_ok(ctx, a[2], (uint32_t)v64,
+                                (uint32_t)PROT_WRITE)) {
+            a32_ios_bsd_err(ctx, verr);
+            return;
+        }
+        if (mincore(a32_guest_ptr(ctx, a[0]), (size_t)a[1],
+#if defined(__APPLE__)
+                (char *)a32_guest_ptr(ctx, a[2])) != 0) {
+#else
+                (unsigned char *)a32_guest_ptr(ctx, a[2])) != 0) {
+#endif
+            sk_fail(ctx);
+            return;
+        }
+        a32_vm32_copyout_invalidate_exec(ctx, a[2], (uint32_t)v64);
+        a32_ios_bsd_ok(ctx, 0U, 0U, false);
+    } else { /* 65 msync */
+        int hf = 0;
+        int verr = 22;
+        if ((a[2] & 0x1U) != 0U) {
+            hf |= MS_ASYNC;
+        }
+        if ((a[2] & 0x2U) != 0U) {
+            hf |= MS_INVALIDATE;
+        }
+        if ((a[2] & 0x10U) != 0U) {
+            hf |= MS_SYNC;
+        }
+        if (!ios_vm_range_ok(ctx, a[0], a[1], &verr)) {
+            a32_ios_bsd_err(ctx, verr);
+        } else if (a[1] == 0U) {
+            a32_ios_bsd_ok(ctx, 0U, 0U, false);
+        } else {
+            size_t hp = a32_backend_page_size();
+            uint64_t lo = (uint64_t)a[0] & ~((uint64_t)hp - 1ULL);
+            uint64_t hi = ((uint64_t)a[0] + (uint64_t)a[1] +
+                (uint64_t)hp - 1ULL) & ~((uint64_t)hp - 1ULL);
+            int r;
+            if (hi > (uint64_t)A32_IOS_HIGH_MIN_VA) {
+                hi = (uint64_t)A32_IOS_HIGH_MIN_VA;
+            }
+            r = msync(a32_guest_ptr(ctx, (uint32_t)lo), (size_t)(hi - lo),
+                hf);
+            /* Host-page rounding can cover unmapped slivers next to the
+             * verified range; those need no sync. */
+            if (r != 0 && errno != ENOMEM) {
+                sk_fail(ctx);
+            } else {
+                a32_ios_bsd_ok(ctx, 0U, 0U, false);
+            }
         }
     }
-    wait_ms = timeout_ns == 0U ? 0 : timeout_ns >= 60000000000ULL ? 60000 :
-        (int)(timeout_ns / 1000000ULL);
-    (void)pthread_mutex_unlock(&g_kq_mu);
-    if (nfds > 0U) { (void)poll(pfds, nfds, wait_ms); }
-    else if (timeout_ns != 0U) {
-        ts.tv_sec = (time_t)(timeout_ns / 1000000000ULL);
-        ts.tv_nsec = (long)(timeout_ns % 1000000000ULL);
-        (void)nanosleep(&ts, NULL);
-    }
-    (void)pthread_mutex_lock(&g_kq_mu);
-    kq = NULL;
-    for (i = 0U; i < SK_KQ_MAX; i++) {
-        if (g_kq[i].used && g_kq[i].rfd == kd) { kq = &g_kq[i]; break; }
-    }
-    if (kq == NULL) {
-        (void)pthread_mutex_unlock(&g_kq_mu);
-        a32_ios_bsd_err(ctx, D_EBADF);
-        return;
-    }
-    for (i = 0U; i < SK_KNOTE_MAX && nout < (uint32_t)nev; i++) {
-        sk_knote_t *kn = &kq->notes[i];
-        sk_knote_t ev;
-        int32_t data;
-        bool eof;
-        if (!kn->used || kn->disabled) { continue; }
-        if (!sk_knote_ready(kn, &data, &eof)) { continue; }
-        ev = *kn;
-        if (ev.filter == (int16_t)D_EV_TIMER) {
-            kn->deadline_ns = sk_now_ns() + ev.period_ns;
-            if (ev.period_ns == 0U) { memset(kn, 0, sizeof(*kn)); }
-        } else if (ev.oneshot) {
-            memset(kn, 0, sizeof(*kn));
-        }
-        sk_emit(ctx, evl, nout, is64, (uint64_t)ev.ident, ev.filter,
-            eof ? (uint16_t)(D_EV_EOF | D_EV_ERROR) : 0U, ev.fflags,
-            eof ? D_EBADF : (int64_t)data, ev.udata);
-        nout++;
-    }
-    a32_vm32_copyout_invalidate_exec(ctx, evl, nout * sz);
-    (void)pthread_mutex_unlock(&g_kq_mu);
-    a32_ios_bsd_ok(ctx, nout, 0U, false);
-}
-
-static void sk_do_kqueue(a32_ctx_t *ctx)
-{
-    sk_kq_t *kq;
-    int fds[2];
-    (void)pthread_mutex_lock(&g_kq_mu);
-    kq = sk_kq_alloc();
-    if (kq == NULL) { (void)pthread_mutex_unlock(&g_kq_mu); a32_ios_bsd_err(ctx, D_ENOMEM); return; }
-    if (pipe(fds) != 0) { (void)pthread_mutex_unlock(&g_kq_mu); sk_fail(ctx); return; }
-    memset(kq, 0, sizeof(*kq));
-    kq->used = true;
-    kq->rfd = fds[0];
-    kq->wfd = fds[1];
-    (void)pthread_mutex_unlock(&g_kq_mu);
-    a32_ios_bsd_ok(ctx, (uint32_t)fds[0], 0U, false);
 }
 
 int a32_ios_dispatch_bsd_sock(a32_ctx_t *ctx, uint32_t bsd_nr,
@@ -844,29 +797,8 @@ int a32_ios_dispatch_bsd_sock(a32_ctx_t *ctx, uint32_t bsd_nr,
         else { a32_ios_bsd_ok(ctx, 0U, 0U, false); }
         break;
     case 135U: sk_do_socketpair(ctx, args); break;
-    case 362U: sk_do_kqueue(ctx); break;
-    case 363U: case 374U: {
-        int32_t sec = 0, nsec = 0;
-        uint64_t tns;
-        if (args[5] != 0U) {
-            if (!a32_vm32_access_ok(ctx, args[5], 8U, (uint32_t)PROT_READ)) {
-                a32_ios_bsd_err(ctx, D_EFAULT);
-                break;
-            }
-            memcpy(&sec, a32_guest_ptr(ctx, args[5]), 4);
-            memcpy(&nsec, a32_guest_ptr(ctx, args[5] + 4U), 4);
-            if (sec < 0 || nsec < 0 || nsec >= 1000000000) {
-                a32_ios_bsd_err(ctx, D_EINVAL);
-                break;
-            }
-        }
-        tns = args[5] == 0U ? 60000000000ULL : /* NULL: cap a 60 s wait */
-            (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
-        sk_do_kevent(ctx, (int)(int32_t)args[0], args[1], (int)(int32_t)args[2],
-            args[3], (int)(int32_t)args[4], tns, bsd_nr == 374U);
-        break;
-    }
-    default: return 0;
+    default: return a32_ios_dispatch_bsd_kevent(ctx, bsd_nr, args,
+        out_handled);
     }
     if (out_handled != NULL) { *out_handled = true; }
     return 0;

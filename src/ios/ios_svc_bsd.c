@@ -5,9 +5,10 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Curated C11, host-portable (macOS arm64 AND aarch64-linux-musl).
- * File-descriptor / IO / VM helpers plus the top-level BSD dispatcher;
- * filesystem / directory syscalls live in ios_svc_bsd_fs.c and the
- * remaining units declared in ios/ios.h.
+ * File-descriptor / IO helpers plus the top-level BSD dispatcher;
+ * filesystem / directory syscalls live in ios_svc_bsd_fs.c, VM
+ * advice syscalls in ios_svc_bsd_sock.c, and the remaining units
+ * declared in ios/ios.h.
  */
 
 #if !defined(__APPLE__)
@@ -18,6 +19,7 @@
 
 #include "a32rt.h"
 #include "ios/ios.h"
+#include "os/backend.h"
 #include "vm/vm32.h"
 
 #include <errno.h>
@@ -156,25 +158,45 @@ static uint32_t ios_ld32(a32_ctx_t *ctx, uint32_t va)
 static int ios_cstr(a32_ctx_t *ctx, uint32_t gva, char *out, size_t cap)
 {
     size_t n = 0U;
+    uint32_t cur = gva;
     if (cap == 0U) {
         return -14;
     }
-    while (n + 1U < cap) {
-        const char *hva;
-        if (!a32_guest_range_ok(ctx, gva + (uint32_t)n, 1U,
-                (uint32_t)PROT_READ)) {
+    for (;;) {
+        uint32_t rem = 0x1000U - (cur & 0xFFFU);
+        const char *blk;
+        size_t want;
+        const char *hit;
+        if (n + 1U >= cap) {
+            out[cap - 1U] = '\0';
+            return -63;
+        }
+        if (!a32_guest_range_ok(ctx, cur, rem, (uint32_t)PROT_READ)) {
             return -14;
         }
-        hva = (const char *)a32_guest_ptr(ctx, gva);
-        out[n] = hva[n];
-        if (hva[n] == '\0') {
+        blk = (const char *)a32_guest_ptr(ctx, cur);
+        want = cap - n - 1U;
+        if (want > rem) {
+            want = rem;
+        }
+        hit = (const char *)memchr(blk, 0, want);
+        if (hit != NULL) {
+            memcpy(out + n, blk, (size_t)(hit - blk) + 1U);
             return 0;
         }
-        n++;
+        if (n + rem >= cap) {
+            out[cap - 1U] = '\0';
+            return -63;
+        }
+        memcpy(out + n, blk, rem);
+        n += rem;
+        cur += rem;
     }
-    out[cap - 1U] = '\0';
-    return -63;
 }
+
+/* mmap / munmap / mprotect / madvise / mincore / msync live in
+ * ios_svc_bsd_sock.c (room under the 900-line cap). */
+void a32_ios_bsd_vm_simple(a32_ctx_t *ctx, uint32_t bsd, const uint32_t *a);
 
 /* Resolve a guest path VA to an absolute host path (negative Darwin errno). */
 static int ios_resolve(a32_ctx_t *ctx, uint32_t gva, char *host, size_t hcap)
@@ -405,11 +427,31 @@ static void ios_do_open(a32_ctx_t *ctx, uint32_t path_va, uint32_t flags,
     a32_ios_bsd_ok(ctx, (uint32_t)fd, 0U, false);
 }
 
-/* Resolved host paths are absolute, so the host dirfd is redundant. */
-static void ios_do_openat(a32_ctx_t *ctx, uint32_t path_va, uint32_t flags,
-    uint32_t mode)
+static void ios_do_openat(a32_ctx_t *ctx, int dirfd, uint32_t path_va,
+    uint32_t flags, uint32_t mode)
 {
-    ios_do_open(ctx, path_va, flags, mode);
+    char tmp[IOS_BSD_PATH_MAX];
+    char host[IOS_BSD_PATH_MAX];
+    int hflags = ios_xlate_oflags(flags);
+    int fd;
+    if (ios_cstr(ctx, path_va, tmp, sizeof(tmp)) != 0) {
+        a32_ios_bsd_err(ctx, 14);
+        return;
+    }
+    if (tmp[0] == '/' || dirfd == -2 || strstr(tmp, "..") != NULL) {
+        if (a32_resolve_guest_path(ctx, tmp, host, sizeof(host)) != 0) {
+            a32_ios_bsd_err(ctx, 2);
+            return;
+        }
+        fd = open(host, hflags, (mode_t)mode);
+    } else {
+        fd = openat(dirfd, tmp, hflags, (mode_t)mode);
+    }
+    if (fd < 0) {
+        ios_fail(ctx);
+        return;
+    }
+    a32_ios_bsd_ok(ctx, (uint32_t)fd, 0U, false);
 }
 
 static void ios_do_lseek(a32_ctx_t *ctx, uint32_t fd, uint32_t lo,
@@ -523,45 +565,41 @@ static void ios_do_fcntl(a32_ctx_t *ctx, uint32_t fd, uint32_t cmd,
         break;
     }
     case IOS_F_GETPATH: {
+        char tmp[1024];
+        size_t k;
 #if defined(__APPLE__)
-        if (!ios_wr_ok(ctx, arg, IOS_BSD_PATH_MAX)) {
-            a32_ios_bsd_err(ctx, 14);
-            return;
-        }
-        r = fcntl((int)(int32_t)fd, F_GETPATH, a32_guest_ptr(ctx, arg));
+        tmp[sizeof(tmp) - 1U] = '\0';
+        r = fcntl((int)(int32_t)fd, F_GETPATH, tmp);
         if (r != 0) {
             ios_fail(ctx);
             return;
         }
-        a32_vm32_copyout_invalidate_exec(ctx, arg, IOS_BSD_PATH_MAX);
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-        return;
+        tmp[sizeof(tmp) - 1U] = '\0';
 #else
-        char proc[64];
-        char tmp[IOS_BSD_PATH_MAX];
-        ssize_t n;
-        if (!ios_wr_ok(ctx, arg, IOS_BSD_PATH_MAX)) {
+        {
+            char proc[64];
+            ssize_t n;
+            snprintf(proc, sizeof(proc), "/proc/self/fd/%d", (int)(int32_t)fd);
+            n = readlink(proc, tmp, sizeof(tmp) - 1U);
+            if (n < 0) {
+                ios_fail(ctx);
+                return;
+            }
+            tmp[n] = '\0';
+        }
+#endif
+        k = strlen(tmp) + 1U;
+        if (k > sizeof(tmp)) {
+            k = sizeof(tmp);
+        }
+        if (!ios_wr_ok(ctx, arg, (uint32_t)k)) {
             a32_ios_bsd_err(ctx, 14);
             return;
         }
-        snprintf(proc, sizeof(proc), "/proc/self/fd/%d", (int)(int32_t)fd);
-        n = readlink(proc, tmp, sizeof(tmp) - 1U);
-        if (n < 0) {
-            ios_fail(ctx);
-            return;
-        }
-        tmp[n] = '\0';
-        {
-            size_t k = (size_t)n + 1U;
-            if (k > IOS_BSD_PATH_MAX) {
-                k = IOS_BSD_PATH_MAX;
-            }
-            memcpy(a32_guest_ptr(ctx, arg), tmp, k);
-            a32_vm32_copyout_invalidate_exec(ctx, arg, (uint32_t)k);
-        }
+        memcpy(a32_guest_ptr(ctx, arg), tmp, k);
+        a32_vm32_copyout_invalidate_exec(ctx, arg, (uint32_t)k);
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return;
-#endif
     }
     default:
         a32_ios_bsd_err(ctx, 22);
@@ -613,87 +651,6 @@ static void ios_do_mmap(a32_ctx_t *ctx, const uint32_t *a)
     a32_ios_bsd_ok(ctx, res, 0U, false);
 }
 
-static void ios_do_vm_simple(a32_ctx_t *ctx, uint32_t bsd, const uint32_t *a)
-{
-    if (bsd == 73U) {
-        int rc = a32_vm_munmap(ctx, a[0], a[1]);
-        if (rc != 0) {
-            a32_ios_bsd_err(ctx, a32_ios_host_to_darwin_errno(-rc));
-            return;
-        }
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-    } else if (bsd == 74U) {
-        int rc = a32_vm_mprotect(ctx, a[0], a[1], a[2] & 7U);
-        if (rc != 0) {
-            a32_ios_bsd_err(ctx, a32_ios_host_to_darwin_errno(-rc));
-            return;
-        }
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-    } else if (bsd == 75U) {
-        uint32_t adv = a[3];
-#if defined(__linux__)
-        if (adv == 5U) {
-            adv = 8U; /* Darwin MADV_FREE -> Linux MADV_FREE */
-        }
-#endif
-        if (a[1] == 0U) {
-            a32_ios_bsd_ok(ctx, 0U, 0U, false);
-            return;
-        }
-        if (madvise(a32_guest_ptr(ctx, a[0]), (size_t)a[1], (int)adv) != 0) {
-            ios_fail(ctx);
-            return;
-        }
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-    } else if (bsd == 78U) {
-        uint64_t v64 = ((uint64_t)a[1] + 4095ULL) / 4096ULL;
-        if (a[1] == 0U ||
-            (uint64_t)a[0] + (uint64_t)a[1] > 0x100000000ULL ||
-            v64 > 0x100000ULL) {
-            a32_ios_bsd_err(ctx, 22);
-            return;
-        }
-        if ((a[0] & 4095U) != 0U ||
-            !a32_guest_range_ok(ctx, a[0], a[1], (uint32_t)PROT_READ) ||
-            !a32_guest_range_ok(ctx, a[2], (uint32_t)v64,
-                                (uint32_t)PROT_WRITE)) {
-            a32_ios_bsd_err(ctx, 22);
-            return;
-        }
-        if (mincore(a32_guest_ptr(ctx, a[0]), (size_t)a[1],
-#if defined(__APPLE__)
-                (char *)a32_guest_ptr(ctx, a[2])) != 0) {
-#else
-                (unsigned char *)a32_guest_ptr(ctx, a[2])) != 0) {
-#endif
-            ios_fail(ctx);
-            return;
-        }
-        a32_vm32_copyout_invalidate_exec(ctx, a[2], (uint32_t)v64);
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-    } else { /* 65 msync */
-        int hf = 0;
-        if ((a[2] & 0x1U) != 0U) {
-            hf |= MS_ASYNC;
-        }
-        if ((a[2] & 0x2U) != 0U) {
-            hf |= MS_INVALIDATE;
-        }
-        if ((a[2] & 0x10U) != 0U) {
-            hf |= MS_SYNC;
-        }
-        if (a[1] == 0U) {
-            a32_ios_bsd_ok(ctx, 0U, 0U, false);
-            return;
-        }
-        if (msync(a32_guest_ptr(ctx, a[0]), (size_t)a[1], hf) != 0) {
-            ios_fail(ctx);
-            return;
-        }
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-    }
-}
-
 /* ---- Signal-number BSD syscalls (direct ios_signals.c calls) ---- */
 
 static bool ios_try_signal(a32_ctx_t *ctx, uint32_t bsd, const uint32_t *a,
@@ -734,6 +691,10 @@ static bool ios_try_signal(a32_ctx_t *ctx, uint32_t bsd, const uint32_t *a,
     default:
         *done = false;
         return false;
+    }
+    if ((bsd == 111U || bsd == 410U || bsd == 37U || bsd == 328U) &&
+            ctx->exit_reason == (uint32_t)A32_EXIT_BRANCH) {
+        return true; /* signal frame pushed; regs/cpsr already set */
     }
     if (rc == 0) {
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
@@ -820,7 +781,9 @@ int a32_ios_handle_svc(a32_ctx_t *ctx)
             (uint64_t)args[3] | ((uint64_t)args[4] << 32), true);
         break;
     case 5U: case 398U: ios_do_open(ctx, args[0], args[1], args[2]); break;
-    case 463U: case 464U: ios_do_openat(ctx, args[1], args[2], args[3]); break;
+    case 463U: case 464U:
+        ios_do_openat(ctx, (int)(int32_t)args[0], args[1], args[2], args[3]);
+        break;
     case 6U: case 399U:
         a32_ios_kq_close((int)(int32_t)args[0]);
         if (close((int)(int32_t)args[0]) != 0) { ios_fail(ctx); } else { a32_ios_bsd_ok(ctx, 0U, 0U, false); }
@@ -842,7 +805,7 @@ int a32_ios_handle_svc(a32_ctx_t *ctx)
     case 92U: case 406U: ios_do_fcntl(ctx, args[0], args[1], args[2]); break;
     case 19U: case 199U: ios_do_lseek(ctx, args[0], args[1], args[2], args[3]); break;
     case 197U: ios_do_mmap(ctx, args); break;
-    case 73U: case 74U: case 75U: case 78U: case 65U: ios_do_vm_simple(ctx, bsd, args); break;
+    case 73U: case 74U: case 75U: case 78U: case 65U: a32_ios_bsd_vm_simple(ctx, bsd, args); break;
     default: a32_ios_bsd_err(ctx, 78); break;
     }
 out:
