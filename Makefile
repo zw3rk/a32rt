@@ -100,6 +100,7 @@ SRCS := src/main.c \
         src/interp/interp_vfp_neon_ext.c \
         src/interp/interp_vfp_neon_int.c \
         src/interp/interp_vfp_neon_shift.c \
+        src/interp/interp_vfp_neon_long.c \
         src/dbt/difftest.c \
         src/vm/vm32.c \
         src/vm/vm_file.c \

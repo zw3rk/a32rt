@@ -50,6 +50,7 @@ bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted);
 bool i_vfp_neon_ext(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted);
 bool i_vfp_neon_int(a32_ctx_t *ctx, uint32_t pc, uint32_t insn);
 bool i_vfp_neon_shift(a32_ctx_t *ctx, uint32_t pc, uint32_t insn);
+bool i_vfp_neon_long(a32_ctx_t *ctx, uint32_t pc, uint32_t insn);
 
 /* Narrow guest memory accessors shared by the VFP/NEON step files. */
 static inline bool mem_r(a32_ctx_t *ctx, uint32_t va, void *out, uint32_t len)
