@@ -780,13 +780,15 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                         r = -fma(a, b, -d);
                     }
                 } else {
-                    r = op_bit ? (d - a * b) : (d + a * b);
+                    double p = vfp_fz_out_d(ctx, vfp_dn_d(ctx, a * b));
+                    r = op_bit ? (d - p) : (d + p);
                 }
             } else if (opc1 == 1U || opc1 == 9U) {
                 if (fused) {
                     r = op_bit ? -fma(a, b, d) : fma(a, b, -d);
                 } else {
-                    r = op_bit ? (-d - a * b) : (-d + a * b);
+                    double p = vfp_fz_out_d(ctx, vfp_dn_d(ctx, a * b));
+                    r = op_bit ? (-d - p) : (-d + p);
                 }
             }
             put_d(ctx, vd, vfp_fz_out_d(ctx, vfp_dn_d(ctx, r)));
@@ -808,13 +810,15 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                         r = -fmaf(a, b, -d);
                     }
                 } else {
-                    r = op_bit ? (d - a * b) : (d + a * b);
+                    float p = vfp_fz_out_f(ctx, vfp_dn_f(ctx, a * b));
+                    r = op_bit ? (d - p) : (d + p);
                 }
             } else if (opc1 == 1U || opc1 == 9U) {
                 if (fused) {
                     r = op_bit ? -fmaf(a, b, d) : fmaf(a, b, -d);
                 } else {
-                    r = op_bit ? (-d - a * b) : (-d + a * b);
+                    float p = vfp_fz_out_f(ctx, vfp_dn_f(ctx, a * b));
+                    r = op_bit ? (-d - p) : (-d + p);
                 }
             }
             put_s(ctx, vd, vfp_fz_out_f(ctx, vfp_dn_f(ctx, r)));
