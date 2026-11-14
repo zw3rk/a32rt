@@ -20,12 +20,14 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(__APPLE__)
@@ -337,3 +339,375 @@ void a32_backend_jit_free(void *buf, size_t size)
 }
 
 /* Worker wake-pipe helpers live in src/os/backend_sync.c (A32-R13-11). */
+
+/* ---- 6. Darwin host futex wait/wake table (A32-IOS-D11) ----
+ *
+ * Linux futex semantics emulated with pthread condvars: FUTEX_WAIT and
+ * FUTEX_WAIT_BITSET park the caller on a table slot keyed by guest uaddr;
+ * FUTEX_WAKE and FUTEX_WAKE_BITSET set woken flags and signal the matching
+ * slots; FUTEX_REQUEUE and FUTEX_CMP_REQUEUE move waiter keys to uaddr2;
+ * FUTEX_WAKE_OP performs its atomic op on uaddr2 under the table lock.
+ * Returns negative Linux errnos, like the kernel path. */
+#if !defined(__linux__)
+
+#define A32_FUTEX_SLOTS 128U
+
+#define A32_FUTEX_WAIT 0U
+#define A32_FUTEX_WAKE 1U
+#define A32_FUTEX_REQUEUE 3U
+#define A32_FUTEX_CMP_REQUEUE 4U
+#define A32_FUTEX_WAKE_OP 5U
+#define A32_FUTEX_WAIT_BITSET 9U
+#define A32_FUTEX_WAKE_BITSET 10U
+#define A32_FUTEX_ALL_BITS 0xFFFFFFFFU
+#define A32_FUTEX_NSEC_PER_SEC 1000000000ULL
+
+typedef struct {
+    bool in_use;
+    bool woken;
+    uint32_t uaddr_va;
+    uint32_t bitset;
+    pthread_cond_t cv;
+} a32_futex_slot_t;
+
+static a32_futex_slot_t g_futex_slots[A32_FUTEX_SLOTS];
+static pthread_mutex_t g_futex_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_futex_once = PTHREAD_ONCE_INIT;
+
+static void futex_slots_init(void)
+{
+    uint32_t i;
+    for (i = 0U; i < A32_FUTEX_SLOTS; i++) {
+        (void)pthread_cond_init(&g_futex_slots[i].cv, NULL);
+        g_futex_slots[i].in_use = false;
+        g_futex_slots[i].woken = false;
+        g_futex_slots[i].uaddr_va = 0U;
+        g_futex_slots[i].bitset = 0U;
+    }
+}
+
+static bool futex_ts_ok(const struct timespec *ts)
+{
+    return ts->tv_sec >= 0 && ts->tv_nsec >= 0 &&
+        ts->tv_nsec < 1000000000L;
+}
+
+static uint32_t futex_read_u32(a32_ctx_t *ctx, uint32_t va, bool *ok)
+{
+    uint32_t v = 0U;
+    if (!a32_guest_range_ok(ctx, va, 4U, (uint32_t)PROT_READ)) {
+        *ok = false;
+        return 0U;
+    }
+    memcpy(&v, a32_guest_ptr(ctx, va), 4U);
+    *ok = true;
+    return v;
+}
+
+/* Wake up to budget unserved waiters keyed by uaddr_va whose bitset
+ * intersects mask. Caller holds g_futex_mu. Returns the number woken. */
+static uint32_t futex_wake_locked(uint32_t uaddr_va, uint32_t mask,
+    uint32_t budget)
+{
+    uint32_t i;
+    uint32_t n = 0U;
+    for (i = 0U; i < A32_FUTEX_SLOTS && n < budget; i++) {
+        a32_futex_slot_t *s = &g_futex_slots[i];
+        if (s->in_use && !s->woken && s->uaddr_va == uaddr_va &&
+            (s->bitset & mask) != 0U) {
+            s->woken = true;
+            (void)pthread_cond_signal(&s->cv);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Move up to max_move unserved waiters from one key to another.
+ * Caller holds g_futex_mu. Returns the number requeued. */
+static uint32_t futex_requeue_locked(uint32_t from_va, uint32_t to_va,
+    uint32_t max_move)
+{
+    uint32_t i;
+    uint32_t n = 0U;
+    for (i = 0U; i < A32_FUTEX_SLOTS && n < max_move; i++) {
+        a32_futex_slot_t *s = &g_futex_slots[i];
+        if (s->in_use && !s->woken && s->uaddr_va == from_va) {
+            s->uaddr_va = to_va;
+            n++;
+        }
+    }
+    return n;
+}
+
+static void futex_add_ns(const struct timespec *base, uint64_t add_ns,
+    struct timespec *out)
+{
+    uint64_t b = (uint64_t)base->tv_sec * A32_FUTEX_NSEC_PER_SEC +
+        (uint64_t)base->tv_nsec;
+    uint64_t sum = b + add_ns;
+    if (sum < b) {
+        sum = UINT64_MAX;
+    }
+    out->tv_sec = (time_t)(sum / A32_FUTEX_NSEC_PER_SEC);
+    out->tv_nsec = (long)(sum % A32_FUTEX_NSEC_PER_SEC);
+}
+
+int a32_backend_darwin_futex(a32_ctx_t *ctx, uint32_t uaddr_va, uint32_t op,
+    uint32_t val, const void *timeout_ts, uint32_t val2,
+    uint32_t uaddr2_va, uint32_t val3)
+{
+    uint32_t basic;
+    if (ctx == NULL) {
+        return -EFAULT;
+    }
+    (void)pthread_once(&g_futex_once, futex_slots_init);
+    basic = op & 0x7FU;
+    switch (basic) {
+    case A32_FUTEX_WAIT:
+    case A32_FUTEX_WAIT_BITSET: {
+        const struct timespec *ts = (const struct timespec *)timeout_ts;
+        uint32_t bitset = A32_FUTEX_ALL_BITS;
+        bool has_deadline = false;
+        struct timespec deadline = { 0, 0 };
+        uint32_t cur = 0U;
+        bool ok = false;
+        uint32_t i;
+        a32_futex_slot_t *slot = NULL;
+        bool timed_out = false;
+        if (basic == A32_FUTEX_WAIT_BITSET) {
+            if (val3 == 0U) {
+                return -EINVAL;
+            }
+            bitset = val3;
+        }
+        cur = futex_read_u32(ctx, uaddr_va, &ok);
+        if (!ok) {
+            return -EFAULT;
+        }
+        if (cur != val) {
+            return -EAGAIN;
+        }
+        if (ts != NULL) {
+            struct timespec now;
+            int64_t d_sec;
+            long d_nsec;
+            clockid_t clk;
+            if (!futex_ts_ok(ts)) {
+                return -EINVAL;
+            }
+            clk = (basic == A32_FUTEX_WAIT ||
+                (op & 0x100U) == 0U) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+            (void)clock_gettime(clk, &now);
+            d_sec = (int64_t)ts->tv_sec - (int64_t)now.tv_sec;
+            d_nsec = ts->tv_nsec - now.tv_nsec;
+            if (d_nsec < 0L) {
+                d_sec -= 1;
+                d_nsec += 1000000000L;
+            }
+            if (d_sec < 0) {
+                return -ETIMEDOUT;
+            }
+            if (basic == A32_FUTEX_WAIT || clk == CLOCK_MONOTONIC) {
+                struct timespec now_r;
+                (void)clock_gettime(CLOCK_REALTIME, &now_r);
+                futex_add_ns(&now_r,
+                    (uint64_t)d_sec * A32_FUTEX_NSEC_PER_SEC +
+                    (uint64_t)d_nsec, &deadline);
+            } else {
+                deadline = *ts;
+            }
+            has_deadline = true;
+        }
+        if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) &
+             ~ctx->sig_mask) != 0ULL) {
+            return -EINTR;
+        }
+        (void)pthread_mutex_lock(&g_futex_mu);
+        cur = futex_read_u32(ctx, uaddr_va, &ok);
+        if (!ok || cur != val) {
+            (void)pthread_mutex_unlock(&g_futex_mu);
+            return ok ? -EAGAIN : -EFAULT;
+        }
+        for (i = 0U; i < A32_FUTEX_SLOTS; i++) {
+            if (!g_futex_slots[i].in_use) {
+                slot = &g_futex_slots[i];
+                break;
+            }
+        }
+        if (slot == NULL) {
+            (void)pthread_mutex_unlock(&g_futex_mu);
+            return -EAGAIN;
+        }
+        slot->in_use = true;
+        slot->woken = false;
+        slot->uaddr_va = uaddr_va;
+        slot->bitset = bitset;
+        while (!slot->woken) {
+            int rc;
+            if (!has_deadline) {
+                rc = pthread_cond_wait(&slot->cv, &g_futex_mu);
+                (void)rc;
+            } else {
+                rc = pthread_cond_timedwait(&slot->cv, &g_futex_mu,
+                    &deadline);
+                if (rc == ETIMEDOUT && !slot->woken) {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+        slot->in_use = false;
+        (void)pthread_mutex_unlock(&g_futex_mu);
+        return timed_out ? -ETIMEDOUT : 0;
+    }
+    case A32_FUTEX_WAKE:
+    case A32_FUTEX_WAKE_BITSET: {
+        uint32_t mask = (basic == A32_FUTEX_WAKE_BITSET) ? val3 :
+            A32_FUTEX_ALL_BITS;
+        uint32_t n;
+        if (!a32_guest_range_ok(ctx, uaddr_va, 4U, (uint32_t)PROT_READ)) {
+            return -EFAULT;
+        }
+        (void)pthread_mutex_lock(&g_futex_mu);
+        n = futex_wake_locked(uaddr_va, mask, val);
+        (void)pthread_mutex_unlock(&g_futex_mu);
+        return (int)n;
+    }
+    case A32_FUTEX_REQUEUE: {
+        bool ok = false;
+        uint32_t woken = 0U;
+        uint32_t moved = 0U;
+        (void)futex_read_u32(ctx, uaddr_va, &ok);
+        if (!ok) {
+            return -EFAULT;
+        }
+        if (!a32_guest_range_ok(ctx, uaddr2_va, 4U, (uint32_t)PROT_READ)) {
+            return -EFAULT;
+        }
+        (void)pthread_mutex_lock(&g_futex_mu);
+        woken = futex_wake_locked(uaddr_va, A32_FUTEX_ALL_BITS, val);
+        moved = futex_requeue_locked(uaddr_va, uaddr2_va, val3);
+        (void)pthread_mutex_unlock(&g_futex_mu);
+        return (int)(woken + moved);
+    }
+    case A32_FUTEX_CMP_REQUEUE: {
+        bool ok = false;
+        uint32_t cur = futex_read_u32(ctx, uaddr_va, &ok);
+        uint32_t woken = 0U;
+        uint32_t moved = 0U;
+        if (!ok) {
+            return -EFAULT;
+        }
+        if (cur != val3) {
+            return -EAGAIN;
+        }
+        if (!a32_guest_range_ok(ctx, uaddr2_va, 4U, (uint32_t)PROT_READ)) {
+            return -EFAULT;
+        }
+        (void)pthread_mutex_lock(&g_futex_mu);
+        woken = futex_wake_locked(uaddr_va, A32_FUTEX_ALL_BITS, val);
+        moved = futex_requeue_locked(uaddr_va, uaddr2_va, 0xFFFFFFFFU);
+        (void)pthread_mutex_unlock(&g_futex_mu);
+        return (int)(woken + moved);
+    }
+    case A32_FUTEX_WAKE_OP: {
+        uint32_t old = 0U;
+        uint32_t newv = 0U;
+        bool ok = false;
+        uint32_t op_op;
+        uint32_t oparg;
+        uint32_t cmp;
+        uint32_t cmparg;
+        bool do_wake2 = false;
+        uint32_t n1 = 0U;
+        uint32_t n2 = 0U;
+        if (!a32_guest_range_ok(ctx, uaddr_va, 4U, (uint32_t)PROT_READ)) {
+            return -EFAULT;
+        }
+        if (!a32_guest_range_ok(ctx, uaddr2_va, 4U,
+                (uint32_t)(PROT_READ | PROT_WRITE))) {
+            return -EFAULT;
+        }
+        op_op = (val3 >> 28) & 0xFU;
+        oparg = (val3 >> 12) & 0xFFFU;
+        cmp = (val3 >> 24) & 0xFU;
+        cmparg = val3 & 0xFFFU;
+        (void)pthread_mutex_lock(&g_futex_mu);
+        n1 = futex_wake_locked(uaddr_va, A32_FUTEX_ALL_BITS, val);
+        old = futex_read_u32(ctx, uaddr2_va, &ok);
+        if (!ok) {
+            (void)pthread_mutex_unlock(&g_futex_mu);
+            return -EFAULT;
+        }
+        switch (op_op) {
+        case 0U:
+            newv = oparg;
+            break;
+        case 1U:
+            newv = old + oparg;
+            break;
+        case 2U:
+            newv = old | oparg;
+            break;
+        case 3U:
+            newv = old & ~oparg;
+            break;
+        case 4U:
+            newv = old ^ oparg;
+            break;
+        default:
+            (void)pthread_mutex_unlock(&g_futex_mu);
+            return -EINVAL;
+        }
+        memcpy(a32_guest_ptr(ctx, uaddr2_va), &newv, 4U);
+        switch (cmp) {
+        case 0U:
+            do_wake2 = (old == cmparg);
+            break;
+        case 1U:
+            do_wake2 = (old != cmparg);
+            break;
+        case 2U:
+            do_wake2 = (old < cmparg);
+            break;
+        case 3U:
+            do_wake2 = (old <= cmparg);
+            break;
+        case 4U:
+            do_wake2 = (old > cmparg);
+            break;
+        case 5U:
+            do_wake2 = (old >= cmparg);
+            break;
+        default:
+            (void)pthread_mutex_unlock(&g_futex_mu);
+            return -EINVAL;
+        }
+        if (do_wake2) {
+            n2 = futex_wake_locked(uaddr2_va, A32_FUTEX_ALL_BITS, val2);
+        }
+        (void)pthread_mutex_unlock(&g_futex_mu);
+        return (int)(n1 + n2);
+    }
+    default:
+        return -ENOSYS;
+    }
+}
+
+void a32_backend_darwin_futex_wake(a32_ctx_t *ctx, uint32_t uaddr_va,
+    uint32_t count)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    (void)pthread_once(&g_futex_once, futex_slots_init);
+    if (!a32_guest_range_ok(ctx, uaddr_va, 4U, (uint32_t)PROT_READ)) {
+        return;
+    }
+    (void)pthread_mutex_lock(&g_futex_mu);
+    (void)futex_wake_locked(uaddr_va, A32_FUTEX_ALL_BITS, count);
+    (void)pthread_mutex_unlock(&g_futex_mu);
+}
+
+#endif /* !defined(__linux__) */

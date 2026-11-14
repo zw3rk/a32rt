@@ -16,6 +16,8 @@ static void thread_exit_cleanup(a32_ctx_t *ctx)
 #if defined(__linux__)
         syscall(SYS_futex, a32_guest_ptr(ctx, ctx->clear_child_tid),
                 1 /* FUTEX_WAKE */, 1, NULL, NULL, 0);
+#else
+        a32_backend_darwin_futex_wake(ctx, ctx->clear_child_tid, 1U);
 #endif
     }
 }
@@ -223,58 +225,6 @@ bool read_guest_strv(a32_ctx_t *ctx, uint32_t vec_va, char **out, int max_count,
     }
     return true;
 }
-
-/* Darwin futex WAIT emulation (no kernel waits). Guest Linux errnos. */
-#if !defined(__linux__)
-bool futex_darwin_wait(a32_ctx_t *ctx, uint32_t a0, uint32_t op,
-                       uint32_t a2, uint32_t a3, uint32_t a5, bool time64)
-{
-    uint32_t basic_op = op & 0x7FU;
-    uint32_t *uaddr = (uint32_t *)a32_guest_ptr(ctx, a0);
-    if (basic_op == 9U && a5 == 0U) {
-        ctx->regs[0] = (uint32_t)-EINVAL;
-        return true;
-    }
-    if (basic_op == 4U && __atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != a5) {
-        ctx->regs[0] = (uint32_t)-11;
-        return true;
-    }
-    if (basic_op != 0U && basic_op != 9U) {
-        return false;
-    }
-    if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != a2) {
-        ctx->regs[0] = (uint32_t)-11;
-        return true;
-    }
-    if (a3 == 0U) {
-        return false;
-    }
-    {
-        struct timespec end_m;
-        struct timespec now_m;
-        long ds;
-        long dn;
-        if (read_guest_timespec(ctx, a3, time64, &end_m)) {
-            if (end_m.tv_sec < 0 || end_m.tv_nsec < 0 || end_m.tv_nsec >= 1000000000L) { ctx->regs[0] = (uint32_t)-EINVAL; return true; }
-            if (basic_op == 0U) {
-                (void)nanosleep(&end_m, NULL);
-            } else {
-                (void)clock_gettime((op & 0x100U) ? CLOCK_REALTIME : CLOCK_MONOTONIC, &now_m);
-                ds = (long)(end_m.tv_sec - now_m.tv_sec);
-                dn = (long)(end_m.tv_nsec - now_m.tv_nsec);
-                if (dn < 0L) { ds -= 1L; dn += 1000000000L; }
-                if (ds >= 0L) {
-                    end_m.tv_sec = (time_t)ds;
-                    end_m.tv_nsec = dn;
-                    (void)nanosleep(&end_m, NULL);
-                }
-            }
-        }
-    }
-    ctx->regs[0] = (uint32_t)-110;
-    return true;
-}
-#endif /* !defined(__linux__) */
 
 static int dispatch_thread_sig(a32_ctx_t *ctx)
 {

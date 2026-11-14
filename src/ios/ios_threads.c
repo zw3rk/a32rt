@@ -36,6 +36,11 @@
 #define DE_BUSY 16
 #define DE_INVAL 22
 #define DE_TIMEDOUT 60
+#define DE_DEADLK 11
+#define MX_SIG_INIT 0x32AAABA7U
+#define MX_SIG_ERRCHK 0x32AAABA1U
+#define MX_SIG_REC 0x32AAABA2U
+#define CV_SIG_INIT 0x3CB0B1BBU
 #define THR_EXIT_ID 0xFFU
 #define ONCE_RESUME_ID 0xFCU
 /* 64-slot thread table; slot 0 is main (pva 0xFFFF5400). */
@@ -43,7 +48,7 @@
 #define THR_STACK_SZ (1024U * 1024U)
 typedef struct {
     bool used, done, detached, joinable, joining;
-    uint32_t pva, stva, stlen, tsd, rv;
+    uint32_t pva, stva, stlen, tsd, rv, dtor_n;
     a32_ctx_t *ch; pthread_t ht;
 } thr_t;
 static thr_t g_thr[THR_N];
@@ -59,7 +64,12 @@ static thr_t *thr_by_pthread(uint32_t pva)
 }
 static thr_t *thr_by_ctx(a32_ctx_t *c)
 {
-    uint32_t i;
+    uint32_t i, idx;
+    if (c != NULL && c->ios_thr_slot_plus1 != 0U) {
+        idx = c->ios_thr_slot_plus1 - 1U;
+        if (idx < THR_N && g_thr[idx].used && g_thr[idx].ch == c)
+            return &g_thr[idx];
+    }
     for (i = 0U; i < THR_N; i++)
         if (g_thr[i].used && g_thr[i].ch == c)
             return &g_thr[i];
@@ -86,32 +96,41 @@ static void tsd_clear(uint32_t slot)
 }
 /* Guest mutex table: host objects keyed by guest VA, never written back. */
 #define MX_N 64U
-typedef struct { bool used, inited; uint32_t gva; uint32_t waiters; pthread_mutex_t mu; } mxe_t;
+typedef struct { bool used, inited, rec; uint32_t gva; uint32_t waiters; pthread_mutex_t mu; } mxe_t;
 static mxe_t g_mx[MX_N];
 static pthread_mutex_t g_mx_mu = PTHREAD_MUTEX_INITIALIZER;
-static mxe_t *mx_lookup(uint32_t gva, bool create)
+static mxe_t *mx_lazy(a32_ctx_t *c, uint32_t gva, bool want_rec)
 {
-    uint32_t i;
-    mxe_t *fr = NULL;
+    mxe_t *e = NULL, *fr = NULL;
+    pthread_mutexattr_t at;
+    uint32_t i, sig = 1U;
+    if (c == NULL || gva == 0U || !a32_guest_range_ok(c, gva, 4U, (uint32_t)RD))
+        return NULL;
+    memcpy(&sig, a32_guest_ptr(c, gva), 4);
+    if (sig != 0U && sig != MX_SIG_INIT && sig != MX_SIG_ERRCHK && sig != MX_SIG_REC)
+        return NULL;
+    want_rec = want_rec || sig == MX_SIG_REC;
     (void)pthread_mutex_lock(&g_mx_mu);
-    for (i = 0U; i < MX_N; i++) {
+    for (i = 0U; i < MX_N; i++)
         if (g_mx[i].used) {
-            if (g_mx[i].gva == gva) {
-                (void)pthread_mutex_unlock(&g_mx_mu);
-                return &g_mx[i];
-            }
-        } else if (fr == NULL && create && g_mx[i].waiters == 0U) {
-            fr = &g_mx[i];
-        }
-    }
-    if (fr != NULL) {
-        fr->used = true; fr->gva = gva;
-        if (!fr->inited)
-            (void)pthread_mutex_init(&fr->mu, NULL);
-        fr->inited = true;
+            if (g_mx[i].gva == gva) { e = &g_mx[i]; break; }
+        } else if (fr == NULL && g_mx[i].waiters == 0U) fr = &g_mx[i];
+    if (e == NULL && fr == NULL) { (void)pthread_mutex_unlock(&g_mx_mu); return NULL; }
+    if (e == NULL) { fr->used = true; fr->gva = gva; e = fr; }
+    if (!e->inited || (want_rec && !e->rec)) {
+        if (e->inited)
+            (void)pthread_mutex_destroy(&e->mu);
+        if (want_rec) {
+            (void)pthread_mutexattr_init(&at);
+            (void)pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+            (void)pthread_mutex_init(&e->mu, &at);
+            (void)pthread_mutexattr_destroy(&at);
+        } else (void)pthread_mutex_init(&e->mu, NULL);
+        e->inited = true;
+        e->rec = want_rec;
     }
     (void)pthread_mutex_unlock(&g_mx_mu);
-    return fr;
+    return e;
 }
 static bool mx_remove(uint32_t gva)
 {
@@ -131,29 +150,28 @@ static bool mx_remove(uint32_t gva)
 typedef struct { bool used, inited; uint32_t gva; uint32_t waiters; pthread_cond_t cv; } cve_t;
 static cve_t g_cv[MX_N];
 static pthread_mutex_t g_cv_mu = PTHREAD_MUTEX_INITIALIZER;
-static cve_t *cv_lookup(uint32_t gva, bool create)
+static cve_t *cv_lazy(a32_ctx_t *c, uint32_t gva)
 {
-    uint32_t i;
-    cve_t *fr = NULL;
+    cve_t *e = NULL, *fr = NULL;
+    uint32_t i, sig = 1U;
+    if (c == NULL || gva == 0U || !a32_guest_range_ok(c, gva, 4U, (uint32_t)RD))
+        return NULL;
+    memcpy(&sig, a32_guest_ptr(c, gva), 4);
+    if (sig != 0U && sig != CV_SIG_INIT)
+        return NULL;
     (void)pthread_mutex_lock(&g_cv_mu);
-    for (i = 0U; i < MX_N; i++) {
+    for (i = 0U; i < MX_N; i++)
         if (g_cv[i].used) {
-            if (g_cv[i].gva == gva) {
-                (void)pthread_mutex_unlock(&g_cv_mu);
-                return &g_cv[i];
-            }
-        } else if (fr == NULL && create && g_cv[i].waiters == 0U) {
-            fr = &g_cv[i];
-        }
-    }
-    if (fr != NULL) {
+            if (g_cv[i].gva == gva) { e = &g_cv[i]; break; }
+        } else if (fr == NULL && g_cv[i].waiters == 0U) fr = &g_cv[i];
+    if (e == NULL && fr == NULL) { (void)pthread_mutex_unlock(&g_cv_mu); return NULL; }
+    if (e == NULL) {
         fr->used = true; fr->gva = gva;
-        if (!fr->inited)
-            (void)pthread_cond_init(&fr->cv, NULL);
-        fr->inited = true;
+        if (!fr->inited) { (void)pthread_cond_init(&fr->cv, NULL); fr->inited = true; }
+        e = fr;
     }
     (void)pthread_mutex_unlock(&g_cv_mu);
-    return fr;
+    return e;
 }
 static bool cv_remove(uint32_t gva)
 {
@@ -169,6 +187,15 @@ static bool cv_remove(uint32_t gva)
     }
     (void)pthread_mutex_unlock(&g_cv_mu);
     return hit;
+}
+/* Static initializers: a guest word holding a valid _PTHREAD_*_SIG_init
+ * signature (or zero) materializes the backing host object on first use. */
+static bool thr_lazy_sig(a32_ctx_t *c, uint32_t gva, uint32_t *out)
+{
+    if (c == NULL || gva == 0U || !a32_guest_range_ok(c, gva, 4U, (uint32_t)RD))
+        return false;
+    memcpy(out, a32_guest_ptr(c, gva), 4);
+    return true;
 }
 /* Guest once table + per-host-thread in-flight once-call stack. */
 typedef struct { bool used, running, done; uint32_t gva; } oncee_t;
@@ -315,7 +342,7 @@ static thr_t *spawn_child(a32_ctx_t *parent, uint32_t entry, uint32_t sp,
     (void)guest_write(ch, tsd, &self, 4U);
     (void)guest_write(ch, ch->ios_errno_va, &zero, 4U);
     (void)pthread_mutex_lock(&g_thr_mu);
-    if (!g_thr[0].used) { g_thr[0].used = true; g_thr[0].pva = 0xFFFF5400U; g_thr[0].ch = parent; }
+    if (!g_thr[0].used) { g_thr[0].used = true; g_thr[0].pva = 0xFFFF5400U; g_thr[0].ch = parent; parent->ios_thr_slot_plus1 = 1U; }
     for (i = 0U; i < THR_N && slot == NULL; i++) {
         if (!g_thr[i].used) {
             slot = &g_thr[i];
@@ -323,7 +350,8 @@ static thr_t *spawn_child(a32_ctx_t *parent, uint32_t entry, uint32_t sp,
             slot->detached = !joinable; slot->joinable = joinable;
             slot->pva = pva; slot->stva = stva; slot->stlen = stlen;
             slot->tsd = (tls == 0U) ? tsd : 0U; slot->rv = 0U; slot->ch = ch;
-            slot->ht = (pthread_t)0;
+            slot->ht = (pthread_t)0; slot->dtor_n = 0U;
+            ch->ios_thr_slot_plus1 = (uint32_t)(slot - g_thr) + 1U;
         }
     }
     (void)pthread_mutex_unlock(&g_thr_mu);
@@ -365,6 +393,34 @@ static void sync_init_once(void)
 static void sync_ensure(void)
 {
     (void)pthread_once(&g_sync_once, sync_init_once);
+}
+/* Waiter table keyed by guest VA: waiters park a stack node under the bucket
+ * lock and sleep until their own woken flag is set, so colliding keys never
+ * consume each other's wakeups. wake_all bumps bcast_seq and wakes every
+ * matching waiter even when *uaddr is unchanged. */
+typedef struct syncw { uint32_t key; bool woken; struct syncw *next; } syncw_t;
+static syncw_t *g_syncw[SYNC_B];
+static uint64_t g_syncseq[SYNC_B];
+static void sync_link(uint32_t b, syncw_t *w) { w->next = g_syncw[b]; g_syncw[b] = w; }
+static void sync_unlink(uint32_t b, syncw_t *w)
+{
+    syncw_t **p = &g_syncw[b];
+    while (*p != NULL && *p != w)
+        p = &(*p)->next;
+    if (*p != NULL)
+        *p = w->next;
+}
+static void sync_kick(uint32_t b, uint32_t key, bool all)
+{
+    syncw_t *w;
+    g_syncseq[b]++;
+    for (w = g_syncw[b]; w != NULL; w = w->next)
+        if (w->key == key && !w->woken) {
+            w->woken = true;
+            if (!all)
+                break;
+        }
+    (void)pthread_cond_broadcast(&g_sync_cv[b]);
 }
 int a32_ios_dispatch_thread_sync_bsd(a32_ctx_t *ctx, uint32_t bsd_nr,
     const uint32_t *args, bool *out_handled)
@@ -434,20 +490,21 @@ int a32_ios_dispatch_thread_sync_bsd(a32_ctx_t *ctx, uint32_t bsd_nr,
     case 305U:
     case 306U:
     case 307U: {
-        uint32_t key = args[0], cur = 0U;
+        uint32_t key = args[0], cur = args[1];
+        syncw_t w;
         b = (key >> 2) & (SYNC_B - 1U);
         if (out_handled != NULL)
             *out_handled = true;
         (void)pthread_mutex_lock(&g_sync_mu[b]);
-        if (a32_guest_range_ok(ctx, key, 4U, (uint32_t)RD)) {
+        if (a32_guest_range_ok(ctx, key, 4U, (uint32_t)RD))
             memcpy(&cur, a32_guest_ptr(ctx, key), 4U);
-            if (cur != args[1]) {
-                (void)pthread_mutex_unlock(&g_sync_mu[b]);
-                a32_ios_bsd_ok(ctx, 0U, 0U, false);
-                return 0;
-            }
+        w.key = key; w.woken = false; w.next = NULL;
+        if (cur == args[1]) {
+            sync_link(b, &w);
+            while (!w.woken)
+                (void)pthread_cond_wait(&g_sync_cv[b], &g_sync_mu[b]);
+            sync_unlink(b, &w);
         }
-        (void)pthread_cond_wait(&g_sync_cv[b], &g_sync_mu[b]);
         (void)pthread_mutex_unlock(&g_sync_mu[b]);
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return 0;
@@ -455,55 +512,50 @@ int a32_ios_dispatch_thread_sync_bsd(a32_ctx_t *ctx, uint32_t bsd_nr,
     case 302U:
     case 304U:
     case 308U:
-        b = (args[0] >> 2) & (SYNC_B - 1U);
-        if (out_handled != NULL)
-            *out_handled = true;
-        (void)pthread_mutex_lock(&g_sync_mu[b]);
-        (void)pthread_cond_signal(&g_sync_cv[b]);
-        (void)pthread_mutex_unlock(&g_sync_mu[b]);
-        a32_ios_bsd_ok(ctx, 0U, 0U, false);
-        return 0;
     case 303U:
         b = (args[0] >> 2) & (SYNC_B - 1U);
         if (out_handled != NULL)
             *out_handled = true;
         (void)pthread_mutex_lock(&g_sync_mu[b]);
-        (void)pthread_cond_broadcast(&g_sync_cv[b]);
+        sync_kick(b, args[0], bsd_nr == 303U);
         (void)pthread_mutex_unlock(&g_sync_mu[b]);
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return 0;
     case 515U: {
         uint32_t addr = args[1], cur = 0U;
         int rc = 0;
+        syncw_t w;
+        struct timespec ts;
         b = (addr >> 2) & (SYNC_B - 1U);
         if (out_handled != NULL)
             *out_handled = true;
-        if ((addr & 3U) != 0U ||
-            !a32_guest_range_ok(ctx, addr, 4U, (uint32_t)RD)) {
+        if ((addr & 3U) != 0U || !a32_guest_range_ok(ctx, addr, 4U, (uint32_t)RD)) {
             a32_ios_bsd_err(ctx, DE_INVAL);
             return 0;
         }
-        (void)pthread_mutex_lock(&g_sync_mu[b]);
-        while (a32_guest_range_ok(ctx, addr, 4U, (uint32_t)RD)) {
-            memcpy(&cur, a32_guest_ptr(ctx, addr), 4U);
-            if (cur != args[2])
-                break;
-            if (args[3] == 0U) {
-                rc = pthread_cond_wait(&g_sync_cv[b], &g_sync_mu[b]);
-            } else {
-                struct timespec ts;
-                (void)clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += (time_t)(args[3] / 1000000U);
-                ts.tv_nsec += (long)((args[3] % 1000000U) * 1000U);
-                if (ts.tv_nsec >= 1000000000L) {
-                    ts.tv_sec += 1;
-                    ts.tv_nsec -= 1000000000L;
-                }
-                rc = pthread_cond_timedwait(&g_sync_cv[b], &g_sync_mu[b], &ts);
-            }
-            if (rc != 0)
-                break;
+        if (args[3] != 0U) {
+            (void)clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += (time_t)(args[3] / 1000000U);
+            ts.tv_nsec += (long)((args[3] % 1000000U) * 1000U);
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
         }
+        (void)pthread_mutex_lock(&g_sync_mu[b]);
+        w.key = addr; w.woken = false; w.next = NULL;
+        sync_link(b, &w);
+        for (;;) {
+            if (!a32_guest_range_ok(ctx, addr, 4U, (uint32_t)RD))
+                break;
+            memcpy(&cur, a32_guest_ptr(ctx, addr), 4U);
+            if (cur != args[2] || w.woken)
+                break;
+            if (args[3] == 0U)
+                rc = pthread_cond_wait(&g_sync_cv[b], &g_sync_mu[b]);
+            else if ((rc = pthread_cond_timedwait(&g_sync_cv[b], &g_sync_mu[b], &ts)) != 0 && !w.woken)
+                break;
+            else
+                rc = 0;
+        }
+        sync_unlink(b, &w);
         (void)pthread_mutex_unlock(&g_sync_mu[b]);
         if (rc == ETIMEDOUT)
             a32_ios_bsd_err(ctx, DE_TIMEDOUT);
@@ -521,10 +573,7 @@ int a32_ios_dispatch_thread_sync_bsd(a32_ctx_t *ctx, uint32_t bsd_nr,
             return 0;
         }
         (void)pthread_mutex_lock(&g_sync_mu[b]);
-        if ((args[0] & 0x00000100U) != 0U)
-            (void)pthread_cond_broadcast(&g_sync_cv[b]);
-        else
-            (void)pthread_cond_signal(&g_sync_cv[b]);
+        sync_kick(b, args[1], (args[0] & 0x00000100U) != 0U);
         (void)pthread_mutex_unlock(&g_sync_mu[b]);
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return 0;
@@ -582,6 +631,7 @@ int a32_ios_stub_pthread(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled)
     case 88U: {
         thr_t *t; uint32_t pv;
         (void)pthread_mutex_lock(&g_thr_mu);
+        if (!g_thr[0].used) { g_thr[0].used = true; g_thr[0].pva = 0xFFFF5400U; g_thr[0].ch = ctx; ctx->ios_thr_slot_plus1 = 1U; }
         t = thr_by_ctx(ctx); pv = (t != NULL) ? t->pva : ctx->ios_pthread_va;
         (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = pv; break;
     }
@@ -607,11 +657,13 @@ int a32_ios_stub_pthread(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled)
         ctx->regs[0] = 0U; break;
     }
     case 90U: {
-        thr_t *t; uint32_t rv, idx, sa, sl, ta; a32_ctx_t *lc; pthread_t ht;
+        thr_t *t, *self; uint32_t rv, idx, sa, sl, ta; a32_ctx_t *lc; pthread_t ht;
         (void)pthread_mutex_lock(&g_thr_mu);
         t = thr_by_pthread(r0);
+        self = thr_by_ctx(ctx);
         if (t == NULL) { (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = (uint32_t)DE_SRCH; break; }
-        if (t->detached || t->joining) { (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = (uint32_t)DE_INVAL; break; }
+        if (self != NULL && t == self) { (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = (uint32_t)DE_DEADLK; break; }
+        if (t->detached || t->joining || t->ht == (pthread_t)0) { (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = (uint32_t)DE_INVAL; break; }
         t->joining = true; ht = t->ht;
         while (!t->done) (void)pthread_cond_wait(&g_thr_cv, &g_thr_mu);
         (void)pthread_mutex_unlock(&g_thr_mu);
@@ -642,66 +694,33 @@ int a32_ios_stub_pthread(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled)
         if (rel) { if (sa != 0U) (void)a32_vm_munmap(ctx, sa, sl); if (ta != 0U) (void)a32_vm_munmap(ctx, ta, 0x1000U); tsd_clear(idx); free(lc); }
         ctx->regs[0] = 0U; break;
     }
-    case 92U:
-        ctx->regs[0] = (mx_lookup(r0, true) == NULL) ? (uint32_t)DE_NOMEM : 0U;
-        break;
-    case 93U: {
-        mxe_t *e = mx_lookup(r0, false);
-        ctx->regs[0] = (e == NULL) ? (uint32_t)DE_INVAL
-                                   : mx_rc(pthread_mutex_lock(&e->mu));
+    case 92U: {
+        mxe_t *e; uint32_t aw = 0U; bool wr = thr_lazy_sig(ctx, r1, &aw) && (aw == 2U || aw == MX_SIG_REC);
+        e = mx_lazy(ctx, r0, wr);
+        ctx->regs[0] = (e == NULL) ? (uint32_t)DE_NOMEM : 0U;
         break;
     }
-    case 94U: {
-        mxe_t *e = mx_lookup(r0, false);
-        ctx->regs[0] = (e == NULL) ? (uint32_t)DE_INVAL
-                                   : mx_rc(pthread_mutex_trylock(&e->mu));
+    case 93U: { mxe_t *e = mx_lazy(ctx, r0, false); ctx->regs[0] = (e == NULL) ? (uint32_t)DE_INVAL : mx_rc(pthread_mutex_lock(&e->mu)); break; }
+    case 94U: { mxe_t *e = mx_lazy(ctx, r0, false); ctx->regs[0] = (e == NULL) ? (uint32_t)DE_INVAL : mx_rc(pthread_mutex_trylock(&e->mu)); break; }
+    case 95U: { mxe_t *e = mx_lazy(ctx, r0, false); ctx->regs[0] = (e == NULL) ? (uint32_t)DE_INVAL : mx_rc(pthread_mutex_unlock(&e->mu)); break; }
+    case 96U: { mxe_t *e = mx_lazy(ctx, r0, false); if (e == NULL) { ctx->regs[0] = (uint32_t)DE_INVAL; break; } (void)mx_remove(r0); ctx->regs[0] = 0U; break; }
+    case 97U: {
+        cve_t *e = cv_lazy(ctx, r0); uint32_t sig = 1U;
+        ctx->regs[0] = (e != NULL) ? 0U : ((thr_lazy_sig(ctx, r0, &sig) && (sig == 0U || sig == CV_SIG_INIT)) ? (uint32_t)DE_NOMEM : (uint32_t)DE_INVAL);
         break;
     }
-    case 95U: {
-        mxe_t *e = mx_lookup(r0, false);
-        ctx->regs[0] = (e == NULL) ? (uint32_t)DE_INVAL
-                                   : mx_rc(pthread_mutex_unlock(&e->mu));
-        break;
-    }
-    case 96U:
-        ctx->regs[0] = mx_remove(r0) ? 0U : (uint32_t)DE_INVAL;
-        break;
-    case 97U:
-        ctx->regs[0] = (cv_lookup(r0, true) == NULL) ? (uint32_t)DE_NOMEM : 0U;
-        break;
     case 98U: {
-        cve_t *ce = cv_lookup(r0, false);
-        mxe_t *me = mx_lookup(r1, false);
-        if (ce == NULL || me == NULL) {
-            ctx->regs[0] = (uint32_t)DE_INVAL;
-            break;
-        }
+        cve_t *ce = cv_lazy(ctx, r0);
+        mxe_t *me = mx_lazy(ctx, r1, false);
+        if (ce == NULL || me == NULL) { ctx->regs[0] = (uint32_t)DE_INVAL; break; }
         __atomic_fetch_add(&ce->waiters, 1U, __ATOMIC_SEQ_CST);
         ctx->regs[0] = mx_rc(pthread_cond_wait(&ce->cv, &me->mu));
         __atomic_fetch_sub(&ce->waiters, 1U, __ATOMIC_SEQ_CST);
         break;
     }
-    case 99U: {
-        cve_t *ce = cv_lookup(r0, false);
-        if (ce == NULL) {
-            ctx->regs[0] = (uint32_t)DE_INVAL;
-            break;
-        }
-        ctx->regs[0] = mx_rc(pthread_cond_signal(&ce->cv));
-        break;
-    }
-    case 100U: {
-        cve_t *ce = cv_lookup(r0, false);
-        if (ce == NULL) {
-            ctx->regs[0] = (uint32_t)DE_INVAL;
-            break;
-        }
-        ctx->regs[0] = mx_rc(pthread_cond_broadcast(&ce->cv));
-        break;
-    }
-    case 101U:
-        ctx->regs[0] = cv_remove(r0) ? 0U : (uint32_t)DE_INVAL;
-        break;
+    case 99U: { cve_t *ce = cv_lazy(ctx, r0); ctx->regs[0] = (ce == NULL) ? (uint32_t)DE_INVAL : mx_rc(pthread_cond_signal(&ce->cv)); break; }
+    case 100U: { cve_t *ce = cv_lazy(ctx, r0); ctx->regs[0] = (ce == NULL) ? (uint32_t)DE_INVAL : mx_rc(pthread_cond_broadcast(&ce->cv)); break; }
+    case 101U: { cve_t *e = cv_lazy(ctx, r0); if (e == NULL) { ctx->regs[0] = (uint32_t)DE_INVAL; break; } (void)cv_remove(r0); ctx->regs[0] = 0U; break; }
     case 102U: {
         oncee_t *oe;
         ocall_t *oc;
@@ -804,13 +823,34 @@ int a32_ios_stub_pthread(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled)
         break;
     }
     case THR_EXIT_ID: {
-        thr_t *t; uint32_t idx, sa, sl, ta, rv; bool det; a32_ctx_t *lc;
+        thr_t *t; uint32_t idx, sa, sl, ta, k, dk = KEY_N, dv = 0U, dtor = 0U; bool det; a32_ctx_t *lc;
         (void)pthread_mutex_lock(&g_thr_mu);
         t = thr_by_ctx(ctx);
         if (t == NULL) { (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = 0U; break; }
-        rv = ctx->regs[0]; t->rv = rv; t->done = true; t->ch = NULL;
+        idx = (uint32_t)(t - g_thr);
+        if (t->dtor_n == 0U)
+            t->rv = ctx->regs[0];
+        if (t->dtor_n < 4U * KEY_N) {
+            (void)pthread_mutex_lock(&g_key_mu);
+            for (k = 0U; k < KEY_N && dk == KEY_N; k++)
+                if (g_key_used[k] && g_key_dtor[k] != 0U && g_tsd[k][idx] != NULL) {
+                    dk = k; dv = (uint32_t)(uintptr_t)g_tsd[k][idx]; dtor = g_key_dtor[k];
+                    g_tsd[k][idx] = NULL;
+                }
+            (void)pthread_mutex_unlock(&g_key_mu);
+        }
+        if (dk != KEY_N) {
+            t->dtor_n++;
+            (void)pthread_mutex_unlock(&g_thr_mu);
+            ctx->regs[0] = dv;
+            ctx->regs[14] = (A32_IOS_STUB_BASE_VA + (THR_EXIT_ID * 8U)) | 1U;
+            a32_set_pc_interwork(ctx, dtor);
+            ctx->exit_reason = (uint32_t)A32_EXIT_BRANCH;
+            break;
+        }
+        t->done = true; t->ch = NULL;
         det = t->detached; sa = t->stva; sl = t->stlen; ta = t->tsd;
-        idx = (uint32_t)(t - g_thr); lc = ctx;
+        lc = ctx;
         if (det) t->used = false;
         (void)pthread_cond_broadcast(&g_thr_cv);
         (void)pthread_mutex_unlock(&g_thr_mu);
