@@ -96,6 +96,115 @@ static ios_pthread_mutex_t g_mu;
 static volatile int g_counter = 0;
 static ios_pthread_key_t g_key = 0U;
 
+/* Darwin SIGABRT (ios_guest.h only names SIGSEGV/SIGUSR1). */
+#define ABRT_SIG 6
+
+static volatile int abrt_got = 0;
+static int abrt_pipe_w = -1;
+
+static void abrt_handler(int sig, void *info, void *ctx)
+{
+    char c = 'A';
+    (void)info;
+    (void)ctx;
+    if (sig != ABRT_SIG) {
+        return;
+    }
+    abrt_got = sig;
+    if (abrt_pipe_w >= 0) {
+        (void)write(abrt_pipe_w, &c, 1);
+    }
+}
+
+static int check_abort(void)
+{
+    uint32_t r1 = 0U;
+    uint32_t carry = 0U;
+    int32_t pr = 0;
+    int rfd = -1;
+    int wfd = -1;
+    int32_t pid = 0;
+    uint32_t fr1 = 0U;
+    uint32_t fcarry = 0U;
+    pr = ios_bsd0_r01((uint32_t)IOS_SYS_pipe, &r1, &carry);
+    if (carry != 0U) {
+        printf("FAIL abort pipe carry\n");
+        return 1;
+    }
+    rfd = pr;
+    wfd = (int)r1;
+    if (rfd < 0 || wfd < 0) {
+        printf("FAIL abort pipe fds\n");
+        return 1;
+    }
+    abrt_got = 0;
+    abrt_pipe_w = wfd;
+    pid = ios_bsd0_r01((uint32_t)IOS_SYS_fork, &fr1, &fcarry);
+    if (fcarry != 0U) {
+        printf("FAIL abort fork\n");
+        close(rfd);
+        close(wfd);
+        return 1;
+    }
+    if (pid == 0) {
+        ios_sigaction_t sa;
+        ios_sigaction_t old;
+        int i = 0;
+        if (fr1 != 1U) {
+            _exit(98);
+        }
+        close(rfd);
+        sa.sa_sigaction = abrt_handler;
+        sa.sa_mask = 0U;
+        sa.sa_flags = IOS_SA_SIGINFO;
+        for (i = 0; i < (int)sizeof(old); i++) {
+            ((char *)&old)[i] = 0;
+        }
+        if (sigaction(ABRT_SIG, &sa, &old) != 0) {
+            _exit(96);
+        }
+        abrt_got = 0;
+        abort();
+        _exit(99);
+    }
+    close(wfd);
+    abrt_pipe_w = -1;
+    {
+        char c = 0;
+        int got = 0;
+        int status = 0;
+        int32_t w = 0;
+        while (got < 1) {
+            int n = read(rfd, &c, 1);
+            if (n <= 0) {
+                break;
+            }
+            got += n;
+        }
+        close(rfd);
+        if (got != 1 || c != 'A') {
+            printf("FAIL abort handler byte got=%d\n", got);
+            return 1;
+        }
+        carry = 0U;
+        w = ios_bsd6((uint32_t)IOS_SYS_wait4, (uint32_t)pid,
+            (uint32_t)(uintptr_t)&status, 0U, 0U, 0U, 0U, &carry);
+        if (carry != 0U || w != pid) {
+            printf("FAIL abort wait4\n");
+            return 1;
+        }
+        if ((status & 0x7F) != 0) {
+            printf("FAIL abort signaled status=%d\n", status);
+            return 1;
+        }
+        if (((status >> 8) & 0xFF) != 134) {
+            printf("FAIL abort exit status=%d\n", status);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Synthetic cond stubs are outside the minimal link-time TBD, so reach them
  * through the stub island (mov.w r12, #id; svc #0x81; bx lr): the same
  * trampolines bound symbols resolve to at runtime. */
@@ -338,6 +447,9 @@ int main(int argc, char **argv)
         return 1;
     }
     if (check_sigsegv() != 0) {
+        return 1;
+    }
+    if (check_abort() != 0) {
         return 1;
     }
     if (check_static_mutex() != 0) {

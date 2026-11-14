@@ -489,33 +489,38 @@ int a32_backend_darwin_futex(a32_ctx_t *ctx, uint32_t uaddr_va, uint32_t op,
             return -EAGAIN;
         }
         if (ts != NULL) {
-            struct timespec now;
-            int64_t d_sec;
-            long d_nsec;
-            clockid_t clk;
             if (!futex_ts_ok(ts)) {
                 return -EINVAL;
             }
-            clk = (basic == A32_FUTEX_WAIT ||
-                (op & 0x100U) == 0U) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
-            (void)clock_gettime(clk, &now);
-            d_sec = (int64_t)ts->tv_sec - (int64_t)now.tv_sec;
-            d_nsec = ts->tv_nsec - now.tv_nsec;
-            if (d_nsec < 0L) {
-                d_sec -= 1;
-                d_nsec += 1000000000L;
-            }
-            if (d_sec < 0) {
-                return -ETIMEDOUT;
-            }
-            if (basic == A32_FUTEX_WAIT || clk == CLOCK_MONOTONIC) {
+            if (basic == A32_FUTEX_WAIT) {
                 struct timespec now_r;
                 (void)clock_gettime(CLOCK_REALTIME, &now_r);
                 futex_add_ns(&now_r,
-                    (uint64_t)d_sec * A32_FUTEX_NSEC_PER_SEC +
-                    (uint64_t)d_nsec, &deadline);
-            } else {
+                    (uint64_t)ts->tv_sec * A32_FUTEX_NSEC_PER_SEC +
+                    (uint64_t)ts->tv_nsec, &deadline);
+            } else if ((op & 0x100U) != 0U) {
                 deadline = *ts;
+            } else {
+                struct timespec now;
+                int64_t d_sec;
+                long d_nsec;
+                (void)clock_gettime(CLOCK_MONOTONIC, &now);
+                d_sec = (int64_t)ts->tv_sec - (int64_t)now.tv_sec;
+                d_nsec = ts->tv_nsec - now.tv_nsec;
+                if (d_nsec < 0L) {
+                    d_sec -= 1;
+                    d_nsec += 1000000000L;
+                }
+                if (d_sec < 0) {
+                    return -ETIMEDOUT;
+                }
+                {
+                    struct timespec now_r;
+                    (void)clock_gettime(CLOCK_REALTIME, &now_r);
+                    futex_add_ns(&now_r,
+                        (uint64_t)d_sec * A32_FUTEX_NSEC_PER_SEC +
+                        (uint64_t)d_nsec, &deadline);
+                }
             }
             has_deadline = true;
         }
@@ -587,7 +592,7 @@ int a32_backend_darwin_futex(a32_ctx_t *ctx, uint32_t uaddr_va, uint32_t op,
         }
         (void)pthread_mutex_lock(&g_futex_mu);
         woken = futex_wake_locked(uaddr_va, A32_FUTEX_ALL_BITS, val);
-        moved = futex_requeue_locked(uaddr_va, uaddr2_va, val3);
+        moved = futex_requeue_locked(uaddr_va, uaddr2_va, val2);
         (void)pthread_mutex_unlock(&g_futex_mu);
         return (int)(woken + moved);
     }
@@ -607,7 +612,7 @@ int a32_backend_darwin_futex(a32_ctx_t *ctx, uint32_t uaddr_va, uint32_t op,
         }
         (void)pthread_mutex_lock(&g_futex_mu);
         woken = futex_wake_locked(uaddr_va, A32_FUTEX_ALL_BITS, val);
-        moved = futex_requeue_locked(uaddr_va, uaddr2_va, 0xFFFFFFFFU);
+        moved = futex_requeue_locked(uaddr_va, uaddr2_va, val2);
         (void)pthread_mutex_unlock(&g_futex_mu);
         return (int)(woken + moved);
     }
