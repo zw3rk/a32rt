@@ -203,6 +203,7 @@ static int sk_sa_h2g(a32_ctx_t *ctx, const struct sockaddr *sa, uint32_t slen,
     uint8_t *gp;
     uint32_t n;
     uint16_t hf;
+    if (slen == 0U) { return 0; }
     if (slen < 2U || slen > SK_BUF_MAX) { return -D_EINVAL; }
     if (gmax == 0U) { return (int)slen; }
     if (!a32_vm32_access_ok(ctx, gva, gmax, (uint32_t)PROT_WRITE)) { return -D_EFAULT; }
@@ -301,6 +302,15 @@ static void sk_do_getsockopt(a32_ctx_t *ctx, const uint32_t *a)
         sk_fail(ctx);
         return;
     }
+    if (!noop && a[1] == D_SOL_SOCKET && a[2] == D_SO_ERROR &&
+            hlen >= (socklen_t)sizeof(int)) {
+        int herr = 0;
+        memcpy(&herr, buf, sizeof(herr));
+        if (herr > 0) {
+            herr = a32_ios_host_to_darwin_errno(herr);
+            memcpy(buf, &herr, sizeof(herr));
+        }
+    }
     if (!a32_vm32_access_ok(ctx, a[3], (uint32_t)hlen, (uint32_t)PROT_WRITE)) {
         a32_ios_bsd_err(ctx, D_EFAULT);
         return;
@@ -397,22 +407,53 @@ static int sk_ctl_g2h(a32_ctx_t *ctx, uint32_t gva, uint32_t glen,
     return 0;
 }
 
+/* Close every SCM_RIGHTS fd carried by hc and all following headers so
+ * a truncated or unwritable guest control buffer never leaks host fds. */
+static void sk_ctl_close_rights(const uint8_t *base, uint32_t ilen,
+    struct msghdr *mhdr, struct cmsghdr *from)
+{
+    struct cmsghdr *hc;
+    for (hc = from; hc != NULL; hc = CMSG_NXTHDR(mhdr, hc)) {
+        uint32_t dlen, nfds, j;
+        int fd;
+        if ((const uint8_t *)hc < base ||
+                (const uint8_t *)hc + CMSG_LEN(0U) > base + ilen ||
+                hc->cmsg_len < CMSG_LEN(0U) ||
+                (const uint8_t *)hc + hc->cmsg_len > base + ilen) {
+            continue;
+        }
+        if (hc->cmsg_level != SOL_SOCKET || hc->cmsg_type != SCM_RIGHTS) {
+            continue;
+        }
+        dlen = (uint32_t)(hc->cmsg_len - CMSG_LEN(0U));
+        nfds = dlen / (uint32_t)sizeof(int);
+        for (j = 0U; j < nfds; j++) {
+            memcpy(&fd, CMSG_DATA(hc) + j * sizeof(int), sizeof(int));
+            if (fd >= 0) { (void)close(fd); }
+        }
+    }
+}
+
 /* Host control buffer -> guest (12B cmsghdr, 4-byte aligned). Iterates
  * with CMSG_FIRSTHDR / CMSG_NXTHDR so both the 12B macOS and the 16B
- * Linux host cmsghdr are decoded correctly. */
+ * Linux host cmsghdr are decoded correctly. Sets *out_trunc when the
+ * guest buffer cannot hold every header (guest sees MSG_CTRUNC). */
 static int sk_ctl_h2g(a32_ctx_t *ctx, const void *in, uint32_t ilen,
-    uint32_t gva, uint32_t gmax)
+    uint32_t gva, uint32_t gmax, bool *out_trunc)
 {
     struct msghdr mhdr;
     struct cmsghdr *hc;
     const uint8_t *base = (const uint8_t *)in;
     uint32_t gp = 0U;
-    if (!a32_vm32_access_ok(ctx, gva, gmax, (uint32_t)PROT_WRITE)) {
-        return -D_EFAULT;
-    }
+    *out_trunc = false;
     memset(&mhdr, 0, sizeof(mhdr));
     mhdr.msg_control = (void *)base;
     mhdr.msg_controllen = ilen;
+    if (!a32_vm32_access_ok(ctx, gva, gmax, (uint32_t)PROT_WRITE)) {
+        *out_trunc = true;
+        sk_ctl_close_rights(base, ilen, &mhdr, CMSG_FIRSTHDR(&mhdr));
+        return -D_EFAULT;
+    }
     for (hc = CMSG_FIRSTHDR(&mhdr); hc != NULL;
             hc = CMSG_NXTHDR(&mhdr, hc)) {
         size_t hlen = hc->cmsg_len;
@@ -428,7 +469,11 @@ static int sk_ctl_h2g(a32_ctx_t *ctx, const void *in, uint32_t ilen,
         lv = hc->cmsg_level;
         tp = hc->cmsg_type;
         gl = 12U + dlen;
-        if (gp + gl > gmax) { break; } /* MSG_CTRUNC */
+        if (gp + gl > gmax) { /* MSG_CTRUNC: drop rest, close its fds */
+            *out_trunc = true;
+            sk_ctl_close_rights(base, ilen, &mhdr, hc);
+            break;
+        }
         gd = (uint8_t *)a32_guest_ptr(ctx, gva + gp);
         lv = (lv == SOL_SOCKET) ? (int32_t)D_SOL_SOCKET : lv;
         tp = (lv == (int32_t)D_SOL_SOCKET && tp == SCM_RIGHTS) ?
@@ -576,17 +621,20 @@ static void sk_do_recv(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
         (void *)ctl_u.raw;
     mh.msg_controllen = (m.msg_control == 0U || m.msg_controllen == 0U) ? 0 :
         sizeof(ctl_u.raw);
+    if (m.msg_control != 0U && m.msg_controllen != 0U &&
+            !a32_vm32_access_ok(ctx, m.msg_control, m.msg_controllen,
+                (uint32_t)PROT_WRITE)) {
+        /* Never let the host install fds into an unwritable guest buffer. */
+        a32_ios_bsd_err(ctx, D_EFAULT);
+        return;
+    }
     r = recvmsg((int)(int32_t)a[0], &mh, flags);
     if (r < 0) { sk_fail(ctx); return; }
     for (i = 0; i < n; i++) {
         a32_vm32_copyout_invalidate_exec(ctx, gb[(uint32_t)i], gl[(uint32_t)i]);
     }
     if (is_msg) {
-        if (a32_vm32_access_ok(ctx, a[1] + 24U, 4U, (uint32_t)PROT_WRITE)) {
-            uint32_t df = sk_flags_h2g(mh.msg_flags);
-            memcpy(a32_guest_ptr(ctx, a[1] + 24U), &df, 4);
-            a32_vm32_copyout_invalidate_exec(ctx, a[1] + 24U, 4U);
-        }
+        bool ctl_trunc = false;
         if (m.msg_name != 0U && mh.msg_name != NULL) {
             rc = sk_sa_h2g(ctx, (const struct sockaddr *)&hs, (uint32_t)mh.msg_namelen,
                 m.msg_name, m.msg_namelen);
@@ -596,10 +644,16 @@ static void sk_do_recv(a32_ctx_t *ctx, const uint32_t *a, bool is_msg)
         }
         if (m.msg_control != 0U && mh.msg_control != NULL) {
             rc = sk_ctl_h2g(ctx, ctl_u.raw, (uint32_t)mh.msg_controllen,
-                m.msg_control, m.msg_controllen);
+                m.msg_control, m.msg_controllen, &ctl_trunc);
             if (rc >= 0 && a32_vm32_access_ok(ctx, a[1] + 20U, 4U, (uint32_t)PROT_WRITE)) {
                 sk_st32(ctx, a[1] + 20U, (uint32_t)rc);
             }
+        }
+        if (a32_vm32_access_ok(ctx, a[1] + 24U, 4U, (uint32_t)PROT_WRITE)) {
+            uint32_t df = sk_flags_h2g(mh.msg_flags);
+            if (ctl_trunc) { df |= D_MSG_CTRUNC; }
+            memcpy(a32_guest_ptr(ctx, a[1] + 24U), &df, 4);
+            a32_vm32_copyout_invalidate_exec(ctx, a[1] + 24U, 4U);
         }
     } else if (m.msg_name != 0U && mh.msg_name != NULL) {
         rc = sk_store_addr(ctx, (const struct sockaddr *)&hs, (uint32_t)mh.msg_namelen,

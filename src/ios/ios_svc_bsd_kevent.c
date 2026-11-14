@@ -38,10 +38,15 @@
 #define KQ_EV_TIMER -7
 #define KQ_EV_ADD 0x0001U
 #define KQ_EV_DELETE 0x0002U
+#define KQ_EV_ENABLE 0x0004U
 #define KQ_EV_DISABLE 0x0008U
 #define KQ_EV_ONESHOT 0x0010U
+#define KQ_EV_CLEAR 0x0020U
+#define KQ_EV_RECEIPT 0x0040U
+#define KQ_EV_DISPATCH 0x0080U
 #define KQ_EV_ERROR 0x4000U
 #define KQ_EV_EOF 0x8000U
+#define KQ_ENOENT 2
 #define KQ_EBADF 9
 #define KQ_EFAULT 14
 #define KQ_EINVAL 22
@@ -68,9 +73,11 @@ static void kq_fail(a32_ctx_t *ctx)
  * on the same fd coexist without overwriting each other. */
 typedef struct {
     bool used; bool oneshot; bool disabled;
+    bool clear; bool dispatch; bool armed_seen;
     int16_t filter; /* KQ_EV_READ / KQ_EV_WRITE / KQ_EV_TIMER */
     uint32_t ident; /* fd for READ/WRITE, timer id for TIMER */
     uint32_t fflags; uint64_t udata; uint64_t deadline_ns; uint64_t period_ns;
+    int32_t last_data;
 } kq_knote_t;
 typedef struct {
     bool used; int rfd; int wfd; /* rfd is the kqueue fd itself */
@@ -103,6 +110,17 @@ static kq_kq_t *kq_alloc(void) /* reclaims pipes closed behind us */
     return NULL;
 }
 
+/* Wake a poll() sleeping in kq_do_kevent. The wfd is non-blocking, so
+ * a full pipe (poll already awake) is a harmless EAGAIN. Call with the
+ * kq lock held. */
+static void kq_wake(const kq_kq_t *kq)
+{
+    ssize_t w;
+    if (kq == NULL || kq->wfd < 0) { return; }
+    w = write(kq->wfd, "", 1);
+    (void)w;
+}
+
 void a32_ios_kq_close(int fd)
 {
     uint32_t i;
@@ -113,6 +131,7 @@ void a32_ios_kq_close(int fd)
     for (i = 0U; i < KQ_MAX; i++) {
         if (g_kq[i].used && g_kq[i].rfd == fd) {
             if (g_kq[i].wfd >= 0 && g_kq[i].wfd != fd) {
+                kq_wake(&g_kq[i]);
                 (void)close(g_kq[i].wfd);
             }
             memset(&g_kq[i], 0, sizeof(g_kq[i]));
@@ -128,15 +147,17 @@ void a32_ios_kq_atfork_reset(void)
     atomic_store_explicit(&g_kq_mu, 0U, memory_order_release);
 }
 
-static void kq_knote_change(kq_kq_t *kq, int16_t filter, uint16_t flags,
-    uint32_t fflags, int32_t data, uint32_t ident, uint64_t udata)
+/* Mutate one knote; returns a Darwin errno (0 on success). Call with
+ * the kq lock held; wakes a sleeper so the change takes effect now. */
+static int kq_knote_change(kq_kq_t *kq, int16_t filter, uint16_t flags,
+    uint32_t fflags, int64_t data, uint32_t ident, uint64_t udata)
 {
     kq_knote_t *kn = NULL;
     kq_knote_t *slot = NULL;
     uint32_t i;
-    uint64_t period;
+    uint64_t period = 0U, mult = 1000000ULL, now;
     if (filter != (int16_t)KQ_EV_READ && filter != (int16_t)KQ_EV_WRITE &&
-            filter != (int16_t)KQ_EV_TIMER) { return; }
+            filter != (int16_t)KQ_EV_TIMER) { return KQ_EINVAL; }
     for (i = 0U; i < KQ_KNOTE_MAX; i++) {
         if (kq->notes[i].used) {
             if (kq->notes[i].filter == filter && kq->notes[i].ident == ident) {
@@ -148,15 +169,46 @@ static void kq_knote_change(kq_kq_t *kq, int16_t filter, uint16_t flags,
         }
     }
     if ((flags & KQ_EV_DELETE) != 0U) {
-        if (kn != NULL) { memset(kn, 0, sizeof(*kn)); }
-        return;
+        if (kn == NULL) { return KQ_ENOENT; }
+        memset(kn, 0, sizeof(*kn));
+        kq_wake(kq);
+        return 0;
     }
     if ((flags & KQ_EV_ADD) == 0U) {
-        if (kn != NULL) { kn->disabled = (flags & KQ_EV_DISABLE) != 0U; }
-        return;
+        if (kn == NULL) { return KQ_ENOENT; }
+        if ((flags & KQ_EV_DISABLE) != 0U) { kn->disabled = true; }
+        if ((flags & KQ_EV_ENABLE) != 0U) {
+            kn->disabled = false;
+            kn->armed_seen = false;
+            kn->last_data = 0;
+        }
+        kq_wake(kq);
+        return 0;
+    }
+    if (filter == (int16_t)KQ_EV_TIMER) {
+        uint32_t unit;
+        if ((fflags & 0x8U) != 0U || (fflags & 0x10U) != 0U) {
+            return KQ_EINVAL; /* NOTE_ABSOLUTE / NOTE_MACHTIME */
+        }
+        unit = fflags & 0x7U;
+        if (unit == 1U) {
+            mult = 1000000000ULL; /* NOTE_SECONDS */
+        } else if (unit == 2U) {
+            mult = 1000ULL; /* NOTE_USECONDS */
+        } else if (unit == 4U) {
+            mult = 1ULL; /* NOTE_NSECONDS */
+        } else if (unit == 0U) {
+            mult = 1000000ULL; /* default: milliseconds */
+        } else {
+            return KQ_EINVAL;
+        }
+        if (data > 0) {
+            period = (uint64_t)data > 0xFFFFFFFFFFFFFFFFULL / mult ?
+                0xFFFFFFFFFFFFFFFFULL : (uint64_t)data * mult;
+        }
     }
     if (kn == NULL) {
-        if (slot == NULL) { return; }
+        if (slot == NULL) { return KQ_ENOMEM; }
         kn = slot;
         memset(kn, 0, sizeof(*kn));
         kn->used = true;
@@ -166,47 +218,81 @@ static void kq_knote_change(kq_kq_t *kq, int16_t filter, uint16_t flags,
     kn->fflags = fflags;
     kn->udata = udata;
     kn->disabled = (flags & KQ_EV_DISABLE) != 0U;
+    if ((flags & KQ_EV_ENABLE) != 0U) { kn->disabled = false; }
     kn->oneshot = (flags & KQ_EV_ONESHOT) != 0U; /* one-shot or periodic */
-    if (filter != (int16_t)KQ_EV_TIMER) { return; }
-    period = data <= 0 ? 0U : (uint64_t)data;
-    period *= ((fflags & 1U) != 0U) ? 1000000000ULL : 1000000ULL; /* s vs ms */
+    kn->clear = (flags & KQ_EV_CLEAR) != 0U;
+    kn->dispatch = (flags & KQ_EV_DISPATCH) != 0U;
+    kn->armed_seen = false;
+    kn->last_data = 0;
+    if (filter != (int16_t)KQ_EV_TIMER) {
+        kq_wake(kq);
+        return 0;
+    }
     kn->period_ns = ((flags & KQ_EV_ONESHOT) != 0U) ? 0U : period;
-    kn->deadline_ns = kq_now_ns() + period;
+    now = kq_now_ns();
+    kn->deadline_ns = period > 0xFFFFFFFFFFFFFFFFULL - now ?
+        0xFFFFFFFFFFFFFFFFULL : now + period;
+    kq_wake(kq);
+    return 0;
 }
 
-static bool kq_knote_ready(const kq_knote_t *kn, int32_t *data, bool *eof)
+/* Readiness probe (zero-timeout poll, never blocks). A bad fd reports
+ * through *out_ebadf (guest sees EV_ERROR/data=EBADF); a hangup/error
+ * reports through *out_eof (guest sees EV_EOF, no EV_ERROR). */
+static bool kq_knote_ready(const kq_knote_t *kn, int64_t *data,
+    bool *out_eof, bool *out_ebadf)
 {
     struct pollfd pfd = { (int)kn->ident,
         (short)(kn->filter == (int16_t)KQ_EV_READ ? POLLIN : POLLOUT), 0 };
-    *eof = false;
+    *out_eof = false;
+    *out_ebadf = false;
     *data = 1;
     if (kn->filter == (int16_t)KQ_EV_TIMER) {
         return kq_now_ns() >= kn->deadline_ns;
     }
-    if (poll(&pfd, 1, 0) < 0 ||
-            (pfd.revents & (POLLNVAL | POLLHUP | POLLERR)) != 0) {
-        *eof = true;
+    if (poll(&pfd, 1, 0) < 0 || (pfd.revents & POLLNVAL) != 0) {
+        *out_ebadf = true;
+        return true;
+    }
+    if ((pfd.revents & (POLLHUP | POLLERR)) != 0) {
+        *out_eof = true;
+        if (kn->filter == (int16_t)KQ_EV_READ) {
+            int n = 0;
+            *data = 0;
+            if (ioctl((int)kn->ident, FIONREAD, &n) == 0 && n > 0) {
+                *data = (int64_t)n;
+            }
+        }
         return true;
     }
     if ((pfd.revents & pfd.events) == 0) { return false; }
     if (kn->filter == (int16_t)KQ_EV_READ) {
         int n = 0;
+        *data = 1;
         if (ioctl((int)kn->ident, FIONREAD, &n) == 0 && n > 0) {
-            *data = (int32_t)n;
+            *data = (int64_t)n;
         }
     }
     return true;
 }
 
-/* 20-byte kevent / 32-byte kevent_qos_s prefix / 48-byte kevent64
- * (4-byte aligned, packed). */
+/* 20-byte kevent / 72-byte kevent_qos_s / 48-byte kevent64
+ * (4-byte aligned, packed). The 72-byte entry is the exact XNU
+ * `#pragma pack(4)` struct kevent_qos_s layout. */
 typedef struct __attribute__((packed, aligned(4))) {
     uint32_t ident; int16_t filter; uint16_t flags; uint32_t fflags;
     int32_t data; uint32_t udata;
 } kq_ev32_t;
 typedef struct __attribute__((packed, aligned(4))) {
-    uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags;
-    int64_t data; uint64_t udata;
+    uint64_t ident;
+    int16_t filter;
+    uint16_t flags;
+    int32_t qos;
+    uint64_t udata;
+    uint32_t fflags;
+    uint32_t xflags;
+    int64_t data;
+    uint64_t ext[4];
 } kq_evqos_t;
 typedef struct __attribute__((packed, aligned(4))) {
     uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags;
@@ -214,7 +300,7 @@ typedef struct __attribute__((packed, aligned(4))) {
 } kq_ev64_t;
 
 _Static_assert(sizeof(kq_ev32_t) == 20, "kevent must be 20 bytes");
-_Static_assert(sizeof(kq_evqos_t) == 32, "kevent_qos entry must be 32 bytes");
+_Static_assert(sizeof(kq_evqos_t) == 72, "kevent_qos_s must be 72 bytes");
 _Static_assert(sizeof(kq_ev64_t) == 48, "kevent64 must be 48 bytes");
 
 static void kq_emit(a32_ctx_t *ctx, uint32_t base, uint32_t idx, uint32_t esz,
@@ -233,26 +319,29 @@ static void kq_emit(a32_ctx_t *ctx, uint32_t base, uint32_t idx, uint32_t esz,
         memcpy(a32_guest_ptr(ctx, base + idx * 48U), &v, 48);
         return;
     }
-    {
-        kq_evqos_t v = { ident, filter, flags, fflags, data, udata };
-        memcpy(a32_guest_ptr(ctx, base + idx * 32U), &v, 32);
+    if (esz == 72U) {
+        kq_evqos_t v = { ident, filter, flags, 0, udata, fflags, 0U,
+            data, { 0U, 0U, 0U, 0U } };
+        memcpy(a32_guest_ptr(ctx, base + idx * 72U), &v, 72);
     }
 }
 
 /* Shared kevent/kevent64/kevent_qos scan; esz is the guest entry stride
- * (20 for kevent, 32 for kevent_qos_s, 48 for kevent64). A NULL timeout
- * arrives as KQ_INF_NS and is clamped to the earliest timer deadline so
- * a timer can fire without sleeping past its expiry. */
+ * (20 for kevent, 72 for kevent_qos_s, 48 for kevent64). Ready knotes
+ * are scanned before sleeping so an already-ready event never incurs
+ * a blocking wait; otherwise poll (in 60 s slices, woken at once by the
+ * rfd pipe on any concurrent change or close) runs until user_deadline.
+ * A NULL timeout arrives as KQ_INF_NS. */
 static void kq_do_kevent(a32_ctx_t *ctx, int kd, uint32_t chl, int nch,
     uint32_t evl, int nev, uint64_t timeout_ns, uint32_t esz)
 {
     kq_kq_t *kq = NULL;
     uint32_t i, nout = 0U;
-    struct pollfd pfds[KQ_KNOTE_MAX];
-    struct timespec ts;
-    nfds_t nfds = 0U;
-    uint64_t wait_ns;
-    uint64_t now;
+    struct pollfd pfds[KQ_KNOTE_MAX + 1U];
+    uint64_t start_ns, user_deadline, wait_ns, now;
+    uint64_t kfds;
+    bool has_timer, use_cap;
+    nfds_t nfds;
     int wait_ms;
     a32_spin_lock(&g_kq_mu);
     for (i = 0U; i < KQ_MAX; i++) {
@@ -285,6 +374,7 @@ static void kq_do_kevent(a32_ctx_t *ctx, int kd, uint32_t chl, int nch,
         uint16_t flags;
         uint32_t fflags, v32;
         int32_t d32;
+        int crc;
         if (esz == 20U) {
             memcpy(&v32, e, 4);
             ident = v32;
@@ -295,6 +385,15 @@ static void kq_do_kevent(a32_ctx_t *ctx, int kd, uint32_t chl, int nch,
             data = d32;
             memcpy(&v32, e + 16U, 4);
             udata = v32;
+        } else if (esz == 72U) {
+            kq_evqos_t q;
+            memcpy(&q, e, 72);
+            ident = q.ident;
+            filter = q.filter;
+            flags = q.flags;
+            fflags = q.fflags;
+            data = q.data;
+            udata = q.udata;
         } else {
             memcpy(&ident, e, 8);
             memcpy(&filter, e + 8U, 2);
@@ -303,89 +402,169 @@ static void kq_do_kevent(a32_ctx_t *ctx, int kd, uint32_t chl, int nch,
             memcpy(&data, e + 16U, 8);
             memcpy(&udata, e + 24U, 8);
         }
-        kq_knote_change(kq, filter, flags, fflags,
-            data > 0x7FFFFFFFLL ? 0x7FFFFFFF : (int32_t)data,
+        crc = kq_knote_change(kq, filter, flags, fflags, data,
             (uint32_t)ident, udata);
+        if (nev > 0 && nout < (uint32_t)nev &&
+                (((flags & KQ_EV_RECEIPT) != 0U) || crc != 0)) {
+            kq_emit(ctx, evl, nout++, esz, ident, filter,
+                (uint16_t)(KQ_EV_ERROR | (flags & KQ_EV_RECEIPT)), 0U,
+                (int64_t)crc, udata);
+        }
+    }
+    if (nout > 0U) {
+        /* Receipts only: report immediately, never block. */
+        a32_vm32_copyout_invalidate_exec(ctx, evl, nout * esz);
+        a32_spin_unlock(&g_kq_mu);
+        a32_ios_bsd_ok(ctx, nout, 0U, false);
+        return;
     }
     if (nev == 0) {
         a32_spin_unlock(&g_kq_mu);
         a32_ios_bsd_ok(ctx, 0U, 0U, false);
         return;
     }
-    for (i = 0U; i < KQ_KNOTE_MAX; i++) {
-        if (kq->notes[i].used && !kq->notes[i].disabled &&
-                kq->notes[i].filter != (int16_t)KQ_EV_TIMER) {
-            pfds[nfds].fd = (int)kq->notes[i].ident;
-            pfds[nfds].events = (kq->notes[i].filter ==
-                (int16_t)KQ_EV_WRITE) ? POLLOUT : POLLIN;
-            pfds[nfds].revents = 0;
-            nfds++;
+    start_ns = kq_now_ns();
+    user_deadline = timeout_ns == KQ_INF_NS ? KQ_INF_NS :
+        (timeout_ns > KQ_INF_NS - start_ns ? KQ_INF_NS :
+         start_ns + timeout_ns);
+    for (;;) {
+        /* Scan ready knotes first: already-ready events never block. */
+        for (i = 0U; i < KQ_KNOTE_MAX && nout < (uint32_t)nev; i++) {
+            kq_knote_t *kn = &kq->notes[i];
+            kq_knote_t ev;
+            int64_t rdata;
+            bool reof, rebadf;
+            if (!kn->used || kn->disabled) { continue; }
+            if (!kq_knote_ready(kn, &rdata, &reof, &rebadf)) {
+                if (kn->clear && kn->filter != (int16_t)KQ_EV_TIMER) {
+                    kn->armed_seen = false;
+                    kn->last_data = 0;
+                }
+                continue;
+            }
+            if (rebadf) {
+                ev = *kn;
+                kq_emit(ctx, evl, nout, esz, (uint64_t)ev.ident,
+                    ev.filter, KQ_EV_ERROR, ev.fflags, KQ_EBADF,
+                    ev.udata);
+                nout++;
+                continue;
+            }
+            if (kn->clear && kn->filter != (int16_t)KQ_EV_TIMER &&
+                    !reof && kn->armed_seen &&
+                    rdata == (int64_t)kn->last_data) {
+                continue; /* edge-triggered: unchanged since delivery */
+            }
+            ev = *kn;
+            if (ev.filter == (int16_t)KQ_EV_TIMER) {
+                kn->deadline_ns = kq_now_ns() + ev.period_ns;
+                if (ev.period_ns == 0U) { memset(kn, 0, sizeof(*kn)); }
+            } else if (ev.oneshot) {
+                memset(kn, 0, sizeof(*kn));
+            }
+            if (kn->used && kn->clear &&
+                    kn->filter != (int16_t)KQ_EV_TIMER && !reof) {
+                kn->armed_seen = true;
+                kn->last_data = (int32_t)rdata;
+            }
+            kq_emit(ctx, evl, nout, esz, (uint64_t)ev.ident, ev.filter,
+                reof ? KQ_EV_EOF : 0U, ev.fflags, rdata, ev.udata);
+            if (kn->used && kn->dispatch) { kn->disabled = true; }
+            nout++;
         }
-    }
-    wait_ns = timeout_ns;
-    now = kq_now_ns();
-    for (i = 0U; i < KQ_KNOTE_MAX; i++) {
-        if (kq->notes[i].used && !kq->notes[i].disabled &&
-                kq->notes[i].filter == (int16_t)KQ_EV_TIMER) {
-            uint64_t dl = kq->notes[i].deadline_ns;
-            if (dl <= now) {
+        if (nout > 0U) { break; }
+        /* Nothing ready: how long may we sleep? */
+        now = kq_now_ns();
+        if (user_deadline != KQ_INF_NS && now >= user_deadline) { break; }
+        has_timer = false;
+        kfds = 0U;
+        for (i = 0U; i < KQ_KNOTE_MAX; i++) {
+            if (!kq->notes[i].used || kq->notes[i].disabled) { continue; }
+            if (kq->notes[i].filter == (int16_t)KQ_EV_TIMER) {
+                has_timer = true;
+            } else {
+                kfds++;
+            }
+        }
+        use_cap = timeout_ns == KQ_INF_NS && !has_timer && kfds == 0U;
+        if (use_cap && now - start_ns >= 60000000000ULL) { break; }
+        wait_ns = user_deadline == KQ_INF_NS ? KQ_INF_NS :
+            user_deadline - now;
+        if (use_cap) {
+            uint64_t left = 60000000000ULL - (now - start_ns);
+            if (left < wait_ns) { wait_ns = left; }
+        }
+        for (i = 0U; i < KQ_KNOTE_MAX; i++) {
+            if (!kq->notes[i].used || kq->notes[i].disabled ||
+                    kq->notes[i].filter != (int16_t)KQ_EV_TIMER) {
+                continue;
+            }
+            if (kq->notes[i].deadline_ns <= now) {
                 wait_ns = 0U;
                 break;
             }
-            if (dl - now < wait_ns) {
-                wait_ns = dl - now;
+            if (kq->notes[i].deadline_ns - now < wait_ns) {
+                wait_ns = kq->notes[i].deadline_ns - now;
             }
         }
-    }
-    if (wait_ns == KQ_INF_NS) {
-        wait_ms = KQ_WAIT_CAP_MS; /* NULL timeout: pragmatic 60 s cap */
-    } else if (wait_ns == 0U) {
-        wait_ms = 0;
-    } else if (wait_ns >= 60000000000ULL) {
-        wait_ms = KQ_WAIT_CAP_MS;
-    } else {
-        wait_ms = (int)((wait_ns + 999999ULL) / 1000000ULL);
-    }
-    a32_spin_unlock(&g_kq_mu);
-    if (nfds > 0U) {
-        (void)poll(pfds, nfds, wait_ms);
-    } else if (wait_ns != 0U && wait_ns != KQ_INF_NS) {
-        ts.tv_sec = (time_t)(wait_ns / 1000000000ULL);
-        ts.tv_nsec = (long)(wait_ns % 1000000000ULL);
-        (void)nanosleep(&ts, NULL);
-    } else if (wait_ns == KQ_INF_NS) {
-        ts.tv_sec = KQ_WAIT_CAP_MS / 1000;
-        ts.tv_nsec = 0;
-        (void)nanosleep(&ts, NULL);
-    }
-    a32_spin_lock(&g_kq_mu);
-    kq = NULL;
-    for (i = 0U; i < KQ_MAX; i++) {
-        if (g_kq[i].used && g_kq[i].rfd == kd) { kq = &g_kq[i]; break; }
-    }
-    if (kq == NULL) {
-        a32_spin_unlock(&g_kq_mu);
-        a32_ios_bsd_err(ctx, KQ_EBADF);
-        return;
-    }
-    for (i = 0U; i < KQ_KNOTE_MAX && nout < (uint32_t)nev; i++) {
-        kq_knote_t *kn = &kq->notes[i];
-        kq_knote_t ev;
-        int32_t data;
-        bool eof;
-        if (!kn->used || kn->disabled) { continue; }
-        if (!kq_knote_ready(kn, &data, &eof)) { continue; }
-        ev = *kn;
-        if (ev.filter == (int16_t)KQ_EV_TIMER) {
-            kn->deadline_ns = kq_now_ns() + ev.period_ns;
-            if (ev.period_ns == 0U) { memset(kn, 0, sizeof(*kn)); }
-        } else if (ev.oneshot) {
-            memset(kn, 0, sizeof(*kn));
+        if (wait_ns == 0U) { continue; } /* re-scan: timer just fired */
+        /* rfd first: a concurrent change/close wakes poll at once.
+         * Unchanged EV_CLEAR notes stay out so poll blocks instead of
+         * spinning on their level-triggered readiness. */
+        nfds = 1U;
+        pfds[0].fd = kq->rfd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        for (i = 0U; i < KQ_KNOTE_MAX && nfds <= KQ_KNOTE_MAX; i++) {
+            kq_knote_t *kn = &kq->notes[i];
+            int64_t rdata;
+            bool reof, rebadf;
+            if (!kn->used || kn->disabled ||
+                    kn->filter == (int16_t)KQ_EV_TIMER) {
+                continue;
+            }
+            if (kn->clear && kn->armed_seen &&
+                    kq_knote_ready(kn, &rdata, &reof, &rebadf) &&
+                    !reof && !rebadf &&
+                    rdata == (int64_t)kn->last_data) {
+                continue;
+            }
+            pfds[nfds].fd = (int)kn->ident;
+            pfds[nfds].events = (kn->filter == (int16_t)KQ_EV_WRITE) ?
+                POLLOUT : POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
         }
-        kq_emit(ctx, evl, nout, esz, (uint64_t)ev.ident, ev.filter,
-            eof ? (uint16_t)(KQ_EV_EOF | KQ_EV_ERROR) : 0U, ev.fflags,
-            eof ? KQ_EBADF : (int64_t)data, ev.udata);
-        nout++;
+        wait_ms = wait_ns >= 60000000000ULL ? KQ_WAIT_CAP_MS :
+            (int)((wait_ns + 999999ULL) / 1000000ULL);
+        a32_spin_unlock(&g_kq_mu);
+        {
+            int prc = poll(pfds, nfds, wait_ms);
+            int perr = prc < 0 ? errno : 0;
+            if (prc > 0 && (pfds[0].revents & POLLIN) != 0) {
+                char tmp[64];
+                ssize_t z;
+                do { z = read(pfds[0].fd, tmp, sizeof(tmp)); } while (z > 0);
+            }
+            a32_spin_lock(&g_kq_mu);
+            kq = NULL;
+            for (i = 0U; i < KQ_MAX; i++) {
+                if (g_kq[i].used && g_kq[i].rfd == kd) {
+                    kq = &g_kq[i];
+                    break;
+                }
+            }
+            if (kq == NULL) {
+                a32_spin_unlock(&g_kq_mu);
+                a32_ios_bsd_err(ctx, KQ_EBADF);
+                return;
+            }
+            if (prc < 0 && perr == EINTR) {
+                a32_spin_unlock(&g_kq_mu);
+                a32_ios_bsd_err(ctx, 4 /* EINTR */);
+                return;
+            }
+        }
     }
     a32_vm32_copyout_invalidate_exec(ctx, evl, nout * esz);
     a32_spin_unlock(&g_kq_mu);
@@ -408,6 +587,12 @@ static void kq_do_kqueue(a32_ctx_t *ctx)
         kq_fail(ctx);
         return;
     }
+    /* Non-blocking so kq_wake never stalls a changer and the drain
+     * read in kq_do_kevent never blocks; close-on-exec for hygiene. */
+    (void)fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    (void)fcntl(fds[1], F_SETFL, O_NONBLOCK);
+    (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
     memset(kq, 0, sizeof(*kq));
     kq->used = true;
     kq->rfd = fds[0];
@@ -476,14 +661,14 @@ int a32_ios_dispatch_bsd_kevent(a32_ctx_t *ctx, uint32_t bsd_nr,
     case 374U: {
         /* kevent_qos (kq, changelist, nchanges, eventlist, nevents,
          * data_out, data_available, flags): no timespec. Probes succeed;
-         * anything else scans the 32B kevent64-prefix entries without
+         * anything else scans the 72B kevent_qos_s entries without
          * blocking. */
         if ((int)(int32_t)args[2] == 0 && (int)(int32_t)args[4] == 0) {
             a32_ios_bsd_ok(ctx, 0U, 0U, false);
             break;
         }
         kq_do_kevent(ctx, (int)(int32_t)args[0], args[1],
-            (int)(int32_t)args[2], args[3], (int)(int32_t)args[4], 0U, 32U);
+            (int)(int32_t)args[2], args[3], (int)(int32_t)args[4], 0U, 72U);
         break;
     }
     default:
