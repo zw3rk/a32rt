@@ -473,6 +473,8 @@ static int do_getrusage(a32_ctx_t *ctx, const uint32_t *args)
  * so translate via <sys/resource.h> symbols instead of hardcoding. */
 static int rl_host(int d)
 {
+    /* Darwin libSystem ORs _RLIMIT_POSIX_FLAG (0x1000) into resource. */
+    d &= ~0x1000;
 #if defined(__APPLE__)
     return d;
 #elif defined(__linux__)
@@ -601,10 +603,10 @@ typedef struct {
 } sysc_t;
 
 static const sysc_t kSysctl[] = {
-    { "kern.ostype", 1, 1, 0U, 0ULL, "Darwin" }, { "kern.osrelease", 1, 2, 0U, 0ULL, "19.6.0" },
+    { "kern.ostype", 1, 1, 0U, 0ULL, "Darwin" }, { "kern.osrelease", 1, 2, 0U, 0ULL, "16.7.0" },
     { "kern.version", 1, 4, 0U, 0ULL, "Darwin Kernel Version 19.6.0" }, { "kern.argmax", 1, 8, 1U, 262144ULL, NULL },
     { "kern.hostname", 1, 10, 0U, 0ULL, "iphone" }, { "kern.usrstack", 1, 35, 2U, 0xE0000000ULL, NULL },
-    { "kern.osversion", 1, 65, 0U, 0ULL, "17G68" }, { "kern.osproductversion", -1, -1, 0U, 0ULL, "10.3.4" },
+    { "kern.osversion", 1, 65, 0U, 0ULL, "14G61" }, { "kern.osproductversion", -1, -1, 0U, 0ULL, "10.3.4" },
     { "hw.machine", 6, 1, 0U, 0ULL, "iPhone5,2" }, { "hw.model", 6, 2, 0U, 0ULL, "N42AP" },
     { "hw.ncpu", 6, 3, 1U, 4ULL, NULL }, { "hw.byteorder", 6, 4, 1U, 1234ULL, NULL },
     { "hw.pagesize", 6, 7, 1U, 4096ULL, NULL }, { "hw.cachelinesize", 6, 16, 1U, 64ULL, NULL },

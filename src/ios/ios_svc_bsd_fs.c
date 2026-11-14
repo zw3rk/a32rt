@@ -5,9 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Curated C11, host-portable (macOS arm64 AND aarch64-linux-musl).
- * stat / statfs / directory / link / rename / chmod / chown helpers plus
- * a32_ios_dispatch_bsd_fs, called from a32_ios_handle_svc in
- * ios_svc_bsd.c before a32_ios_dispatch_bsd_proc_net.
+ * stat / statfs / dir / link / rename / chmod / chown helpers plus
+ * a32_ios_dispatch_bsd_fs (via a32_ios_handle_svc in ios_svc_bsd.c).
  */
 
 #if !defined(__APPLE__)
@@ -51,8 +50,7 @@
 
 static bool ios_wr_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len)
 {
-    return len == 0U ||
-        a32_guest_range_ok(ctx, va, len, (uint32_t)PROT_WRITE);
+    return len == 0U || a32_guest_range_ok(ctx, va, len, (uint32_t)PROT_WRITE);
 }
 
 static int ios_cstr(a32_ctx_t *ctx, uint32_t gva, char *out, size_t cap)
@@ -263,7 +261,7 @@ _Static_assert(sizeof(ios_statfs64_t) == 2168,
 
 /* Fill one statfs64 entry from a path (NULL when is_fd) or an open fd. */
 static void ios_statfs_one(a32_ctx_t *ctx, uint32_t buf_va,
-    bool is_fd, int fd, const char *path)
+    bool is_fd, int fd, const char *path, uint32_t ok_rv)
 {
     ios_statfs64_t o;
 #if defined(__linux__)
@@ -282,7 +280,11 @@ static void ios_statfs_one(a32_ctx_t *ctx, uint32_t buf_va,
     o.f_files = (uint64_t)hs.f_files;
     o.f_ffree = (uint64_t)hs.f_ffree;
     memcpy(o.f_fsid, &hs.f_fsid, sizeof(o.f_fsid));
-    o.f_flags = (uint32_t)hs.f_flags;
+    /* Linux ST_* -> Darwin MNT_*: RDONLY, SYNCHRONOUS, NOEXEC, NOSUID,
+     * NODEV, NOATIME; the host fs is always guest-local (MNT_LOCAL). */
+    o.f_flags = (uint32_t)((hs.f_flags & 1UL ? 0x1U : 0U) | (hs.f_flags & 16UL ? 0x2U : 0U) |
+        (hs.f_flags & 8UL ? 0x4U : 0U) | (hs.f_flags & 2UL ? 0x8U : 0U) |
+        (hs.f_flags & 4UL ? 0x10U : 0U) | (hs.f_flags & 1024UL ? 0x10000000U : 0U) | 0x1000U);
 #else
     struct statfs hs;
     int rc = is_fd ? fstatfs(fd, &hs) : statfs(path, &hs);
@@ -310,7 +312,7 @@ static void ios_statfs_one(a32_ctx_t *ctx, uint32_t buf_va,
 #endif
     memcpy(a32_guest_ptr(ctx, buf_va), &o, sizeof(o));
     a32_vm32_copyout_invalidate_exec(ctx, buf_va, (uint32_t)sizeof(o));
-    a32_ios_bsd_ok(ctx, 0U, 0U, false);
+    a32_ios_bsd_ok(ctx, ok_rv, 0U, false);
 }
 
 static void ios_do_statfs(a32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
@@ -330,7 +332,7 @@ static void ios_do_statfs(a32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va,
     } else {
         host[0] = '\0';
     }
-    ios_statfs_one(ctx, buf_va, is_fd, fd, host);
+    ios_statfs_one(ctx, buf_va, is_fd, fd, host, 0U);
 }
 
 /* getfsstat64: single-entry table for the sysroot; count query when buf == 0. */
@@ -352,7 +354,7 @@ static void ios_do_getfsstat(a32_ctx_t *ctx, uint32_t buf_va, uint32_t size)
     if (a32_resolve_guest_path(ctx, "/", host, sizeof(host)) != 0) {
         snprintf(host, sizeof(host), "/");
     }
-    ios_statfs_one(ctx, buf_va, false, 0, host);
+    ios_statfs_one(ctx, buf_va, false, 0, host, 1U);
 }
 
 /* ---- *at plumbing (Darwin -> host flag/fd translation) ---- */
@@ -367,10 +369,7 @@ static int ios_resolve2(a32_ctx_t *ctx, uint32_t a_va, uint32_t b_va,
     char *ha, char *hb)
 {
     int r = ios_resolve(ctx, a_va, ha, IOS_BSD_PATH_MAX);
-    if (r != 0) {
-        return r;
-    }
-    return ios_resolve(ctx, b_va, hb, IOS_BSD_PATH_MAX);
+    return (r != 0) ? r : ios_resolve(ctx, b_va, hb, IOS_BSD_PATH_MAX);
 }
 
 /* ---- fstatat64 (469): fd/path/buf/flag, always 64-bit layout ---- */
@@ -694,13 +693,8 @@ static void ios_do_faccessat(a32_ctx_t *ctx, uint32_t fd, uint32_t p_va,
 {
     char host[IOS_BSD_PATH_MAX];
     int rc;
-    int hf = 0;
-    if ((flag & IOS_AT_SYMLINK_NOFOLLOW) != 0U) {
-        hf |= AT_SYMLINK_NOFOLLOW;
-    }
-    if ((flag & IOS_AT_EACCESS) != 0U) {
-        hf |= AT_EACCESS;
-    }
+    int hf = ((flag & IOS_AT_SYMLINK_NOFOLLOW) != 0U ? AT_SYMLINK_NOFOLLOW : 0) |
+        ((flag & IOS_AT_EACCESS) != 0U ? AT_EACCESS : 0);
     rc = ios_resolve(ctx, p_va, host, sizeof(host));
     if (rc != 0) {
         a32_ios_bsd_err(ctx, -rc);
@@ -836,8 +830,8 @@ int a32_ios_dispatch_bsd_fs(a32_ctx_t *ctx, uint32_t bsd_nr,
     case 339U: ios_do_fstat(ctx, args[0], args[1], true); break;
     case 340U: ios_do_stat(ctx, args[0], args[1], true, true); break;
     case 469U: ios_do_fstatat(ctx, args[0], args[1], args[2], args[3]); break;
-    case 157U: case 345U: ios_do_statfs(ctx, args[0], args[1], false, 0); break;
-    case 158U: case 346U: ios_do_statfs(ctx, 0U, args[1], true, (int)(int32_t)args[0]); break;
+    case 345U: ios_do_statfs(ctx, args[0], args[1], false, 0); break;
+    case 346U: ios_do_statfs(ctx, 0U, args[1], true, (int)(int32_t)args[0]); break;
     case 347U: ios_do_getfsstat(ctx, args[0], args[1]); break;
     case 344U: ios_do_getdirentries64(ctx, args[0], args[1], args[2], args[3]); break;
     case 9U: ios_do_link(ctx, args[0], args[1]); break;
