@@ -24,7 +24,7 @@
     .type JIT_RUN_BLOCK, %function
 #endif
 JIT_RUN_BLOCK:
-    stp     x29, x30, [sp, #-160]!
+    stp     x29, x30, [sp, #-176]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
     stp     x21, x22, [sp, #32]
@@ -40,8 +40,10 @@ JIT_RUN_BLOCK:
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
     /* x21 = Soft-TLB base for Regime A2 (0 in A1, where x21 stays scratch).
-     * A2 memory sequences materialize it per access (x21 doubles as TMP3);
-     * this entry load keeps the documented register meaning on block entry. */
+     * A32-IOS-P4: spill it once at [sp, #160] so every A2 guest access
+     * reloads it with one `ldr x21, [sp, #160]` instead of up to four
+     * MOVZ/MOVK materializations (and stays position-independent). The
+     * host sp is constant for the whole JIT block residency. */
 #if defined(__APPLE__)
     adrp    x21, VM32_TLB_BASE@PAGE
     ldr     x21, [x21, VM32_TLB_BASE@PAGEOFF]
@@ -49,6 +51,7 @@ JIT_RUN_BLOCK:
     adrp    x21, VM32_TLB_BASE
     ldr     x21, [x21, :lo12:VM32_TLB_BASE]
 #endif
+    str     x21, [sp, #160]
     mov     x27, x2                 /* x27 = cur_entry (a32_cache_entry_t *) */
     mov     x28, x3                 /* x28 = &g_cache_epoch */
 
@@ -100,7 +103,95 @@ JIT_RUN_BLOCK:
     cbnz    w17, .Lslow_exit
     and     w17, w15, #1
     eor     w17, w17, w26           /* bit 0 must match current is_thumb */
-    cbnz    w17, .Lslow_exit
+    cbz     w17, .Lmode_ok
+    /* A32_EXIT_INTERWORK with a mode switch: probe chain0/chain1/IBTC/RAS
+     * inline with the candidate key before paying a full C slow exit.
+     * w15 still holds the raw (bit0-intact) target and [x19, #64] is
+     * untouched, so a miss falls through to .Lslow_exit exactly as before.
+     * x21/x23/x30 are scratch here (x21 is reloaded per A2 access from
+     * [sp, #160]; x30 is restored from the stack on slow exit). */
+    ldp     x17, x23, [x19, #368]   /* pending_signals, trace/gdb/single-step/itstate */
+    orr     x21, x17, x23
+    cbnz    x21, .Lslow_exit        /* signals/flags/single-step/trace: slow path */
+    and     w17, w15, #1            /* w17 = cand_thumb */
+    mov     w21, #-4
+    orr     w21, w21, w17, lsl #1   /* w21 = cand_mask (~1 Thumb, ~3 ARM) */
+    and     w23, w15, w21           /* w23 = cand_aligned_pc */
+    orr     w30, w23, w17           /* w30 = next_key */
+    ldar    w21, [x28]              /* w21 = cur_epoch */
+    cbz     w21, .Lslow_exit
+    orr     x30, x30, x21, lsl #32  /* x30 = next_key | epoch<<32 */
+    ldr     x23, [x27, #48]         /* cur_entry->chain_entry[0] */
+    cbz     x23, .Lslow_exit
+    ldp     x21, x17, [x23]
+    eor     x21, x21, x30
+    cbz     x21, .Liw_hit_chain
+    lsr     x21, x21, #32           /* slot 0 missed on stale epoch: re-chain in C */
+    cbnz    x21, .Lslow_exit
+    ldr     x23, [x27, #56]         /* cur_entry->chain_entry[1] */
+    cbz     x23, .Lslow_exit
+    ldp     x21, x17, [x23]
+    eor     x21, x21, x30
+    cbnz    x21, .Liw_try_ibtc
+    cbz     x17, .Lslow_exit
+    b       .Liw_hit_chain
+.Liw_try_ibtc:
+    lsr     x21, x21, #32           /* slot 1 missed on stale epoch: re-chain in C */
+    cbnz    x21, .Lslow_exit
+    ubfx    w17, w30, #1, #10       /* ibtc_idx = (next_key >> 1) & 1023 */
+    add     x22, x19, x17, lsl #5
+    ldr     x23, [x22, #2496]       /* x23 = ibtc.entry */
+    cbz     x23, .Liw_try_ras
+    ldp     x21, x17, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x21, x21, x30
+    cbnz    x21, .Liw_try_ras
+    cbz     x17, .Lslow_exit
+    mov     x27, x23                /* cur_entry = next_entry */
+    ldr     x21, [x19, #384]        /* blocks_executed */
+    ldr     x22, [x19, #408]        /* ibtc_hits */
+    add     x21, x21, #1
+    add     x22, x22, #1
+    str     x21, [x19, #384]
+    str     x22, [x19, #408]
+    b       .Liw_commit_mode
+.Liw_try_ras:
+    ldr     w17, [x19, #424]        /* w17 = ctx->ras_top */
+    sub     w17, w17, #1
+    and     w17, w17, #0x3f         /* r_idx = (ras_top - 1) & 63 */
+    add     x22, x19, x17, lsl #5
+    ldr     x23, [x22, #448]        /* x23 = ras[r_idx].entry */
+    cbz     x23, .Lslow_exit
+    ldp     x21, x22, [x23]         /* next_entry->key|epoch, next_entry->host_code */
+    eor     x21, x21, x30
+    cbnz    x21, .Lslow_exit
+    cbz     x22, .Lslow_exit
+    str     w17, [x19, #424]        /* ctx->ras_top = r_idx */
+    mov     x17, x22                /* x17 = host_code */
+    mov     x27, x23                /* cur_entry = next_entry */
+    ldr     x21, [x19, #384]        /* blocks_executed */
+    ldr     x23, [x19, #416]        /* ras_hits */
+    add     x21, x21, #1
+    add     x23, x23, #1
+    str     x21, [x19, #384]
+    str     x23, [x19, #416]
+    b       .Liw_commit_mode
+.Liw_hit_chain:
+    cbz     x17, .Lslow_exit
+    mov     x27, x23
+    add     x24, x24, #1
+    b       .Liw_commit_mode
+.Liw_commit_mode:
+    /* Commit the mode switch: w26/cand mask/aligned pc + CPSR.T. */
+    and     w21, w15, #1
+    mov     w26, w21
+    mov     w21, #-4
+    orr     w25, w21, w26, lsl #1
+    and     w15, w15, w25
+    ldr     w21, [x19, #64]
+    bic     w21, w21, #0x20
+    orr     w21, w21, w26, lsl #5
+    str     w21, [x19, #64]
+    b       .Lrun_loop
 .Lmode_ok:
     ldp     x17, x23, [x19, #368]   /* x17 = pending_signals (64b), x23 = flags (lo32) | itstate (hi32) */
     orr     x22, x17, x23
@@ -226,8 +317,11 @@ JIT_RUN_BLOCK:
     orr     w14, w14, w17
     str     w14, [x19, #352]
 2:
-    and     w17, w14, #0x07c00000
-    cbz     w17, 3f
+    /* A32-IOS-P1: host libSystem/C code always runs with standard IEEE-754
+     * FPCR == 0. A fault or exit may land mid-block while NEON Standard
+     * FPSCR is active even when scalar rounding bits are clear. */
+    mrs     x17, fpcr
+    cbz     x17, 3f
     msr     fpcr, xzr
 3:
     /* Return exit_reason in w0 */
@@ -242,7 +336,7 @@ JIT_RUN_BLOCK:
     ldp     x23, x24, [sp, #48]
     ldp     x25, x26, [sp, #64]
     ldp     x27, x28, [sp, #80]
-    ldp     x29, x30, [sp], #160
+    ldp     x29, x30, [sp], #176
     ret
 #ifndef __APPLE__
     .size JIT_RUN_BLOCK, .-JIT_RUN_BLOCK

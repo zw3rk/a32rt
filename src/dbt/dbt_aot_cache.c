@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    8U
+#define A32_AOT_VERSION    9U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  4096U
 #define A32_AOT_MAX_PC_MAP 256U
@@ -32,6 +32,8 @@ typedef struct a32_aot_header {
     uint32_t version;
     uint32_t num_blocks;
     uint32_t load_bias;
+    uint32_t ios_flags;  /* bit 0: ctx->is_ios at save time */
+    uint32_t regime;     /* a32_vm32_regime_t at save time */
 } a32_aot_header_t;
 
 typedef struct a32_aot_block_header {
@@ -120,6 +122,15 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path,
         h = fnv1a_64_step(h, &ctx->elf_base, sizeof(ctx->elf_base));
         h = fnv1a_64_step(h, &ctx->interp_base, sizeof(ctx->interp_base));
         h = fnv1a_64_step(h, &ctx->elf_entry, sizeof(ctx->elf_entry));
+        /* A32-IOS-D3: the hash covers the raw executable bytes (format
+         * agnostic: ELF32 and Mach-O/Fat hash identically cleanly), plus
+         * the personality and window regime so Regime A1 vs A2 and ELF
+         * vs iOS caches never collide. */
+        uint32_t ios_flag = ctx->is_ios ? 1U : 0U;
+        h = fnv1a_64_step(h, &ios_flag, sizeof(ios_flag));
+        uint32_t regime = (uint32_t)a32_vm32_current_regime();
+        h = fnv1a_64_step(h, &regime, sizeof(regime));
+        h = fnv1a_64_step(h, &ctx->guest_base, sizeof(ctx->guest_base));
         if (ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
             h = fnv1a_64_step(h, ctx->sysroot, strlen(ctx->sysroot));
         }
@@ -170,7 +181,7 @@ static int resolve_cache_path(const a32_ctx_t *ctx, const char *elf_path,
 
 static void copy_file(const char *src_path, const char *dst_path)
 {
-    int src_fd = open(src_path, O_RDONLY | O_CLOEXEC);
+    int src_fd = open(src_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (src_fd < 0) {
         return;
     }
@@ -358,6 +369,8 @@ int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
         .version    = A32_AOT_VERSION,
         .num_blocks = count_st.count,
         .load_bias  = (ctx != NULL) ? ctx->elf_base : 0U,
+        .ios_flags  = (ctx != NULL && ctx->is_ios) ? 1U : 0U,
+        .regime     = (uint32_t)a32_vm32_current_regime(),
     };
 
     if (fwrite(&hdr, sizeof(hdr), 1U, f) != 1U) {
@@ -407,6 +420,14 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
     }
     if (hdr.magic != A32_AOT_MAGIC || hdr.version != A32_AOT_VERSION ||
         hdr.num_blocks > A32_AOT_MAX_BLOCKS) {
+        if (cache_path_for_unlink != NULL) {
+            (void)unlink(cache_path_for_unlink);
+        }
+        return -1;
+    }
+    /* A32-IOS-D3: Regime A1 vs A2 and ELF vs iOS caches never collide. */
+    if (((hdr.ios_flags & 1U) != (ctx->is_ios ? 1U : 0U)) ||
+        hdr.regime != (uint32_t)a32_vm32_current_regime()) {
         if (cache_path_for_unlink != NULL) {
             (void)unlink(cache_path_for_unlink);
         }
@@ -524,8 +545,11 @@ static int load_cache_from_path(a32_ctx_t *ctx, const char *cache_path,
     if (fd < 0) {
         return -1;
     }
+    /* A32-IOS-D3: refuse non-regular, foreign-owned, or group/world
+     * writable cache files before mapping any bytes. */
     struct stat st;
-    if (!(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0022) == 0)) {
+    if (!(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+          st.st_uid == geteuid() && (st.st_mode & 0022) == 0)) {
         close(fd);
         return -1;
     }

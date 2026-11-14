@@ -93,6 +93,13 @@ bool a32_decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
                 a64_emit_mov_imm32(b, A64_TMP1, 0x0800009FU);
                 a64_emit_and_reg_w(b, false, A64_TMP0, rt, A64_TMP1, A64_SHIFT_LSL, 0U);
                 a64_emit(b, 0xD51B4420U | A64_TMP0); /* MSR FPSR, xTmp0 */
+                /* A32-IOS-P1: VMSR installs scalar controls itself; record
+                 * the scalar op and drop any active NEON Standard FPSCR
+                 * (the pre-placeholder flush guarantees depth == 0 here
+                 * unless hoisted for a pure-NEON loop, which precludes
+                 * scalar ops). */
+                b->saw_scalar_vfp   = true;
+                b->fpcr_neon_active = false;
             }
             return true;
         }
@@ -264,6 +271,9 @@ bool a32_decode_vfp(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
     /* 4. VFP data-processing (bit 4 == 0) */
     if ((insn & 0x0F000010U) == 0x0E000000U) {
+        /* A32-IOS-P1: scalar VFP arithmetic/compare/convert observe the
+         * scalar FPSCR, never an active NEON Standard FPSCR. */
+        vfp_scalar_fpcr_sync(b);
         unsigned opc1 = ((insn >> 20) & 0xFU) & ~4U;
         unsigned opc2 = (insn >> 16) & 0xFU;
         bool d_bit    = ((insn >> 22) & 1U) != 0U;

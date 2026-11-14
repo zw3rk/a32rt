@@ -160,6 +160,13 @@ static void scan_text_range(aot_scan_buf_t *sb, uint32_t r_start, uint32_t r_end
         return;
     }
     const a32_ctx_t *ctx = sb->ctx;
+    /* A32-IOS-P6: on Mach-O ARM/Thumb mixed binaries with LC_FUNCTION_STARTS,
+     * skip the blind 4-byte ARM linear gap sweep (it misreads Thumb-2 code
+     * and literal pools as ARM32); rely on the seeded function starts plus
+     * recursive direct-branch/BL/BLX call-graph discovery instead. */
+    if (!prefer_thumb && ctx->is_ios && ctx->ios_fn_starts_count > 0U) {
+        return;
+    }
 
     if (prefer_thumb) {
         uint32_t scan_start = (r_start + 1U) & ~1U;
@@ -398,6 +405,29 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     };
 
     seed_elf_symbols(&sb, ctx, elf_path, (entry_pc == ctx->elf_base) ? &entry_thumb : NULL);
+
+    /* A32-IOS-P6 (consumer): seed LC_FUNCTION_STARTS plus the LC_MAIN entry
+     * and __mod_init_func initializers alongside the ELF entry points.
+     * Function-start entries carry the Thumb bit, like ELF st_value; the
+     * LC_MAIN/init VAs are raw Mach-O armv7 addresses (Thumb-2 code). */
+    if (ctx->is_ios && ctx->ios_fn_starts != NULL && ctx->ios_fn_starts_count > 0U) {
+        for (uint32_t i = 0U; i < ctx->ios_fn_starts_count; i++) {
+            uint32_t raw = ctx->ios_fn_starts[i];
+            bool is_t = (raw & 1U) != 0U;
+            uint32_t fn_pc = raw & (is_t ? ~1U : ~3U);
+            aot_try_add_target(&sb, fn_pc, is_t, is_t ? 2U : 4U);
+        }
+    }
+    if (ctx->is_ios) {
+        if (ctx->ios_main_va != 0U) {
+            aot_try_add_target(&sb, ctx->ios_main_va & ~1U, true, 2U);
+        }
+        for (uint32_t i = 0U; i < ctx->ios_init_count && i < 64U; i++) {
+            if (ctx->ios_init_va[i] != 0U) {
+                aot_try_add_target(&sb, ctx->ios_init_va[i] & ~1U, true, 2U);
+            }
+        }
+    }
 
     bool has_aux_exec = false;
     for (size_t i = 0U; i < ctx->region_count; i++) {

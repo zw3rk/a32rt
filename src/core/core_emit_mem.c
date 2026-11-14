@@ -23,11 +23,15 @@ static void emit_soft_tlb_fault_itstate(a64_buf_t *b, uint32_t itstate)
     }
 }
 
-/* ---- Per-block AOT site staging (P2 #7) ---- */
-static a32_vm32_mem_site_t g_site_stage[A32_AOT_SITE_PER_BLOCK];
-static uint32_t g_site_stage_base = 0U;
-static uint32_t g_site_stage_count = 0U;
-static bool g_site_stage_valid = false;
+/* ---- Per-block AOT site staging (P2 #7, A32-IOS-D4) ----
+ * Thread-local like g_compile_buf: concurrent pthread_create/clone block
+ * translations without g_jit_lock must never corrupt each other's patch
+ * sites or PC maps (the PC map side already lives in thread-local
+ * t_stage_pc_map in vm_jit_state.c). */
+static _Thread_local a32_vm32_mem_site_t g_site_stage[A32_AOT_SITE_PER_BLOCK];
+static _Thread_local uint32_t g_site_stage_base = 0U;
+static _Thread_local uint32_t g_site_stage_count = 0U;
+static _Thread_local bool g_site_stage_valid = false;
 
 void a32_emit_sites_flush(void)
 {
@@ -37,6 +41,16 @@ void a32_emit_sites_flush(void)
     }
     g_site_stage_valid = false;
     g_site_stage_count = 0U;
+}
+
+/* Discard this thread's staged sites for one guest block without
+ * publishing them (DBT epoch-retry retranslation in dbt_jit_query.c). */
+void a32_emit_sites_reset_block(uint32_t guest_start_pc)
+{
+    if (g_site_stage_valid && g_site_stage_base == guest_start_pc) {
+        g_site_stage_valid = false;
+        g_site_stage_count = 0U;
+    }
 }
 
 static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
@@ -73,38 +87,17 @@ static void emit_site_record(a64_buf_t *b, uint32_t opc, unsigned rt,
     g_site_stage_valid = true;
 }
 
-/* X-form MOVZ/MOVK for 64-bit immediates (TLB-base materialization). */
-static void emit_movz_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
-{
-    a64_emit(b, 0xD2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
-}
-
-static void emit_movk_x(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
-{
-    a64_emit(b, 0xF2800000U | ((hw & 3U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
-}
-
 static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_span, bool is_store)
 {
-    uint64_t base = (uint64_t)a32_vm32_tlb_base;
-    uint16_t h0 = (uint16_t)(base & 0xFFFFU);
-    uint16_t h1 = (uint16_t)((base >> 16) & 0xFFFFU);
-    uint16_t h2 = (uint16_t)((base >> 32) & 0xFFFFU);
-    uint16_t h3 = (uint16_t)((base >> 48) & 0xFFFFU);
     uint32_t cur_pc = a32_jit_last_record_pc();
     uint32_t itstate = a32_jit_last_record_itstate();
     uint32_t tag_off = is_store ? 16U : 0U;
 
-    emit_movz_x(b, 21U, h0, 0U);
-    if (h1 != 0U) {
-        emit_movk_x(b, 21U, h1, 1U);
-    }
-    if (h2 != 0U) {
-        emit_movk_x(b, 21U, h2, 2U);
-    }
-    if (h3 != 0U) {
-        emit_movk_x(b, 21U, h3, 3U);
-    }
+    /* A32-IOS-P4: single-instruction Soft-TLB base reload. The trampoline
+     * spills the regime base once per run_block entry at [sp, #160], so
+     * translated code stays position-independent across ASLR runs. The
+     * host sp is constant for the whole JIT block residency. */
+    a64_emit(b, 0xF94053F5U); /* ldr x21, [sp, #160] */
     /* 20-bit Soft-TLB index: gva >> 12 (into x21 = &g_tlb[idx]). */
     a64_emit_ubfm_w(b, 23U, addr_w, 12U, 31U);
     a64_emit_orr_reg_w(b, 23U, A64_ZR, 23U, A64_SHIFT_LSL, 5U);
@@ -544,6 +537,15 @@ size_t a64_emit_b_cond_placeholder(a64_buf_t *b, unsigned cond)
 {
     if (!b->self_loop_vfp_active && b->vfp_slot_dirty != 0U) {
         a64_vfp_cache_flush(b, false);
+    }
+    /* A32-IOS-P1: a conditional skip region may execute scalar VFP ops
+     * under fpcr_neon_active, so restore scalar FPCR up front (outside
+     * the region) and clear the flag. Skipped for a pure-NEON self-loop
+     * whose preheader hoisted Standard FPSCR for the whole loop body. */
+    if (b->cond_branch_depth == 0U && b->fpcr_neon_active &&
+        !(b->preheader_neon_fpcr && !b->saw_scalar_vfp)) {
+        a64_emit_fpcr_restore_scalar(b);
+        b->fpcr_neon_active = false;
     }
     b->cond_branch_depth++;
     size_t idx = b->count;

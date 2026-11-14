@@ -571,6 +571,13 @@ static void vfp_record_preheader_access(a64_buf_t *b, uint8_t kind, uint8_t reg,
 
 void a64_vfp_emit_exit_flush(a64_buf_t *b)
 {
+    /* A32-IOS-P1: every block/side exit leaves with scalar FPCR active so
+     * direct-chain jumps and C slow exits observe scalar controls. The
+     * flag stays set: the flush may sit on a taken side-exit branch
+     * while fallthrough continues the block under Standard FPSCR. */
+    if (b->fpcr_neon_active) {
+        a64_emit_fpcr_restore_scalar(b);
+    }
     if (b->self_loop_vfp_active) {
         for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
             if ((b->vfp_slot_dirty & (1U << i)) != 0U) {
@@ -583,9 +590,17 @@ void a64_vfp_emit_exit_flush(a64_buf_t *b)
 }
 
 void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs,
-                             unsigned count, uint32_t written_mask)
+                             unsigned count, uint32_t written_mask, bool neon_fpcr_hoist)
 {
     b->self_loop_vfp_active = true;
+    /* A32-IOS-P1: pure-NEON self-loops install Standard FPSCR once in the
+     * preheader (before loop_body_offset); the loop body then runs with
+     * fpcr_neon_active set and emits zero MSR FPCR instructions. */
+    if (neon_fpcr_hoist) {
+        a64_emit_fpcr_install_neon(b);
+        b->fpcr_neon_active   = true;
+        b->preheader_neon_fpcr = true;
+    }
     b->vfp_slot_dirty       = written_mask;
     for (unsigned i = 0U; i < count; i++) {
         b->vfp_slot_kind[i] = kinds[i];
