@@ -662,6 +662,14 @@ void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc)
         if (!b->self_loop_vfp_active) {
             a64_vfp_cache_flush(b, false);
         }
+        /* A non-hoisted self-loop back-edge runs under whatever FPCR the
+         * body left active; restore scalar controls before the exit poll
+         * (pass-2 preheader hoists cover the preheader_neon_fpcr case, and
+         * .Lbail restores via the exit flush below). */
+        if (b->fpcr_neon_active && !b->preheader_neon_fpcr) {
+            a64_emit_fpcr_restore_scalar(b);
+            b->fpcr_neon_active = false;
+        }
         emit_exit_sig_check(b, 7U);
         /* [3] ldar w21, [x28] (cur_epoch = g_cache_epoch) */
         a64_emit(b, 0x88DFFC00U | (28U << 5) | 21U);
@@ -743,10 +751,12 @@ void a64_emit_exit_branch_reg(a64_buf_t *b, unsigned target_reg, bool interwork)
     if (b->lr_written_from_pc) {
         b->is_call = true;
     }
-    a64_vfp_emit_exit_flush(b);
+    /* Copy target_reg into TMP0 first: the exit flush below touches TMP2,
+     * so a target_reg of TMP2 must already be safe in TMP0 (w15). */
     if (target_reg != A64_TMP0) {
         a64_emit_mov_w(b, A64_TMP0, target_reg);
     }
+    a64_vfp_emit_exit_flush(b);
 
     size_t patch_sig = emit_exit_sig_check(b, 0U);
 

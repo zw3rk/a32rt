@@ -335,8 +335,12 @@ void a64_emit_isb(a64_buf_t *b);
 /* NEON Standard FPSCR install / scalar restore shared by the DBT FPCR
  * coalescing protocol (A32-IOS-P1): Standard FPSCR is FZ=1, DN=1,
  * RMode=RN with AHP taken from ctx->fpscr; the scalar restore keeps only
- * the scalar rounding/flush controls (0x07c00000). Both sequences clobber
- * TMP1/TMP2, which never hold live guest state around FP ops. */
+ * the scalar rounding/flush controls (0x07c00000). The install runs in a
+ * pass-2 preheader where TMP1/TMP2 are dead. The restore runs on block
+ * exits and branch boundaries where TMP0(w15)/TMP1(w16) already hold the
+ * exit PC/reason, so it must use only x23 (chain scratch, dead at every
+ * block exit and at every conditional branch / self-loop boundary) and
+ * TMP2, never w15/w16. */
 static inline void a64_emit_fpcr_install_neon(a64_buf_t *b)
 {
     a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
@@ -349,10 +353,10 @@ static inline void a64_emit_fpcr_install_neon(a64_buf_t *b)
 
 static inline void a64_emit_fpcr_restore_scalar(a64_buf_t *b)
 {
-    a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
+    a64_emit_ldr_imm_w(b, 23U, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
     a64_emit_mov_imm32(b, A64_TMP2, 0x07C00000U);
-    a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
-    a64_emit(b, 0xD51B4400U | A64_TMP1); /* MSR FPCR, xTmp1 */
+    a64_emit_and_reg_w(b, false, 23U, 23U, A64_TMP2, A64_SHIFT_LSL, 0U);
+    a64_emit(b, 0xD51B4400U | 23U); /* MSR FPCR, x23 */
 }
 
 /* Branches & block exits */

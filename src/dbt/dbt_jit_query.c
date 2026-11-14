@@ -42,6 +42,67 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
     a32_ctx_normalize_itstate(ctx, is_thumb);
     bool uncached = (ctx->itstate != 0U) || ctx->single_step;
 
+    /* A32-IOS-P4: lockless g_ht fast path before taking jit_lock. Mirrors
+     * the dbt_jit_run.c RAS-miss probe: atomic-acquire loads validated by
+     * validate_cache_candidate. A lock-free reader lease pins the cache
+     * against reset recycling across the probe; on a hit with an already
+     * sealed batch the lease is kept as the execution lease and we return
+     * without ever taking jit_lock. Anything else falls through to the
+     * locked path below (which re-probes under the lock). */
+    if (!uncached && key != 0U) {
+        a32_jit_exec_enter();
+        uint32_t pre_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_acquire);
+        a32_cache_entry_t *hit_entry = NULL;
+        const void *hit_code = NULL;
+        bool hit_is_call = false;
+        uint32_t hit_start = 0U;
+        uint32_t hit_end = 0U;
+        if (pre_epoch != 0U) {
+            uint32_t slot = hash_key(key);
+            for (unsigned probe = 0U; probe < 4U; probe++) {
+                a32_cache_entry_t *cand = &g_ht[(slot + probe) & A32_HT_MASK];
+                const void *cand_code =
+                    atomic_load_explicit(&cand->host_code, memory_order_acquire);
+                const void *found_code = NULL;
+                a32_cache_entry_t *found_entry = NULL;
+                if (validate_cache_candidate(cand, cand_code, key, pre_epoch,
+                                             &found_code, &found_entry, &hit_is_call,
+                                             &hit_start, &hit_end)) {
+                    hit_entry = found_entry;
+                    hit_code = found_code;
+                    break;
+                }
+            }
+        }
+        if (hit_entry != NULL && hit_code != NULL) {
+            /* The batch flags were stored before this entry was published,
+             * so an empty batch means this entry's pages are already RX
+             * sealed; re-validate the epoch after reading them. */
+            bool sealed = (__atomic_load_n(&g_batch_max, __ATOMIC_ACQUIRE) <=
+                           __atomic_load_n(&g_batch_min, __ATOMIC_ACQUIRE));
+            bool still_valid =
+                (atomic_load_explicit(&g_cache_epoch, memory_order_acquire) == pre_epoch) &&
+                (atomic_load_explicit(&hit_entry->epoch, memory_order_acquire) == pre_epoch) &&
+                (atomic_load_explicit(&hit_entry->host_code, memory_order_relaxed) == hit_code);
+            if (still_valid && (!flush_now || sealed)) {
+                if (out_snap != NULL) {
+                    out_snap->code = hit_code;
+                    out_snap->is_call = hit_is_call;
+                    out_snap->guest_pc = hit_start;
+                    out_snap->guest_end_pc = hit_end;
+                    out_snap->code_bytes =
+                        atomic_load_explicit(&hit_entry->code_bytes, memory_order_relaxed);
+                    out_snap->epoch = pre_epoch;
+                }
+                if (!flush_now) {
+                    a32_jit_exec_leave();
+                }
+                return hit_entry;
+            }
+        }
+        a32_jit_exec_leave();
+    }
+
     jit_lock_acquire();
     uint32_t cur_epoch = atomic_load_explicit(&g_cache_epoch, memory_order_relaxed);
     if (!uncached) {
@@ -145,9 +206,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         bool queue_done  = false;
         uint32_t entry_itstate = (q_head == 0U && is_thumb) ? ctx->itstate : 0U;
         for (unsigned attempt = 0U;; attempt++) {
-            if (attempt > 0U) {
-                a32_emit_sites_reset_block(cur_b_pc);
-            }
+            a32_emit_sites_reset_block(cur_b_pc);
             /* Translation into thread-local staging. */
             a32_jit_stage_reset();
             a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
@@ -192,6 +251,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
             }
 
             if (buf.overflow) {
+                a32_emit_sites_reset_block(cur_b_pc);
                 if (hold_lock) {
                     jit_lock_release();
                 }
@@ -215,6 +275,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
                 break;
             }
             if (!a32_jit_range_executable(ctx, cur_b_pc, is_thumb ? 2U : 4U)) {
+                a32_emit_sites_reset_block(cur_b_pc);
                 ctx->fault_addr  = cur_b_pc;
                 ctx->exit_reason = A32_EXIT_FAULT;
                 jit_lock_release();
@@ -238,6 +299,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         if (!uncached) {
             a32_cache_entry_t *raced = a32_jit_find_ht_entry_locked(cur_b_key, cur_epoch);
             if (raced != NULL) {
+                a32_emit_sites_reset_block(cur_b_pc);
                 if (q_head == 0U) {
                     first_entry = raced;
                     if (out_snap != NULL) {
@@ -255,6 +317,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         }
         uint8_t *dst = a32_jit_allocate_code_space_locked(ctx, code_bytes);
         if (dst == NULL) {
+            a32_emit_sites_reset_block(cur_b_pc);
             jit_lock_release();
             if (q_head == 0U) {
                 return NULL;
@@ -279,6 +342,7 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
         a32_cache_entry_t *res_entry = NULL;
 
         if (uncached && oneshot_entry != NULL) {
+            a32_emit_sites_reset_block(cur_b_pc);
             a32_jit_populate_ht_entry_locked(oneshot_entry, cur_b_key, dst, cur_b_pc, end_pc,
                                              (uint32_t)code_bytes, buf.is_call, side_start, side_count,
                                              0U, stage_words, buf.count, false);

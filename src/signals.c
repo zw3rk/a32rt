@@ -195,10 +195,8 @@ a32_ctx_t *a32_signals_get_thread_ctx(void)
 
 static bool is_on_altstack(const a32_ctx_t *ctx, uint32_t sp)
 {
-    return (ctx->altstack_size > 0U &&
-            !(ctx->altstack_flags & A32_SS_DISABLE) &&
-            sp >= ctx->altstack_sp &&
-            (sp - ctx->altstack_sp) < ctx->altstack_size);
+    return (ctx->altstack_size > 0U && !(ctx->altstack_flags & A32_SS_DISABLE) &&
+            sp >= ctx->altstack_sp && (sp - ctx->altstack_sp) < ctx->altstack_size);
 }
 
 static int32_t get_altstack_ss_flags(const a32_ctx_t *ctx, bool on_altstack)
@@ -206,15 +204,13 @@ static int32_t get_altstack_ss_flags(const a32_ctx_t *ctx, bool on_altstack)
     if (ctx->altstack_size == 0U || (ctx->altstack_flags & A32_SS_DISABLE)) {
         return (int32_t)A32_SS_DISABLE;
     }
-    return (int32_t)((on_altstack ? A32_SS_ONSTACK : 0U) |
-                     (ctx->altstack_flags & 0x80000000U));
+    return (int32_t)((on_altstack ? A32_SS_ONSTACK : 0U) | (ctx->altstack_flags & 0x80000000U));
 }
 
 static bool sig_is_ignored(int sig, uint32_t handler)
 {
-    return (handler == A32_SIG_IGN ||
-            (handler == A32_SIG_DFL &&
-             (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT)));
+    return (handler == A32_SIG_IGN || (handler == A32_SIG_DFL &&
+            (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT)));
 }
 
 static void fill_guest_siginfo(a32_siginfo_t *dst, int sig,
@@ -497,9 +493,13 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         if (ctx->difftest_trap_fault && (sig == SIGSEGV || sig == SIGBUS)) {
             exit_code = A32_EXIT_FAULT;
         } else if (ctx->is_ios) {
-            if (!a32_ios_signals_deliver_sync(ctx, sig, ctx->fault_addr)) {
-                write_unhandled_sig_msg(sig, guest_pc, ctx->fault_addr);
-                _exit(128 + sig);
+            /* Same XNU rule as handle_guest_fault: a fault inside a valid
+             * mapping (even PROT_NONE) is SIGBUS, an unmapped VA SIGSEGV. */
+            int ios_sig = (a32_guest_range_ok(ctx, ctx->fault_addr, 1U, 0U) &&
+                    ctx->fault_addr >= a32_min_va(ctx)) ? SIGBUS : SIGSEGV;
+            if (!a32_ios_signals_deliver_sync(ctx, ios_sig, ctx->fault_addr)) {
+                write_unhandled_sig_msg(ios_sig, guest_pc, ctx->fault_addr);
+                _exit(128 + ios_sig);
             }
         } else {
             guest_sigaction_t *act = &g_guest_sigactions[sig];
@@ -529,10 +529,24 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         uc->uc_mcontext->__ss.__x[15] = (uint64_t)exit_r15;
         uc->uc_mcontext->__ss.__x[16] = (uint64_t)exit_code;
         uc->uc_mcontext->__ss.__pc    = uc->uc_mcontext->__ss.__lr;
+        /* Scalar FPCR restore: a faulting NEON block may leave Standard FPSCR live. */
+        uc->uc_mcontext->__ns.__fpcr = ctx->fpscr & 0x07C00000U;
 #else
         uc->uc_mcontext.regs[15] = (uint64_t)exit_r15;
         uc->uc_mcontext.regs[16] = (uint64_t)exit_code;
         uc->uc_mcontext.pc       = uc->uc_mcontext.regs[30];
+        {
+            /* fpsimd_context scan: fpcr is word 3 (offset 12) past magic 0x46508001. */
+            uint32_t *fpw = (uint32_t *)uc->uc_mcontext.__reserved;
+            size_t n = sizeof(uc->uc_mcontext.__reserved) >> 2U;
+            size_t i = 0U;
+            while (i + 4U <= n && fpw[i] != 0x46508001U) {
+                size_t adv = (size_t)(fpw[i + 1U] / 4U);
+                if (adv < 4U || adv > n) break;
+                i += adv;
+            }
+            if (i + 4U <= n) fpw[i + 3U] = ctx->fpscr & 0x07C00000U;
+        }
 #endif
         return;
     }
@@ -633,8 +647,7 @@ void a32_signals_check_pending(a32_ctx_t *ctx)
 {
     if (!ctx) return;
     if (ctx->is_ios) { a32_ios_signals_check_pending(ctx); return; }
-    uint64_t pending = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST);
-    uint64_t unmasked = pending & ~ctx->sig_mask;
+    uint64_t unmasked = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & ~ctx->sig_mask;
     while (unmasked != 0ULL) {
         int sig = __builtin_ctzll(unmasked) + 1;
         uint64_t bit = 1ULL << (sig - 1);
@@ -661,8 +674,7 @@ bool a32_signals_deliver_sync(a32_ctx_t *ctx, int sig, uint32_t fault_addr)
     if (act->handler == A32_SIG_DFL || act->handler == A32_SIG_IGN) return false;
     siginfo_t si;
     memset(&si, 0, sizeof(si));
-    si.si_signo = sig;
-    si.si_code  = 1;
+    si.si_signo = sig; si.si_code = 1;
     deliver_guest_signal(ctx, sig, act, &si);
     return true;
 }
@@ -677,17 +689,13 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
         return -EINVAL;
     }
     if ((act_va != 0U && !a32_guest_range_ok(ctx, act_va, sizeof(guest_sigaction_t), PROT_READ)) ||
-        (oldact_va != 0U && !a32_guest_range_ok(ctx, oldact_va, sizeof(guest_sigaction_t), PROT_WRITE))) {
-        return -EFAULT;
-    }
+        (oldact_va != 0U && !a32_guest_range_ok(ctx, oldact_va, sizeof(guest_sigaction_t), PROT_WRITE))) return -EFAULT;
 
     guest_sigaction_t cur = g_guest_sigactions[signum];
 
     if (act_va != 0U) {
         guest_sigaction_t new_act;
-        if (!guest_read(ctx, &new_act, act_va, sizeof(new_act))) {
-            return -EFAULT;
-        }
+        if (!guest_read(ctx, &new_act, act_va, sizeof(new_act))) return -EFAULT;
         unsigned long sa_flags = (unsigned long)(SA_SIGINFO | SA_NODEFER);
         if (new_act.handler <= 1U || (new_act.flags & A32_SA_RESTART) != 0U) {
             sa_flags |= (unsigned long)SA_RESTART;
@@ -719,9 +727,7 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
     }
 
     if (oldact_va != 0U) {
-        if (!guest_write(ctx, oldact_va, &cur, sizeof(cur))) {
-            return -EFAULT;
-        }
+        if (!guest_write(ctx, oldact_va, &cur, sizeof(cur))) return -EFAULT;
     }
 
     return 0;
@@ -730,13 +736,9 @@ int a32_sys_rt_sigaction(a32_ctx_t *ctx, int signum, uint32_t act_va,
 int a32_sys_rt_sigprocmask(a32_ctx_t *ctx, int how, uint32_t set_va,
                            uint32_t oldset_va, uint32_t sigsetsize)
 {
-    if (!ctx || sigsetsize != sizeof(uint64_t)) {
-        return -EINVAL;
-    }
+    if (!ctx || sigsetsize != sizeof(uint64_t)) return -EINVAL;
     if ((set_va != 0U && !a32_guest_range_ok(ctx, set_va, 8U, (uint32_t)PROT_READ)) ||
-        (oldset_va != 0U && !a32_guest_range_ok(ctx, oldset_va, 8U, (uint32_t)PROT_WRITE))) {
-        return -EFAULT;
-    }
+        (oldset_va != 0U && !a32_guest_range_ok(ctx, oldset_va, 8U, (uint32_t)PROT_WRITE))) return -EFAULT;
 
     uint64_t old_mask = ctx->sig_mask;
 
@@ -784,9 +786,7 @@ int a32_sys_rt_sigreturn(a32_ctx_t *ctx)
 {
     if (!ctx) return -EINVAL;
     uint32_t sp = ctx->regs[13];
-    if (!a32_guest_range_ok(ctx, sp, (uint32_t)sizeof(a32_rt_sigframe_t), (uint32_t)PROT_READ)) {
-        return -EFAULT;
-    }
+    if (!a32_guest_range_ok(ctx, sp, (uint32_t)sizeof(a32_rt_sigframe_t), (uint32_t)PROT_READ)) return -EFAULT;
     a32_rt_sigframe_t *frame = (a32_rt_sigframe_t *)a32_guest_ptr(ctx, sp);
     const a32_sigcontext_t *sc = &frame->uc.uc_mcontext;
     memcpy(ctx->regs, &sc->arm_r0, sizeof(ctx->regs));
@@ -838,9 +838,7 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
     old_st.ss_size  = ctx->altstack_size;
 
     if (uss_va != 0U) {
-        if (on_altstack) {
-            return -EPERM;
-        }
+        if (on_altstack) return -EPERM;
         a32_stack_t new_st;
         memcpy(&new_st, a32_guest_ptr(ctx, uss_va), sizeof(new_st));
 
@@ -854,18 +852,14 @@ int a32_sys_sigaltstack(a32_ctx_t *ctx, uint32_t uss_va, uint32_t uoss_va)
             ctx->altstack_size  = 0U;
             ctx->altstack_flags = A32_SS_DISABLE;
         } else {
-            if (new_st.ss_size < 2048U) {
-                return -ENOMEM;
-            }
+            if (new_st.ss_size < 2048U) return -ENOMEM;
             ctx->altstack_sp    = new_st.ss_sp;
             ctx->altstack_size  = new_st.ss_size;
             ctx->altstack_flags = uflags;
         }
     }
 
-    if (uoss_va != 0U) {
-        memcpy(a32_guest_ptr(ctx, uoss_va), &old_st, sizeof(old_st));
-    }
+    if (uoss_va != 0U) memcpy(a32_guest_ptr(ctx, uoss_va), &old_st, sizeof(old_st));
 
     return 0;
 }

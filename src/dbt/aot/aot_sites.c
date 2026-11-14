@@ -14,6 +14,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,15 +120,20 @@ static void site_path(char *dst, size_t dst_len, const char *dir,
     snprintf(dst, dst_len, "%s/a3ts-%08x.bin", dir, guest_pc_base);
 }
 
+/* Monotonic temp-name counter for atomic site saves (A32-IOS-D3). */
+static _Atomic unsigned g_site_save_seq = 0U;
+
 int a32_aot_site_save(const char *dir, uint32_t guest_pc_base,
     const a32_vm32_mem_site_t *sites, uint32_t count)
 {
     char path[512];
+    char tmp[576];
     uint8_t *buf = NULL;
     size_t len = 0U;
     int fd = -1;
     size_t done = 0U;
     int rc;
+    int n;
     if (dir == NULL || dir[0] == '\0') {
         return -EINVAL;
     }
@@ -135,7 +142,15 @@ int a32_aot_site_save(const char *dir, uint32_t guest_pc_base,
         return rc;
     }
     site_path(path, sizeof(path), dir, guest_pc_base);
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    /* Unique temp name per save; O_EXCL|O_NOFOLLOW refuses symlinks and
+     * pre-existing files instead of following them. */
+    n = snprintf(tmp, sizeof(tmp), "%s.tmp.%d.%u", path, (int)getpid(),
+        atomic_fetch_add_explicit(&g_site_save_seq, 1U, memory_order_relaxed));
+    if (n < 0 || (size_t)n >= sizeof(tmp)) {
+        free(buf);
+        return -ENAMETOOLONG;
+    }
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) {
         rc = -errno;
         free(buf);
@@ -153,6 +168,12 @@ int a32_aot_site_save(const char *dir, uint32_t guest_pc_base,
         done += (size_t)w;
     }
     close(fd);
+    if (rc == 0 && rename(tmp, path) != 0) {
+        rc = -errno;
+    }
+    if (rc != 0) {
+        (void)unlink(tmp);
+    }
     free(buf);
     return rc;
 }
@@ -166,6 +187,12 @@ typedef struct {
     a32_vm32_mem_site_t sites[A32_AOT_SITE_PER_BLOCK];
 } a32_aot_site_slot_t;
 
+/* Leaf guard for g_site_slots: track runs unlocked during translation
+ * while fetch drains on save/load paths, so concurrent translations must
+ * not corrupt each other's staged records (A32-IOS-D4). fetch uses
+ * trylock and reports -EAGAIN when busy; neither save nor load treats a
+ * missed fetch as fatal. */
+static pthread_mutex_t g_site_mu = PTHREAD_MUTEX_INITIALIZER;
 static a32_aot_site_slot_t g_site_slots[A32_AOT_SITE_TRACK_MAX];
 
 int a32_aot_site_track(uint32_t guest_pc_base,
@@ -173,58 +200,72 @@ int a32_aot_site_track(uint32_t guest_pc_base,
 {
     uint32_t i;
     uint32_t free_slot = A32_AOT_SITE_TRACK_MAX;
+    int rc = -ENOSPC;
     if (sites == NULL || count == 0U || count > A32_AOT_SITE_PER_BLOCK) {
         return -EINVAL;
     }
+    pthread_mutex_lock(&g_site_mu);
     for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
         if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
             memcpy(g_site_slots[i].sites, sites,
                 (size_t)count * sizeof(sites[0]));
             g_site_slots[i].count = count;
-            return 0;
+            rc = 0;
+            goto out;
         }
         if (!g_site_slots[i].used && free_slot == A32_AOT_SITE_TRACK_MAX) {
             free_slot = i;
         }
     }
-    if (free_slot == A32_AOT_SITE_TRACK_MAX) {
-        return -ENOSPC;
+    if (free_slot != A32_AOT_SITE_TRACK_MAX) {
+        g_site_slots[free_slot].used = true;
+        g_site_slots[free_slot].base = guest_pc_base;
+        g_site_slots[free_slot].count = count;
+        memcpy(g_site_slots[free_slot].sites, sites,
+            (size_t)count * sizeof(sites[0]));
+        rc = 0;
     }
-    g_site_slots[free_slot].used = true;
-    g_site_slots[free_slot].base = guest_pc_base;
-    g_site_slots[free_slot].count = count;
-    memcpy(g_site_slots[free_slot].sites, sites,
-        (size_t)count * sizeof(sites[0]));
-    return 0;
+out:
+    pthread_mutex_unlock(&g_site_mu);
+    return rc;
 }
 
 int a32_aot_site_fetch(uint32_t guest_pc_base,
     a32_vm32_mem_site_t *sites, uint32_t cap, uint32_t *out_count)
 {
     uint32_t i;
+    int rc = -ENOENT;
     if (out_count != NULL) {
         *out_count = 0U;
     }
     if (sites == NULL || cap == 0U || out_count == NULL) {
         return -EINVAL;
     }
+    if (pthread_mutex_trylock(&g_site_mu) != 0) {
+        return -EAGAIN;
+    }
     for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
         if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
             if (g_site_slots[i].count > cap) {
-                return -E2BIG;
+                rc = -E2BIG;
+                break;
             }
             memcpy(sites, g_site_slots[i].sites,
                 (size_t)g_site_slots[i].count * sizeof(sites[0]));
             *out_count = g_site_slots[i].count;
-            return 0;
+            rc = 0;
+            break;
         }
     }
-    return -ENOENT;
+    pthread_mutex_unlock(&g_site_mu);
+    return rc;
 }
 
 void a32_aot_site_clear(void)
 {
+    pthread_mutex_lock(&g_site_mu);
     memset(g_site_slots, 0, sizeof(g_site_slots));
+    pthread_mutex_unlock(&g_site_mu);
 }
 
 int a32_aot_site_load(const char *dir, uint32_t guest_pc_base,
@@ -245,12 +286,15 @@ int a32_aot_site_load(const char *dir, uint32_t guest_pc_base,
         return -EINVAL;
     }
     site_path(path, sizeof(path), dir, guest_pc_base);
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         return -errno;
     }
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
-        (uint64_t)st.st_size > 16U * 1024U * 1024U) {
+    /* Refuse symlinks (O_NOFOLLOW above), non-regular, foreign-owned, or
+     * group/world-writable payloads before trusting a single byte. */
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != geteuid() || (st.st_mode & 0022) != 0 ||
+        st.st_size <= 0 || (uint64_t)st.st_size > 16U * 1024U * 1024U) {
         rc = -EBADMSG;
         goto out;
     }
