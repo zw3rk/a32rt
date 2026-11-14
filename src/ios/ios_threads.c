@@ -75,11 +75,6 @@ static thr_t *thr_by_ctx(a32_ctx_t *c)
             return &g_thr[i];
     return NULL;
 }
-static uint32_t thr_index(a32_ctx_t *c)
-{
-    thr_t *t = thr_by_ctx(c);
-    return (t == NULL) ? 0U : (uint32_t)(t - g_thr);
-}
 /* Per-thread TSD: 64 keys x 64 slots; main thread uses slot 0. */
 #define KEY_N 64U
 static bool g_key_used[KEY_N];
@@ -340,6 +335,7 @@ static thr_t *spawn_child(a32_ctx_t *parent, uint32_t entry, uint32_t sp,
     ch->regs[13] = sp;
     self = pva;
     (void)guest_write(ch, tsd, &self, 4U);
+    (void)guest_write(ch, tsd + 8U, &ch->ios_errno_va, 4U);
     (void)guest_write(ch, ch->ios_errno_va, &zero, 4U);
     (void)pthread_mutex_lock(&g_thr_mu);
     if (!g_thr[0].used) { g_thr[0].used = true; g_thr[0].pva = 0xFFFF5400U; g_thr[0].ch = parent; parent->ios_thr_slot_plus1 = 1U; }
@@ -789,18 +785,19 @@ int a32_ios_stub_pthread(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled)
         break;
     }
     case 104U: {
-        uint32_t slot; bool ok;
+        uint32_t slot; bool ok; void *v = (void *)(uintptr_t)r1;
         (void)pthread_mutex_lock(&g_key_mu); ok = (r0 < KEY_N && g_key_used[r0]); (void)pthread_mutex_unlock(&g_key_mu);
         if (!ok) { ctx->regs[0] = (uint32_t)DE_INVAL; break; }
-        (void)pthread_mutex_lock(&g_thr_mu); slot = thr_index(ctx); (void)pthread_mutex_unlock(&g_thr_mu);
-        g_tsd[r0][slot] = (void *)(uintptr_t)r1; ctx->regs[0] = 0U; break;
+        slot = (ctx->ios_thr_slot_plus1 != 0U && ctx->ios_thr_slot_plus1 <= THR_N) ? (ctx->ios_thr_slot_plus1 - 1U) : 0U;
+        __atomic_store_n(&g_tsd[r0][slot], v, __ATOMIC_SEQ_CST); ctx->regs[0] = 0U; break;
     }
     case 105U: {
-        uint32_t slot; bool ok;
+        uint32_t slot; bool ok; void *v;
         (void)pthread_mutex_lock(&g_key_mu); ok = (r0 < KEY_N && g_key_used[r0]); (void)pthread_mutex_unlock(&g_key_mu);
         if (!ok) { ctx->regs[0] = 0U; break; }
-        (void)pthread_mutex_lock(&g_thr_mu); slot = thr_index(ctx); (void)pthread_mutex_unlock(&g_thr_mu);
-        ctx->regs[0] = (uint32_t)(uintptr_t)g_tsd[r0][slot]; break;
+        slot = (ctx->ios_thr_slot_plus1 != 0U && ctx->ios_thr_slot_plus1 <= THR_N) ? (ctx->ios_thr_slot_plus1 - 1U) : 0U;
+        v = __atomic_load_n(&g_tsd[r0][slot], __ATOMIC_SEQ_CST);
+        ctx->regs[0] = (uint32_t)(uintptr_t)v; break;
     }
     case ONCE_RESUME_ID: {
         ocall_t *oc = oc_self();

@@ -315,7 +315,7 @@ static void ex_rt(a32_ctx_t *ctx, uint32_t id)
 
 typedef struct { uint32_t *w; uint32_t n; uint32_t cap; } leaf_em_t;
 typedef struct { const char *name; uint32_t off; } leaf_sym_t;
-#define LEAF_N 12U
+#define LEAF_N 16U
 static leaf_sym_t g_leaf_syms[LEAF_N];
 static uint32_t g_leaf_count = 0U;
 static bool g_leaf_ok = false;
@@ -384,6 +384,11 @@ static uint32_t le_emit_all(uint32_t *w, uint32_t cap)
     le_reg("_pthread_self", &e);
     le_put(&e, 0xEE1D0F70U);
     le_put(&e, 0xE5900000U);
+    le_put(&e, 0xE12FFF1EU);
+    /* ___error: errno addr = [TPIDRURO,#8]; mrc; ldr r0,[r0,#8]; bx lr */
+    le_reg("___error", &e);
+    le_put(&e, 0xEE1D0F70U);
+    le_put(&e, 0xE5900008U);
     le_put(&e, 0xE12FFF1EU);
     /* _strlen(r0): scan for NUL, length = end - start - 1. */
     le_reg("_strlen", &e);
@@ -535,6 +540,7 @@ int a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx)
 {
     uint32_t nwords;
     uint32_t tp0 = 0U;
+    uint32_t tp8 = 0U;
     uint8_t *base;
     if (ctx == NULL) {
         return -1;
@@ -553,6 +559,18 @@ int a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx)
     }
     memcpy(&tp0, a32_guest_ptr(ctx, ctx->tls_tp), 4U);
     if (tp0 != ctx->ios_pthread_va) {
+        (void)pthread_mutex_unlock(&g_leaf_mu);
+        return -1;
+    }
+    /* Verify TPIDRURO slot 2 holds the errno VA for the ___error leaf. */
+    if (ctx->ios_errno_va == 0U ||
+        !a32_guest_range_ok(ctx, ctx->tls_tp + 8U, 4U,
+            (uint32_t)PROT_READ)) {
+        (void)pthread_mutex_unlock(&g_leaf_mu);
+        return -1;
+    }
+    memcpy(&tp8, a32_guest_ptr(ctx, ctx->tls_tp + 8U), 4U);
+    if (tp8 != ctx->ios_errno_va) {
         (void)pthread_mutex_unlock(&g_leaf_mu);
         return -1;
     }

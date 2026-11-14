@@ -848,9 +848,11 @@ int a32_ios_handle_stub_svc(a32_ctx_t *ctx) { uint32_t id, r0; bool hd = false, 
     if (ctx == NULL) return 0;
     id = ctx->regs[12]; r0 = ctx->regs[0];
     if (a32_ios_handle_stub_ext(ctx, id, &xh) == 0 && xh) return 0;
+    if (id == 0xFAU) { a32_ios_exit_teardown(ctx, 134); return 0; }
     if (id == 0xFDU) { qsort_resume(ctx, gc_self()); return 0; } if (id <= 1U) { ctx->regs[0] = 0U; return 0; }
     if (id == 2U || id == 4U) { ios_bye(134U); return 0; }
-    if (id == 6U) { ctx->exit_reason = 0U; (void)a32_ios_sys_pthread_kill(ctx, 0U, 6);
+    if (id == 6U) { ctx->exit_reason = 0U; ctx->regs[15] = A32_IOS_STUB_BASE_VA + 0xFAU * 8U; ctx->cpsr |= (uint32_t)A32_CPSR_T;
+        (void)a32_ios_sys_pthread_kill(ctx, 0U, 6); (void)a32_ios_signals_check_pending(ctx);
         if (ctx->exit_reason == (uint32_t)A32_EXIT_BRANCH) return 0;
         a32_ios_exit_teardown(ctx, 134); return 0; }
     if (id == 3U) { ctx->regs[0] = ctx->ios_errno_va; return 0; }

@@ -13,6 +13,7 @@
 
 #include "a32rt.h"
 #include "ios/ios.h"
+#include "os/sys_priv.h"
 #include "vm/vm32.h"
 
 #include <errno.h>
@@ -209,13 +210,14 @@ static void mach_ensure_init(void)
 
 static void mach_ensure_thread_port(a32_ctx_t *ctx, uint32_t *out_name)
 {
-    uintptr_t me = (uintptr_t)ctx; uint32_t got = 0U; int hit = -1;
+    uintptr_t me = (uintptr_t)ctx; uint32_t got = 0U, want = 0x203U + ((((uint32_t)get_host_tid(ctx)) & 0xFFU) << 2); int hit = -1, o;
     pthread_mutex_lock(&g_mach_lock);
     for (unsigned i = 0U; i < MACH_PORT_COUNT; i++) {
         if (g_ports[i].used && g_ports[i].kind == MACH_KIND_THREAD && g_ports[i].owner_ctx == me) { got = g_ports[i].name; hit = (int)i; break; }
     }
     if (hit < 0) {
-        if (mach_alloc_slot_locked(MACH_KIND_THREAD, 0U, &got) >= 0) { hit = mach_find_locked(got); if (hit >= 0) { g_ports[hit].owner_ctx = me; } }
+        if ((o = mach_find_locked(want)) >= 0 && g_ports[o].used && g_ports[o].owner_ctx != 0U && g_ports[o].owner_ctx != me) { want = 0U; }
+        if (mach_alloc_slot_locked(MACH_KIND_THREAD, want, &got) >= 0) { hit = mach_find_locked(got); if (hit >= 0) { g_ports[hit].owner_ctx = me; } }
         else { got = 0U; }
     }
     pthread_mutex_unlock(&g_mach_lock);

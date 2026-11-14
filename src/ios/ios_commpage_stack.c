@@ -235,6 +235,7 @@ static int ios_setup_runtime_data(a32_ctx_t *ctx)
     memset(a32_guest_ptr(ctx, A32_IOS_RUNTIME_DATA_VA), 0, 0x1000u);
     ios_w32(ctx, A32_IOS_RUNTIME_DATA_VA + 0x000u, 0xFFFF5400u);
     ios_w32(ctx, A32_IOS_RUNTIME_DATA_VA + 0x004u, 1u);
+    ios_w32(ctx, A32_IOS_RUNTIME_DATA_VA + 0x008u, 0xFFFF5500u);
     ios_w32(ctx, A32_IOS_RUNTIME_DATA_VA + 0x400u, 0x54485244u);
     ios_w32(ctx, A32_IOS_RUNTIME_DATA_VA + 0x500u, 0);
     ios_w32(ctx, A32_IOS_RUNTIME_DATA_VA + 0x510u, 0x000A0DFFu);
