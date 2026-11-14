@@ -55,6 +55,13 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
         ctx->exit_reason = A32_EXIT_BKPT;
         return A32_EXIT_BKPT;
     }
+    /* Darwin __builtin_trap() lowers to UDF 0xDEFE; on XNU this delivers
+     * SIGTRAP, matching BKPT exactly (A32-IOS-D18). */
+    if (hw == 0xDEFEU && ctx->is_ios) {
+        ctx->regs[15] = pc;
+        ctx->exit_reason = A32_EXIT_BKPT;
+        return A32_EXIT_BKPT;
+    }
 
     bool skip = false;
     if (use_it) {
