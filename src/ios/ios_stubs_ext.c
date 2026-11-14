@@ -408,38 +408,38 @@ static uint32_t le_emit_all(uint32_t *w, uint32_t cap)
     le_patch(&e, p1, done);
     le_put(&e, 0xE0420003U);
     le_put(&e, 0xE12FFF1EU);
-    /* _strncmp(r0, r1, r2): bounded loop, 0 when n runs out. */
+    /* _strncmp(r0, r1, r2): bounded loop, 0 when n runs out (uses r12, never callee-saved r4). */
     le_reg("_strncmp", &e);
     loop = le_mark(&e);
     le_put(&e, 0xE2522001U);
     p1 = le_b_fwd(&e, 3U);
     le_put(&e, 0xE4D03001U);
-    le_put(&e, 0xE4D14001U);
-    le_put(&e, 0xE1530004U);
+    le_put(&e, 0xE4D1C001U);
+    le_put(&e, 0xE153000CU);
     p2 = le_b_fwd(&e, 1U);
     le_put(&e, 0xE3530000U);
     le_b(&e, 1U, loop);
     diff = le_mark(&e);
     le_patch(&e, p2, diff);
-    le_put(&e, 0xE0430004U);
+    le_put(&e, 0xE043000CU);
     le_put(&e, 0xE12FFF1EU);
     zero = le_mark(&e);
     le_patch(&e, p1, zero);
     le_put(&e, 0xE3A00000U);
     le_put(&e, 0xE12FFF1EU);
-    /* _memcmp(r0, r1, r2): bounded loop without NUL check. */
+    /* _memcmp(r0, r1, r2): bounded loop without NUL check (uses r12, never callee-saved r4). */
     le_reg("_memcmp", &e);
     loop = le_mark(&e);
     le_put(&e, 0xE2522001U);
     p1 = le_b_fwd(&e, 3U);
     le_put(&e, 0xE4D03001U);
-    le_put(&e, 0xE4D14001U);
-    le_put(&e, 0xE1530004U);
+    le_put(&e, 0xE4D1C001U);
+    le_put(&e, 0xE153000CU);
     p2 = le_b_fwd(&e, 1U);
     le_b(&e, 14U, loop);
     diff = le_mark(&e);
     le_patch(&e, p2, diff);
-    le_put(&e, 0xE0430004U);
+    le_put(&e, 0xE043000CU);
     le_put(&e, 0xE12FFF1EU);
     zero = le_mark(&e);
     le_patch(&e, p1, zero);
@@ -514,23 +514,38 @@ static uint32_t le_emit_all(uint32_t *w, uint32_t cap)
     return e.n;
 }
 
+static uint32_t g_leaf_code[256];
+static uint32_t g_leaf_nwords = 0U;
+
+static bool le_ensure_code_locked(void)
+{
+    if (!g_leaf_ok) {
+        g_leaf_nwords = le_emit_all(g_leaf_code, 256U);
+        if (g_leaf_nwords == 0U ||
+            (size_t)g_leaf_nwords * 4U > A32_IOS_LEAF_STUB_SIZE) {
+            g_leaf_nwords = 0U;
+            return false;
+        }
+        g_leaf_ok = true;
+    }
+    return true;
+}
+
 int a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx)
 {
-    static uint32_t code[256];
     uint32_t nwords;
     uint32_t tp0 = 0U;
     uint8_t *base;
-    bool sealed_rw = false;
     if (ctx == NULL) {
         return -1;
     }
     (void)pthread_mutex_lock(&g_leaf_mu);
-    if (g_leaf_ok) {
+    if (!le_ensure_code_locked()) {
         (void)pthread_mutex_unlock(&g_leaf_mu);
-        return 0;
+        return -1;
     }
-    /* Only bind `_pthread_self` (and siblings) when TPIDRURO slot 0
-     * really is the pthread pointer on this thread. */
+    nwords = g_leaf_nwords;
+    /* Verify TPIDRURO slot 0 holds the main pthread pointer. */
     if (ctx->tls_tp == 0U || ctx->ios_pthread_va == 0U ||
         !a32_guest_range_ok(ctx, ctx->tls_tp, 4U, (uint32_t)PROT_READ)) {
         (void)pthread_mutex_unlock(&g_leaf_mu);
@@ -541,36 +556,10 @@ int a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx)
         (void)pthread_mutex_unlock(&g_leaf_mu);
         return -1;
     }
-    nwords = le_emit_all(code, 256U);
-    if (nwords == 0U || (size_t)nwords * 4U > A32_IOS_LEAF_STUB_SIZE) {
-        (void)pthread_mutex_unlock(&g_leaf_mu);
-        return -1;
-    }
-    if (!a32_guest_range_ok(ctx, A32_IOS_LEAF_STUB_VA,
-        (uint32_t)(nwords * 4U), (uint32_t)(PROT_READ | PROT_WRITE))) {
-        if (a32_vm_mprotect(ctx, A32_IOS_LEAF_STUB_VA,
-            A32_IOS_LEAF_STUB_SIZE,
-            (uint32_t)(PROT_READ | PROT_WRITE)) != 0) {
-            (void)pthread_mutex_unlock(&g_leaf_mu);
-            return -1;
-        }
-        sealed_rw = true;
-    }
+    /* Called from ios_setup_tramp while [A32_IOS_TRAMP_BASE_VA, +SIZE) is RW
+     * prior to ios_seal(..., 0x5u, "ios_tramp"). */
     base = (uint8_t *)a32_guest_ptr(ctx, A32_IOS_LEAF_STUB_VA);
-    memcpy(base, code, (size_t)nwords * 4U);
-    if (sealed_rw && a32_vm_mprotect(ctx, A32_IOS_LEAF_STUB_VA,
-        A32_IOS_LEAF_STUB_SIZE,
-        (uint32_t)(PROT_READ | PROT_EXEC)) != 0) {
-        (void)pthread_mutex_unlock(&g_leaf_mu);
-        return -1;
-    }
-    a32_vm32_copyout_invalidate_exec(ctx, A32_IOS_LEAF_STUB_VA,
-        (size_t)nwords * 4U);
-    (void)a32_jit_invalidate_range(ctx, A32_IOS_LEAF_STUB_VA,
-        A32_IOS_LEAF_STUB_VA + nwords * 4U);
-    __builtin___clear_cache((char *)base,
-        (char *)base + (size_t)nwords * 4U);
-    g_leaf_ok = true;
+    memcpy(base, g_leaf_code, (size_t)nwords * 4U);
     (void)pthread_mutex_unlock(&g_leaf_mu);
     return 0;
 }
@@ -596,15 +585,19 @@ uint32_t a32_ios_lookup_synth_ext(a32_ctx_t *ctx, const char *sym_name,
     if (ctx == NULL || sym_name == NULL) {
         return 0U;
     }
-    (void)a32_ios_emit_native_leaf_stubs(ctx);
+    (void)pthread_mutex_lock(&g_leaf_mu);
+    (void)le_ensure_code_locked();
     for (i = 0U; i < g_leaf_count; i++) {
         if (strcmp(sym_name, g_leaf_syms[i].name) == 0) {
+            uint32_t va = A32_IOS_LEAF_STUB_VA + g_leaf_syms[i].off * 4U;
+            (void)pthread_mutex_unlock(&g_leaf_mu);
             if (out_found != NULL) {
                 *out_found = true;
             }
-            return A32_IOS_LEAF_STUB_VA + g_leaf_syms[i].off * 4U;
+            return va;
         }
     }
+    (void)pthread_mutex_unlock(&g_leaf_mu);
     for (i = 0U; i < sizeof(kRtSyms) / sizeof(kRtSyms[0]); i++) {
         if (strcmp(sym_name, kRtSyms[i].name) == 0) {
             if (out_found != NULL) {

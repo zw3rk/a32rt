@@ -886,7 +886,8 @@ bool a32_interp_vfp_step(a32_ctx_t *ctx, uint32_t insn)
             return false;
         }
         if (((insn >> 4) & 1U) != 0U) {
-            return vfp_mcr_mrc(ctx, ctx->regs[15] & ~1U, insn);
+            return vfp_mcr_mrc(ctx, ctx->regs[15] & ~1U, insn) ||
+                i_vfp_neon_int(ctx, ctx->regs[15] & ~1U, insn);
         }
         return vfp_cdp(ctx, ctx->regs[15] & ~1U, insn);
     }

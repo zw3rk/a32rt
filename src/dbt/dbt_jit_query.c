@@ -165,14 +165,17 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
             }
 
             if (!uncached && !buf.overflow && buf.has_self_loop &&
-                !buf.vfp_preheader_ineligible && buf.vfp_preheader_count > 0U) {
+                !buf.vfp_preheader_ineligible &&
+                (buf.vfp_preheader_count > 0U || (buf.saw_neon_fp && !buf.saw_scalar_vfp))) {
                 uint8_t  saved_kinds[A64_VFP_CACHE_SLOTS];
                 uint8_t  saved_regs[A64_VFP_CACHE_SLOTS];
                 unsigned saved_count   = buf.vfp_preheader_count;
                 uint32_t saved_written = buf.vfp_preheader_written;
                 bool pass1_neon_only = buf.saw_neon_fp && !buf.saw_scalar_vfp;
-                memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
-                memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
+                if (saved_count > 0U) {
+                    memcpy(saved_kinds, buf.vfp_preheader_kinds, saved_count);
+                    memcpy(saved_regs, buf.vfp_preheader_regs, saved_count);
+                }
 
                 a32_jit_stage_reset();
                 a32_emit_sites_reset_block(cur_b_pc);

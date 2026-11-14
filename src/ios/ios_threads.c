@@ -658,7 +658,9 @@ int a32_ios_stub_pthread(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled)
     }
     case 90U: {
         thr_t *t, *self; uint32_t rv, idx, sa, sl, ta; a32_ctx_t *lc; pthread_t ht;
+        if (r0 != 0U && r0 == ctx->ios_pthread_va) { ctx->regs[0] = (uint32_t)DE_DEADLK; break; }
         (void)pthread_mutex_lock(&g_thr_mu);
+        if (!g_thr[0].used && ctx->ios_pthread_va == 0xFFFF5400U) { g_thr[0].used = true; g_thr[0].pva = 0xFFFF5400U; g_thr[0].ch = ctx; ctx->ios_thr_slot_plus1 = 1U; }
         t = thr_by_pthread(r0);
         self = thr_by_ctx(ctx);
         if (t == NULL) { (void)pthread_mutex_unlock(&g_thr_mu); ctx->regs[0] = (uint32_t)DE_SRCH; break; }

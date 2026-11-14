@@ -28,8 +28,13 @@ exports:
                        _sys_icache_invalidate,
                        _sigaction, _sigprocmask, _kill, _raise,
                        _pthread_self, _pthread_create, _pthread_join,
+                       _pthread_detach, _pthread_once,
                        _pthread_mutex_init, _pthread_mutex_lock,
+                       _pthread_mutex_trylock,
                        _pthread_mutex_unlock, _pthread_mutex_destroy,
+                       _pthread_cond_init, _pthread_cond_wait,
+                       _pthread_cond_signal, _pthread_cond_broadcast,
+                       _pthread_cond_destroy,
                        _pthread_key_create, _pthread_setspecific,
                        _pthread_getspecific ]
 ...

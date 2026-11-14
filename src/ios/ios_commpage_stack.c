@@ -284,10 +284,10 @@ int a32_ios_commpage_setup(a32_ctx_t *ctx)
     if (ios_seal(ctx, A32_IOS_COMMPAGE_VA, 0x1000u, 0x1u, "ios_commpage") != 0) {
         return -1;
     }
-    if (ios_setup_tramp(ctx) != 0) {
+    if (ios_setup_runtime_data(ctx) != 0) {
         return -1;
     }
-    if (ios_setup_runtime_data(ctx) != 0) {
+    if (ios_setup_tramp(ctx) != 0) {
         return -1;
     }
     return 0;

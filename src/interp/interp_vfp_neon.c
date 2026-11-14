@@ -74,34 +74,33 @@ bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted)
         unsigned rm = insn & 0xFU;
         unsigned nregs = (type == 0x7U) ? 1U : (type == 0xAU) ? 2U :
                          (type == 0x6U) ? 3U : (type == 0x2U) ? 4U : 0U;
-        if (nregs == 0U) {
-            return false;
-        }
-        uint32_t addr = ctx->regs[rn];
-        if (!i_mem_ok(ctx, addr, nregs * 8U, l ? (uint32_t)PROT_READ : (uint32_t)PROT_WRITE)) {
-            *faulted = true;
-            (void)i_fault(ctx, addr, !l);
-            return true;
-        }
-        for (unsigned r = 0U; r < nregs; r++) {
-            unsigned d = (d_start + r) & 31U;
-            if (l) {
-                if (!mem_r(ctx, addr + r * 8U, &ctx->vfp_d[d], 8U)) {
-                    *faulted = true;
-                    return true;
-                }
-            } else {
-                if (!mem_w(ctx, addr + r * 8U, &ctx->vfp_d[d], 8U)) {
-                    *faulted = true;
-                    return true;
+        if (nregs != 0U) {
+            uint32_t addr = ctx->regs[rn];
+            if (!i_mem_ok(ctx, addr, nregs * 8U, l ? (uint32_t)PROT_READ : (uint32_t)PROT_WRITE)) {
+                *faulted = true;
+                (void)i_fault(ctx, addr, !l);
+                return true;
+            }
+            for (unsigned r = 0U; r < nregs; r++) {
+                unsigned d = (d_start + r) & 31U;
+                if (l) {
+                    if (!mem_r(ctx, addr + r * 8U, &ctx->vfp_d[d], 8U)) {
+                        *faulted = true;
+                        return true;
+                    }
+                } else {
+                    if (!mem_w(ctx, addr + r * 8U, &ctx->vfp_d[d], 8U)) {
+                        *faulted = true;
+                        return true;
+                    }
                 }
             }
+            if (rm != 0xFU) {
+                ctx->regs[rn] = addr + ((rm == 0xDU) ? (nregs * 8U) : ctx->regs[rm]);
+            }
+            ctx->regs[15] = pc + 4U;
+            return true;
         }
-        if (rm != 0xFU) {
-            ctx->regs[rn] = addr + ((rm == 0xDU) ? (nregs * 8U) : ctx->regs[rm]);
-        }
-        ctx->regs[15] = pc + 4U;
-        return true;
     }
     if ((insn & 0xFEB80090U) == 0xF2800010U) {
         uint8_t imm8 = (uint8_t)((((insn >> 24) & 1U) << 7) |
@@ -152,7 +151,7 @@ bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted)
         unsigned dd = (((insn >> 22) & 1U) << 4) | ((insn >> 12) & 0xFU);
         unsigned dm = (((insn >> 5) & 1U) << 4) | (insn & 0xFU);
         if (op > 2U || size > 2U || (op + size) >= 3U) {
-            return false;
+            goto neon_after_vrev;
         }
         unsigned regs = is_q ? 2U : 1U;
         for (unsigned r = 0U; r < regs; r++) {

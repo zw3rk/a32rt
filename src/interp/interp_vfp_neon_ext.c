@@ -885,5 +885,5 @@ bool i_vfp_neon_ext(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted)
     if (x_alu(ctx, pc, insn)) {
         return true;
     }
-    return false;
+    return i_vfp_neon_int(ctx, pc, insn);
 }

@@ -39,6 +39,9 @@ if [ "$(uname)" = "Darwin" ]; then
             NEED_BUILD=1
         fi
     done
+    if [ "$NEED_BUILD" = "0" ] && [ -n "$(find "$ROOT/tests/ios" -newer "$OUT/test-ios-static" 2>/dev/null)" ]; then
+        NEED_BUILD=1
+    fi
     if [ "$NEED_BUILD" = "1" ]; then
         echo "▸ building iOS fixtures"
         sh "$ROOT/tests/ios/build_ios_fixtures.sh" || exit 1
