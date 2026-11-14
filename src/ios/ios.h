@@ -60,7 +60,9 @@
 #define IOS_LC_DYLD_INFO             0x00000022U
 #define IOS_LC_DYLD_INFO_ONLY        (0x00000022U | IOS_LC_REQ_DYLD)
 #define IOS_LC_LOAD_UPWARD_DYLIB     (0x00000023U | IOS_LC_REQ_DYLD)
+#define IOS_LC_FUNCTION_STARTS       0x00000026U
 #define IOS_LC_MAIN                  (0x00000028U | IOS_LC_REQ_DYLD)
+#define IOS_LC_DATA_IN_CODE          0x00000029U
 
 #define IOS_SECTION_TYPE_MASK        0x000000FFU
 #define IOS_S_NON_LAZY_SYMBOL_PTRS   0x06U
@@ -91,6 +93,9 @@
 #define A32_IOS_THRTRAMP_VA          0xFFFF1900U /* Thumb-2 pthread start wrapper */
 #define A32_IOS_STUB_BASE_VA         0xFFFF2000U /* 256 * 8B Thumb-2 svc #0x81 stubs */
 #define A32_IOS_MAX_STUBS            256U
+#define A32_IOS_LEAF_STUB_VA         0xFFFF2800U /* 6 KiB native Thumb-2 leaf stubs */
+#define A32_IOS_LEAF_STUB_SIZE       0x00001800U
+#define A32_IOS_C_EXIT_STUB_VA       ((A32_IOS_STUB_BASE_VA + 5U * 8U) | 1U)
 #define A32_IOS_COMMPAGE_VA          0xFFFF4000U /* 4 KiB RO XNU 32-bit _COMM_PAGE */
 #define A32_IOS_RUNTIME_DATA_VA      0xFFFF5000U /* 4 KiB RW TSD/pthread/errno/stdio */
 
@@ -178,6 +183,13 @@ typedef struct ios_symtab_command {
     uint32_t strsize;
 } ios_symtab_command_t;
 
+typedef struct ios_linkedit_data_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t dataoff;
+    uint32_t datasize;
+} ios_linkedit_data_command_t;
+
 typedef struct ios_dysymtab_command {
     uint32_t cmd;
     uint32_t cmdsize;
@@ -241,6 +253,13 @@ typedef struct a32_ios_image {
     bool                    dep_weak[A32_IOS_MAX_DEPS];
     size_t                  rpath_count;
     char                    rpaths[A32_IOS_MAX_RPATHS][256];
+    uint64_t                st_dev;
+    uint64_t                st_ino;
+    bool                    has_fn_starts;
+    ios_linkedit_data_command_t fn_starts;
+    uint8_t                *cached_export;
+    uint8_t                *cached_symtab;
+    uint8_t                *cached_strtab;
 } a32_ios_image_t;
 
 /* ---- Compiler-verified 32-bit iOS (APCS-GNU 4B-aligned) kernel structs ---- */
@@ -324,8 +343,13 @@ bool     a32_ios_rd_sleb(const uint8_t *buf, size_t size, size_t *pos, int64_t *
 uint32_t a32_ios_resolve_in(a32_ctx_t *ctx, a32_ios_image_t *images,
                             size_t image_count, size_t img_idx,
                             const char *sym_name, unsigned depth, bool *out_found);
+void     a32_ios_free_image_caches(a32_ios_image_t *images, size_t image_count);
 int      a32_ios_bind_all(a32_ctx_t *ctx, a32_ios_image_t *images, size_t image_count);
 uint32_t a32_ios_lookup_synth_sym(a32_ctx_t *ctx, const char *sym_name, bool *out_found);
+uint32_t a32_ios_lookup_synth_ext(a32_ctx_t *ctx, const char *sym_name, bool *out_found);
+int      a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx);
+int      a32_ios_handle_stub_ext(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled);
+void     a32_ios_exit_teardown(a32_ctx_t *ctx, int code);
 
 /* CommPage, trampolines, and Darwin stack setup (ios_commpage_stack.c) */
 int      a32_ios_commpage_setup(a32_ctx_t *ctx);
@@ -344,8 +368,12 @@ int      a32_ios_dispatch_bsd_proc_net(a32_ctx_t *ctx, uint32_t bsd_nr,
                                        const uint32_t *args, bool *out_handled);
 int      a32_ios_dispatch_bsd_sock(a32_ctx_t *ctx, uint32_t bsd_nr,
                                    const uint32_t *args, bool *out_handled);
+int      a32_ios_dispatch_bsd_kevent(a32_ctx_t *ctx, uint32_t bsd_nr,
+                                     const uint32_t *args, bool *out_handled);
 void     a32_ios_kq_close(int fd);
+void     a32_ios_kq_atfork_reset(void);
 int      a32_ios_dispatch_mach_or_arm_trap(a32_ctx_t *ctx, uint32_t raw_r12);
+uint32_t a32_ios_mach_thread_self_port(a32_ctx_t *ctx);
 int      a32_ios_dispatch_thread_sync_bsd(a32_ctx_t *ctx, uint32_t bsd_nr,
                                           const uint32_t *args, bool *out_handled);
 int      a32_ios_thread_kill_target(a32_ctx_t *caller, uint32_t target_id, int host_sig);

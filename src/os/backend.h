@@ -74,4 +74,13 @@ int a32_backend_worker_sync_init(a32_worker_sync_t *ws);
 void a32_backend_worker_sync_destroy(a32_worker_sync_t *ws);
 void a32_backend_worker_notify_signal(a32_worker_sync_t *ws);
 
+/* ---- 5. Darwin host futex wait/wake table (A32-IOS-D11) ---- */
+#if !defined(__linux__)
+int a32_backend_darwin_futex(a32_ctx_t *ctx, uint32_t uaddr_va, uint32_t op,
+    uint32_t val, const void *timeout_ts, uint32_t val2,
+    uint32_t uaddr2_va, uint32_t val3);
+void a32_backend_darwin_futex_wake(a32_ctx_t *ctx, uint32_t uaddr_va,
+    uint32_t count);
+#endif
+
 #endif /* A32RT_OS_BACKEND_H */

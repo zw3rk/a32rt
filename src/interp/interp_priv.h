@@ -45,8 +45,9 @@ uint32_t i_t32_mem_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2)
  * insn is a memory-block encoding and returns its exit code. */
 uint32_t i_a32_mem_step(a32_ctx_t *ctx, uint32_t pc, uint32_t insn,
     bool *claimed);
-/* NEON memory/VMOV-imm/VREV/VALU subset (interp_vfp_neon.c). */
+/* NEON memory/VMOV-imm/VREV/VALU subset (interp_vfp_neon.c & interp_vfp_neon_ext.c). */
 bool i_vfp_neon(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted);
+bool i_vfp_neon_ext(a32_ctx_t *ctx, uint32_t pc, uint32_t insn, bool *faulted);
 
 /* Narrow guest memory accessors shared by the VFP/NEON step files. */
 static inline bool mem_r(a32_ctx_t *ctx, uint32_t va, void *out, uint32_t len)

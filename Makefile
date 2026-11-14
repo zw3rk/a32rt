@@ -97,6 +97,7 @@ SRCS := src/main.c \
         src/interp/interp_t32_mem_step.c \
         src/interp/interp_vfp.c \
         src/interp/interp_vfp_neon.c \
+        src/interp/interp_vfp_neon_ext.c \
         src/dbt/difftest.c \
         src/vm/vm32.c \
         src/vm/vm_file.c \
@@ -113,10 +114,12 @@ SRCS := src/main.c \
         src/ios/ios_svc_bsd_fs.c \
         src/ios/ios_svc_bsd_proc.c \
         src/ios/ios_svc_bsd_sock.c \
+        src/ios/ios_svc_bsd_kevent.c \
         src/ios/ios_svc_mach.c \
         src/ios/ios_signals.c \
         src/ios/ios_threads.c \
         src/ios/ios_stubs.c \
+        src/ios/ios_stubs_ext.c \
         src/os/backend_sync.c \
         $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S

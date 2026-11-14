@@ -16,6 +16,7 @@
 #endif
 
 #include "a32rt.h"
+#include "os/backend.h"
 #include "vm/vm32.h"
 #include "vm/vm_priv.h"
 

@@ -175,6 +175,9 @@ typedef struct a32_ctx {
     uint32_t    ios_wqthread_va;
     uint32_t    ios_init_count;
     uint32_t    ios_init_va[64];
+    uint32_t    ios_thr_slot_plus1;
+    uint32_t    ios_fn_starts_count;
+    uint32_t   *ios_fn_starts;
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
