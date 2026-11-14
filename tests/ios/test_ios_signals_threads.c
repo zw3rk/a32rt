@@ -96,6 +96,174 @@ static ios_pthread_mutex_t g_mu;
 static volatile int g_counter = 0;
 static ios_pthread_key_t g_key = 0U;
 
+/* Synthetic cond stubs are outside the minimal link-time TBD, so reach them
+ * through the stub island (mov.w r12, #id; svc #0x81; bx lr): the same
+ * trampolines bound symbols resolve to at runtime. */
+#define IOS_STUB_ISLAND_VA 0xFFFF2000U
+#define IOS_STUB_COND_INIT 97U
+#define IOS_STUB_COND_WAIT 98U
+#define IOS_STUB_COND_SIGNAL 99U
+#define IOS_STUB_COND_BROADCAST 100U
+#define IOS_STUB_COND_DESTROY 101U
+
+typedef struct test_cond {
+    uint32_t words[8];
+} test_cond_t;
+
+static int stub_cond0(uint32_t id, uint32_t a0)
+{
+    int (*fn)(uint32_t) =
+        (int (*)(uint32_t))(uintptr_t)(IOS_STUB_ISLAND_VA + id * 8U + 1U);
+    return fn(a0);
+}
+
+static int stub_cond_wait(uint32_t cond_va, uint32_t mutex_va)
+{
+    int (*fn)(uint32_t, uint32_t) = (int (*)(uint32_t, uint32_t))(uintptr_t)
+        (IOS_STUB_ISLAND_VA + (uint32_t)IOS_STUB_COND_WAIT * 8U + 1U);
+    return fn(cond_va, mutex_va);
+}
+
+/* Zero-initialized static mutex/cond objects materialize host state lazily. */
+static ios_pthread_mutex_t g_static_mu;
+static test_cond_t g_static_cv;
+static ios_pthread_mutex_t g_cv_mu;
+static volatile int g_cv_flag = 0;
+
+static int check_static_mutex(void)
+{
+    static ios_pthread_mutex_t sig_mu;
+    if (pthread_mutex_lock(&g_static_mu) != 0) {
+        printf("FAIL static mutex lock\n");
+        return 1;
+    }
+    if (pthread_mutex_unlock(&g_static_mu) != 0) {
+        printf("FAIL static mutex unlock\n");
+        return 1;
+    }
+    sig_mu.__opaque[0] = 0x32AAABA7U;
+    if (pthread_mutex_lock(&sig_mu) != 0) {
+        printf("FAIL sig mutex lock\n");
+        return 1;
+    }
+    if (pthread_mutex_unlock(&sig_mu) != 0) {
+        printf("FAIL sig mutex unlock\n");
+        return 1;
+    }
+    return 0;
+}
+
+static void *signaler(void *arg)
+{
+    uint32_t cv_va = (uint32_t)(uintptr_t)&g_static_cv;
+    (void)arg;
+    pthread_mutex_lock(&g_cv_mu);
+    g_cv_flag = 1;
+    stub_cond0(IOS_STUB_COND_SIGNAL, cv_va);
+    pthread_mutex_unlock(&g_cv_mu);
+    return (void *)0;
+}
+
+static int check_static_cond(void)
+{
+    uint32_t cv_va = (uint32_t)(uintptr_t)&g_static_cv;
+    uint32_t mu_va = (uint32_t)(uintptr_t)&g_cv_mu;
+    ios_pthread_t th = 0U;
+    void *ret = 0;
+    if (stub_cond0(IOS_STUB_COND_INIT, cv_va) != 0) {
+        printf("FAIL static cond init\n");
+        return 1;
+    }
+    if (stub_cond0(IOS_STUB_COND_BROADCAST, cv_va) != 0) {
+        printf("FAIL static cond broadcast\n");
+        return 1;
+    }
+    g_cv_flag = 0;
+    if (pthread_mutex_init(&g_cv_mu, 0) != 0) {
+        printf("FAIL cv mutex init\n");
+        return 1;
+    }
+    if (pthread_create(&th, 0, signaler, 0) != 0) {
+        printf("FAIL create signaler\n");
+        return 1;
+    }
+    pthread_mutex_lock(&g_cv_mu);
+    while (g_cv_flag == 0) {
+        if (stub_cond_wait(cv_va, mu_va) != 0) {
+            printf("FAIL static cond wait\n");
+            pthread_mutex_unlock(&g_cv_mu);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_cv_mu);
+    if (pthread_join(th, &ret) != 0 || ret != 0) {
+        printf("FAIL join signaler\n");
+        return 1;
+    }
+    if (stub_cond0(IOS_STUB_COND_DESTROY, cv_va) != 0) {
+        printf("FAIL static cond destroy\n");
+        return 1;
+    }
+    if (pthread_mutex_destroy(&g_cv_mu) != 0) {
+        printf("FAIL cv mutex destroy\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int check_self_join(void)
+{
+    if (pthread_join(pthread_self(), 0) != 11) {
+        printf("FAIL self join not EDEADLK\n");
+        return 1;
+    }
+    return 0;
+}
+
+static ios_pthread_key_t g_dtor_key = 0U;
+static volatile int g_dtor_ran = 0;
+static volatile uint32_t g_dtor_val = 0U;
+
+static void dtor_fn(void *v)
+{
+    g_dtor_val = (uint32_t)(uintptr_t)v;
+    g_dtor_ran = 1;
+}
+
+static void *tsd_worker(void *arg)
+{
+    if (pthread_setspecific(g_dtor_key, arg) != 0) {
+        return (void *)1;
+    }
+    return (void *)0;
+}
+
+static int check_tsd_dtor(void)
+{
+    ios_pthread_t th = 0U;
+    void *ret = 0;
+    g_dtor_ran = 0;
+    g_dtor_val = 0U;
+    if (pthread_key_create(&g_dtor_key, dtor_fn) != 0) {
+        printf("FAIL dtor key_create\n");
+        return 1;
+    }
+    if (pthread_create(&th, 0, tsd_worker, (void *)0x1234U) != 0) {
+        printf("FAIL create tsd worker\n");
+        return 1;
+    }
+    if (pthread_join(th, &ret) != 0 || ret != 0) {
+        printf("FAIL join tsd worker\n");
+        return 1;
+    }
+    if (g_dtor_ran != 1 || g_dtor_val != 0x1234U) {
+        printf("FAIL dtor ran=%d val=%lx\n", g_dtor_ran,
+            (unsigned long)g_dtor_val);
+        return 1;
+    }
+    return 0;
+}
+
 static void *worker(void *arg)
 {
     int i = 0;
@@ -172,7 +340,19 @@ int main(int argc, char **argv)
     if (check_sigsegv() != 0) {
         return 1;
     }
+    if (check_static_mutex() != 0) {
+        return 1;
+    }
+    if (check_self_join() != 0) {
+        return 1;
+    }
     if (run_threads && check_threads() != 0) {
+        return 1;
+    }
+    if (run_threads && check_static_cond() != 0) {
+        return 1;
+    }
+    if (run_threads && check_tsd_dtor() != 0) {
         return 1;
     }
     printf("PASS test_ios_signals_threads\n");

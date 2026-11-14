@@ -143,7 +143,7 @@ typedef struct {
 } ios_act_t;
 
 static ios_act_t g_ios_acts[32];
-static siginfo_t g_ios_pending_info[32];
+static _Thread_local siginfo_t g_ios_pending_info[33];
 static __thread bool g_has_sigsuspend_mask;
 static __thread uint64_t g_sigsuspend_mask;
 
@@ -642,6 +642,7 @@ int a32_ios_sys_sigsuspend(a32_ctx_t *ctx, uint32_t mask)
          ~ctx->sig_mask) != 0ULL) {
         g_has_sigsuspend_mask = true;
         g_sigsuspend_mask = saved;
+        a32_ios_bsd_err(ctx, (int)IOS_EINTR);
         a32_ios_signals_check_pending(ctx);
         if (g_has_sigsuspend_mask) {
             g_has_sigsuspend_mask = false;
@@ -656,7 +657,6 @@ int a32_ios_sys_sigsuspend(a32_ctx_t *ctx, uint32_t mask)
 int a32_ios_sys_kill(a32_ctx_t *ctx, int pid, int dsig, int posix)
 {
     int host_sig = 0;
-    (void)ctx;
     (void)posix;
     if (dsig != 0) {
         if (dsig < 1 || dsig > 31) {
@@ -666,6 +666,10 @@ int a32_ios_sys_kill(a32_ctx_t *ctx, int pid, int dsig, int posix)
         if (host_sig < 0) {
             return -IOS_EINVAL;
         }
+    }
+    if (host_sig > 0 && ctx != NULL && (pid_t)pid == getpid()) {
+        a32_ios_signals_enqueue_host(ctx, host_sig, NULL);
+        return 0;
     }
     if (kill((pid_t)pid, host_sig) != 0) {
         return -a32_ios_host_to_darwin_errno(errno);
@@ -688,9 +692,6 @@ int a32_ios_sys_pthread_kill(a32_ctx_t *ctx, uint32_t port_or_tid, int dsig)
     }
     if (a32_ios_thread_kill_target(ctx, port_or_tid, host_sig) < 0) {
         return -IOS_ESRCH;
-    }
-    if (host_sig > 0) {
-        a32_ios_signals_check_pending(ctx);
     }
     return 0;
 }

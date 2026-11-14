@@ -819,7 +819,9 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
                              basic_op == 12U /* FUTEX_CMP_REQUEUE_PI */);
         void *uaddr2 = NULL;
         if (takes_uaddr2) {
-            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a4, 4U, PROT_READ));
+            uint32_t uaddr2_prot = (basic_op == 5U) ?
+                (uint32_t)(PROT_READ | PROT_WRITE) : (uint32_t)PROT_READ;
+            FAIL_EFAULT_IF(!a32_guest_range_ok(ctx, a4, 4U, uaddr2_prot));
             uaddr2 = a32_guest_ptr(ctx, a4);
         } else {
             uaddr2 = (void *)(uintptr_t)a4;
@@ -828,10 +830,9 @@ int a32_sys_dispatch_sig_time(a32_ctx_t *ctx)
         ctx->regs[0] = host_ret(syscall(SYS_futex, a32_guest_ptr(ctx, a0),
                                         (int)a1, a2, arg4, uaddr2, a5));
 #else
-        (void)arg4; (void)uaddr2;
-        if (!futex_darwin_wait(ctx, a0, a1, a2, a3, a5, time64)) {
-            ctx->regs[0] = 0U;
-        }
+        (void)uaddr2;
+        ctx->regs[0] = (uint32_t)a32_backend_darwin_futex(ctx, a0, a1, a2,
+            has_timeout ? arg4 : NULL, a3, a4, a5);
 #endif
         break;
     }
