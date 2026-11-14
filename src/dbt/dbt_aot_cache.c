@@ -191,7 +191,11 @@ static void copy_file(const char *src_path, const char *dst_path)
         close(src_fd);
         return;
     }
-    int dst_fd = open(tmp_dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    /* Same atomic-replace discipline as a32_aot_save_cache: drop any stale
+     * temp, then create exclusively without following symlinks. */
+    (void)unlink(tmp_dst);
+    int dst_fd =
+        open(tmp_dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (dst_fd < 0) {
         close(src_fd);
         return;
