@@ -46,20 +46,17 @@
 #define IOS_INDIRECT_LOCAL 0x80000000u
 #define IOS_BIND_FLAG_WEAK_IMPORT 0x01u
 #define IOS_BIND_FLAG_NON_WEAK_DEF 0x08u
+#define IOS_N_WEAK_REF 0x0040u
 
 static bool ios_addr_ok(const a32_ios_image_t *img, uint32_t va)
 {
     size_t k;
     for (k = 0; k < img->seg_count; k++) {
         uint32_t start;
-        if (img->segs[k].is_pagezero || img->segs[k].vmsize == 0u) {
-            continue;
-        }
+        if (img->segs[k].is_pagezero || img->segs[k].vmsize == 0u) { continue; }
         start = a32_page_down(img->segs[k].vmaddr);
         if (va >= start && va + 4u > va &&
-            va + 4u <= start + img->segs[k].vmsize) {
-            return true;
-        }
+            va + 4u <= start + img->segs[k].vmsize) { return true; }
     }
     return false;
 }
@@ -69,9 +66,7 @@ static bool ios_addr_ok_any(const a32_ios_image_t *images, size_t count,
 {
     size_t k;
     for (k = 0; k < count; k++) {
-        if (!images[k].is_synthetic && ios_addr_ok(&images[k], va)) {
-            return true;
-        }
+        if (!images[k].is_synthetic && ios_addr_ok(&images[k], va)) { return true; }
     }
     return false;
 }
@@ -83,21 +78,15 @@ static uint32_t *ios_slot_ptr(const a32_ctx_t *ctx, const a32_ios_image_t *img,
     uint32_t start;
     uint64_t end;
     uint64_t va;
-    if (seg_idx >= (uint32_t)img->seg_count) {
-        return NULL;
-    }
+    if (seg_idx >= (uint32_t)img->seg_count) { return NULL; }
     if (img->segs[seg_idx].is_pagezero || img->segs[seg_idx].vmsize == 0u) {
         return NULL;
     }
-    if (seg_off + 4u > (uint64_t)img->segs[seg_idx].vmsize) {
-        return NULL;
-    }
+    if (seg_off + 4u > (uint64_t)img->segs[seg_idx].vmsize) { return NULL; }
     start = a32_page_down(img->segs[seg_idx].vmaddr);
     end = (uint64_t)start + (uint64_t)img->segs[seg_idx].vmsize;
     va = (uint64_t)start + seg_off;
-    if (va < (uint64_t)start || va + 4u > end) {
-        return NULL;
-    }
+    if (va < (uint64_t)start || va + 4u > end) { return NULL; }
     return (uint32_t *)a32_guest_ptr(ctx, (uint32_t)va);
 }
 
@@ -236,9 +225,7 @@ static int ios_run_local_relocs(a32_ctx_t *ctx, a32_ios_image_t *img)
         uint32_t va;
         uint32_t v;
         memcpy(&addr, e, 4);
-        if ((addr & 0x80000000u) != 0u) {
-            continue;
-        }
+        if ((addr & 0x80000000u) != 0u) { continue; }
         va = img->mh_va + addr;
         if (!ios_addr_ok(img, va)) {
             free(blob);
@@ -273,23 +260,13 @@ static int ios_bind_target(const a32_ios_image_t *img, size_t img_idx,
 {
     (void)image_count;
     if (st->ordinal_is_special) {
-        if (st->ordinal == 0) {
-            return (int)img_idx;
-        }
-        if (st->ordinal == -1) {
-            return 0;
-        }
-        if (st->ordinal == -2) {
-            return -4;
-        }
-        if (st->ordinal == -3) {
-            return -5;
-        }
+        if (st->ordinal == 0) { return (int)img_idx; }
+        if (st->ordinal == -1) { return 0; }
+        if (st->ordinal == -2) { return -4; }
+        if (st->ordinal == -3) { return -5; }
         return -2;
     }
-    if (st->ordinal == 0) {
-        return (int)img_idx;
-    }
+    if (st->ordinal == 0) { return (int)img_idx; }
     if (st->ordinal < 0 ||
         st->ordinal > (int64_t)A32_IOS_MAX_DEPS ||
         (uint64_t)st->ordinal > (uint64_t)img->dep_count) {
@@ -317,9 +294,7 @@ static int ios_bind_once(a32_ctx_t *ctx, a32_ios_image_t *images,
         fprintf(stderr, "a32rt: %s: bind without symbol\n", img->path);
         return -1;
     }
-    if (is_weak && (st->sym_flags & IOS_BIND_FLAG_NON_WEAK_DEF) != 0u) {
-        return 0;
-    }
+    if (is_weak && (st->sym_flags & IOS_BIND_FLAG_NON_WEAK_DEF) != 0u) { return 0; }
     weak = is_weak || ((st->sym_flags & IOS_BIND_FLAG_WEAK_IMPORT) != 0u);
     target = ios_bind_target(img, img_idx, st, image_count);
     if (target == -5) {
@@ -700,6 +675,121 @@ out:
     return rc;
 }
 
+/* Classic external relocations from LC_DYSYMTAB (extreloff/nextrel). */
+static int ios_run_classic_extrel(a32_ctx_t *ctx, a32_ios_image_t *images,
+                                  size_t image_count, size_t img_idx)
+{
+    a32_ios_image_t *img = &images[img_idx];
+    uint8_t *syms = NULL;
+    uint8_t *strs = NULL;
+    uint8_t *ext = NULL;
+    uint64_t ext_bytes;
+    uint64_t sym_bytes;
+    int rc = -1;
+    uint32_t r;
+    if (!img->has_dysymtab || img->dysymtab.extreloff == 0u ||
+        img->dysymtab.nextrel == 0u) {
+        return 0;
+    }
+    if (!img->has_symtab || img->symtab.nsyms == 0u ||
+        img->symtab.strsize == 0u) {
+        return 0;
+    }
+    ext_bytes = (uint64_t)img->dysymtab.nextrel * 8ULL;
+    sym_bytes = (uint64_t)img->symtab.nsyms * (uint64_t)sizeof(ios_nlist32_t);
+    if (ext_bytes > img->slice_size || ext_bytes > 0x10000000ULL ||
+        sym_bytes > img->slice_size || sym_bytes > 0x10000000ULL) {
+        return -1;
+    }
+    syms = a32_ios_read_blob(img, img->symtab.symoff, (uint32_t)sym_bytes);
+    strs = a32_ios_read_blob(img, img->symtab.stroff, img->symtab.strsize);
+    ext = a32_ios_read_blob(img, img->dysymtab.extreloff, (uint32_t)ext_bytes);
+    if (syms == NULL || strs == NULL || ext == NULL) {
+        goto out;
+    }
+    for (r = 0; r < img->dysymtab.nextrel; r++) {
+        const uint8_t *e = ext + (size_t)r * 8u;
+        const uint8_t *se;
+        uint32_t raw_addr;
+        uint32_t info;
+        uint32_t symnum;
+        uint32_t slot_va;
+        uint32_t strx;
+        uint16_t n_desc;
+        const char *nm;
+        uint32_t sym_addr = 0;
+        bool found = false;
+        uint32_t add;
+        uint32_t val;
+        size_t k;
+        size_t s;
+        bool ok = false;
+        memcpy(&raw_addr, e, 4);
+        memcpy(&info, e + 4, 4);
+        if ((raw_addr & 0x80000000u) != 0u) {
+            continue;
+        }
+        if (((info >> 27) & 1u) != 1u || ((info >> 28) & 0xFu) != 0u ||
+            ((info >> 25) & 3u) != 2u || ((info >> 24) & 1u) != 0u) {
+            continue;
+        }
+        symnum = info & 0x00FFFFFFu;
+        if (symnum >= img->symtab.nsyms) {
+            continue;
+        }
+        slot_va = raw_addr + img->slide;
+        for (s = 0; s < img->seg_count; s++) {
+            uint32_t start;
+            if (img->segs[s].is_pagezero || img->segs[s].vmsize == 0u ||
+                (img->segs[s].initprot & 2u) == 0u) {
+                continue;
+            }
+            start = a32_page_down(img->segs[s].vmaddr);
+            if (slot_va >= start && slot_va + 4u > slot_va &&
+                slot_va + 4u <= start + img->segs[s].vmsize) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            goto out;
+        }
+        se = syms + (size_t)symnum * sizeof(ios_nlist32_t);
+        memcpy(&strx, se, 4);
+        n_desc = (uint16_t)se[6] | ((uint16_t)se[7] << 8);
+        if (strx >= img->symtab.strsize) {
+            continue;
+        }
+        nm = (const char *)(strs + strx);
+        if (memchr(nm, '\0',
+                   (size_t)(img->symtab.strsize - strx)) == NULL) {
+            goto out;
+        }
+        for (k = 0; k < image_count; k++) {
+            sym_addr = a32_ios_resolve_in(ctx, images, image_count, k, nm, 0u,
+                                          &found);
+            if (found) {
+                break;
+            }
+        }
+        if (!found) {
+            if ((n_desc & IOS_N_WEAK_REF) == 0u) {
+                goto out;
+            }
+            sym_addr = 0;
+        }
+        memcpy(&add, a32_guest_ptr(ctx, slot_va), 4);
+        val = sym_addr + add;
+        memcpy(a32_guest_ptr(ctx, slot_va), &val, 4);
+    }
+    rc = 0;
+out:
+    free(syms);
+    free(strs);
+    free(ext);
+    return rc;
+}
+
 int a32_ios_bind_all(a32_ctx_t *ctx, a32_ios_image_t *images,
                      size_t image_count)
 {
@@ -784,6 +874,9 @@ int a32_ios_bind_all(a32_ctx_t *ctx, a32_ios_image_t *images,
             continue;
         }
         if (ios_run_classic_bind(ctx, images, image_count, i) != 0) {
+            return -1;
+        }
+        if (ios_run_classic_extrel(ctx, images, image_count, i) != 0) {
             return -1;
         }
     }
