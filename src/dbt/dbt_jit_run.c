@@ -592,6 +592,11 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
     reason = a32_jit_run_block(ctx, code, (void *)&g_dummy_entry,
         &g_cache_epoch);
     a32_jit_exec_leave();
+    if (reason == A32_EXIT_BRANCH) {
+        ctx->regs[15] &= is_thumb ? ~1U : ~3U;
+    } else if (reason == A32_EXIT_INTERWORK) {
+        a32_set_pc_interwork(ctx, ctx->regs[15]);
+    }
     ctx->exit_reason = reason;
     return reason;
 }

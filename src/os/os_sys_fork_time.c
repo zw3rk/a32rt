@@ -619,9 +619,9 @@ bool a32_guest_range_ok(a32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t req_
     uint64_t max_end;
     if (req_prot == (uint32_t)PROT_READ) {
         max_end = 0x100000000ULL;
-    } else if (va >= 0xFFFF0000U && end <= 0xFFFF1000ULL) {
-        /* kuser helpers page: guest-EXEC, host-READ (A32-R9-12). */
-        max_end = 0xFFFF1000ULL;
+    } else if (va >= 0xFFFF0000U && end <= (ctx->is_ios ? 0xFFFF8000ULL : 0xFFFF1000ULL)) {
+        /* kuser helpers page (Linux) or iOS trampolines / TSD runtime page. */
+        max_end = ctx->is_ios ? 0xFFFF8000ULL : 0xFFFF1000ULL;
     } else {
         max_end = 0xFFFF0000ULL;
     }

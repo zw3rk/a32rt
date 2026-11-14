@@ -39,6 +39,8 @@ uint32_t i_fault(a32_ctx_t *ctx, uint32_t va, bool is_write);
 void i_set_pc_branch(a32_ctx_t *ctx, uint32_t target, bool interwork);
 uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc);
 uint32_t i_thumb_step(a32_ctx_t *ctx, uint32_t pc);
+uint32_t i_t32_step_ext(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2);
+uint32_t i_t32_mem_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2);
 /* Extra load/store + LDM/STM step (interp_a32_mem.c). Sets *claimed when
  * insn is a memory-block encoding and returns its exit code. */
 uint32_t i_a32_mem_step(a32_ctx_t *ctx, uint32_t pc, uint32_t insn,

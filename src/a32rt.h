@@ -162,6 +162,19 @@ typedef struct a32_ctx {
     uint32_t    excl_addr;
     uint32_t    excl_size;
     bool        excl_valid;
+    /* 32-bit iOS (armv7 / armv7s) Mach-O & XNU personality state */
+    bool        is_ios;
+    bool        ios_uses_dyld;
+    bool        ios_has_crt0;
+    bool        difftest_trap_fault;
+    uint32_t    ios_mh_va;
+    uint32_t    ios_main_va;
+    uint32_t    ios_errno_va;
+    uint32_t    ios_pthread_va;
+    uint32_t    ios_threadstart_va;
+    uint32_t    ios_wqthread_va;
+    uint32_t    ios_init_count;
+    uint32_t    ios_init_va[64];
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -217,6 +230,11 @@ static inline uint32_t a32_page_down(uint32_t x)
 static inline uint32_t a32_page_up(uint32_t x)
 {
     return (x + (A32_PAGE_SIZE - 1U)) & ~(A32_PAGE_SIZE - 1U);
+}
+
+static inline uint32_t a32_min_va(const a32_ctx_t *ctx)
+{
+    return (ctx != NULL && ctx->is_ios) ? 0x00001000U : A32_LOW_GUARD_SIZE;
 }
 
 static inline uint32_t a32_make_key(uint32_t pc, bool is_thumb)

@@ -548,7 +548,7 @@ bool a32_jit_range_executable(const a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         return false;
     }
     uint32_t end = addr + len;
-    if (addr >= A32_KUSER_BASE_32 && end <= A32_KUSER_BASE_32 + 0x1000U) {
+    if (!ctx->is_ios && addr >= A32_KUSER_BASE_32 && end <= A32_KUSER_BASE_32 + 0x1000U) {
         return true;
     }
     for (unsigned attempt = 0U; attempt < 2U; attempt++) {

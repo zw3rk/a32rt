@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "a32rt.h"
 #include "dbt/difftest.h"
+#include "ios/ios.h"
 #include "vm/vm32.h"
 
 #include <errno.h>
@@ -374,6 +375,7 @@ int main(int argc, char **argv, char **envp)
     }
 
     ctx.exec_path = exec_path;
+    ctx.is_ios    = a32_ios_is_macho_fd(exec_fd, exec_path, &ctx);
 
     a32_host_probe(&ctx);
 
@@ -388,12 +390,16 @@ int main(int argc, char **argv, char **envp)
     }
 
     a32_elf_info_t elf_info;
-    if (a32_elf_load(&ctx, exec_fd, exec_path, &elf_info) != 0) {
-        return 1;
-    }
-
-    if (a32_kuser_setup(&ctx) != 0) {
-        return 1;
+    if (ctx.is_ios) {
+        if (a32_ios_load(&ctx, exec_fd, exec_path, &elf_info) != 0 ||
+            a32_ios_commpage_setup(&ctx) != 0) {
+            return 1;
+        }
+    } else {
+        if (a32_elf_load(&ctx, exec_fd, exec_path, &elf_info) != 0 ||
+            a32_kuser_setup(&ctx) != 0) {
+            return 1;
+        }
     }
 
     /* A32-R4-7: install host handlers BEFORE applying the captured
@@ -408,7 +414,10 @@ int main(int argc, char **argv, char **envp)
     char **clean_envp = filter_exec_sig_env(envp);
 
     uint32_t initial_sp = 0U;
-    if (a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp) != 0) {
+    int stack_rc = ctx.is_ios
+        ? a32_ios_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp)
+        : a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp);
+    if (stack_rc != 0) {
         return 1;
     }
 

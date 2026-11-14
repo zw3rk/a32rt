@@ -134,7 +134,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
 
     uint64_t old_aligned = a32_vm_page_align_up((uint64_t)old_len);
     uint64_t new_aligned = a32_vm_page_align_up((uint64_t)new_len);
-    if (old_addr < A32_LOW_GUARD_SIZE ||
+    if (old_addr < a32_min_va(ctx) ||
         (uint64_t)old_addr + old_aligned > (uint64_t)A32_KUSER_BASE_32) {
         return (uint32_t)(-EINVAL);
     }
@@ -249,7 +249,7 @@ uint32_t a32_vm_mremap(a32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
             return (uint32_t)(-ENOMEM);
         }
     } else {
-        if ((new_addr & (A32_PAGE_SIZE - 1U)) != 0U || new_addr < A32_LOW_GUARD_SIZE ||
+        if ((new_addr & (A32_PAGE_SIZE - 1U)) != 0U || new_addr < a32_min_va(ctx) ||
             (uint64_t)new_addr + new_aligned > (uint64_t)A32_KUSER_BASE_32 ||
             ((uint64_t)new_addr < (uint64_t)old_addr + old_aligned &&
              (uint64_t)old_addr < (uint64_t)new_addr + new_aligned)) {

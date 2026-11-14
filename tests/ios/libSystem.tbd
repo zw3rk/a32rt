@@ -1,0 +1,31 @@
+--- !tapi-tbd-v3
+# tests/ios/libSystem.tbd — minimal 32-bit iOS libSystem stub for a32rt fixtures.
+# Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+# SPDX-License-Identifier: Apache-2.0
+archs:           [ armv7, armv7s ]
+platform:        ios
+install-name:    /usr/lib/libSystem.B.dylib
+exports:
+  - archs:           [ armv7, armv7s ]
+    symbols:         [ dyld_stub_binder,
+                       ___stack_chk_guard, ___stack_chk_fail,
+                       ___error, _environ,
+                       ___stdoutp, ___stderrp, ___stdinp,
+                       _exit, __exit, _abort,
+                       _read, _write, _open, _close, _unlink, _lseek,
+                       _stat, _fstat, _mmap, _munmap, _mprotect,
+                       _getpid, _gettimeofday, _sysctlbyname, _getentropy,
+                       _malloc, _calloc, _realloc, _free,
+                       _strlen, _strcmp, _strncmp,
+                       _memcpy, _memmove, _memset, _memcmp,
+                       _puts, _printf, _snprintf,
+                       _mach_absolute_time, _mach_timebase_info,
+                       _mach_task_self, _mach_host_self, _mach_thread_self,
+                       _sys_icache_invalidate,
+                       _sigaction, _sigprocmask, _kill, _raise,
+                       _pthread_self, _pthread_create, _pthread_join,
+                       _pthread_mutex_init, _pthread_mutex_lock,
+                       _pthread_mutex_unlock, _pthread_mutex_destroy,
+                       _pthread_key_create, _pthread_setspecific,
+                       _pthread_getspecific ]
+...

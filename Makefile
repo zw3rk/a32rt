@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build build-darwin test tests check check-line-limits check-headers \
+.PHONY: help all build build-darwin test tests check check-line-limits check-headers test-ios \
         test-hello-hl test-hello-lima \
         test-m1-hl test-m1-lima \
         test-m2-hl test-m2-lima \
@@ -93,6 +93,8 @@ SRCS := src/main.c \
         src/interp/interp_a32.c \
         src/interp/interp_a32_mem.c \
         src/interp/interp_thumb.c \
+        src/interp/interp_t32_step.c \
+        src/interp/interp_t32_mem_step.c \
         src/interp/interp_vfp.c \
         src/interp/interp_vfp_neon.c \
         src/dbt/difftest.c \
@@ -102,13 +104,27 @@ SRCS := src/main.c \
         src/vm/vm_mremap.c \
         src/vm/vm_window.c \
         src/dbt/aot/aot_sites.c \
+        src/ios/ios_macho.c \
+        src/ios/ios_dylib.c \
+        src/ios/ios_export.c \
+        src/ios/ios_bind.c \
+        src/ios/ios_commpage_stack.c \
+        src/ios/ios_svc_bsd.c \
+        src/ios/ios_svc_bsd_fs.c \
+        src/ios/ios_svc_bsd_proc.c \
+        src/ios/ios_svc_bsd_sock.c \
+        src/ios/ios_svc_mach.c \
+        src/ios/ios_signals.c \
+        src/ios/ios_threads.c \
+        src/ios/ios_stubs.c \
         src/os/backend_sync.c \
         $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S
 HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
         src/interp/interp.h src/interp/interp_priv.h src/interp/decode_priv.h \
         src/dbt/difftest.h src/dbt/jit_priv.h \
-        src/vm/vm32.h src/vm/vm_priv.h src/os/backend.h src/os/sys_priv.h src/dbt/aot/aot.h
+        src/vm/vm32.h src/vm/vm_priv.h src/os/backend.h src/os/sys_priv.h \
+        src/dbt/aot/aot.h src/ios/ios.h
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
 TEST_BINS := $(BUILD_DIR)/hello-armhf-static \
@@ -644,3 +660,6 @@ bench: bench-hl bench-lima ## Run complete benchmark suite across hyper-linux an
 
 clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR)
+
+test-ios: check build-darwin build ## Run 32-bit iOS (armv7/armv7s) qualification suite (Darwin + Linux Docker)
+	./tools/run_ios_suite.sh

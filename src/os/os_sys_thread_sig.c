@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "ios/ios.h"
 #include "os/sys_priv.h"
 
 static void thread_exit_cleanup(a32_ctx_t *ctx)
@@ -702,8 +703,30 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
                        (gflags & ~(0x100U | 0x200U | 0x1000U)) != 0U);
         int hflags       = ((gflags & 0x100U) ? AT_SYMLINK_NOFOLLOW : 0) |
                            ((gflags & 0x200U) ? AT_EACCESS : 0);
+        char gpath[PATH_MAX];
         char resolved[PATH_MAX];
-        RESOLVE_AT_CONFINED(dirfd, path_va, resolved, (hflags & AT_SYMLINK_NOFOLLOW) == 0);
+        int vfd;
+        int grc = read_guest_cstr(ctx, path_va, gpath, sizeof gpath);
+        if (grc != 0) {
+            FAIL_ERR(-grc);
+        }
+        RESOLVE_AT(dirfd, path_va, resolved, (hflags & AT_SYMLINK_NOFOLLOW) == 0);
+        vfd = try_open_virtual_proc(ctx, gpath, resolved);
+        if (vfd >= 0) {
+            close(vfd);
+            if ((mode & 2U) == 0U &&
+                ((mode & 1U) == 0U || is_proc_self_exe(gpath, resolved))) {
+                ctx->regs[0] = 0U;
+                break;
+            }
+            FAIL_ERR(EACCES);
+        }
+        if (vfd != VIRTUAL_PROC_NOT_MATCHED) {
+            FAIL_ERR(-vfd);
+        }
+        if (a32_sys_path_denied(ctx, resolved)) {
+            FAIL_ERR(ENOENT);
+        }
         if (nr == ARM_NR_faccessat2) {
 #if defined(__linux__)
             long rc = syscall(SYS_faccessat2, dirfd, resolved, (int)mode, (int)gflags);
@@ -745,53 +768,18 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
         break;
     }
 
-    case ARM_NR_getpid:
-        ctx->regs[0] = (uint32_t)getpid();
-        break;
-
-    case ARM_NR_getppid:
-        ctx->regs[0] = (uint32_t)getppid();
-        break;
-
-    case ARM_NR_getpgrp:
-        ctx->regs[0] = (uint32_t)getpgrp();
-        break;
-
-    case ARM_NR_gettid:
-        ctx->regs[0] = (uint32_t)get_host_tid(ctx);
-        break;
-
-    case ARM_NR_getuid32:
-        ctx->regs[0] = (uint32_t)getuid();
-        break;
-
-    case ARM_NR_geteuid32:
-        ctx->regs[0] = (uint32_t)geteuid();
-        break;
-
-    case ARM_NR_getgid32:
-        ctx->regs[0] = (uint32_t)getgid();
-        break;
-
-    case ARM_NR_getegid32:
-        ctx->regs[0] = (uint32_t)getegid();
-        break;
-
-    case ARM_NR_setuid32:
-        ctx->regs[0] = host_ret(setuid((uid_t)a0));
-        break;
-
-    case ARM_NR_setgid32:
-        ctx->regs[0] = host_ret(setgid((gid_t)a0));
-        break;
-
-    case ARM_NR_setreuid32:
-        ctx->regs[0] = host_ret(setreuid((uid_t)a0, (uid_t)a1));
-        break;
-
-    case ARM_NR_setregid32:
-        ctx->regs[0] = host_ret(setregid((gid_t)a0, (gid_t)a1));
-        break;
+    case ARM_NR_getpid: ctx->regs[0] = (uint32_t)getpid(); break;
+    case ARM_NR_getppid: ctx->regs[0] = (uint32_t)getppid(); break;
+    case ARM_NR_getpgrp: ctx->regs[0] = (uint32_t)getpgrp(); break;
+    case ARM_NR_gettid: ctx->regs[0] = (uint32_t)get_host_tid(ctx); break;
+    case ARM_NR_getuid32: ctx->regs[0] = (uint32_t)getuid(); break;
+    case ARM_NR_geteuid32: ctx->regs[0] = (uint32_t)geteuid(); break;
+    case ARM_NR_getgid32: ctx->regs[0] = (uint32_t)getgid(); break;
+    case ARM_NR_getegid32: ctx->regs[0] = (uint32_t)getegid(); break;
+    case ARM_NR_setuid32: ctx->regs[0] = host_ret(setuid((uid_t)a0)); break;
+    case ARM_NR_setgid32: ctx->regs[0] = host_ret(setgid((gid_t)a0)); break;
+    case ARM_NR_setreuid32: ctx->regs[0] = host_ret(setreuid((uid_t)a0, (uid_t)a1)); break;
+    case ARM_NR_setregid32: ctx->regs[0] = host_ret(setregid((gid_t)a0, (gid_t)a1)); break;
 
     case ARM_NR_setresuid:
     case ARM_NR_setresuid32: {
@@ -880,6 +868,9 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
 
 int a32_handle_syscall(a32_ctx_t *ctx)
 {
+    if (ctx->is_ios) {
+        return a32_ios_handle_svc(ctx);
+    }
     uint32_t nr = ctx->regs[7];
     if (ctx->trace_enabled) {
         fprintf(stderr, "[a32rt] syscall nr=%u (0x%x) args=(0x%x, 0x%x, 0x%x, 0x%x)\n",

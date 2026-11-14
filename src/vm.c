@@ -591,7 +591,7 @@ uint32_t a32_vm_mmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_
     uint32_t target_va     = 0U;
     bool     update_cursor = false;
     if ((flags & (A32_MAP_FIXED | A32_MAP_FIXED_NOREPLACE)) != 0U) {
-        if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < A32_LOW_GUARD_SIZE ||
+        if ((addr & (A32_PAGE_SIZE - 1U)) != 0U || addr < a32_min_va(ctx) ||
             ((uint64_t)addr & (gap_align - 1ULL)) != 0ULL ||
             ((host_flags & (MAP_SHARED | MAP_ANONYMOUS)) == MAP_SHARED &&
              (((uint64_t)pgoffset * A32_PAGE_SIZE) & (gap_align - 1ULL)) != 0ULL)) {
@@ -733,7 +733,7 @@ int a32_vm_protect_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t 
     }
     uint64_t aligned_len = a32_vm_page_align_up((uint64_t)len);
     uint64_t end64       = (uint64_t)addr + aligned_len;
-    if (addr < A32_LOW_GUARD_SIZE ||
+    if (addr < a32_min_va(ctx) ||
         aligned_len == 0ULL ||
         end64 > (uint64_t)A32_KUSER_BASE_32 ||
         !a32_vm_mapped_range(addr, (uint32_t)end64, NULL, NULL, NULL, 0U)) {
@@ -782,7 +782,7 @@ int a32_vm_unmap_locked(a32_ctx_t *ctx, uint32_t addr, uint32_t len)
         return -EINVAL;
     }
     uint64_t aligned_len = a32_vm_page_align_up((uint64_t)len);
-    if (addr < A32_LOW_GUARD_SIZE ||
+    if (addr < a32_min_va(ctx) ||
         (uint64_t)addr + aligned_len > (uint64_t)A32_KUSER_BASE_32) {
         return -EINVAL;
     }

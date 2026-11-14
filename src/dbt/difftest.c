@@ -21,6 +21,7 @@
 #include "vm/vm32.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <sys/mman.h>
 
 static a32_dbt_step_fn g_dbt_step = NULL;
@@ -103,14 +104,16 @@ int a32_difftest_run_dbt(a32_ctx_t *ctx, a32_difftest_stats_t *stats)
 
 static int difftest_done(a32_ctx_t *ctx, const a32_ctx_t *ref,
     const a32_ctx_t *dut, a32_difftest_stats_t *s,
-    a32_difftest_stats_t *stats, int rc)
+    a32_difftest_stats_t *stats, a32_ctx_t *prev_tls, int rc)
 {
     /* RC-U3-r4 #2: restore the arena to the reference window. A no-op
      * on paths that never switched (coverage mode, alloc failure). */
+    a32_signals_set_thread_ctx(prev_tls);
     a32_vm32_set_arena_base((uintptr_t)(uintptr_t)ref->guest_base);
     s->interp_hash = a32_interp_state_hash(ref);
     s->dbt_hash = a32_interp_state_hash(dut);
     memcpy(ctx, ref, sizeof(*ctx));
+    ctx->difftest_trap_fault = false;
     if (stats != NULL) {
         *stats = *s;
     }
@@ -244,6 +247,7 @@ static void difftest_mirror_regs(const a32_ctx_t *ref, a32_ctx_t *dut)
     uint64_t dut_base = dut->guest_base;
     memcpy(dut, ref, sizeof(*dut));
     dut->guest_base = dut_base;
+    dut->difftest_trap_fault = true;
     memset(dut->ibtc, 0, sizeof(dut->ibtc));
     memset(dut->ras, 0, sizeof(dut->ras));
     dut->ras_top = 0U;
@@ -313,12 +317,15 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
     }
     static a32_ctx_t ref;
     static a32_ctx_t dut;
+    a32_ctx_t *prev_tls = a32_signals_get_thread_ctx();
     bool separate = false;
     uint64_t compared = 0U;
     int final_rc = 0;
     void *win_out = NULL;
     memcpy(&ref, ctx, sizeof(ref));
     memcpy(&dut, ctx, sizeof(dut));
+    ref.difftest_trap_fault = false;
+    dut.difftest_trap_fault = true;
     /* RC-U3-r3 #2: the DUT always runs in a private shadow window so the
      * two engines never share memory, on A1 and A2 alike. Allocation
      * failure is fatal: falling back to a shared window would compare
@@ -327,7 +334,7 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
     if (a32_backend_map_anon(NULL, (size_t)DIFFTEST_WINDOW_SIZE, 0,
             0, 0, 0, &win_out) != 0 || win_out == NULL) {
         fprintf(stderr, "[difftest] shadow window allocation failed\n");
-        return difftest_done(ctx, &ref, &dut, &s, stats, 1);
+        return difftest_done(ctx, &ref, &dut, &s, stats, prev_tls, 1);
     }
     dut.guest_base = (uint64_t)(uintptr_t)win_out;
     /* RC-U3-r4 #2: the A2 Soft-TLB addends are arena-global (loaded by
@@ -338,15 +345,18 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
         if (difftest_sync_dut(&ref, &dut) != 0) {
             fprintf(stderr, "[difftest] initial window mirror failed\n");
             (void)a32_backend_unmap(win_out, (size_t)DIFFTEST_WINDOW_SIZE);
-            return difftest_done(ctx, &ref, &dut, &s, stats, 1);
+            return difftest_done(ctx, &ref, &dut, &s, stats, prev_tls, 1);
         }
     } else {
         difftest_mirror_regs(&ref, &dut);
     }
+    a32_signals_set_thread_ctx(&ref);
     for (uint64_t i = 0ULL; i < max_steps; i++) {
         uint32_t pc = ref.regs[15];
         uint32_t r_rc = a32_interp_step(&ref);
+        a32_signals_set_thread_ctx(&dut);
         uint32_t d_rc = g_dbt_step(&dut);
+        a32_signals_set_thread_ctx(&ref);
         bool dut_fallback = false;
         bool r_cont = (r_rc == A32_EXIT_NONE || r_rc == A32_EXIT_BRANCH ||
             r_rc == A32_EXIT_INTERWORK);
@@ -407,6 +417,9 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
             /* Exactly-once syscall on ref, then mirror the result. */
             ref.syscalls_executed++;
             ex = a32_handle_syscall(&ref);
+            if (ex == 0 && (ref.pending_signals & ~ref.sig_mask) != 0ULL) {
+                a32_signals_check_pending(&ref);
+            }
             if (separate) {
                 if (difftest_sync_dut(&ref, &dut) != 0) {
                     fprintf(stderr,
@@ -438,6 +451,40 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
             compared++;
             continue;
         }
+        if (r_rc == A32_EXIT_FAULT) {
+            if (!a32_interp_state_equal(&ref, &dut) ||
+                ref.fault_addr != dut.fault_addr ||
+                (separate &&
+                 difftest_mem_hash(&ref) != difftest_mem_hash(&dut))) {
+                s.diverged = true;
+                s.first_diverge_pc = pc;
+                fprintf(stderr,
+                    "[difftest] DIVERGENCE on fault at pc=0x%08x step=%llu\n",
+                    pc, (unsigned long long)s.steps);
+                final_rc = 1;
+                goto difftest_out;
+            }
+            if (a32_signals_deliver_sync(&ref, SIGSEGV, ref.fault_addr)) {
+                if ((ref.pending_signals & ~ref.sig_mask) != 0ULL) {
+                    a32_signals_check_pending(&ref);
+                }
+                if (separate) {
+                    if (difftest_sync_dut(&ref, &dut) != 0) {
+                        fprintf(stderr,
+                            "[difftest] window mirror failed at pc=0x%08x\n", pc);
+                        final_rc = 1;
+                        goto difftest_out;
+                    }
+                } else {
+                    difftest_mirror_regs(&ref, &dut);
+                }
+                compared++;
+                continue;
+            }
+            s.fault_count++;
+            final_rc = 1;
+            goto difftest_out;
+        }
         if (!a32_interp_state_equal(&ref, &dut)) {
             s.diverged = true;
             s.first_diverge_pc = pc;
@@ -460,10 +507,8 @@ int a32_difftest_run_compare(a32_ctx_t *ctx, uint64_t max_steps,
                 s.first_undef_pc = pc;
             }
         }
-        if (r_rc == A32_EXIT_FAULT) {
-            s.fault_count++;
-        }
-        break;
+        final_rc = 1;
+        goto difftest_out;
     }
     if (separate && difftest_mem_hash(&ref) != difftest_mem_hash(&dut)) {
         s.diverged = true;
@@ -484,5 +529,5 @@ difftest_out:
         s.diverged = true;
         final_rc = 1;
     }
-    return difftest_done(ctx, &ref, &dut, &s, stats, final_rc);
+    return difftest_done(ctx, &ref, &dut, &s, stats, prev_tls, final_rc);
 }

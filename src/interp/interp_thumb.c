@@ -73,12 +73,13 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
             ctx->exit_reason = A32_EXIT_SVC;
             goto adv_it_ret;
         }
-        if (hw == 0xBF00U) {
-            /* Thumb NOP: successful completion, IT advances normally. */
+        if ((hw & 0xFF0FU) == 0xBF00U) {
+            /* Thumb NOP-compatible hints (NOP/YIELD/WFE/WFI/SEV/SEVL and
+             * reserved 0xBFx0 with mask == 0): IT advances normally. */
             ctx->regs[15] = next;
             goto adv_it;
         }
-        if ((hw & 0xFF00U) == 0xDE00U || hw == 0xBFA0U) {
+        if ((hw & 0xFF00U) == 0xDE00U) {
             i_undef(ctx);
             goto trap_ret;
         }
@@ -438,7 +439,7 @@ static uint32_t t16_step(a32_ctx_t *ctx, uint32_t pc, bool *in_it, unsigned *it_
                     }
                 }
             }
-        } else if ((hw & 0xF800U) == 0xA000U) {
+        } else if ((hw & 0xF000U) == 0xA000U) {
             /* ADR: ADD Rd, PC/SP, #imm8 << 2. No flags. */
             unsigned rt = (hw >> 8) & 7U;
             uint32_t base = ((hw >> 11) & 1U) != 0U ? ctx->regs[13] :
@@ -682,173 +683,11 @@ trap_ret:
     return ctx->exit_reason;
 }
 
-/* 32-bit Thumb-2 single step (subset + VFP routing + UNDEF fallback). */
+/* 32-bit Thumb-2 single step delegated to interp_t32_step.c. */
 
 static uint32_t t32_step(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1, uint16_t hw2)
 {
-    uint32_t next = pc + 4U;
-    /* VFP/NEON coprocessor patterns route to interp_vfp via synthetic word. */
-    uint8_t h1hi = (uint8_t)(hw1 >> 8);
-    if (h1hi == 0xEDU || h1hi == 0xFDU || h1hi == 0xEEU || h1hi == 0xFEU) {
-        uint32_t word = ((uint32_t)hw1 << 16) | hw2;
-        /* Rebuild the A32-style coprocessor view for the VFP unit. */
-        if (a32_interp_vfp_step(ctx, word)) {
-            if (ctx->exit_reason != A32_EXIT_NONE) {
-                return ctx->exit_reason;
-            }
-            if (ctx->regs[15] == pc) {
-                ctx->regs[15] = next;
-            }
-            return A32_EXIT_NONE;
-        }
-        ctx->regs[15] = next;
-        i_undef(ctx);
-        return A32_EXIT_UNDEF;
-    }
-    /* B.W T4 (unconditional, hw2[15:14,12]=101) and B<cond>.W T3
-     * (conditional, hw2[15:14,12]=100, cond=hw1[9:6] < 14).
-     * Data-processing modified-immediate has hw2[15]=0 and does not match. */
-    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x9000U) {
-        uint32_t s = (uint32_t)((hw1 >> 10U) & 1U);
-        uint32_t j1 = (uint32_t)((hw2 >> 13U) & 1U);
-        uint32_t j2 = (uint32_t)((hw2 >> 11U) & 1U);
-        uint32_t i1 = ~(j1 ^ s) & 1U;
-        uint32_t i2 = ~(j2 ^ s) & 1U;
-        uint32_t uoff = (s << 24U) | (i1 << 23U) | (i2 << 22U) |
-            ((uint32_t)(hw1 & 0x3FFU) << 12U) | ((uint32_t)(hw2 & 0x7FFU) << 1U);
-        int32_t off = (int32_t)(uoff << 7U) >> 7;
-        i_set_pc_branch(ctx, (pc + 4U) + (uint32_t)off, false);
-        return A32_EXIT_NONE;
-    }
-    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U &&
-        ((hw1 >> 6U) & 0xFU) < 14U) {
-        unsigned cond = (hw1 >> 6U) & 0xFU;
-        if (!a32_interp_cond_passes(ctx->cpsr, cond)) {
-            ctx->regs[15] = next;
-            return A32_EXIT_NONE;
-        }
-        uint32_t s = (uint32_t)((hw1 >> 10U) & 1U);
-        uint32_t j1 = (uint32_t)((hw2 >> 13U) & 1U);
-        uint32_t j2 = (uint32_t)((hw2 >> 11U) & 1U);
-        uint32_t uoff = (s << 20U) | (j2 << 19U) | (j1 << 18U) |
-            ((uint32_t)(hw1 & 0x3FU) << 12U) | ((uint32_t)(hw2 & 0x7FFU) << 1U);
-        int32_t off = (int32_t)(uoff << 11U) >> 11;
-        i_set_pc_branch(ctx, (pc + 4U) + (uint32_t)off, false);
-        return A32_EXIT_NONE;
-    }
-    if ((hw1 & 0xFFF0U) == 0xF3C0U && (hw2 & 0xFF00U) == 0xBF00U) {
-        ctx->itstate = hw2 & 0xFFU;
-        a32_ctx_normalize_itstate(ctx, true);
-        ctx->regs[15] = next;
-        return A32_EXIT_NONE;
-    }
-    if ((hw1 & 0xFE00U) == 0xF800U) {
-        bool sign_ext = ((hw1 >> 8) & 1U) != 0U;
-        bool u_imm12  = ((hw1 >> 7) & 1U) != 0U;
-        unsigned size = (hw1 >> 5) & 3U; /* 0=byte, 1=half, 2=word */
-        bool is_load  = ((hw1 >> 4) & 1U) != 0U;
-        unsigned rn   = hw1 & 0xFU;
-        unsigned rt   = (hw2 >> 12) & 0xFU;
-
-        if (size > 2U || (size == 2U && sign_ext) ||
-            (!is_load && (sign_ext || rt == 15U || rn == 15U))) {
-            ctx->regs[15] = next;
-            i_undef(ctx);
-            return A32_EXIT_UNDEF;
-        }
-
-        /* Addressing mode via the shared T32 helper (A32-R13-10). */
-        t32_ls_dec_t ls = t32_decode_ls(rn, rt, u_imm12, size, is_load, sign_ext, hw2);
-        if (ls.undef) {
-            ctx->regs[15] = next;
-            i_undef(ctx);
-            return A32_EXIT_UNDEF;
-        }
-
-        uint32_t ea = 0U;
-        uint32_t wb_val = 0U;
-        if (ls.kind == 0U) {
-            uint32_t base = (pc + 4U) & ~3U;
-            ea = ls.up ? (base + ls.imm) : (base - ls.imm);
-        } else if (ls.kind == 1U) {
-            ea = ctx->regs[rn] + ls.imm;
-        } else if (ls.kind == 2U) {
-            ea = ctx->regs[rn] + (ctx->regs[ls.rm] << ls.shift);
-        } else {
-            uint32_t base = ctx->regs[rn];
-            wb_val = ls.up ? (base + ls.imm) : (base - ls.imm);
-            ea = ls.pre ? wb_val : base;
-        }
-        bool do_wb = ls.wb;
-
-        if (ls.hint) {
-            /* PLD / PLI hint */
-            ctx->regs[15] = next;
-            return A32_EXIT_NONE;
-        }
-
-        if (is_load) {
-            uint32_t v = 0U;
-            if (size == 0U) {
-                uint8_t b = 0U;
-                if (!i_load_bytes(ctx, ea, &b, 1U)) {
-                    return A32_EXIT_FAULT;
-                }
-                v = sign_ext ? (uint32_t)(int32_t)(int8_t)b : (uint32_t)b;
-            } else if (size == 1U) {
-                uint16_t h = 0U;
-                if (!i_load_bytes(ctx, ea, &h, 2U)) {
-                    return A32_EXIT_FAULT;
-                }
-                v = sign_ext ? (uint32_t)(int32_t)(int16_t)h : (uint32_t)h;
-            } else {
-                if (!i_load_u32(ctx, ea, &v)) {
-                    return A32_EXIT_FAULT;
-                }
-            }
-            if (do_wb) {
-                ctx->regs[rn] = wb_val;
-            }
-            if (rt == 15U) {
-                i_set_pc_branch(ctx, v, true);
-                return A32_EXIT_NONE;
-            }
-            ctx->regs[rt] = v;
-        } else {
-            if (size == 0U) {
-                uint8_t b = (uint8_t)ctx->regs[rt];
-                if (!i_store_bytes(ctx, ea, &b, 1U)) {
-                    return A32_EXIT_FAULT;
-                }
-            } else if (size == 1U) {
-                uint16_t h = (uint16_t)ctx->regs[rt];
-                if (!i_store_bytes(ctx, ea, &h, 2U)) {
-                    return A32_EXIT_FAULT;
-                }
-            } else {
-                if (!i_store_u32(ctx, ea, ctx->regs[rt])) {
-                    return A32_EXIT_FAULT;
-                }
-            }
-            if (do_wb) {
-                ctx->regs[rn] = wb_val;
-            }
-        }
-        ctx->regs[15] = next;
-        return A32_EXIT_NONE;
-    }
-    /* UDF.W (F7F0 A000): permanent undefined instruction. It must trap
-     * as UNDEF and never dispatch the syscall selected by r7 (A32-R7-1).
-     * The outer stepper restores the faulting PC; IT is preserved by the
-     * caller so retry uses the pre-instruction slot (A32-R7-13). */
-    if (hw1 == 0xF7F0U && (hw2 & 0xFF00U) == 0xA000U) {
-        ctx->regs[15] = next;
-        i_undef(ctx);
-        return A32_EXIT_UNDEF;
-    }
-    ctx->regs[15] = next;
-    i_undef(ctx);
-    return A32_EXIT_UNDEF;
+    return i_t32_step_ext(ctx, pc, hw1, hw2);
 }
 
 

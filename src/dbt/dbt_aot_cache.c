@@ -461,7 +461,7 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
                     (w1 & 0xFFE00000U) == 0x72800000U &&
                     (w0 & 31U) == (w1 & 31U)) {
                     uint32_t orig_pc = (((w0 >> 5U) & 0xFFFFU) << 16U) | ((w1 >> 5U) & 0xFFFFU);
-                    if (orig_pc >= A32_LOW_GUARD_SIZE && orig_pc < A32_KUSER_BASE_32) {
+                    if (orig_pc >= a32_min_va(ctx) && orig_pc < A32_KUSER_BASE_32) {
                         uint32_t reloc_pc = orig_pc + delta;
                         words_buf[w]      = (w0 & ~(0xFFFFU << 5U)) | (((reloc_pc >> 16U) & 0xFFFFU) << 5U);
                         words_buf[w + 1U] = (w1 & ~(0xFFFFU << 5U)) | ((reloc_pc & 0xFFFFU) << 5U);

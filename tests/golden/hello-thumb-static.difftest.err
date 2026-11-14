@@ -1,1 +1,1 @@
-[difftest] DIVERGENCE at pc=0x000200f6 step=N rc_interp=4 rc_dbt=1
+[difftest] DIVERGENCE at pc=0xffff0fc8 step=N rc_interp=0 rc_dbt=1

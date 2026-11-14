@@ -66,6 +66,7 @@ static double vfp_fz_in_d(a32_ctx_t *ctx, double v)
 static float vfp_fz_out_f(a32_ctx_t *ctx, float f)
 {
     if (vfp_fz(ctx) && fpclassify(f) == FP_SUBNORMAL) {
+        ctx->fpscr |= (1U << 3);
         return copysignf(0.0f, f);
     }
     return f;
@@ -74,6 +75,7 @@ static float vfp_fz_out_f(a32_ctx_t *ctx, float f)
 static double vfp_fz_out_d(a32_ctx_t *ctx, double v)
 {
     if (vfp_fz(ctx) && fpclassify(v) == FP_SUBNORMAL) {
+        ctx->fpscr |= (1U << 3);
         return copysign(0.0, v);
     }
     return v;
@@ -305,7 +307,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             ctx->regs[15] = pc + 4U;
             return true;
         }
-        if (is_double && (opc1 == 4U || opc1 == 5U)) {
+        if (is_double && (opc1 == 4U || opc1 == 5U) && (((insn >> 5) & 1U) != 0U)) {
             unsigned dd = crn | (((insn >> 7) & 1U) << 4);
             unsigned lane = ((opc1 & 1U) << 1) | ((opc2 >> 1) & 1U);
             uint64_t v = ctx->vfp_d[dd & 31U];
@@ -325,7 +327,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             ctx->regs[15] = pc + 4U;
             return true;
         }
-        if (is_double && (opc1 == 0U || opc1 == 1U) && opc2 != 0U) {
+        if (is_double && (opc1 == 0U || opc1 == 1U) && (((insn >> 5) & 1U) != 0U)) {
             unsigned dd = crn | (((insn >> 7) & 1U) << 4);
             unsigned lane = ((opc1 & 1U) << 1) | ((opc2 >> 1) & 1U);
             uint64_t v = ctx->vfp_d[dd & 31U];
@@ -335,7 +337,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             ctx->regs[15] = pc + 4U;
             return true;
         }
-        if (is_double && ((opc1 & 2U) == 0U)) {
+        if (is_double && ((opc1 & 2U) == 0U) && (((insn >> 5) & 3U) == 0U)) {
             unsigned dd = crn | (((insn >> 7) & 1U) << 4);
             uint64_t v = ctx->vfp_d[dd & 31U];
             uint32_t w = (opc1 & 1U) ? (uint32_t)(v >> 32) : (uint32_t)v;
@@ -372,7 +374,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         ctx->regs[15] = pc + 4U;
         return true;
     }
-    if (is_double && (opc1 == 0U || opc1 == 1U) && opc2 != 0U) {
+    if (is_double && (opc1 == 0U || opc1 == 1U) && (((insn >> 5) & 1U) != 0U)) {
         unsigned dd = crn | (((insn >> 7) & 1U) << 4);
         unsigned lane = ((opc1 & 1U) << 1) | ((opc2 >> 1) & 1U);
         uint32_t w = (rd == 15U) ? 0U : ctx->regs[rd];
@@ -383,7 +385,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         ctx->regs[15] = pc + 4U;
         return true;
     }
-    if (is_double && ((opc1 & 2U) == 0U)) {
+    if (is_double && ((opc1 & 2U) == 0U) && (((insn >> 5) & 3U) == 0U)) {
         unsigned dd = crn | (((insn >> 7) & 1U) << 4);
         uint32_t w = (rd == 15U) ? 0U : ctx->regs[rd];
         uint64_t v = ctx->vfp_d[dd & 31U];
@@ -626,8 +628,8 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         if (opc2 == 4U || opc2 == 5U) {
             bool zero = (opc2 == 5U);
             if (dbl) {
-                double a = get_d(ctx, vd);
-                double b = zero ? 0.0 : get_d(ctx, vm);
+                double a = vfp_fz_in_d(ctx, get_d(ctx, vd));
+                double b = zero ? 0.0 : vfp_fz_in_d(ctx, get_d(ctx, vm));
                 /* IOC for VCMPE, and for either form on signaling-NaN
                  * inputs classified from payload bits (A32-R7-30). */
                 if (a != a || b != b) {
@@ -643,8 +645,8 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                     cmp_set_fpscr(ctx, false, false, true, false);
                 }
             } else {
-                float a = get_s(ctx, vd);
-                float b = zero ? 0.0f : get_s(ctx, vm);
+                float a = vfp_fz_in_f(ctx, get_s(ctx, vd));
+                float b = zero ? 0.0f : vfp_fz_in_f(ctx, get_s(ctx, vm));
                 if (a != a || b != b) {
                     if (n_bit || vfp_snan_f(a) || vfp_snan_f(b)) {
                         ctx->fpscr |= (1U << 0);
@@ -855,6 +857,31 @@ bool a32_interp_vfp_step(a32_ctx_t *ctx, uint32_t insn)
     }
     if (cls == 0xEU) {
         unsigned cp = (insn >> 8) & 0xFU;
+        if (cp == 15U) {
+            uint32_t masked = insn & 0x0FFF0FFFU;
+            unsigned rt = (insn >> 12) & 0xFU;
+            if (masked == 0x0E1D0F70U) {
+                ctx->regs[rt] = ctx->tls_tp;
+                ctx->regs[15] = pc + 4U;
+                return true;
+            }
+            if (masked == 0x0E1D0F50U) {
+                ctx->regs[rt] = ctx->tls_tpidrurw;
+                ctx->regs[15] = pc + 4U;
+                return true;
+            }
+            if (masked == 0x0E0D0F50U) {
+                ctx->tls_tpidrurw = ctx->regs[rt];
+                ctx->regs[15] = pc + 4U;
+                return true;
+            }
+            if (masked == 0x0E070FBAU || masked == 0x0E070F9AU || masked == 0x0E070F95U) {
+                if (masked != 0x0E070F95U) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+                ctx->regs[15] = pc + 4U;
+                return true;
+            }
+            return false;
+        }
         if (cp != 10U && cp != 11U) {
             return false;
         }

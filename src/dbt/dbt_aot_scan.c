@@ -66,7 +66,8 @@ static void add_target(aot_scan_buf_t *sb, uint32_t pc, bool thumb)
 
 static void aot_try_add_target(aot_scan_buf_t *sb, uint32_t tgt, bool thumb, uint32_t min_len)
 {
-    if (tgt >= A32_LOW_GUARD_SIZE && tgt <= A32_KUSER_BASE_32 - min_len &&
+    uint32_t max_va = sb->ctx->is_ios ? 0xFFFF8000U : A32_KUSER_BASE_32;
+    if (tgt >= a32_min_va(sb->ctx) && tgt <= max_va - min_len &&
         a32_jit_range_executable(sb->ctx, tgt, min_len)) {
         add_target(sb, tgt, thumb);
     }
@@ -401,7 +402,8 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
     bool has_aux_exec = false;
     for (size_t i = 0U; i < ctx->region_count; i++) {
         const a32_region_t *r = &ctx->regions[i];
-        if ((r->prot & 0x4U) == 0U || r->start < A32_LOW_GUARD_SIZE || r->end > A32_KUSER_BASE_32) {
+        if ((r->prot & 0x4U) == 0U || r->start < a32_min_va(ctx) ||
+            r->end > (ctx->is_ios ? 0xFFFF8000U : A32_KUSER_BASE_32)) {
             continue;
         }
         if (elf_info->text_start > 0U && elf_info->text_end > elf_info->text_start &&

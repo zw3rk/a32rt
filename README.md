@@ -1,8 +1,12 @@
-# `a32rt` — AArch32 (`arm32` / `armhf`) → AArch64 (`aarch64-linux`) User-Mode Binary Translator
+# `a32rt` — AArch32 (`armhf` Linux ELF & 32-Bit iOS `armv7`/`armv7s` Mach-O) → AArch64 Binary Translator
 
-`a32rt` is a standalone, zero-dependency, Rosetta-style user-mode dynamic (JIT) and ahead-of-time (AOT) binary translator that runs 32-bit ARM (`armv7l` / `armhf`, A32 and Thumb-2, VFPv4-D32, and NEON ASIMD) Linux ELF binaries on 64-bit AArch64 Linux systems whose CPUs lack hardware 32-bit EL0 execution support (such as Apple Silicon M1–M4 and modern AArch64 server processors).
+`a32rt` is a standalone, zero-dependency, Rosetta-style user-mode dynamic (JIT), reference-interpreter, and ahead-of-time (AOT) binary translator that runs **both** 32-bit ARM Linux ELF binaries (`armv7l` / `armhf` / `armel`) **and** 32-bit iOS Mach-O binaries (`armv7` / `armv7s`, thin `MH_MAGIC` and universal `FAT_MAGIC`) on 64-bit AArch64 hosts whose CPUs lack hardware 32-bit EL0 execution support (Apple Silicon M1–M5 on macOS and Linux, and modern AArch64 server processors).
 
-It builds as a single static-PIE `aarch64-linux` ELF executable (`_build/a32rt`) written in Curated C11 and minimal AArch64 assembly, loads an `arm32` ELF and its optional `PT_INTERP` dynamic linker (`ld-musl-armhf.so.1` or `ld-linux-armhf.so.3`) into a reserved 4 GiB guest virtual address window `[G, G + 4 GiB)`, and issues only standard `aarch64-linux` syscalls.
+It builds from a single Curated-C11 and AArch64-assembly tree into two standalone zero-dependency host binaries:
+- `_build/a32rt`: Static-PIE `aarch64-linux` ELF executable (for native AArch64 Linux and [`hyper-linux`](../hyper-linux) on Apple Silicon).
+- `_build/a32rt-darwin`: Native `arm64-apple-darwin` Mach-O executable (runs directly on macOS Apple Silicon with `MAP_JIT` APRR W^X and 7-instruction 4 KiB Soft-TLB over 16 KiB host pages, no VM required).
+
+At startup `a32rt` inspects the guest binary's magic bytes and automatically selects either the **Linux ARM EABI (`ELFCLASS32` `EM_ARM`)** personality or the **32-bit iOS Darwin/XNU (`MH_MAGIC` / `FAT_MAGIC` `CPU_TYPE_ARM`)** personality inside a reserved 4 GiB guest virtual address window `[G, G + 4 GiB)`.
 
 For the full architectural specification, register allocation, and design rationale, see [`A32RT.md`](A32RT.md) and [`docs/HOST-CONTRACT.md`](docs/HOST-CONTRACT.md).
 
@@ -10,10 +14,13 @@ For the full architectural specification, register allocation, and design ration
 
 ## Key Features
 
-- **Zero External Dependencies**: Written in strict C11 (`-std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra`) and AArch64 assembly (`src/trampoline.S`). Uses a bespoke A32/T32 decoder, direct 32-bit AArch64 instruction encoder (`src/a64_emit.c`), runtime code cache, and EABI syscall/signal layer.
-- **Parametric 4 GiB Guest Window (`[G, G + 4 GiB)`)**:
-  - **Identity mode (`G = 0`)**: On plain AArch64 Linux when `[0x00010000, 0xffff0000)` is free, guest addresses equal host addresses.
-  - **Offset mode (`G = 0x1_0000_0000`)**: Under [`hyper-linux`](../hyper-linux) on macOS Apple Silicon (where `[0, 4 GiB)` is reserved by macOS `PAGEZERO`), `a32rt` holds `G` in reserved host register `x20` (`xG`) and lowers all guest memory accesses via `[xG, wAddr, uxtw]`, preserving exact 32-bit address wrap-around (`mod 2^32`).
+- **Zero External Dependencies & Dual Host Backends**: Written in strict Curated C11 (`-std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra`, `<= 900` lines per file) and AArch64 assembly (`src/trampoline.S`), with `src/os/backend_linux.c` (`aarch64-linux` / `hyper-linux`) and `src/os/backend_darwin.c` (standalone macOS `arm64`).
+- **Dual Execution Engines (`--interp` + `--dbt`), Lockstep `--difftest` & Persistent `--aot`**:
+  - **Portable Reference Interpreter (`src/interp/`)**: Complete Curated-C11 oracle covering A32, 16-bit Thumb (`T16`), 32-bit Thumb-2 (`T32`), VFPv4-D32, and NEON ASIMD (`--interp`), plus instruction-by-instruction lockstep verification against the AArch64 JIT (`--difftest`).
+  - **AArch64 DBT (`src/dbt/`) & Persistent `.a32cache` (`--aot`)**: Direct 32-bit AArch64 emitter (`src/core/`), 8-slot in-cache chaining, IBTC, RAS, and persistent content-hashed `.a32cache` artifacts supporting both ELF32 (`PT_LOAD` / `.so`) and 32-bit iOS Mach-O (`LC_SEGMENT`, thin and universal `FAT_MAGIC` slice offset) binaries.
+- **Parametric 4 GiB Guest Window (`[G, G + 4 GiB)`) & Soft-TLB**:
+  - **Regime A1 (`H == 4096`)**: On 4 KiB AArch64 Linux (`G = 0`) and under [`hyper-linux`](../hyper-linux) (`G = 0x1_0000_0000`), `a32rt` holds `G` in reserved register `x20` (`xG`) and lowers all guest memory accesses via `[xG, wAddr, uxtw]`, preserving exact 32-bit address wrap-around (`mod 2^32`).
+  - **Regime A2 (`H > 4096`, e.g. 16 KiB macOS or 16/64 KiB Linux)**: Uses a 7-instruction 4 KiB Soft-TLB (`x20 = &ctx->tlb[0]`) with 2-instruction miss stubs and 24-byte `dbt_mem_site_t` fault/preemption recovery over in-place `Provider A` (`src/vm/vm_file.c`) COW arenas.
 - **Complete ARMv7-A + ARMv8-A AArch32 User-Mode ISA + VFPv4-D32 + NEON (ASIMD) + Crypto**:
   - **A32 & Thumb-2 (`T16`/`T32`)**: Data processing, barrel shifter, multiply/accumulate, hardware divide (`SDIV`/`UDIV`), saturating/DSP/parallel byte & halfword media instructions, bitfield ops, load/store word/byte/halfword/doubleword/multiple (`LDM`/`STM`, `PUSH`/`POP`), `IT` blocks, table branches (`TBB`/`TBH`), barriers (`DMB`/`DSB`/`ISB`), hardware CRC-32 (`CRC32{B,H,W}` and Castagnoli `CRC32C{B,H,W}`), and exclusives (`LDREX`/`STREX{B,H,D}` lowered directly to 8/16/32/64-bit `LDXR`/`STXR` pairs).
   - **VFPv4-D32, NEON, ARMv8-A Directed-Rounding FP & Crypto**: Full `s0`–`s31` (32 single-precision), `d0`–`d31` (32 double-precision), and `q0`–`q15` (16 quadword SIMD) register file, including `VLD1`–`VLD4`/`VST1`–`VST4` multi-structure loads/stores, `VTBL`/`VTBX`, polynomial arithmetic (`VMULL.P8` and 64×64→128 carryless `VMULL.P64`), saturating/rounding/widening/narrowing SIMD, `VCMP` + `VMRS APSR_nzcv`, `FPSCR` ↔ `FPCR`/`FPSR` synchronization, ARMv8-A floating-point extensions (`VSEL{EQ,VS,GE,GT}.F32/.F64`, scalar & vector `VMAXNM`/`VMINNM`, `VRINT{A,N,P,M,Z,R,X}.F32/.F64`, `VCVT{A,N,P,M}.{S32,U32}.{F32,F64}`), and hardware Cryptography Extensions (`AESE.8`, `AESD.8`, `AESMC.8`, `AESIMC.8`, `SHA1{C,P,M,H,SU0,SU1}.32`, `SHA256{H,H2,SU0,SU1}.32`) advertised via `AT_HWCAP2 = 0x1f`.
@@ -27,29 +34,53 @@ For the full architectural specification, register allocation, and design ration
   - **Synthetic `0xffff0000` `[vectors]` kuser Page**: Populates real A32 instruction sequences at `0xffff0f60` (`__kuser_cmpxchg64`), `0xffff0fa0` (`__kuser_memory_barrier`), `0xffff0fc0` (`__kuser_cmpxchg`), `0xffff0fe0` (`__kuser_get_tls`), and helper version `5` at `0xffff0ffc`.
   - **ARM EABI Syscall & Struct Shim**: Translates 240+ ARM EABI (`r7`, `r0`–`r5`) syscalls and private ARM syscalls (`cacheflush`, `set_tls`, `get_tls`) to `aarch64-linux` (`x8`, `x0`–`x5`), shimming 32-to-64 structures (`stat64`, `statx`, `statfs64`, `sysinfo`, `rusage`, `iovec`, `msghdr`/`cmsghdr`, `epoll_event`, `flock64`, `timespec`/`timeval`/`itimerspec` time32 & time64 variants, TTY/block/network `ioctl` structs `termios`, `winsize`, `ifreq`, `ifconf`, `BLKGETSIZE*`, `unshare`, `faccessat2`, `fallocate`, `splice`, `sync_file_range2`, `tee`, `timerfd_create`, `signalfd4`, `inotify_init1`, `preadv`/`pwritev`, `setns`, `seccomp`, `memfd_create`, `copy_file_range`, `rseq`, `close_range`), `/proc/self/{exe,maps,auxv,cmdline,stat,status}`, `/proc/cpuinfo`, and `execve` re-wrapping.
   - **Threads, Futexes, Self-Modifying Code & Signals**: Supports `clone` (`CLONE_VM | CLONE_THREAD | CLONE_SETTLS`) with isolated per-thread JIT state, 3-class signal routing (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` side-table PC recovery, guest write-protect SMC invalidation, and asynchronous RT signal delivery), and authentic 32-bit ARM `rt_sigframe` / `sigframe` including the `VFP_MAGIC` (`0x56465001`) coprocessor frame (`d0`–`d31`, `fpscr`, `fpexc`) in `ucontext_t.uc_regspace` across `rt_sigreturn` (`r7 = 173`) / `sigreturn` (`r7 = 119`).
+- **32-Bit iOS (`armv7` / `armv7s`) Mach-O & Darwin/XNU Runtime Personality (`src/ios/`)**:
+  - **Thin & Universal Fat Mach-O Loader (`ios_macho.c`)**: Auto-detects thin 32-bit `MH_MAGIC` (`0xfeedface`) and universal `FAT_MAGIC` / `FAT_CIGAM` (`0xcafebabe` / `0xbebafeca`) binaries, selects the best `CPU_TYPE_ARM (12)` slice (`armv7s` → `armv7` → `armv6` → `CPU_SUBTYPE_ARM_ALL`), maps `LC_SEGMENT` (`__PAGEZERO` guard, `__TEXT`, `__DATA`, `__LINKEDIT`) with PIE slide when `MH_PIE` is set, and initializes entry state from `LC_UNIXTHREAD` or `LC_MAIN` (`CPSR.T` derived from `entry & 1`).
+  - **Dual Dynamic-Linking Modes (`ios_dylib.c`, `ios_bind.c`, `ios_export.c`, `ios_stubs.c`)**: When `--sysroot` provides an extracted iOS SDK/rootfs containing `/usr/lib/dyld`, maps `dyld` and hands off on an authentic XNU `mh_execute_header` + `apple[]` initial stack; otherwise runs a built-in recursive `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB` / `LC_REEXPORT_DYLIB` loader (`@executable_path`, `@loader_path`, and `@rpath` via `LC_RPATH`) with `LC_DYLD_INFO[_ONLY]` rebase/bind/weak-bind/lazy-bind bytecode execution, classic `LC_SYMTAB` + `LC_DYSYMTAB` indirect-symbol binding, Mach-O export-trie resolution (including re-exports and resolver thunks), topological `__mod_init_func` constructors, and a synthetic `libSystem.B.dylib` `svc #0x81` stub island (`malloc`/`free`/`realloc`/`posix_memalign`, `printf`/`snprintf`, string/memory/ctype/`qsort`/`bsearch`/`arc4random`, `dlopen`/`dlsym`, `setjmp`/`longjmp`, `pthread_*`, `dispatch_once`/`dispatch_sync_f`, and minimal Objective-C selector/class hooks).
+  - **XNU `_COMM_PAGE`, `TPIDRURO`, `svc #0x80` BSD/Mach/ARM Traps, Threads & Signals**: Populates the 32-bit ARM Darwin `_COMM_PAGE` at `0xFFFF4000` (mirrored at `0xFFFF0000`), maintains per-thread `TPIDRURO` (`mrc p15, 0, Rt, c13, c0, 3` with low 2 bits cleared per Darwin `cthread` ABI), routes `svc #0x80` across BSD syscalls (`r12 > 0` and indirect `syscall()` `r12 == 0` with `r0:r1` 64-bit returns and `CPSR.C` carry-flag error polarity, including `kqueue`/`kevent`, sockets, `sysctl`, `mmap`/`mincore`, `fork`/`wait4`, and `--image-fd` `execve`), Mach traps (`r12 < 0`: `mach_absolute_time`, `mach_timebase_info`, `mach_msg_trap`, `mach_vm_*`, `semaphore_*`), and ARM fast traps (`r12 = 0x80000000..`: `thread_set_tsd_base`, `icache_invalidate`, `dcache_flush`), plus `bsdthread`/`pthread`/`ulock_wait`/`ulock_wake` synchronization and 32-bit Darwin signal frames (`__darwin_arm_ucontext`, `sigreturn #184`, `sigaltstack`, `sigsuspend`).
 - **Built-In GDB RSP Stub**: Launch with `--gdb <port>` (or `A32RT_GDB=<port>`) to debug guest `arm32` binaries with `gdb-multiarch` or `lldb` (inspect `r0`–`r15`/`cpsr`, read/write guest memory, single-step basic blocks, and set software breakpoints).
 
 ---
 
 ## Quick Start
 
-### 1. Build `a32rt` and Test Fixtures
+### 1. Build `a32rt` (Linux & macOS) and Test Fixtures
 
 Inside the Nix development environment (or with `aarch64-unknown-linux-musl-gcc` and `clang`/`ld.lld` installed):
 
 ```sh
 nix develop -c make all
+make build-darwin
 ```
 
 This produces:
-- `_build/a32rt`: Static-PIE `aarch64-linux` binary translator (`~240 KiB`, zero runtime dependencies).
+- `_build/a32rt`: Static-PIE `aarch64-linux` binary translator (zero runtime dependencies).
+- `_build/a32rt-darwin`: Standalone native `arm64-apple-darwin` Mach-O binary translator (runs directly on macOS Apple Silicon without a VM).
 - `_build/a32rt-binfmt-p`: Symlink enabling `binfmt_misc` `P` (preserve `argv[0]`) mode automatically.
-- `_build/hello-*`, `_build/test-m1-*` .. `_build/test-m5-*`, `_build/bench-coremark-*`: Freestanding A32 and Thumb-2 verification binaries.
+- `_build/hello-*`, `_build/test-m1-*` .. `_build/test-m5-*`, `_build/bench-coremark-*`, and `_build/ios/*`: Freestanding Linux ELF32 and 32-bit iOS (`armv7`/`armv7s`/universal fat) verification binaries.
 
-### 2. Run on Plain AArch64 Linux (or inside Lima VM)
+### 2. Run 32-Bit iOS (`armv7` / `armv7s`) Mach-O Binaries (macOS or Linux)
 
 ```sh
-# Run a static armhf binary directly:
+# Run thin armv7/armv7s or universal fat iOS Mach-O binaries directly on macOS:
+./_build/a32rt-darwin ./_build/ios/test-ios-fat
+./_build/a32rt-darwin --difftest ./_build/ios/test-ios-dylib
+
+# Run or AOT-compile 32-bit iOS Mach-O binaries on AArch64 Linux:
+./_build/a32rt --aot ./_build/ios/test-ios-fat
+./_build/a32rt ./_build/ios/test-ios-fat
+
+# Run the full 61-leg 32-bit iOS qualification suite across macOS & Linux:
+make test-ios
+```
+
+### 3. Run Linux ELF32 Binaries on Standalone macOS or Plain AArch64 Linux
+
+```sh
+# Run directly on macOS Apple Silicon (no VM):
+./_build/a32rt-darwin ./_build/hello-armhf-static
+
+# Run a static armhf binary on AArch64 Linux:
 ./_build/a32rt ./_build/hello-armhf-static
 
 # Run a dynamically linked musl armv7 binary (e.g. busybox or apk) with a sysroot:
@@ -62,7 +93,7 @@ This produces:
 ./_build/a32rt --stats --sysroot ./_build/sysroot-armv7 ./_build/sysroot-armv7/sbin/apk --version
 ```
 
-### 3. Run under `hyper-linux` (`hl`) on macOS Apple Silicon
+### 4. Run under `hyper-linux` (`hl`) on macOS Apple Silicon
 
 ```sh
 # Direct invocation via hyper-linux:
@@ -73,7 +104,7 @@ This produces:
   ./_build/sysroot-armv7/bin/busybox sh -c 'uname -a && echo ok'
 ```
 
-### 4. Register with Linux `binfmt_misc`
+### 5. Register with Linux `binfmt_misc`
 
 On any AArch64 Linux host, register `_build/a32rt` (with `OCF` flags) or `_build/a32rt-binfmt-p` (with `OCFP` flags) to execute `arm32` ELF binaries transparently (`AT_EXECFD` is supported natively):
 
@@ -87,16 +118,22 @@ echo ':arm32:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\
 ## CLI Options & Environment Variables
 
 ```text
-Usage: a32rt [options] [--] <arm32-elf> [guest-args...]
+Usage: a32rt [options] [--] <arm32-elf-or-ios-macho> [guest-args...]
 ```
 
 | CLI Flag | Environment Variable | Description |
 | :--- | :--- | :--- |
+| `--interp` | `A32RT_ENGINE=interp` | Execute using the portable Curated-C11 A32/Thumb-2/VFP/NEON reference interpreter. |
+| `--dbt` | `A32RT_ENGINE=dbt` | Execute using the AArch64 dynamic binary translator (default). |
+| `--difftest` | `A32RT_ENGINE=difftest` | Run `--interp` and `--dbt` in instruction-by-instruction lockstep and verify zero state divergence. |
 | `--window <hex>` | `A32RT_WINDOW=<hex>` | Guest 4 GiB window base `G` (e.g. `0x0` or `0x100000000`). Probed via `/dev/a32host` or address-space availability if unset. |
-| `--sysroot <path>` | `A32RT_SYSROOT=<path>` | Guest `armhf` sysroot directory for `PT_INTERP` (`ld-musl-armhf.so.1` / `ld-linux-armhf.so.3`) and absolute file paths. |
+| `--sysroot <path>` | `A32RT_SYSROOT=<path>` | Guest `armhf` Linux rootfs (`PT_INTERP`) or extracted 32-bit iOS SDK/rootfs (`/usr/lib/dyld` and dylibs). |
 | `--cache <dir>` | `A32RT_CACHE=<dir>` | Directory for persistent `.a32cache` AOT translation artifacts (default: `$XDG_CACHE_HOME` or `/tmp`). |
-| `--aot` | `A32RT_AOT=1` | Pre-translate `PT_LOAD` executable segments (including `PT_INTERP` and relocatable `.so` libraries) into `<cache>` and exit `0`. |
-| `--auto-aot` | `A32RT_AUTO_AOT=1` | Automatically save compiled JIT blocks into the persistent `.a32cache` on exit (`ARM_NR_exit` / `ARM_NR_exit_group`) when no warm cache was loaded at startup, and propagate across `execve`. |
+| `--aot` | `A32RT_AOT=1` | Pre-translate executable segments (`PT_LOAD` ELF32 / `.so` or `LC_SEGMENT` thin/fat iOS Mach-O) into `<cache>` and exit `0`. |
+| `--auto-aot` | `A32RT_AUTO_AOT=1` | Automatically save compiled JIT blocks into the persistent `.a32cache` on exit when no warm cache was loaded at startup, and propagate across `execve`. |
+| `--execfn <path>` | — | Override resolved guest executable path (`AT_EXECFN` / `apple[0]`) across descriptor-backed `execve`. |
+| `--image-fd <fd>` | — | Load the guest ELF or Mach-O image directly from open file descriptor `<fd>` (eliminating path TOCTOU). |
+| `--no-host` | — | Bypass `/dev/a32host` probing and use standalone user-space `Provider A` VM management. |
 | `--stats` | `A32RT_STATS=1` | Print JIT/AOT telemetry (blocks, emitted bytes, W^X toggles, chain/IBTC/RAS hits, cache flushes) to `stderr` on exit. |
 | `--trace` | `A32RT_TRACE=1` | Trace translated basic block entries and guest syscalls to `stderr`. |
 | `--gdb <port>` | `A32RT_GDB=<port>` | Start the GDB Remote Serial Protocol (RSP) server on `127.0.0.1:<port>` and wait for debugger attach before guest entry. |
@@ -105,27 +142,26 @@ Usage: a32rt [options] [--] <arm32-elf> [guest-args...]
 
 ---
 
-## Verification & Milestone Suite (`M0`–`M8`)
+## Verification & Milestone Suite (`M0`–`M8`, `iOS`, & `Parity`)
 
-`a32rt` is continuously verified against two targets:
-1. **Primary Target (`*-hl`)**: Running inside [`hyper-linux`](../hyper-linux) (`../hyper-linux/_build/hl`) on macOS Apple Silicon in offset mode (`G = 0x1_0000_0000`) with `/dev/a32host` (`A32H_ABI 1.0`).
-2. **Ground-Truth Linux Oracle (`*-lima`)**: Running the exact same static-PIE `_build/a32rt` binary on real AArch64 Linux inside Lima (`limactl`, `hl-rosetta` VM).
-
-Run the complete test suite on either target via `Makefile`:
+`a32rt` is continuously verified across **three host environments** (`_build/a32rt-darwin` on standalone macOS Apple Silicon, `_build/a32rt` under [`hyper-linux`](../hyper-linux) in offset mode `G = 0x1_0000_0000`, and `_build/a32rt` on AArch64 Linux):
 
 ```sh
-# Run all M0..M8 suites under hyper-linux (macOS Apple Silicon):
+# Run the 61-leg 32-bit iOS Mach-O qualification suite (Darwin + Linux aarch64):
+make test-ios
+
+# Run the 66-row multi-engine ELF32 parity gate (Darwin + hyper-linux, interp/dbt/difftest/AOT):
+HL_PARITY=1 sh tests/parity_suite.sh
+
+# Run all M0..M8 Linux suites under hyper-linux or inside the Lima AArch64 Linux VM:
 make test-all-hl
-
-# Run all M0..M8 suites inside the Lima AArch64 Linux VM:
 make test-all-lima
-
-# Show all individual Makefile targets:
-make help
 ```
 
-| Milestone | Target (`hl` / `Lima`) | Coverage Verified |
+| Milestone | Target (`Darwin` / `hl` / `Linux`) | Coverage Verified |
 | :--- | :--- | :--- |
+| **iOS** | `make test-ios` | **61/61 PASS** across standalone macOS (`_build/a32rt-darwin`) and AArch64 Linux (`_build/a32rt`) in `--interp`, `--dbt`, `--difftest` (`0` divergences), `--sysroot`, and `--aot`: thin `armv7` & `armv7s` `MH_MAGIC`, universal `FAT_MAGIC`, `LC_DYLD_INFO_ONLY` + `@executable_path` + `@rpath` (`LC_RPATH`) dylib binding & `__mod_init_func`, `_COMM_PAGE`, `TPIDRURO`, BSD/Mach/ARM `svc #0x80` traps (`kqueue`/`kevent`, `socketpair`, `poll`, `sysctl`, `mach_msg_trap`, `mach_vm_*`, `semaphore_*`, `fork`/`wait4`/`execve`), `pthread`/`ulock` synchronization, and Darwin 32-bit signal frames (`sigaltstack`, `SA_ONSTACK`, `SA_RESETHAND`, `sigreturn #184`). |
+| **Parity** | `HL_PARITY=1 sh tests/parity_suite.sh` | **66/66 PASS (`0 fail, 0 gap`)** across A32, Thumb-2 (`T16`/`T32`), and `armel` fixtures in `--interp`, `--dbt`, `--difftest`, and `--aot` on standalone macOS and `hyper-linux`. |
 | **M0** | `make test-hello-hl`<br>`make test-hello-lima` | Static `ET_EXEC` ELF32 loader, `[G, G+4GiB)` reservation, `0xffff0000` kuser page, A32 & Thumb-2 baseline decoder, trampoline context switch, `write` + `exit_group`. |
 | **M1** | `make test-m1-hl`<br>`make test-m1-lima` | Complete ARMv7-A integer/branch/bitfield/DSP/media ISA (A32 & Thumb-2), `PT_INTERP` dynamic linking with real Alpine `ld-musl-armhf.so.1` + `busybox sh -c 'ls / && echo ok'`, `/proc/self/{exe,maps,auxv,cmdline,stat,status}`, `getdents64`, `fork` + `wait4` + `execve`, file-backed `mmap2(PROT_EXEC)` code execution. |
 | **M2** | `make test-m2-hl`<br>`make test-m2-lima` | Direct block chaining, 1024-entry lock-free IBTC, 64-entry in-trampoline RAS, dead-NZCV elision, single-batch W^X + `IC IVAU`, multi-region & shared-library `.a32cache` AOT pre-translation (`busybox` + `ld-musl-armhf.so.1`), CoreMark-style CRC benchmark (`0x41dd` across 2,000 iterations in A32 & Thumb-2). |
@@ -216,35 +252,37 @@ a32rt/
 ├── LICENSE              # Apache-2.0
 ├── Makefile             # Self-documenting top-level build & verification driver
 ├── README.md            # Overview, usage, benchmarks & verification guide
-├── flake.nix            # Nix flake for static-PIE aarch64-linux a32rt, armhf toolchains & hydraJobs
+├── flake.nix            # Nix flake for static-PIE aarch64-linux & darwin a32rt, armhf toolchains & hydraJobs
 ├── docs/
-│   └── HOST-CONTRACT.md # Versioned host contract & /dev/a32host ABI (A32H_ABI 1.0)
+│   └── HOST-CONTRACT.md # Versioned host contract & /dev/a32host ABI (A32H_ABI 1.0/1.1)
 ├── include/
 │   └── a32host.h        # Shared C11 header for /dev/a32host ioctls (vendored by hyper-linux)
 ├── tools/
+│   ├── run_ios_suite.sh    # 61-leg macOS & Linux 32-bit iOS qualification runner (interp/dbt/difftest/AOT)
 │   └── setup_m7_sysroot.py # Alpine v3.21 armv7 & Debian bookworm armhf glibc 2.36 sysroot provisioner
 ├── src/
 │   ├── a32rt.h          # Internal structures, CPU state (a32_ctx_t), and module APIs
-│   ├── main.c           # CLI parsing, AT_EXECFD, host probing & startup orchestration
+│   ├── a64_emit.h       # Direct 32-bit AArch64 instruction encoder interface
+│   ├── main.c           # CLI parsing, ELF32 vs. Mach-O dispatch, AT_EXECFD & startup orchestration
 │   ├── host.c           # /dev/a32host handshake & runtime capability detection
-│   ├── vm.c             # [G, G+4GiB) guest window reservation, guest mmap2/mprotect/mremap/brk
 │   ├── elf32.c          # ELFCLASS32 EM_ARM loader, PT_INTERP, and 0xffff0000 kuser page setup
-│   ├── stack32.c        # 32-bit initial stack, argv/envp/auxv builder & AT_PLATFORM ("v8l")
-│   ├── a64_emit.h/.c    # Direct 32-bit AArch64 instruction encoder (scalar, FP & ASIMD)
-│   ├── decode_a32.c     # A32 instruction decoder & A64 lowering
-│   ├── decode_t32.c     # T32 (Thumb-1 / Thumb-2) instruction decoder & A64 lowering
-│   ├── vfp_neon.c       # VFPv4-D32 & NEON (ASIMD) coprocessor decoder & A64 lowering
-│   ├── jit.c            # Code cache, RW chain slots, IBTC, RAS, W^X batching & dispatcher
-│   ├── aot.c            # Persistent disk-backed AOT cache (.a32cache, FNV-1a keyed)
-│   ├── trampoline.S     # Host <-> guest context switch & in-trampoline chain/IBTC dispatch
-│   ├── syscalls.c       # ARM EABI (r7, r0-r5) -> aarch64-linux syscall & struct shim
+│   ├── stack32.c        # 32-bit Linux initial stack, argv/envp/auxv builder & AT_PLATFORM ("v8l")
 │   ├── signals.c        # 3-class signal router, PC side-table recovery & arm32 rt_sigframe
-│   └── gdb.c            # GDB Remote Serial Protocol (RSP) stub (--gdb / A32RT_GDB)
+│   ├── gdb.c            # GDB Remote Serial Protocol (RSP) stub (--gdb / A32RT_GDB)
+│   ├── trampoline.S     # Host <-> guest context switch & in-trampoline chain/IBTC/Soft-TLB dispatch
+│   ├── core/            # AArch64 scalar, FP/ASIMD & Soft-TLB emitters (core_emit_*.c)
+│   ├── interp/          # Portable Curated-C11 A32, T16/T32 Thumb-2 & VFP/NEON reference interpreter
+│   ├── dbt/             # AArch64 JIT cache, chaining, IBTC, RAS, lockstep difftest & .a32cache AOT
+│   ├── vm/              # Class-A 4 GiB window, Soft-TLB, and Provider A in-place file COW (vm32, vm_file)
+│   ├── os/              # Linux ARM EABI syscall/struct shims plus backend_linux.c & backend_darwin.c
+│   └── ios/             # 32-bit iOS (armv7/armv7s) Mach-O/FAT loader, dyld binder, _COMM_PAGE, BSD/Mach/ARM traps, signals, threads & libSystem stub island
 └── tests/
+    ├── parity_suite.sh            # 66-row multi-engine ELF32 parity gate (golden outputs in tests/golden/)
+    ├── ios/                       # 32-bit iOS Mach-O/FAT fixtures, @rpath dylibs & build_ios_fixtures.sh
     ├── hello.c                    # M0 / M0-hl A32 & Thumb-2 smoke test
     ├── test_m1_isa_fs.c           # M1 / M1-hl full A32/T32 ISA, /proc/self/*, getdents64, fork/wait4
     ├── bench_coremark.c           # M2 / M2-hl CoreMark-style CRC & AOT cache benchmark
-    ├── bench_suite.c              # Multi-workload cross-architecture benchmark suite (armhf/thumb/aarch64/x86_64/i386)
+    ├── bench_suite.c              # Multi-workload cross-architecture benchmark suite
     ├── test_m3_threads_signals.c  # M3 / M3-hl clone threads, futex, RT signals, SIGSEGV & SMC
     ├── test_m4_vfp_neon.c         # M4 / M4-hl VFPv4-D32 (s0-s31, d0-d31) & NEON SIMD suite
     ├── test_m5_ltp_gdb.c          # M5 / M5-hl LTP compatibility & 32-to-64 struct conformance suite

@@ -71,7 +71,7 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
     } else if (ctx->has_host_info && ctx->host_info.window_hint != 0ULL &&
                try_reserve_window(ctx->host_info.window_hint) == 0) {
         ctx->guest_base = ctx->host_info.window_hint;
-    } else if (try_reserve_window(0ULL) == 0) {
+    } else if (!ctx->is_ios && try_reserve_window(0ULL) == 0) {
         ctx->guest_base = 0ULL;
     } else {
         bool found = false;
