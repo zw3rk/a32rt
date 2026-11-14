@@ -169,13 +169,18 @@ static uint64_t ni_qshl(uint64_t v, unsigned e, unsigned s, bool sat_u, bool *sa
             return (sv > 0) ? 0x7FFFFFFFFFFFFFFFULL : 0x8000000000000000ULL;
         }
         if (sv >= 0) {
-            if (sv > (smax >> s)) {
+            if (s >= e - 1U || (uint64_t)sv > (((1ULL << (e - 1U)) - 1ULL) >> s)) {
                 *sat = true;
                 return ((uint64_t)smax) & ni_emask(e);
             }
         } else {
-            int64_t thr = -((smax + 1) >> s);
-            if (sv < thr) {
+            if (s >= e) {
+                *sat = true;
+                return ((uint64_t)smin) & ni_emask(e);
+            }
+            uint64_t lim = (1ULL << (e - 1U)) >> s;
+            uint64_t mag = 0ULL - (uint64_t)sv;
+            if (mag > lim) {
                 *sat = true;
                 return ((uint64_t)smin) & ni_emask(e);
             }
@@ -273,8 +278,8 @@ static bool ni_vext(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
     n = neon_reg_n(insn);
     m = neon_reg_m(insn);
     if (!is_q) {
-        uint64_t lo = ctx->vfp_d[m & 31U];
-        uint64_t hi = ctx->vfp_d[n & 31U];
+        uint64_t lo = ctx->vfp_d[n & 31U];
+        uint64_t hi = ctx->vfp_d[m & 31U];
         uint64_t out;
         unsigned s = imm4 * 8U;
         if (s == 0U) {
@@ -290,10 +295,10 @@ static bool ni_vext(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         unsigned mb = (m & ~1U) & 31U;
         unsigned nb = (n & ~1U) & 31U;
         uint64_t words[4];
-        words[0] = ctx->vfp_d[mb];
-        words[1] = ctx->vfp_d[(mb + 1U) & 31U];
-        words[2] = ctx->vfp_d[nb];
-        words[3] = ctx->vfp_d[(nb + 1U) & 31U];
+        words[0] = ctx->vfp_d[nb];
+        words[1] = ctx->vfp_d[(nb + 1U) & 31U];
+        words[2] = ctx->vfp_d[mb];
+        words[3] = ctx->vfp_d[(mb + 1U) & 31U];
         for (unsigned i = 0U; i < 32U; i++) {
             src[i] = (uint8_t)(words[i >> 3] >> ((i & 7U) * 8U));
         }
@@ -331,7 +336,7 @@ static bool ni_narrow(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
     }
     if (op5 == 4U || op5 == 5U) {
         bool src_u = (op5 == 5U) && is_q;
-        bool dst_u = (op5 == 4U) ? is_q : true;
+        bool dst_u = is_q;
         bool sat_op = (op5 == 4U) ? is_q : true;
         unsigned per = ni_per(size);
         unsigned e = 8U << size;
@@ -450,12 +455,16 @@ static bool ni_same(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
     }
     /* VQSUB (VQADD lives in x_alu) */
     if (op == 2U && b4) {
-        if (size > 3U || (size == 3U && is_q)) {
+        if (size > 3U) {
             return false;
         }
         if (size == 3U) {
-            uint64_t a = ctx->vfp_d[dn & 31U];
-            uint64_t b = ctx->vfp_d[dm & 31U];
+            for (unsigned half = 0U; half <= (is_q ? 1U : 0U); half++) {
+            unsigned d0 = is_q ? (((dd & ~1U) + half) & 31U) : (dd & 31U);
+            unsigned n0 = is_q ? (((dn & ~1U) + half) & 31U) : (dn & 31U);
+            unsigned m0 = is_q ? (((dm & ~1U) + half) & 31U) : (dm & 31U);
+            uint64_t a = ctx->vfp_d[n0];
+            uint64_t b = ctx->vfp_d[m0];
             uint64_t r;
             bool sat = false;
             if (!u) {
@@ -480,7 +489,8 @@ static bool ni_same(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             if (sat) {
                 ctx->fpscr |= NI_FPSCR_QC;
             }
-            ctx->vfp_d[dd & 31U] = r;
+            ctx->vfp_d[d0] = r;
+            }
         } else {
             unsigned e = 8U << size;
             unsigned p = ni_per(size);
@@ -559,21 +569,21 @@ static bool ni_same(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         return true;
     }
     /* VSHL / VRSHL / VQSHL / VQRSHL register (op 4 / 5) */
-    if ((op == 4U || op == 5U) && (size < 3U || !is_q)) {
+    if (op == 4U || op == 5U) {
         unsigned e = (size == 3U) ? 64U : 8U << size;
         unsigned esz = (size == 3U) ? 3U : size;
         unsigned p = ni_per(esz);
         unsigned per = is_q ? p * 2U : p;
-        bool rounding = b4;
-        bool sat_op = (op == 5U);
+        bool rounding = (op == 5U);
+        bool sat_op = b4;
         for (unsigned k = 0U; k < per; k++) {
             unsigned half = (is_q && k >= p) ? 1U : 0U;
             unsigned k0 = (is_q && k >= p) ? k - p : k;
             unsigned d0 = is_q ? (((dd & ~1U) + half) & 31U) : dd & 31U;
             unsigned n0 = is_q ? (((dn & ~1U) + half) & 31U) : dn & 31U;
             unsigned m0 = is_q ? (((dm & ~1U) + half) & 31U) : dm & 31U;
-            uint64_t a = ni_get(ctx->vfp_d[n0], k0, esz);
-            uint64_t mb = ni_get(ctx->vfp_d[m0], k0, esz);
+            uint64_t a = ni_get(ctx->vfp_d[m0], k0, esz);
+            uint64_t mb = ni_get(ctx->vfp_d[n0], k0, esz);
             int s = (int)(int8_t)(mb & 0xFFU);
             uint64_t r;
             if (s >= 0) {
@@ -590,12 +600,10 @@ static bool ni_same(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             } else {
                 unsigned t = (unsigned)(-s);
                 if (!rounding) {
-                    if (t >= e) {
-                        r = 0ULL;
-                    } else if (!u) {
+                    if (!u) {
                         r = (uint64_t)ni_asr(ni_sext(a, e), t) & ni_emask(e);
                     } else {
-                        r = (a >> t) & ni_emask(e);
+                        r = (t >= e) ? 0ULL : (a >> t) & ni_emask(e);
                     }
                 } else {
                     if (t > e) {

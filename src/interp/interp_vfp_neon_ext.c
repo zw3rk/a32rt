@@ -21,8 +21,8 @@
 
 static int64_t x_sat_s(int64_t v, unsigned bits)
 {
-    int64_t lo = -(1LL << (bits - 1U));
-    int64_t hi = (1LL << (bits - 1U)) - 1LL;
+    int64_t lo = (bits >= 64U) ? (-0x7FFFFFFFFFFFFFFFLL - 1) : -(1LL << (bits - 1U));
+    int64_t hi = (bits >= 64U) ? 0x7FFFFFFFFFFFFFFFLL : ((1LL << (bits - 1U)) - 1LL);
     if (v < lo) {
         return lo;
     }
@@ -858,9 +858,12 @@ static bool x_alu(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 a = (int64_t)ua;
                 b = (int64_t)ub;
             }
-            unsigned bits = (size == 0U) ? 8U : (size == 1U) ? 16U : (size == 2U) ? 32U : 64U;
-            int64_t s = a + b;
-            uint64_t r = u ? x_sat_u(s, bits) : (uint64_t)x_sat_s(s, bits);
+            uint64_t r; unsigned bits = (size == 0U) ? 8U : (size == 1U) ? 16U : (size == 2U) ? 32U : 64U;
+            if (size == 3U) { uint64_t ua = x_glane(s0, k0, size), ub = x_glane(s1, k0, size), res = ua + ub;
+                bool ov = u ? (res < ua) : ((((ua ^ ~ub) & (ua ^ res)) >> 63) != 0U);
+                if (ov) { ctx->fpscr |= (1U << 27); res = u ? ~0ULL : ((ua >> 63) ? 0x8000000000000000ULL : 0x7FFFFFFFFFFFFFFFULL); } r = res;
+            } else { int64_t s = a + b; uint64_t t = u ? x_sat_u(s, bits) : (uint64_t)x_sat_s(s, bits);
+                if (t != (uint64_t)s) { ctx->fpscr |= (1U << 27); } r = t; }
             uint64_t cur = ctx->vfp_d[d0];
             cur = x_plane(cur, k0, size, r);
             ctx->vfp_d[d0] = cur;
