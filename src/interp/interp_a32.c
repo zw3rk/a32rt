@@ -401,6 +401,13 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
             ctx->regs[15] = pc + 4U;
             return A32_EXIT_NONE;
         }
+        /* Darwin __builtin_trap() unconditional form; SIGTRAP on XNU
+         * when is_ios (A32-IOS-D18). */
+        if (((insn & 0x0FFFFFFFU) == 0x07FFDEFEU) && ctx->is_ios) {
+            ctx->regs[15] = pc;
+            ctx->exit_reason = A32_EXIT_BKPT;
+            return A32_EXIT_BKPT;
+        }
         if ((insn & 0x0FFFFFF0U) == 0x07F000F0U) {
             ctx->regs[15] = pc + 4U;
             i_undef(ctx);
@@ -424,6 +431,13 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
     if ((insn & 0x0FF000F0U) == 0x01200070U) {
         /* BKPT reports its own instruction PC; the outer stepper does not
          * restore it (A32-R7-22). */
+        ctx->regs[15] = pc;
+        ctx->exit_reason = A32_EXIT_BKPT;
+        return A32_EXIT_BKPT;
+    }
+    /* Darwin __builtin_trap() lowers to UDF 0xE7FFDEFE (cond-passed here);
+     * on XNU this delivers SIGTRAP, matching BKPT exactly (A32-IOS-D18). */
+    if (((insn & 0x0FFFFFFFU) == 0x07FFDEFEU) && ctx->is_ios) {
         ctx->regs[15] = pc;
         ctx->exit_reason = A32_EXIT_BKPT;
         return A32_EXIT_BKPT;
