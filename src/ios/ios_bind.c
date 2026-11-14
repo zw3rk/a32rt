@@ -42,8 +42,10 @@
 #define IOS_BIND_DO_ADD_ADDR_IMM 0xB0u
 #define IOS_BIND_DO_TIMES_SKIPPING 0xC0u
 
-#define IOS_INDIRECT_ABS 0xFFFFFFFEu
-#define IOS_INDIRECT_LOCAL 0xFFFFFFFFu
+#define IOS_INDIRECT_ABS 0x40000000u
+#define IOS_INDIRECT_LOCAL 0x80000000u
+#define IOS_BIND_FLAG_WEAK_IMPORT 0x01u
+#define IOS_BIND_FLAG_NON_WEAK_DEF 0x08u
 
 static bool ios_addr_ok(const a32_ios_image_t *img, uint32_t va)
 {
@@ -261,21 +263,29 @@ typedef struct ios_bind_state {
     bool have_sym;
     char sym[512];
     int64_t addend;
+    uint32_t sym_flags;
 } ios_bind_state_t;
 
-/* Resolve the bind target image for an ordinal. Returns -1 to skip (missing
- * weak dylib), -2 on fatal ordinal error, else the image index. */
+/* Resolve the bind target. -1 = weak-missing (write 0), -2 = fatal,
+ * -4 = flat lookup, -5 = weak flat lookup, else image index. */
 static int ios_bind_target(const a32_ios_image_t *img, size_t img_idx,
                            const ios_bind_state_t *st, size_t image_count)
 {
+    (void)image_count;
     if (st->ordinal_is_special) {
         if (st->ordinal == 0) {
             return (int)img_idx;
         }
-        if (image_count == 0u) {
-            return -2;
+        if (st->ordinal == -1) {
+            return 0;
         }
-        return 0;
+        if (st->ordinal == -2) {
+            return -4;
+        }
+        if (st->ordinal == -3) {
+            return -5;
+        }
+        return -2;
     }
     if (st->ordinal == 0) {
         return (int)img_idx;
@@ -289,15 +299,15 @@ static int ios_bind_target(const a32_ios_image_t *img, size_t img_idx,
 }
 
 static int ios_bind_once(a32_ctx_t *ctx, a32_ios_image_t *images,
-                         size_t image_count, size_t img_idx,
-                         const ios_bind_state_t *st, bool is_weak)
+    size_t image_count, size_t img_idx, const ios_bind_state_t *st, bool is_weak)
 {
     a32_ios_image_t *img = &images[img_idx];
     int target;
-    uint32_t sym_addr;
+    uint32_t sym_addr = 0;
     bool found = false;
+    bool weak;
     uint32_t *slot;
-    uint32_t val;
+    uint32_t val = 0;
     slot = ios_slot_ptr(ctx, img, st->seg_idx, st->seg_off);
     if (slot == NULL) {
         fprintf(stderr, "a32rt: %s: bind slot out of range\n", img->path);
@@ -307,37 +317,71 @@ static int ios_bind_once(a32_ctx_t *ctx, a32_ios_image_t *images,
         fprintf(stderr, "a32rt: %s: bind without symbol\n", img->path);
         return -1;
     }
-    target = ios_bind_target(img, img_idx, st, image_count);
-    if (target == -1) {
+    if (is_weak && (st->sym_flags & IOS_BIND_FLAG_NON_WEAK_DEF) != 0u) {
         return 0;
     }
-    if (target < 0 || (size_t)target >= image_count) {
-        fprintf(stderr, "a32rt: %s: bad bind ordinal for '%s'\n", img->path,
-                st->sym);
-        return -1;
+    weak = is_weak || ((st->sym_flags & IOS_BIND_FLAG_WEAK_IMPORT) != 0u);
+    target = ios_bind_target(img, img_idx, st, image_count);
+    if (target == -5) {
+        weak = true;
+        target = -4;
     }
-    if (!st->ordinal_is_special || st->ordinal == 0) {
-        sym_addr = a32_ios_resolve_in(ctx, images, image_count, (size_t)target,
-                                  st->sym, 0u, &found);
-    } else {
+    if (target == -1) {
+        weak = true;
+    }
+    if (!weak && !st->ordinal_is_special && target >= 0 &&
+        st->ordinal > 0 && (uint64_t)st->ordinal <= (uint64_t)img->dep_count &&
+        img->dep_weak[st->ordinal - 1] &&
+        img->dep_image_idx[st->ordinal - 1] < 0) {
+        weak = true;
+    }
+    if (target == -1) {
+        val = 0;
+        memcpy(slot, &val, 4);
+        return 0;
+    }
+    if (target == -4) {
         size_t k;
-        sym_addr = 0;
         for (k = 0; k < image_count; k++) {
-            sym_addr = a32_ios_resolve_in(ctx, images, image_count, k, st->sym,
-                                      0u, &found);
+            sym_addr = a32_ios_resolve_in(ctx, images, image_count, k,
+                st->sym, 0u, &found);
             if (found) {
                 break;
             }
         }
+        if (!found) {
+            sym_addr = a32_ios_lookup_synth_sym(ctx, st->sym, &found);
+        }
+    } else {
+        if (target < 0 || (size_t)target >= image_count) {
+            fprintf(stderr, "a32rt: %s: bad bind ordinal for '%s'\n",
+                    img->path, st->sym);
+            return -1;
+        }
+        if (is_weak) {
+            size_t k;
+            for (k = 0; k < image_count; k++) {
+                sym_addr = a32_ios_resolve_in(ctx, images, image_count, k,
+                    st->sym, 0u, &found);
+                if (found) {
+                    break;
+                }
+            }
+        } else {
+            sym_addr = a32_ios_resolve_in(ctx, images, image_count,
+                (size_t)target, st->sym, 0u, &found);
+        }
     }
     if (!found) {
-        if (is_weak) {
+        if (weak) {
+            val = 0;
+            memcpy(slot, &val, 4);
             return 0;
         }
         fprintf(stderr, "a32rt: %s: cannot resolve '%s'\n", img->path, st->sym);
         return -1;
     }
-    val = sym_addr + (uint32_t)st->addend;
+    val = sym_addr + (uint32_t)(int32_t)st->addend;
     memcpy(slot, &val, 4);
     return 0;
 }
@@ -383,7 +427,7 @@ static int ios_run_bind_stream(a32_ctx_t *ctx, a32_ios_image_t *images,
             break;
         case IOS_BIND_SET_SYM_TRAILING: {
             size_t len = 0;
-            (void)imm;
+            st.sym_flags = imm;
             st.have_sym = false;
             while (pos < (size_t)size && buf[pos] != 0u) {
                 if (len + 1u < sizeof st.sym) {
@@ -595,8 +639,20 @@ static int ios_run_classic_bind(a32_ctx_t *ctx, a32_ios_image_t *images,
                     continue;
                 }
                 memcpy(&tab_idx, ind + (size_t)idx64 * 4u, 4);
-                if (tab_idx == IOS_INDIRECT_ABS ||
-                    tab_idx == IOS_INDIRECT_LOCAL) {
+                if ((tab_idx & IOS_INDIRECT_LOCAL) != 0u) {
+                    if ((tab_idx & IOS_INDIRECT_ABS) == 0u) {
+                        uint32_t cur;
+                        if (!ios_addr_ok(img, va) &&
+                            !ios_addr_ok_any(images, image_count, va)) {
+                            goto out;
+                        }
+                        memcpy(&cur, a32_guest_ptr(ctx, va), 4);
+                        cur += img->slide;
+                        memcpy(a32_guest_ptr(ctx, va), &cur, 4);
+                    }
+                    continue;
+                }
+                if (tab_idx == IOS_INDIRECT_ABS) {
                     continue;
                 }
                 if (tab_idx >= img->symtab.nsyms) {
@@ -690,22 +746,6 @@ int a32_ios_bind_all(a32_ctx_t *ctx, a32_ios_image_t *images,
             }
             free(blob);
         }
-        if (img->dyld_info.weak_bind_size > 0u) {
-            blob = a32_ios_read_blob(img, img->dyld_info.weak_bind_off,
-                                 img->dyld_info.weak_bind_size);
-            if (blob == NULL) {
-                fprintf(stderr, "a32rt: %s: cannot read weak bind opcodes\n",
-                        img->path);
-                return -1;
-            }
-            if (ios_run_bind_stream(ctx, images, image_count, i, blob,
-                                    img->dyld_info.weak_bind_size, false,
-                                    true) != 0) {
-                free(blob);
-                return -1;
-            }
-            free(blob);
-        }
         if (img->dyld_info.lazy_bind_size > 0u) {
             blob = a32_ios_read_blob(img, img->dyld_info.lazy_bind_off,
                                  img->dyld_info.lazy_bind_size);
@@ -717,6 +757,22 @@ int a32_ios_bind_all(a32_ctx_t *ctx, a32_ios_image_t *images,
             if (ios_run_bind_stream(ctx, images, image_count, i, blob,
                                     img->dyld_info.lazy_bind_size, true,
                                     false) != 0) {
+                free(blob);
+                return -1;
+            }
+            free(blob);
+        }
+        if (img->dyld_info.weak_bind_size > 0u) {
+            blob = a32_ios_read_blob(img, img->dyld_info.weak_bind_off,
+                                 img->dyld_info.weak_bind_size);
+            if (blob == NULL) {
+                fprintf(stderr, "a32rt: %s: cannot read weak bind opcodes\n",
+                        img->path);
+                return -1;
+            }
+            if (ios_run_bind_stream(ctx, images, image_count, i, blob,
+                                    img->dyld_info.weak_bind_size, false,
+                                    true) != 0) {
                 free(blob);
                 return -1;
             }

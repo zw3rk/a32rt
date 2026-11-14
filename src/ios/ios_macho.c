@@ -283,6 +283,28 @@ static bool ios_seg_is_pagezero(const ios_segment_command_t *sg)
            (sg->initprot == 0 && sg->maxprot == 0 && sg->filesize == 0u);
 }
 
+static bool ios_va_in_exec_seg(const a32_ios_image_t *img, uint32_t va)
+{
+    size_t k;
+    uint32_t key = va & ~1U;
+    for (k = 0; k < img->seg_count; k++) {
+        uint32_t start;
+        uint32_t end;
+        if (img->segs[k].is_pagezero || img->segs[k].vmsize == 0u) {
+            continue;
+        }
+        if ((img->segs[k].initprot & 4U) == 0U) {
+            continue;
+        }
+        start = a32_page_down(img->segs[k].vmaddr);
+        end = start + img->segs[k].vmsize;
+        if (key >= start && key < end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int ios_copy_payload(a32_ctx_t *ctx, int fd, uint64_t slice_off,
                             uint64_t slice_size,
                             const ios_segment_command_t *sg, uint32_t slid_va,
@@ -331,7 +353,6 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
     uint32_t min_va = UINT32_MAX;
     uint64_t max_end = 0;
     uint32_t slide = 0;
-    uint32_t prev_end = 0;
     size_t pos = 0;
     uint32_t i;
     size_t s;
@@ -418,12 +439,34 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
             break;
         }
         case IOS_LC_MAIN: {
+            uint32_t eoff;
             if (csz < 24u) {
                 bad = true;
                 break;
             }
+            eoff = ios_rd_le32(b + 8);
+            if ((uint64_t)eoff >= (uint64_t)img->slice_size) {
+                bad = true;
+                break;
+            }
             par->has_main = true;
-            par->main_entryoff = ios_rd_le32(b + 8);
+            par->main_entryoff = eoff;
+            break;
+        }
+        case IOS_LC_FUNCTION_STARTS: {
+            ios_linkedit_data_command_t lc;
+            if (csz < sizeof(ios_linkedit_data_command_t)) {
+                bad = true;
+                break;
+            }
+            memcpy(&lc, b, sizeof lc);
+            if ((uint64_t)lc.dataoff + (uint64_t)lc.datasize >
+                (uint64_t)img->slice_size) {
+                bad = true;
+                break;
+            }
+            img->has_fn_starts = true;
+            img->fn_starts = lc;
             break;
         }
         case IOS_LC_UNIXTHREAD: {
@@ -550,6 +593,10 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
         } else {
             slide = 0u;
         }
+        if (((mh.flags & IOS_MH_PIE) != 0u) &&
+            (uint64_t)min_va + (uint64_t)slide < (uint64_t)A32_IOS_PIE_BASE) {
+            slide = A32_IOS_PIE_BASE - min_va;
+        }
     } else if (mh.filetype == IOS_MH_DYLIB) {
         uint64_t span = (uint64_t)a32_page_up((uint32_t)(max_end - min_va));
         uint64_t nb;
@@ -573,9 +620,10 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
         const ios_segment_command_t *sg = &tsegs[s];
         a32_ios_seg_map_t *dst;
         uint64_t slid;
+        uint64_t slid_end;
         uint32_t seg_start;
         uint32_t seg_end;
-        uint32_t map_start;
+        size_t k;
         void *res = NULL;
         if (img->seg_count >= A32_IOS_MAX_SEGMENTS) {
             fprintf(stderr, "a32rt: %s: too many segments\n", img->path);
@@ -591,31 +639,49 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
             img->seg_count++;
             continue;
         }
+        if (sg->filesize > sg->vmsize) {
+            fprintf(stderr, "a32rt: %s: filesize exceeds vmsize\n", img->path);
+            free(cmds);
+            return -1;
+        }
+        if ((uint64_t)sg->fileoff + (uint64_t)sg->filesize > img->slice_size) {
+            fprintf(stderr, "a32rt: %s: segment outside slice\n", img->path);
+            free(cmds);
+            return -1;
+        }
         slid = (uint64_t)sg->vmaddr + (uint64_t)slide;
-        if (slid + (uint64_t)sg->vmsize > (uint64_t)A32_KUSER_BASE_32) {
+        slid_end = slid + (uint64_t)sg->vmsize;
+        if (slid < (uint64_t)a32_min_va(ctx) ||
+            slid_end > (uint64_t)A32_IOS_HIGH_MIN_VA ||
+            slid_end <= slid) {
             fprintf(stderr, "a32rt: %s: segment out of guest bounds\n", img->path);
             free(cmds);
             return -1;
         }
         seg_start = a32_page_down((uint32_t)slid);
-        seg_end = a32_page_up((uint32_t)(slid + (uint64_t)sg->vmsize));
-        if (seg_start < 0x1000u || seg_end <= seg_start) {
+        seg_end = a32_page_up((uint32_t)slid_end);
+        if (seg_end <= seg_start) {
             fprintf(stderr, "a32rt: %s: bad segment range\n", img->path);
             free(cmds);
             return -1;
         }
-        map_start = seg_start;
-        if (seg_start < prev_end) {
-            if (seg_start < a32_page_down(prev_end)) {
+        for (k = 0; k < img->seg_count; k++) {
+            uint32_t es;
+            uint32_t ee;
+            if (img->segs[k].is_pagezero || img->segs[k].vmsize == 0u) {
+                continue;
+            }
+            es = a32_page_down(img->segs[k].vmaddr);
+            ee = es + img->segs[k].vmsize;
+            if (seg_start < ee && es < seg_end) {
                 fprintf(stderr, "a32rt: %s: overlapping segments\n", img->path);
                 free(cmds);
                 return -1;
             }
-            map_start = prev_end;
         }
-        if (seg_end > map_start) {
-            if (a32_backend_map_anon(a32_guest_ptr(ctx, map_start),
-                                    (size_t)(seg_end - map_start),
+        if (seg_end > seg_start) {
+            if (a32_backend_map_anon(a32_guest_ptr(ctx, seg_start),
+                                    (size_t)(seg_end - seg_start),
                                     PROT_READ | PROT_WRITE, 1, 1, 0,
                                     &res) != 0) {
                 fprintf(stderr, "a32rt: %s: failed to map segment: %s\n", img->path,
@@ -623,18 +689,12 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
                 free(cmds);
                 return -1;
             }
-            if (a32_vm_record_region(ctx, map_start, seg_end, 0x3u, 0x12u,
+            if (a32_vm_record_region(ctx, seg_start, seg_end, 0x3u, 0x12u,
                                      img->path) != 0) {
                 fprintf(stderr, "a32rt: %s: failed to record segment\n", img->path);
                 free(cmds);
                 return -1;
             }
-        }
-        if (sg->filesize > 0u &&
-            (uint64_t)sg->fileoff + (uint64_t)sg->filesize > img->slice_size) {
-            fprintf(stderr, "a32rt: %s: segment outside slice\n", img->path);
-            free(cmds);
-            return -1;
         }
         if (ios_copy_payload(ctx, img->fd, img->slice_off, img->slice_size, sg,
                              (uint32_t)slid, img->path) != 0) {
@@ -659,12 +719,34 @@ int a32_ios_parse_map(a32_ctx_t *ctx, a32_ios_image_t *img, a32_ios_parsed_t *pa
         dst->initprot = (uint32_t)sg->initprot;
         dst->maxprot = (uint32_t)sg->maxprot;
         img->seg_count++;
-        if (seg_end > prev_end) {
-            prev_end = seg_end;
-        }
     }
     img->filetype = mh.filetype;
     img->slide = slide;
+    if (par->has_main) {
+        uint32_t eva;
+        if (img->mh_va == 0u) {
+            fprintf(stderr, "a32rt: %s: LC_MAIN without header mapping\n",
+                    img->path);
+            free(cmds);
+            return -1;
+        }
+        eva = img->mh_va + par->main_entryoff;
+        if (!ios_va_in_exec_seg(img, eva)) {
+            fprintf(stderr, "a32rt: %s: LC_MAIN entry outside executable segment\n",
+                    img->path);
+            free(cmds);
+            return -1;
+        }
+    }
+    if (par->has_thread) {
+        uint32_t tpc = par->tstate[15] + slide;
+        if (!ios_va_in_exec_seg(img, tpc)) {
+            fprintf(stderr, "a32rt: %s: LC_UNIXTHREAD pc outside executable segment\n",
+                    img->path);
+            free(cmds);
+            return -1;
+        }
+    }
     free(cmds);
     return 0;
 }

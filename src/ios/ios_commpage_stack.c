@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #define IOS_STACK_TOP 0xE0000000u
 #define IOS_STACK_SIZE (8u * 1024u * 1024u)
@@ -88,14 +89,23 @@ static void ios_wstr(a32_ctx_t *ctx, uint32_t va, const char *s)
 /* Populate one 4 KiB XNU 32-bit _COMM_PAGE. */
 static void ios_fill_commpage(a32_ctx_t *ctx, uint32_t va)
 {
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    uint8_t ncpus;
+    if (ncpu < 1L) {
+        ncpu = 1L;
+    }
+    if (ncpu > 64L) {
+        ncpu = 64L;
+    }
+    ncpus = (uint8_t)ncpu;
     memset(a32_guest_ptr(ctx, va), 0, 0x1000u);
     ios_wstr(ctx, va + 0x000u, "commpage 32-bit");
     ios_w16(ctx, va + 0x01Eu, 13);
-    ios_w8(ctx, va + 0x022u, 4);
+    ios_w8(ctx, va + 0x022u, ncpus);
     ios_w16(ctx, va + 0x026u, 64);
-    ios_w8(ctx, va + 0x034u, 4);
-    ios_w8(ctx, va + 0x035u, 4);
-    ios_w8(ctx, va + 0x036u, 4);
+    ios_w8(ctx, va + 0x034u, ncpus);
+    ios_w8(ctx, va + 0x035u, ncpus);
+    ios_w8(ctx, va + 0x036u, ncpus);
     ios_w64(ctx, va + 0x058u, 0x100000000ULL);
     ios_w8(ctx, va + 0x085u, 12);
     ios_w8(ctx, va + 0x087u, 12);
@@ -167,10 +177,13 @@ static int ios_setup_tramp(a32_ctx_t *ctx)
             }
             ios_emit_call_target(&p, ctx->ios_init_va[k]);
         }
-        if ((size_t)(crt0_end - p) < 14u) {
+        if ((size_t)(crt0_end - p) < 20u) {
             return -1;
         }
         ios_emit_call_target(&p, ctx->ios_main_va);
+        ios_emit_movw(&p, 12u, A32_IOS_C_EXIT_STUB_VA & 0xFFFFu);
+        ios_emit_movt(&p, 12u, (A32_IOS_C_EXIT_STUB_VA >> 16) & 0xFFFFu);
+        *p++ = 0x4760u;
         *p++ = 0xF04Fu;
         *p++ = 0x0C01u;
         *p++ = 0xDF80u;
@@ -200,6 +213,9 @@ static int ios_setup_tramp(a32_ctx_t *ctx)
         *p++ = (uint16_t)(0x0C00u | k);
         *p++ = 0xDF81u;
         *p++ = 0x4770u;
+    }
+    if (a32_ios_emit_native_leaf_stubs(ctx) != 0) {
+        return -1;
     }
     if (ios_seal(ctx, A32_IOS_TRAMP_BASE_VA, A32_IOS_TRAMP_SIZE, 0x5u,
                  "ios_tramp") != 0) {
@@ -361,10 +377,23 @@ int a32_ios_stack_setup(a32_ctx_t *ctx, const a32_elf_info_t *info,
         memcpy(apple0, pfx, np);
         memcpy(apple0 + np, exec_path, ne + 1u);
     }
-    apple_va[0] = ios_push_str(ctx, &sp, apple0);
-    apple_va[1] = ios_push_str(ctx, &sp, "pfz=0xffff4000");
-    apple_va[2] = ios_push_str(ctx, &sp, "stack_guard=0x000a0dff");
-    apple_va[3] = ios_push_str(ctx, &sp, "malloc_entropy=0x11223344,0x55667788");
+    {
+        char guard_str[64];
+        uint32_t guard = 0x000A0DFFu;
+        uint8_t *gp = (uint8_t *)a32_guest_ptr(ctx,
+            A32_IOS_RUNTIME_DATA_VA + A32_IOS_STACK_GUARD_OFF);
+        memcpy(&guard, gp, 4);
+        if (guard == 0u) {
+            guard = 0x000A0DFFu;
+            memcpy(gp, &guard, 4);
+        }
+        snprintf(guard_str, sizeof guard_str, "stack_guard=0x%08x", guard);
+        apple_va[0] = ios_push_str(ctx, &sp, apple0);
+        apple_va[1] = ios_push_str(ctx, &sp, "pfz=0xffff4000");
+        apple_va[2] = ios_push_str(ctx, &sp, guard_str);
+        apple_va[3] = ios_push_str(ctx, &sp,
+            "malloc_entropy=0x11223344,0x55667788");
+    }
     if (apple_va[0] == 0u || apple_va[1] == 0u || apple_va[2] == 0u ||
         apple_va[3] == 0u) {
         return -1;
