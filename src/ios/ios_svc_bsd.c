@@ -427,6 +427,22 @@ static void ios_do_open(a32_ctx_t *ctx, uint32_t path_va, uint32_t flags,
     a32_ios_bsd_ok(ctx, (uint32_t)fd, 0U, false);
 }
 
+/* True only for a real ".." segment (at start or after '/'), so names
+ * like "a..b" stay on the direct openat path. */
+static bool path_has_dotdot(const char *p)
+{
+    for (;;) {
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0')) {
+            return true;
+        }
+        p = strchr(p, '/');
+        if (p == NULL) {
+            return false;
+        }
+        p++;
+    }
+}
+
 static void ios_do_openat(a32_ctx_t *ctx, int dirfd, uint32_t path_va,
     uint32_t flags, uint32_t mode)
 {
@@ -434,11 +450,14 @@ static void ios_do_openat(a32_ctx_t *ctx, int dirfd, uint32_t path_va,
     char host[IOS_BSD_PATH_MAX];
     int hflags = ios_xlate_oflags(flags);
     int fd;
+    bool need_resolve;
     if (ios_cstr(ctx, path_va, tmp, sizeof(tmp)) != 0) {
         a32_ios_bsd_err(ctx, 14);
         return;
     }
-    if (tmp[0] == '/' || dirfd == -2 || strstr(tmp, "..") != NULL) {
+    need_resolve = tmp[0] == '/' || dirfd == -2 ||
+        (ctx->sysroot != NULL && ctx->sysroot[0] != '\0' && path_has_dotdot(tmp));
+    if (need_resolve) {
         if (a32_resolve_guest_path(ctx, tmp, host, sizeof(host)) != 0) {
             a32_ios_bsd_err(ctx, 2);
             return;
