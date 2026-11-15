@@ -187,12 +187,10 @@ typedef struct {
     a32_vm32_mem_site_t sites[A32_AOT_SITE_PER_BLOCK];
 } a32_aot_site_slot_t;
 
-/* Leaf guard for g_site_slots: track runs unlocked during translation
- * while fetch drains on save/load paths, so concurrent translations must
- * not corrupt each other's staged records (A32-IOS-D4). fetch uses
- * trylock and reports -EAGAIN when busy; neither save nor load treats a
- * missed fetch as fatal. */
-static pthread_mutex_t g_site_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Leaf guard for g_site_slots: track/fetch/clear serialize under a spin
+ * lock so fetch never spuriously fails with -EAGAIN outside a signal
+ * handler (write_block_cb must not silently omit site records). */
+static _Atomic uint32_t g_site_lock = 0U;
 static a32_aot_site_slot_t g_site_slots[A32_AOT_SITE_TRACK_MAX];
 
 int a32_aot_site_track(uint32_t guest_pc_base,
@@ -204,7 +202,7 @@ int a32_aot_site_track(uint32_t guest_pc_base,
     if (sites == NULL || count == 0U || count > A32_AOT_SITE_PER_BLOCK) {
         return -EINVAL;
     }
-    pthread_mutex_lock(&g_site_mu);
+    a32_spin_lock(&g_site_lock);
     for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
         if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
             memcpy(g_site_slots[i].sites, sites,
@@ -226,7 +224,7 @@ int a32_aot_site_track(uint32_t guest_pc_base,
         rc = 0;
     }
 out:
-    pthread_mutex_unlock(&g_site_mu);
+    a32_spin_unlock(&g_site_lock);
     return rc;
 }
 
@@ -241,9 +239,7 @@ int a32_aot_site_fetch(uint32_t guest_pc_base,
     if (sites == NULL || cap == 0U || out_count == NULL) {
         return -EINVAL;
     }
-    if (pthread_mutex_trylock(&g_site_mu) != 0) {
-        return -EAGAIN;
-    }
+    a32_spin_lock(&g_site_lock);
     for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
         if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
             if (g_site_slots[i].count > cap) {
@@ -257,15 +253,15 @@ int a32_aot_site_fetch(uint32_t guest_pc_base,
             break;
         }
     }
-    pthread_mutex_unlock(&g_site_mu);
+    a32_spin_unlock(&g_site_lock);
     return rc;
 }
 
 void a32_aot_site_clear(void)
 {
-    pthread_mutex_lock(&g_site_mu);
+    a32_spin_lock(&g_site_lock);
     memset(g_site_slots, 0, sizeof(g_site_slots));
-    pthread_mutex_unlock(&g_site_mu);
+    a32_spin_unlock(&g_site_lock);
 }
 
 int a32_aot_site_load(const char *dir, uint32_t guest_pc_base,

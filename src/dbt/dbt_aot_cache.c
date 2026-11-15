@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define A32_AOT_MAGIC      0x41333243U /* "A32C" */
-#define A32_AOT_VERSION    9U
+#define A32_AOT_VERSION    10U
 #define A32_AOT_MAX_BLOCKS 16384U
 #define A32_AOT_MAX_WORDS  4096U
 #define A32_AOT_MAX_PC_MAP 256U
@@ -42,6 +42,7 @@ typedef struct a32_aot_block_header {
     uint32_t is_thumb;
     uint32_t word_count;
     uint32_t pc_map_count;
+    uint32_t site_count;
 } a32_aot_block_header_t;
 
 static uint64_t fnv1a_64_step(uint64_t hash, const void *data, size_t len)
@@ -74,7 +75,7 @@ static uint64_t hash_fd_contents(uint64_t h, int fd)
     h = fnv1a_64_step(h, &mt, sizeof(mt));
     h = fnv1a_64_step(h, &mtn, sizeof(mtn));
 
-    uint8_t buf[4096];
+    uint8_t buf[16384];
     off_t offset = 0;
     while (offset < st.st_size) {
         size_t to_read = sizeof(buf);
@@ -88,7 +89,22 @@ static uint64_t hash_fd_contents(uint64_t h, int fd)
             }
             return 0ULL;
         }
-        h = fnv1a_64_step(h, buf, (size_t)n);
+        size_t done = 0U;
+        size_t len = (size_t)n;
+        while (done + 8U <= len) {
+            uint64_t w = 0ULL;
+            memcpy(&w, buf + done, sizeof(w));
+            for (unsigned k = 0U; k < 8U; k++) {
+                h ^= (uint64_t)((w >> (k * 8U)) & 0xFFULL);
+                h *= 0x100000001b3ULL;
+            }
+            done += 8U;
+        }
+        while (done < len) {
+            h ^= (uint64_t)buf[done];
+            h *= 0x100000001b3ULL;
+            done++;
+        }
         offset += (off_t)n;
     }
     return (h != 0ULL) ? h : 1ULL;
@@ -130,7 +146,6 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path,
         h = fnv1a_64_step(h, &ios_flag, sizeof(ios_flag));
         uint32_t regime = (uint32_t)a32_vm32_current_regime();
         h = fnv1a_64_step(h, &regime, sizeof(regime));
-        h = fnv1a_64_step(h, &ctx->guest_base, sizeof(ctx->guest_base));
         if (ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
             h = fnv1a_64_step(h, ctx->sysroot, strlen(ctx->sysroot));
         }
@@ -229,23 +244,6 @@ typedef struct aot_save_state {
     bool             error;
 } aot_save_state_t;
 
-/* Cache directory for per-block 24-byte site payloads: same precedence
- * as format_cache_path (ctx dir, A32RT_CACHE, XDG_CACHE_HOME, /tmp). */
-static const char *aot_site_dir(const a32_ctx_t *ctx)
-{
-    const char *dir = (ctx != NULL) ? ctx->cache_dir : NULL;
-    if (dir == NULL || dir[0] == '\0') {
-        dir = getenv("A32RT_CACHE");
-    }
-    if (dir == NULL || dir[0] == '\0') {
-        dir = getenv("XDG_CACHE_HOME");
-    }
-    if (dir == NULL || dir[0] == '\0') {
-        dir = "/tmp";
-    }
-    return dir;
-}
-
 static bool aot_block_valid(const a32_ctx_t *ctx, uint32_t guest_pc, uint32_t guest_end_pc,
                             bool is_thumb, const uint32_t *words, size_t word_count,
                             const a32_pc_map_stage_t *pc_map, size_t pc_map_count)
@@ -259,8 +257,19 @@ static bool aot_block_valid(const a32_ctx_t *ctx, uint32_t guest_pc, uint32_t gu
     }
     uint32_t align_mask = is_thumb ? 1U : 3U;
     if ((guest_pc & align_mask) != 0U || (guest_end_pc & align_mask) != 0U ||
-        guest_end_pc <= guest_pc || (guest_end_pc - guest_pc) > 512U) {
+        guest_end_pc <= guest_pc || (guest_end_pc - guest_pc) > 4096U) {
         return false;
+    }
+    for (size_t i = 0U; i < word_count; i++) {
+        uint32_t w = words[i];
+        if (((w & 0xFFE00000U) == 0xD2C00000U || (w & 0xFFE00000U) == 0xD2E00000U ||
+             (w & 0xFFE00000U) == 0xF2C00000U || (w & 0xFFE00000U) == 0xF2E00000U) &&
+            ((w >> 5) & 0xFFFFU) != 0U) {
+            if (ctx != NULL) {
+                ((a32_ctx_t *)ctx)->aot_abs64_words++;
+            }
+            return false;
+        }
     }
     return a32_jit_range_executable(ctx, guest_pc, guest_end_pc - guest_pc);
 }
@@ -292,33 +301,28 @@ static void write_block_cb(uint32_t guest_pc, uint32_t guest_end_pc,
         return;
     }
 
+    a32_vm32_mem_site_t site_buf[A32_AOT_SITE_PER_BLOCK];
+    uint32_t n_sites = 0U;
+    (void)a32_aot_site_fetch(guest_pc, site_buf, A32_AOT_SITE_PER_BLOCK, &n_sites);
+
     a32_aot_block_header_t bh = {
         .guest_pc     = guest_pc,
         .guest_end_pc = guest_end_pc,
         .is_thumb     = (is_thumb ? 1U : 0U) | (is_call ? 2U : 0U),
         .word_count   = (uint32_t)word_count,
         .pc_map_count = (uint32_t)pc_map_count,
+        .site_count   = n_sites,
     };
 
     if (fwrite(&bh, sizeof(bh), 1U, st->f) != 1U ||
         fwrite(words, sizeof(uint32_t), word_count, st->f) != word_count ||
-        fwrite(pc_map, sizeof(a32_pc_map_stage_t), pc_map_count, st->f) != pc_map_count) {
+        fwrite(pc_map, sizeof(a32_pc_map_stage_t), pc_map_count, st->f) != pc_map_count ||
+        (n_sites > 0U &&
+         fwrite(site_buf, sizeof(a32_vm32_mem_site_t), n_sites, st->f) != n_sites)) {
         st->error = true;
         return;
     }
     st->count++;
-    /* Persist this block's 24-byte site records (when the emitters
-     * tracked any) next to the block cache; site failures never fail
-     * the block save itself. */
-    {
-        a32_vm32_mem_site_t site_buf[A32_AOT_SITE_PER_BLOCK];
-        uint32_t n_sites = 0U;
-        if (a32_aot_site_fetch(guest_pc, site_buf, A32_AOT_SITE_PER_BLOCK,
-                &n_sites) == 0) {
-            (void)a32_aot_site_save(aot_site_dir(st->ctx), guest_pc,
-                site_buf, n_sites);
-        }
-    }
 }
 
 /* Staged per-block site records from the DBT emitters (src/core/). */
@@ -327,12 +331,6 @@ extern void a32_emit_sites_flush(void);
 int a32_aot_save_cache(a32_ctx_t *ctx, const char *elf_path)
 {
     if (elf_path == NULL) {
-        return -1;
-    }
-    /* Regime A2 code words embed the process-local Soft-TLB base, so a
-     * cache written here would fault on reload after ASLR slides it.
-     * Skip persisting (JIT stays correct); site payloads remain valid. */
-    if (a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
         return -1;
     }
     /* Drain the emitter-staged site batch for the final block first, so
@@ -451,6 +449,7 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
         return -1;
     }
 
+    a32_vm32_mem_site_t site_buf[A32_AOT_SITE_PER_BLOCK];
     uint32_t i = 0U;
     for (; i < hdr.num_blocks; i++) {
         a32_aot_block_header_t bh;
@@ -461,9 +460,10 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
             (bh.guest_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
             (bh.guest_end_pc & ((bh.is_thumb & 1U) ? 1U : 3U)) != 0U ||
             bh.guest_end_pc <= bh.guest_pc ||
-            bh.guest_end_pc - bh.guest_pc > 512U ||
+            bh.guest_end_pc - bh.guest_pc > 4096U ||
             bh.word_count == 0U || bh.word_count > A32_AOT_MAX_WORDS ||
-            bh.pc_map_count >= A32_AOT_MAX_PC_MAP) {
+            bh.pc_map_count >= A32_AOT_MAX_PC_MAP ||
+            bh.site_count > A32_AOT_SITE_PER_BLOCK) {
             break;
         }
         if (fread(words_buf, sizeof(uint32_t), bh.word_count, f) != bh.word_count) {
@@ -471,6 +471,10 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
         }
         if (bh.pc_map_count > 0U &&
             fread(pc_map_buf, sizeof(a32_pc_map_stage_t), bh.pc_map_count, f) != bh.pc_map_count) {
+            break;
+        }
+        if (bh.site_count > 0U &&
+            fread(site_buf, sizeof(a32_vm32_mem_site_t), bh.site_count, f) != bh.site_count) {
             break;
         }
         if (delta != 0U && bh.guest_pc < A32_KUSER_BASE_32) {
@@ -506,16 +510,8 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
                                       (size_t)bh.pc_map_count) != 0) {
             break;
         }
-        /* Restore this block's 24-byte site records into the registry
-         * for the fault-recovery path; a missing payload just means the
-         * block was saved before its emitters tracked sites. */
-        {
-            a32_vm32_mem_site_t site_buf[A32_AOT_SITE_PER_BLOCK];
-            uint32_t n_sites = 0U;
-            if (a32_aot_site_load(aot_site_dir(ctx), bh.guest_pc, site_buf,
-                    A32_AOT_SITE_PER_BLOCK, &n_sites) == 0) {
-                (void)a32_aot_site_track(bh.guest_pc, site_buf, n_sites);
-            }
+        if (bh.site_count > 0U) {
+            (void)a32_aot_site_track(bh.guest_pc, site_buf, bh.site_count);
         }
     }
 
@@ -572,9 +568,6 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
     if (ctx == NULL || elf_path == NULL) {
         return -1;
     }
-    if (a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
-        return -1;
-    }
     char cache_path[PATH_MAX];
     if (resolve_cache_path(ctx, elf_path, cache_path, sizeof(cache_path), false, NULL) != 0) {
         return -1;
@@ -585,9 +578,6 @@ int a32_aot_load_cache(a32_ctx_t *ctx, const char *elf_path)
 int a32_aot_load_fd(a32_ctx_t *ctx, int fd, uint32_t load_bias)
 {
     if (ctx == NULL || fd < 0) {
-        return -1;
-    }
-    if (a32_vm32_current_regime() == A32_VM32_REGIME_A2_SOFT_TLB) {
         return -1;
     }
     uint64_t fd_hash = compute_fd_hash(fd);

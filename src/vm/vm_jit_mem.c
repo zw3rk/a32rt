@@ -278,12 +278,17 @@ uint8_t *a32_jit_allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
         p_end = A32_CACHE_PAGES;
     }
 
+    /* APRR write protection is thread-global, not per-page: hoist the
+     * toggle outside the per-page loop so a multi-page block calls
+     * pthread_jit_write_protect_np(0) once per RW transition. */
+#if defined(__APPLE__)
+    pthread_jit_write_protect_np(0);
+    if (ctx != NULL && ctx->stats_enabled) {
+        ctx->aprr_toggles++;
+    }
+#endif
     for (size_t p = p_start; p < p_end; p++) {
 #if defined(__APPLE__)
-        pthread_jit_write_protect_np(0);
-        if (ctx != NULL && ctx->stats_enabled) {
-            ctx->aprr_toggles++;
-        }
         if (!g_page_is_rw[p]) {
             g_page_is_rw[p] = true;
             ctx->wx_transitions++;
