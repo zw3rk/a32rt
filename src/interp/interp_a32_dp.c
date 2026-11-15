@@ -429,7 +429,7 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
             }
             unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
             bool is_logical = false;
-            if (is_imm && rd != 15U) {
+            if (is_imm) {
                 if ((opc == 0x2U || opc == 0x4U || opc == 0xAU || opc == 0xBU)) {
                     bool is_sub = (opc == 0x2U || opc == 0xAU);
                     unsigned d2 = (opc == 0xAU || opc == 0xBU) ? (unsigned)A64_ZR : dst;
@@ -450,7 +450,7 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                     handled = true;
                     goto dp_done;
                 }
-                if ((opc == 0xDU || opc == 0xFU) && rd != 15U) {
+                if ((opc == 0xDU || opc == 0xFU)) {
                     uint32_t v = (opc == 0xDU) ? imm32 : ~imm32;
                     a64_emit_mov_imm32(b, dst, v);
                     is_logical = true;
@@ -506,6 +506,9 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                 } else if (set_flags && !is_imm) {
                     a32_pred_logical_reg_s1(b, ctx, 0U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                         has_imm_carry, imm_carry, shift_carry_reg, live_out);
+                } else if (set_flags && is_imm) {
+                    a32_pred_logical_reg_s1(b, ctx, 0U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
+                        has_imm_carry, imm_carry, A64_ZR, live_out);
                 } else {
                     a64_emit_and_reg_w(b, false, dst, src_n, src_m,
                         fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
@@ -525,9 +528,9 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                         a32_pred_logical_reg_s1(b, ctx, 4U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, shift_carry_reg, live_out);
                     } else {
-                        a64_emit_eor_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                        a32_pred_logical_reg_s1(b, ctx, 4U, dst, dst, dst, A64_SHIFT_LSL, 0U,
-                            false, 0U, A64_ZR, live_out);
+                        a64_emit_mov_imm32(b, A64_TMP1, imm32);
+                        a32_pred_logical_reg_s1(b, ctx, 4U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
+                            has_imm_carry, imm_carry, A64_ZR, live_out);
                         is_logical = false;
                         handled = true;
                         break;
@@ -625,9 +628,9 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                         a32_pred_logical_reg_s1(b, ctx, 2U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, shift_carry_reg, live_out);
                     } else {
-                        a64_emit_orr_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                        a32_pred_logical_reg_s1(b, ctx, 2U, dst, dst, dst, A64_SHIFT_LSL, 0U,
-                            false, 0U, A64_ZR, live_out);
+                        a64_emit_mov_imm32(b, A64_TMP1, imm32);
+                        a32_pred_logical_reg_s1(b, ctx, 2U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
+                            has_imm_carry, imm_carry, A64_ZR, live_out);
                         is_logical = false;
                         handled = true;
                         break;
@@ -671,9 +674,9 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                         a32_pred_logical_reg_s1(b, ctx, 1U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, shift_carry_reg, live_out);
                     } else {
-                        a64_emit_bic_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                        a32_pred_logical_reg_s1(b, ctx, 1U, dst, dst, dst, A64_SHIFT_LSL, 0U,
-                            false, 0U, A64_ZR, live_out);
+                        a64_emit_mov_imm32(b, A64_TMP1, imm32);
+                        a32_pred_logical_reg_s1(b, ctx, 1U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
+                            has_imm_carry, imm_carry, A64_ZR, live_out);
                         is_logical = false;
                         handled = true;
                         break;

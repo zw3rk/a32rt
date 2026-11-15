@@ -191,7 +191,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                     pred = 1U;
                 }
                 if (pred <= 9U) {
-                    if (is_imm_b) {
+                    if (is_imm_b && rn_b < 15U) {
                         unsigned rot_b = ((insn >> 8) & 0xFU) * 2U;
                         uint32_t imm_b = a32_ror32(insn & 0xFFU, rot_b);
                         if (a32_pred_branchless(b, cond, pred, rd_b, rn_b, 0U,
@@ -323,9 +323,6 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             if (!p_bit && off_fused && off_reg == rt) {
                 a64_emit_mov_w(b, A64_TMP1, off_reg);
                 off_reg = A64_TMP1;
-                off_sh = A64_SHIFT_LSL;
-                off_amt = 0U;
-                off_fused = false;
             }
         }
         bool pc_fold = (!reg_off && rn == 15U && p_bit && !w_bit);
@@ -653,6 +650,7 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
                             fprintf(stderr, "a32rt: unhandled A32 instruction 0x%08x at pc=0x%08x\n", ri, rpc);
                         }
                         a64_emit_exit_undef(b, rpc);
+                        a64_patch_b_cond(b, sk, b->count);
                         b->guest_end_pc = rpc + 4U;
                         return true;
                     }
