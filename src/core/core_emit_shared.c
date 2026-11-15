@@ -565,7 +565,7 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
      * expose a torn word assembled from neither architectural store
      * (A32-R7-8).
      */
-    if (count > 0U) {
+    if (l_bit && count >= 3U) {
         a64_emit_ldrb_imm_w(b, A64_ZR, A64_TMP2, 0U);
         if (total_bytes > 1U) {
             a64_emit_ldrb_imm_w(b, A64_ZR, A64_TMP2, total_bytes - 1U);
@@ -618,6 +618,9 @@ void a64_emit_ldm_stm(a64_buf_t *b, unsigned rn, uint32_t reg_mask,
     }
 
     if (loads_pc) {
+        if (l_bit && ((reg_mask & (1U << 15)) != 0U) && rn == 13U) {
+            b->is_return = true;
+        }
         a64_emit_exit_branch_reg(b, A64_TMP0, true);
         if (is_uncond && out_ends_block) {
             *out_ends_block = true;

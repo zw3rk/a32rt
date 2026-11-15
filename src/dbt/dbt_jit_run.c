@@ -360,6 +360,24 @@ int a32_jit_run(a32_ctx_t *ctx)
                 ctx->ibtc[ibtc_idx].entry     = cur_entry;
                 need_chain                    = true;
             }
+            {
+                a32_ibtc_entry_t *r = &ctx->ras[(ctx->ras_top - 1U) & (A32_RAS_SIZE - 1U)];
+                if (!uncached && cur_entry != NULL && r->entry == NULL &&
+                    r->key == key && r->caller != NULL) {
+                    a32_cache_entry_t *caller_e = (a32_cache_entry_t *)r->caller;
+                    r->epoch     = snap.epoch;
+                    r->host_code = snap.code;
+                    r->entry     = cur_entry;
+                    r->caller    = NULL;
+                    jit_lock_acquire();
+                    if (atomic_load_explicit(&g_cache_epoch, memory_order_relaxed) == snap.epoch &&
+                        atomic_load_explicit(&caller_e->epoch, memory_order_relaxed) == snap.epoch &&
+                        atomic_load_explicit(&cur_entry->epoch, memory_order_relaxed) == snap.epoch) {
+                        set_ht_ret_slot_locked(caller_e, key, snap.code, cur_entry, snap.epoch);
+                    }
+                    jit_lock_release();
+                }
+            }
         }
 
         a32_cache_entry_t *chain_prev_entry = prev_entry;
@@ -454,6 +472,7 @@ int a32_jit_run(a32_ctx_t *ctx)
                     ctx->ras[top].epoch         = epoch;
                     ctx->ras[top].host_code     = found_code;
                     ctx->ras[top].entry         = found_e;
+                    ctx->ras[top].caller        = NULL;
                     if (cur_entry != NULL && !uncached) {
                         jit_lock_acquire();
                         if (atomic_load_explicit(&g_cache_epoch, memory_order_relaxed) == epoch &&
@@ -468,6 +487,7 @@ int a32_jit_run(a32_ctx_t *ctx)
                     ctx->ras[top].epoch     = 0U;
                     ctx->ras[top].host_code = NULL;
                     ctx->ras[top].entry     = NULL;
+                    ctx->ras[top].caller    = uncached ? NULL : cur_entry;
                 }
                 ctx->ras_top = (top + 1U) & (A32_RAS_SIZE - 1U);
             }
