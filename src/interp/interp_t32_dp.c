@@ -6,6 +6,20 @@
  */
 
 #include "interp/decode_priv.h"
+extern uint8_t a32_pred_cond_mask(unsigned cond);
+extern bool a32_pred_fold_addsub_imm(a64_buf_t *b, bool is_sub, bool set_flags,
+    unsigned dst, unsigned src_n, uint32_t imm32);
+extern bool a32_pred_try_logical_imm(a64_buf_t *b, unsigned opc,
+    unsigned dst, unsigned src_n, uint32_t eff_imm);
+extern void a32_pred_logical_imm_s1(a64_buf_t *b, a32_ctx_t *ctx, unsigned base_opc,
+    unsigned dst, unsigned src_n, uint32_t eff_imm, bool has_imm_carry,
+    unsigned imm_carry, uint8_t live_out, bool is_test);
+extern void a32_pred_logical_reg_s1(a64_buf_t *b, a32_ctx_t *ctx, unsigned op_class,
+    unsigned dst, unsigned src_n, unsigned src_m, unsigned shift,
+    unsigned amount, bool has_imm_carry, unsigned imm_carry,
+    unsigned shift_carry_reg, uint8_t live_out);
+extern bool a32_pred_fuse_imm_shift(unsigned shift_type, unsigned imm5, bool is_logical,
+    bool want_carry, unsigned *out_shift, unsigned *out_amount);
 
 static uint32_t thumb_expand_imm(uint32_t imm12, bool *out_has_carry, unsigned *out_carry)
 {
@@ -102,8 +116,8 @@ static bool emit_t32_dp_op(a64_buf_t *b, unsigned op, bool set_flags,
     return true;
 }
 
-bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t hw1, uint16_t hw2,
-                            bool is_uncond, bool flags_live, bool *out_ends_block)
+bool a32_translate_t32_insn_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t hw1, uint16_t hw2,
+                            bool is_uncond, uint8_t live_out, bool *out_ends_block)
 {
     /* VFPv4-D32 / NEON delegation */
     if ((hw1 & 0xEF00U) == 0xEF00U ||
@@ -215,10 +229,8 @@ bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
         bool set_flags = ((hw1 >> 4) & 1U) != 0U;
         unsigned rn = hw1 & 0xFU;
         unsigned rd = (hw2 >> 8) & 0xFU;
-
-        /* Intra-block dead-NZCV flag liveness elimination */
         if (set_flags && rd != 15U && op != 0xAU && op != 0xBU) {
-            if (!flags_live) {
+            if (live_out == 0U) {
                 set_flags = false;
                 ctx->flags_elided++;
             }
@@ -227,9 +239,97 @@ bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
         bool has_carry = false;
         unsigned carry = 0U;
         uint32_t imm32 = thumb_expand_imm(imm12, &has_carry, &carry);
-        a64_emit_mov_imm32(b, A64_TMP1, imm32);
-
         unsigned src_n = (op != 0x2U && op != 0x3U) ? a32_load_reg(b, rn, pc_val, A64_TMP2) : rn;
+        bool is_branch = (rd == 15U && !set_flags);
+        unsigned fold_dst = (rd == 15U && set_flags) ? (unsigned)A64_ZR : (rd == 15U ? A64_TMP0 : rd);
+        if (!is_branch && (op == 0x8U || op == 0xDU)) {
+            bool is_sub = (op == 0xDU);
+            if (a32_pred_fold_addsub_imm(b, is_sub, set_flags, fold_dst, src_n, imm32)) {
+                if (rd == 15U && !set_flags) {
+                    a64_emit_exit_branch_reg(b, fold_dst, false);
+                    if (is_uncond) {
+                        *out_ends_block = true;
+                    }
+                }
+                return true;
+            }
+        }
+        if (!is_branch && op == 0xEU && imm32 == 0U && rd != 15U) {
+            a64_emit_sub_reg_w(b, set_flags, rd, A64_ZR, src_n, A64_SHIFT_LSL, 0U);
+            return true;
+        }
+        if (!is_branch && ((op == 0x2U && rn == 15U) || (op == 0x3U && rn == 15U)) && rd != 15U) {
+            uint32_t v = (op == 0x2U) ? imm32 : ~imm32;
+            a64_emit_mov_imm32(b, rd, v);
+            if (set_flags) {
+                if (live_out == 0U) {
+                    ctx->flags_elided++;
+                } else if ((live_out & 0x3U) == 0U) {
+                    a64_emit_and_reg_w(b, true, A64_ZR, rd, rd, A64_SHIFT_LSL, 0U);
+                } else {
+                    a64_emit_logical_flags(b, rd, has_carry, carry, A64_ZR);
+                }
+            }
+            return true;
+        }
+        if (!is_branch && (op <= 0x4U)) {
+            bool is_test = (rd == 15U);
+            unsigned base = 0U;
+            uint32_t eff = imm32;
+            unsigned cls = 0U;
+            if (op == 0x0U) {
+                base = 0U;
+                cls = 0U;
+            } else if (op == 0x1U) {
+                base = 0U;
+                eff = ~imm32;
+                cls = 1U;
+            } else if (op == 0x2U) {
+                base = 1U;
+                cls = 2U;
+            } else if (op == 0x3U) {
+                base = 1U;
+                eff = ~imm32;
+                cls = 3U;
+            } else {
+                base = 2U;
+                cls = 4U;
+            }
+            unsigned imms = 0U;
+            unsigned immr = 0U;
+            if (a64_encode_logical_imm32(eff, &imms, &immr)) {
+                unsigned rdst = is_test ? A64_TMP0 : rd;
+                if (rd == 15U && !set_flags) {
+                    rdst = A64_TMP0;
+                }
+                if (!set_flags) {
+                    a64_emit_logical_imm_w(b, base, rdst, src_n, eff);
+                } else if (op == 0x0U || op == 0x1U) {
+                    a32_pred_logical_imm_s1(b, ctx, base, rdst, src_n, eff,
+                        has_carry, carry, live_out, is_test);
+                } else if (op == 0x2U || op == 0x3U || op == 0x4U) {
+                    if (live_out == 0U) {
+                        a64_emit_logical_imm_w(b, base, rdst, src_n, eff);
+                        ctx->flags_elided++;
+                    } else if ((live_out & 0x3U) == 0U) {
+                        a64_emit_logical_imm_w(b, base, rdst, src_n, eff);
+                        a64_emit_and_reg_w(b, true, A64_ZR, rdst, rdst, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_logical_imm_w(b, base, rdst, src_n, eff);
+                        a64_emit_logical_flags(b, rdst, has_carry, carry, A64_ZR);
+                    }
+                    (void)cls;
+                }
+                if (rd == 15U && !set_flags) {
+                    a64_emit_exit_branch_reg(b, rdst, false);
+                    if (is_uncond) {
+                        *out_ends_block = true;
+                    }
+                }
+                return true;
+            }
+        }
+        a64_emit_mov_imm32(b, A64_TMP1, imm32);
         if (emit_t32_dp_op(b, op, set_flags, rd, rn, src_n, A64_TMP1,
                            has_carry, carry, A64_ZR, is_uncond, out_ends_block)) {
             return true;
@@ -351,24 +451,96 @@ bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
 
         /* Intra-block dead-NZCV flag liveness elimination */
         if (set_flags && rd != 15U && op != 0xAU && op != 0xBU) {
-            if (!flags_live) {
+            if (live_out == 0U) {
                 set_flags = false;
                 ctx->flags_elided++;
             }
         }
         unsigned shift_type = (hw2 >> 4) & 3U;
         unsigned imm5 = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
-
         unsigned shift_carry_reg = A64_ZR;
-        unsigned src_m = a32_load_reg(b, rm, pc_val, A64_TMP1);
-        a64_emit_shift_imm_w(b, A64_TMP1, src_m, shift_type, imm5,
-                             set_flags && op <= 0x4U, &shift_carry_reg);
-        src_m = A64_TMP1;
-
+        unsigned src_m = A64_TMP1;
+        bool fused = false;
+        unsigned fused_sh = 0U;
+        unsigned fused_amt = 0U;
+        bool is_rsb_adc = (op == 0xAU || op == 0xBU || op == 0xEU);
+        if (rm != 15U && !is_rsb_adc) {
+            bool want_c = set_flags && op <= 0x4U && ((live_out & 0x2U) != 0U);
+            if (op == 0x8U || op == 0xDU) {
+                want_c = false;
+            }
+            bool lg = (op <= 0x4U);
+            if (a32_pred_fuse_imm_shift(shift_type, imm5, lg, want_c, &fused_sh, &fused_amt)) {
+                fused = true;
+                src_m = rm;
+                if (rm == 15U) {
+                    src_m = a32_load_reg(b, rm, pc_val, A64_TMP1);
+                    fused = false;
+                }
+            }
+        }
+        if (!fused) {
+            unsigned tmp = a32_load_reg(b, rm, pc_val, A64_TMP1);
+            a64_emit_shift_imm_w(b, A64_TMP1, tmp, shift_type, imm5,
+                                 set_flags && op <= 0x4U, &shift_carry_reg);
+            src_m = A64_TMP1;
+        }
         unsigned src_n = (op != 0x2U && op != 0x3U) ? a32_load_reg(b, rn, pc_val, A64_TMP0) : rn;
-        if (emit_t32_dp_op(b, op, set_flags, rd, rn, src_n, src_m,
-                           false, 0U, shift_carry_reg, is_uncond, out_ends_block)) {
-            return true;
+        if (!fused) {
+            if (emit_t32_dp_op(b, op, set_flags, rd, rn, src_n, src_m,
+                               false, 0U, shift_carry_reg, is_uncond, out_ends_block)) {
+                return true;
+            }
+        } else {
+            unsigned s_n = src_n;
+            unsigned s_m = src_m;
+            unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
+            bool done = false;
+            if (op == 0x0U && !set_flags) {
+                a64_emit_and_reg_w(b, false, dst, s_n, s_m, fused_sh, fused_amt);
+                done = true;
+            } else if (op == 0x1U && !set_flags) {
+                a64_emit_bic_reg_w(b, false, dst, s_n, s_m, fused_sh, fused_amt);
+                done = true;
+            } else if (op == 0x2U && !set_flags) {
+                if (rn == 15U) {
+                    a64_emit_orr_reg_w(b, dst, A64_ZR, s_m, fused_sh, fused_amt);
+                } else {
+                    a64_emit_orr_reg_w(b, dst, s_n, s_m, fused_sh, fused_amt);
+                }
+                done = true;
+            } else if (op == 0x3U && !set_flags) {
+                if (rn == 15U) {
+                    a64_emit_orn_reg_w(b, dst, A64_ZR, s_m, fused_sh, fused_amt);
+                } else {
+                    a64_emit_orn_reg_w(b, dst, s_n, s_m, fused_sh, fused_amt);
+                }
+                done = true;
+            } else if (op == 0x4U && !set_flags) {
+                a64_emit_eor_reg_w(b, dst, s_n, s_m, fused_sh, fused_amt);
+                done = true;
+            } else if (op == 0x8U) {
+                a64_emit_add_reg_w(b, set_flags, (rd == 15U && set_flags) ? A64_ZR : dst,
+                    s_n, s_m, fused_sh, fused_amt);
+                done = true;
+            } else if (op == 0xDU) {
+                a64_emit_sub_reg_w(b, set_flags, (rd == 15U && set_flags) ? A64_ZR : dst,
+                    s_n, s_m, fused_sh, fused_amt);
+                done = true;
+            }
+            if (done) {
+                if (rd == 15U && !set_flags) {
+                    a64_emit_exit_branch_reg(b, dst, false);
+                    if (is_uncond) {
+                        *out_ends_block = true;
+                    }
+                }
+                return true;
+            }
+            if (emit_t32_dp_op(b, op, set_flags, rd, rn, s_n, s_m,
+                               false, 0U, shift_carry_reg, is_uncond, out_ends_block)) {
+                return true;
+            }
         }
     }
 
@@ -383,7 +555,7 @@ bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
             bool set_flags = ((hw1 >> 4) & 1U) != 0U;
             /* Intra-block dead-NZCV flag liveness elimination */
             if (set_flags && rd != 15U) {
-                if (!flags_live) {
+                if (live_out == 0U) {
                     set_flags = false;
                     ctx->flags_elided++;
                 }
@@ -547,3 +719,11 @@ bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
 
     return a32_translate_t32_mem_insn(b, hw1, hw2, pc_val, pc_align4, is_uncond, out_ends_block);
 }
+
+bool a32_translate_t32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t hw1, uint16_t hw2,
+    bool is_uncond, bool flags_live, bool *out_ends_block)
+{
+    uint8_t live = flags_live ? 0xFU : 0U;
+    return a32_translate_t32_insn_nzcv(ctx, b, pc, hw1, hw2, is_uncond, live, out_ends_block);
+}
+
