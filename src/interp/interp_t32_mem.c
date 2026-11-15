@@ -260,6 +260,10 @@ bool a32_translate_t32_mem_insn(a64_buf_t *b, uint16_t hw1, uint16_t hw2,
     }
 
     /* 8. Coprocessor p15 */
+    if ((((uint32_t)hw1 << 16) | hw2) == 0x0C500F1EU ||
+        ((((uint32_t)hw1 << 16) | hw2) & 0x0FF00FFFU) == 0x0C500F1EU) {
+        return a64_emit_cp15(b, ((uint32_t)hw1 << 16) | hw2);
+    }
     if ((hw1 & 0xFFEFU) == 0xEE0DU || (hw1 & 0xFFEFU) == 0xEE07U) {
         return a64_emit_cp15(b, ((uint32_t)hw1 << 16) | hw2);
     }
@@ -731,6 +735,7 @@ bool a32_translate_t32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
     for (unsigned idx = 0U; idx < num_insns; idx++) {
         const t32_insn_info_t *info = &block_insns[idx];
         uint32_t cur_pc = info->pc;
+        b->cur_insn_pc = cur_pc;
         uint16_t hw1 = info->hw1;
 
         if (idx > 0U && itstate == 0U && (b->count + 1536U >= b->cap)) {

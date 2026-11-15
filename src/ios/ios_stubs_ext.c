@@ -58,20 +58,7 @@ void a32_ios_exit_teardown(a32_ctx_t *ctx, int code)
         (void)a32_aot_save_cache(ctx, ctx->exec_path);
     }
     if (ctx != NULL && ctx->stats_enabled) {
-        fprintf(stderr,
-            "[a32rt stats] blocks_compiled=%llu blocks_executed=%llu chain_hits=%llu "
-            "ibtc_hits=%llu ras_hits=%llu flags_elided=%llu syscalls=%llu "
-            "icache_flushes=%llu wx_transitions=%llu window=0x%llx\n",
-            (unsigned long long)ctx->blocks_compiled,
-            (unsigned long long)ctx->blocks_executed,
-            (unsigned long long)ctx->chain_hits,
-            (unsigned long long)ctx->ibtc_hits,
-            (unsigned long long)ctx->ras_hits,
-            (unsigned long long)ctx->flags_elided,
-            (unsigned long long)ctx->syscalls_executed,
-            (unsigned long long)ctx->icache_flushes,
-            (unsigned long long)ctx->wx_transitions,
-            (unsigned long long)ctx->guest_base);
+        a32_print_stats(ctx);
     }
     fflush(NULL);
     _exit(code & 0xFF);

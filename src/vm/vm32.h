@@ -82,6 +82,7 @@ uintptr_t a32_vm32_arena_base(void);
 #define A32_VM32_TLB_SIZE (1U << A32_VM32_TLB_BITS) /* 1048576 entries */
 #define A32_VM32_TLB_INVALID_TAG (~UINT64_C(0))
 #define A32_PROT_EOF_CUT 0x80U
+#define A32_PROT_WATCH 0x40U
 
 typedef struct {
     uint64_t read_tag; /* Offset 0: (gva & ~0xFFF) if readable, else ~0 */
@@ -122,6 +123,8 @@ bool a32_vm32_range_prot_ok(uint32_t va, uint32_t len, uint32_t req_prot);
  * mremap can preserve PROT_NONE bytes instead of skipping them. */
 bool a32_vm32_page_eof_cut(uint32_t gva);
 int a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut);
+void a32_vm32_mark_code_range(uint32_t start_gva, uint32_t end_gva);
+void a32_vm32_clear_code_watches(void);
 
 /* Soft-TLB base address for the A2 emitter/trampoline (x21). Set by
  * a32_vm32_init: &g_tlb[0] when regime == A2_SOFT_TLB, 0 (unused) in A1. */

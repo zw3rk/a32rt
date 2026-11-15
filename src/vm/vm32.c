@@ -661,3 +661,13 @@ void a32_vm32_reservation_bump(uint32_t gva_aligned)
     atomic_fetch_add(&g_ll[h].epoch, 1ULL);
     atomic_store(&g_ll[h].owner, NULL);
 }
+
+void a32_vm32_mark_code_range(uint32_t start_gva, uint32_t end_gva)
+{
+    (void)start_gva;
+    (void)end_gva;
+}
+
+void a32_vm32_clear_code_watches(void)
+{
+}

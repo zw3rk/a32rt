@@ -482,6 +482,22 @@ bool a64_emit_cp15(a64_buf_t *b, uint32_t insn28)
 {
     unsigned rt = (insn28 >> 12) & 0xFU;
     uint32_t masked = insn28 & 0x0FFF0FFFU;
+    if (masked == 0x0E1E0F10U && rt < 15U) {
+        a64_emit(b, 0xD53BE000U | (rt & 31U));
+        return true;
+    }
+    {
+        uint32_t mrrc_masked = insn28 & 0x0FF00FFFU;
+        unsigned rt2 = (insn28 >> 16) & 0xFU;
+        unsigned rt_lo = (insn28 >> 12) & 0xFU;
+        if (mrrc_masked == 0x0C500F1EU && rt_lo < 15U && rt2 < 15U && rt_lo != rt2) {
+            a64_emit(b, 0xD53BE050U);
+            a64_emit_mov_w(b, rt_lo, 16U);
+            a64_emit(b, 0xD360FE11U);
+            a64_emit_mov_w(b, rt2, 17U);
+            return true;
+        }
+    }
     if (masked == 0x0E1D0F70U) {
         a64_emit_ldr_imm_w(b, rt, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, tls_tp));
         return true;

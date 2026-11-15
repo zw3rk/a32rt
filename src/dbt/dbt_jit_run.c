@@ -385,6 +385,12 @@ int a32_jit_run(a32_ctx_t *ctx)
         pthread_jit_write_protect_np(1);
 #endif
         uint32_t reason         = a32_jit_run_block(ctx, code, run_entry, &g_cache_epoch);
+        if (ctx->stats_enabled && reason < 8U) {
+            ctx->exits_by_reason[reason]++;
+        }
+        if (ctx->stats_enabled && reason == A32_EXIT_FAULT) {
+            ctx->tlb_slow_hits++;
+        }
         is_thumb                = (ctx->cpsr & A32_CPSR_T) != 0U;
         bool     sync_sig_taken = ctx->sync_sig_delivered;
         if (sync_sig_taken) {

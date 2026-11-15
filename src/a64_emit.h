@@ -42,6 +42,7 @@
 #define A64_XG   20U
 #define A64_TMP3 21U
 #define A64_ADDR 22U
+#define A64_XTLB 25U
 #define A64_ZR   31U
 
 /* Shift types */
@@ -103,6 +104,34 @@ typedef struct a64_buf {
     bool      saw_neon_fp;         /* block emitted >= 1 NEON FP op */
     bool      saw_scalar_vfp;      /* block emitted >= 1 scalar VFP op */
     bool      preheader_neon_fpcr; /* pass-2 self-loop hoisted NEON FPCR into preheader */
+    a32_ctx_t *ctx;
+    bool       is_thumb;
+    bool       is_return;
+    bool       stats_enabled;
+    bool       fpscr_zero_spec;
+    uint8_t    preheader_fpcr_mode;
+    uint16_t   n_neon_fp;
+    uint16_t   n_scalar_fp;
+    uint32_t   cur_insn_pc;
+    /* Out-of-line cold stubs emitted before block tail */
+    uint32_t   cold_words[512];
+    size_t     cold_count;
+    uint32_t   cold_patch_src[128];
+    uint32_t   cold_patch_dst[128];
+    uint8_t    cold_patch_kind[128];
+    size_t     cold_patch_count;
+    /* Consecutive [rn, #imm] memory group state */
+    uint32_t   mem_grp_words_idx;
+    uint32_t   mem_grp_pc[16];
+    uint32_t   mem_grp_itstate[16];
+    int32_t    mem_grp_off[16];
+    uint8_t    mem_grp_rt[16];
+    uint8_t    mem_grp_rt2[16];
+    uint8_t    mem_grp_op[16];
+    uint8_t    mem_grp_rn;
+    uint8_t    mem_grp_count;
+    unsigned   mem_grp_cond_depth;
+    bool       mem_grp_active;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
@@ -343,6 +372,9 @@ void a64_emit_isb(a64_buf_t *b);
  * TMP2, never w15/w16. */
 static inline void a64_emit_fpcr_install_neon(a64_buf_t *b)
 {
+    if (b->ctx != NULL) {
+        b->ctx->fpcr_switches_emitted++;
+    }
     a64_emit_ldr_imm_w(b, A64_TMP1, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
     a64_emit_mov_imm32(b, A64_TMP2, 0x04000000U);
     a64_emit_and_reg_w(b, false, A64_TMP1, A64_TMP1, A64_TMP2, A64_SHIFT_LSL, 0U);
@@ -353,6 +385,9 @@ static inline void a64_emit_fpcr_install_neon(a64_buf_t *b)
 
 static inline void a64_emit_fpcr_restore_scalar(a64_buf_t *b)
 {
+    if (b->ctx != NULL) {
+        b->ctx->fpcr_switches_emitted++;
+    }
     a64_emit_ldr_imm_w(b, 23U, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fpscr));
     a64_emit_mov_imm32(b, A64_TMP2, 0x07C00000U);
     a64_emit_and_reg_w(b, false, 23U, 23U, A64_TMP2, A64_SHIFT_LSL, 0U);
@@ -365,6 +400,24 @@ void   a64_patch_b_cond(a64_buf_t *b, size_t patch_idx, size_t target_idx);
 size_t a64_emit_cbz_w_placeholder(a64_buf_t *b, bool is_cbnz, unsigned rt);
 void   a64_patch_cbz_w(a64_buf_t *b, size_t patch_idx, size_t target_idx);
 void   a64_emit_ret(a64_buf_t *b);
+
+void a64_buf_flush_cold_stubs(a64_buf_t *b);
+void a64_emit_movn_w(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw);
+bool a64_encode_logical_imm32(uint32_t imm, unsigned *out_imms, unsigned *out_immr);
+void a64_emit_logical_imm_w(a64_buf_t *b, unsigned opc, unsigned rd, unsigned rn, uint32_t imm);
+void a64_emit_csinc_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
+void a64_emit_csinv_w(a64_buf_t *b, unsigned rd, unsigned rn, unsigned rm, unsigned cond);
+
+unsigned a64_vfp_src_s(a64_buf_t *b, unsigned scratch_vt, unsigned s_idx);
+unsigned a64_vfp_dst_s(a64_buf_t *b, unsigned scratch_vt, unsigned s_idx);
+void     a64_vfp_commit_s(a64_buf_t *b, unsigned host_vt, unsigned s_idx);
+unsigned a64_vfp_src_d(a64_buf_t *b, unsigned scratch_vt, unsigned d_idx);
+unsigned a64_vfp_dst_d(a64_buf_t *b, unsigned scratch_vt, unsigned d_idx);
+void     a64_vfp_commit_d(a64_buf_t *b, unsigned host_vt, unsigned d_idx);
+unsigned a64_vfp_src_q(a64_buf_t *b, unsigned scratch_vt, unsigned q_idx);
+unsigned a64_vfp_dst_q(a64_buf_t *b, unsigned scratch_vt, unsigned q_idx);
+void     a64_vfp_commit_q(a64_buf_t *b, unsigned host_vt, unsigned q_idx);
+int      a64_vfp_find_exact_slot(const a64_buf_t *b, uint8_t kind, uint8_t reg);
 
 /* Standard fragment exit sequences */
 void a64_emit_exit_branch(a64_buf_t *b, uint32_t target_pc);

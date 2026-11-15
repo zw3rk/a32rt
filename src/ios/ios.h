@@ -350,6 +350,9 @@ uint32_t a32_ios_lookup_synth_ext(a32_ctx_t *ctx, const char *sym_name, bool *ou
 int      a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx);
 int      a32_ios_handle_stub_ext(a32_ctx_t *ctx, uint32_t stub_id, bool *out_handled);
 void     a32_ios_exit_teardown(a32_ctx_t *ctx, int code);
+void     a32_ios_refresh_runtime_pid(a32_ctx_t *ctx);
+int      a32_ios_emit_time_pid_leaf_stubs(a32_ctx_t *ctx, uint32_t *io_cur_va);
+uint32_t a32_ios_lookup_time_pid_leaf(const char *sym_name, bool *out_found);
 
 /* CommPage, trampolines, and Darwin stack setup (ios_commpage_stack.c) */
 int      a32_ios_commpage_setup(a32_ctx_t *ctx);

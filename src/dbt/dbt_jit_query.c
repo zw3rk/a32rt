@@ -211,16 +211,27 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
             a32_jit_stage_reset();
             a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
 
+            uint64_t tr_t0 = 0U;
+            if (ctx != NULL && ctx->stats_enabled) {
+                tr_t0 = a32_host_monotonic_ns();
+            }
             a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
             buf.guest_start_pc = cur_b_pc;
+            buf.ctx = ctx;
+            buf.is_thumb = is_thumb;
+            buf.stats_enabled = (ctx != NULL && ctx->stats_enabled);
             if (uncached) {
                 buf.vfp_preheader_ineligible = true;
             }
 
+            bool tr_ok = false;
             if (is_thumb) {
-                a32_translate_t32_block(ctx, &buf, cur_b_pc);
+                tr_ok = a32_translate_t32_block(ctx, &buf, cur_b_pc);
             } else {
-                a32_translate_a32_block(ctx, &buf, cur_b_pc);
+                tr_ok = a32_translate_a32_block(ctx, &buf, cur_b_pc);
+            }
+            if (tr_ok) {
+                a64_buf_flush_cold_stubs(&buf);
             }
 
             bool can_promote_regs = !buf.vfp_preheader_ineligible && (buf.vfp_preheader_count > 0U);
@@ -241,15 +252,25 @@ a32_cache_entry_t *a32_jit_lookup_or_compile_entry(a32_ctx_t *ctx, uint32_t pc, 
                 a32_jit_record_pc_map(0U, cur_b_pc, entry_itstate);
                 a64_buf_init(&buf, stage_words, A32_AOT_MAX_WORDS);
                 buf.guest_start_pc = cur_b_pc;
+                buf.ctx = ctx;
+                buf.is_thumb = is_thumb;
+                buf.stats_enabled = (ctx != NULL && ctx->stats_enabled);
                 a64_buf_start_self_loop(&buf, saved_kinds, saved_regs, saved_count,
                                         saved_written, pass1_neon_only);
+                bool tr_ok2 = false;
                 if (is_thumb) {
-                    a32_translate_t32_block(ctx, &buf, cur_b_pc);
+                    tr_ok2 = a32_translate_t32_block(ctx, &buf, cur_b_pc);
                 } else {
-                    a32_translate_a32_block(ctx, &buf, cur_b_pc);
+                    tr_ok2 = a32_translate_a32_block(ctx, &buf, cur_b_pc);
+                }
+                if (tr_ok2) {
+                    a64_buf_flush_cold_stubs(&buf);
                 }
             }
 
+            if (ctx != NULL && ctx->stats_enabled) {
+                ctx->ns_translate += a32_host_monotonic_ns() - tr_t0;
+            }
             if (buf.overflow) {
                 a32_emit_sites_reset_block(cur_b_pc);
                 if (hold_lock) {

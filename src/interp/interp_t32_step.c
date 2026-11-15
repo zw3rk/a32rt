@@ -319,6 +319,40 @@ uint32_t i_t32_step_ext(a32_ctx_t *ctx, uint32_t pc, uint16_t hw1,
     uint32_t pc_val = pc + 4U;
     uint32_t pc_align4 = pc_val & ~3U;
 
+    {
+        uint32_t word32 = ((uint32_t)hw1 << 16) | hw2;
+        unsigned rt32 = (word32 >> 12) & 0xFU;
+        if ((word32 & 0x0FFF0FFFU) == 0x0E1E0F10U && rt32 < 15U) {
+#if defined(__aarch64__)
+            uint64_t freq = 0ULL;
+            __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+            ctx->regs[rt32] = (uint32_t)freq;
+#else
+            ctx->regs[rt32] = 0U;
+#endif
+            ctx->regs[15] = next;
+            return A32_EXIT_NONE;
+        }
+        {
+            unsigned rt_lo = (word32 >> 12) & 0xFU;
+            unsigned rt_hi = (word32 >> 16) & 0xFU;
+            if ((word32 & 0x0FF00FFFU) == 0x0C500F1EU && rt_lo < 15U && rt_hi < 15U &&
+                rt_lo != rt_hi) {
+#if defined(__aarch64__)
+                uint64_t cnt = 0ULL;
+                __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+                ctx->regs[rt_lo] = (uint32_t)cnt;
+                ctx->regs[rt_hi] = (uint32_t)(cnt >> 32);
+#else
+                ctx->regs[rt_lo] = 0U;
+                ctx->regs[rt_hi] = 0U;
+#endif
+                ctx->regs[15] = next;
+                return A32_EXIT_NONE;
+            }
+        }
+    }
+
     /* VFP / NEON / CP15 delegation (matches interp_t32_dp.c ordering). */
     bool is_vfp = ((hw1 & 0xEF00U) == 0xEF00U) ||
         ((hw1 & 0xFF10U) == 0xF900U) ||

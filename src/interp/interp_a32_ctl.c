@@ -362,6 +362,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             if (cp == 10U || cp == 11U) {
                 /* VFPv4-D32 / NEON delegation */
                 handled = a32_decode_vfp_neon_a32(b, insn, pc);
+            } else if ((insn & 0x0FF00FFFU) == 0x0C500F1EU) {
+                handled = a64_emit_cp15(b, insn);
             } else if (cp == 15U) {
                 handled = a64_emit_cp15(b, insn);
             }
@@ -682,6 +684,7 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
     /* Translation & emission loop */
     for (unsigned i = 0U; i < num_insns; i++) {
         uint32_t cur_pc = pc + (i * 4U);
+        b->cur_insn_pc = cur_pc;
         if (i > 0U && (b->count + 1280U >= b->cap)) {
             b->guest_end_pc = cur_pc;
             a64_emit_exit_branch_imm(b, cur_pc, false);

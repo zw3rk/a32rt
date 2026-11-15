@@ -66,6 +66,7 @@ SRCS := src/main.c \
         src/stack32.c \
         src/core/core_emit_alu.c \
         src/core/core_emit_mem.c \
+        src/core/core_emit_exit.c \
         src/core/core_emit_shared.c \
         src/interp/interp_a32_ctl.c \
         src/interp/interp_a32_dp.c \
@@ -101,6 +102,8 @@ SRCS := src/main.c \
         src/interp/interp_vfp_neon_int.c \
         src/interp/interp_vfp_neon_shift.c \
         src/interp/interp_vfp_neon_long.c \
+        src/interp/interp_pred_imm.c \
+        src/interp/interp_vfp_cache.c \
         src/dbt/difftest.c \
         src/vm/vm32.c \
         src/vm/vm_file.c \
@@ -123,6 +126,7 @@ SRCS := src/main.c \
         src/ios/ios_threads.c \
         src/ios/ios_stubs.c \
         src/ios/ios_stubs_ext.c \
+        src/ios/ios_stubs_time.c \
         src/os/backend_sync.c \
         $(A32_BACKEND_SRC)
 ASM_SRCS := src/trampoline.S

@@ -843,6 +843,35 @@ uint32_t i_a32_step(a32_ctx_t *ctx, uint32_t pc)
     {
         uint32_t masked = insn & 0x0FFF0FFFU;
         unsigned rt = (insn >> 12) & 0xFU;
+        if (masked == 0x0E1E0F10U && rt < 15U) {
+#if defined(__aarch64__)
+            uint64_t freq = 0ULL;
+            __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+            ctx->regs[rt] = (uint32_t)freq;
+#else
+            ctx->regs[rt] = 0U;
+#endif
+            ctx->regs[15] = pc + 4U;
+            return A32_EXIT_NONE;
+        }
+        {
+            uint32_t mrrc_masked = insn & 0x0FF00FFFU;
+            unsigned rt_lo = (insn >> 12) & 0xFU;
+            unsigned rt_hi = (insn >> 16) & 0xFU;
+            if (mrrc_masked == 0x0C500F1EU && rt_lo < 15U && rt_hi < 15U && rt_lo != rt_hi) {
+#if defined(__aarch64__)
+                uint64_t cnt = 0ULL;
+                __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+                ctx->regs[rt_lo] = (uint32_t)cnt;
+                ctx->regs[rt_hi] = (uint32_t)(cnt >> 32);
+#else
+                ctx->regs[rt_lo] = 0U;
+                ctx->regs[rt_hi] = 0U;
+#endif
+                ctx->regs[15] = pc + 4U;
+                return A32_EXIT_NONE;
+            }
+        }
         if (masked == 0x0E1D0F70U) {
             ctx->regs[rt] = ctx->tls_tp; /* TPIDRURO read (c13, c0, 3) */
             ctx->regs[15] = pc + 4U;

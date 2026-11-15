@@ -59,7 +59,7 @@ typedef struct a32_ibtc_entry {
     uint32_t    epoch;
     const void *host_code;
     void       *entry;
-    uint64_t    pad;
+    void       *caller;
 } a32_ibtc_entry_t;
 
 _Static_assert(sizeof(a32_ibtc_entry_t) == 32, "a32_ibtc_entry_t must be 32 bytes");
@@ -178,6 +178,20 @@ typedef struct a32_ctx {
     uint32_t    ios_thr_slot_plus1;
     uint32_t    ios_fn_starts_count;
     uint32_t   *ios_fn_starts;
+    /* Attribution timers & codegen/runtime counters (A32-R20-P0) */
+    bool        difftest_mode;
+    uint64_t    ns_vm_init;
+    uint64_t    ns_translate;
+    uint64_t    ns_wx_flush;
+    uint64_t    aprr_toggles;
+    uint64_t    tlb_checks_emitted;
+    uint64_t    tlb_group_guards;
+    uint64_t    tlb_slow_hits;
+    uint64_t    vfp_cache_copies_emitted;
+    uint64_t    fpcr_switches_emitted;
+    uint64_t    fpcr_guard_slow_hits;
+    uint64_t    aot_abs64_words;
+    uint64_t    exits_by_reason[8];
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -297,6 +311,10 @@ static inline int a32_host_prot(const a32_ctx_t *ctx, uint32_t guest_prot)
 
 /* Host handshake (`src/host.c`) */
 void a32_host_probe(a32_ctx_t *ctx);
+
+/* Attribution timers & stats (A32-R20-P0, `src/main.c`) */
+uint64_t a32_host_monotonic_ns(void);
+void a32_print_stats(const a32_ctx_t *ctx);
 
 /* Guest window & memory management (`src/vm.c`) */
 int      a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window);

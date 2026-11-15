@@ -18,11 +18,62 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(__linux__)
 #include <sys/auxv.h>
 #endif
 #include <sys/syscall.h>
 #include <unistd.h>
+
+uint64_t a32_host_monotonic_ns(void)
+{
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+void a32_print_stats(const a32_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    fprintf(stderr,
+        "[a32rt stats] blocks_compiled=%llu blocks_executed=%llu chain_hits=%llu "
+        "ibtc_hits=%llu ras_hits=%llu flags_elided=%llu syscalls=%llu "
+        "icache_flushes=%llu wx_transitions=%llu\n",
+        (unsigned long long)ctx->blocks_compiled,
+        (unsigned long long)ctx->blocks_executed,
+        (unsigned long long)ctx->chain_hits,
+        (unsigned long long)ctx->ibtc_hits,
+        (unsigned long long)ctx->ras_hits,
+        (unsigned long long)ctx->flags_elided,
+        (unsigned long long)ctx->syscalls_executed,
+        (unsigned long long)ctx->icache_flushes,
+        (unsigned long long)ctx->wx_transitions);
+    fprintf(stderr,
+        "[a32rt stats-ext] ns_vm_init=%llu ns_translate=%llu ns_wx_flush=%llu "
+        "aprr_toggles=%llu tlb_checks=%llu tlb_groups=%llu tlb_slow=%llu "
+        "vfp_copies=%llu fpcr_sw=%llu fpcr_slow=%llu aot_abs64=%llu "
+        "exits=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        (unsigned long long)ctx->ns_vm_init,
+        (unsigned long long)ctx->ns_translate,
+        (unsigned long long)ctx->ns_wx_flush,
+        (unsigned long long)ctx->aprr_toggles,
+        (unsigned long long)ctx->tlb_checks_emitted,
+        (unsigned long long)ctx->tlb_group_guards,
+        (unsigned long long)ctx->tlb_slow_hits,
+        (unsigned long long)ctx->vfp_cache_copies_emitted,
+        (unsigned long long)ctx->fpcr_switches_emitted,
+        (unsigned long long)ctx->fpcr_guard_slow_hits,
+        (unsigned long long)ctx->aot_abs64_words,
+        (unsigned long long)ctx->exits_by_reason[1],
+        (unsigned long long)ctx->exits_by_reason[2],
+        (unsigned long long)ctx->exits_by_reason[3],
+        (unsigned long long)ctx->exits_by_reason[4],
+        (unsigned long long)ctx->exits_by_reason[5],
+        (unsigned long long)ctx->exits_by_reason[6],
+        (unsigned long long)ctx->exits_by_reason[7]);
+}
 
 static bool getenv_bool(const char *name)
 {
@@ -393,6 +444,11 @@ int main(int argc, char **argv, char **envp)
     char **clean_envp = filter_exec_sig_env(envp);
     ctx.host_envp = clean_envp;
 
+    ctx.difftest_mode = (exec_mode == A32_EXEC_DIFFTEST);
+    uint64_t vm_t0 = 0U;
+    if (ctx.stats_enabled) {
+        vm_t0 = a32_host_monotonic_ns();
+    }
     if (a32_vm_init(&ctx, requested_window) != 0) {
         free(ctx.ios_fn_starts);
         return 1;
@@ -403,6 +459,9 @@ int main(int argc, char **argv, char **envp)
     if (a32_vm32_init(&ctx) != 0) {
         free(ctx.ios_fn_starts);
         return 1;
+    }
+    if (ctx.stats_enabled) {
+        ctx.ns_vm_init = a32_host_monotonic_ns() - vm_t0;
     }
 
     a32_elf_info_t elf_info;
@@ -456,15 +515,24 @@ int main(int argc, char **argv, char **envp)
 
     if (exec_mode == A32_EXEC_INTERP) {
         int irc = a32_difftest_run_interp(&ctx, 0ULL, NULL);
+        if (ctx.stats_enabled) {
+            a32_print_stats(&ctx);
+        }
         free(ctx.ios_fn_starts);
         return irc;
     }
     if (exec_mode == A32_EXEC_DIFFTEST) {
         int drc = a32_difftest_run_compare(&ctx, 0ULL, NULL);
+        if (ctx.stats_enabled) {
+            a32_print_stats(&ctx);
+        }
         free(ctx.ios_fn_starts);
         return drc;
     }
     int rc = a32_difftest_run_dbt(&ctx, NULL);
+    if (ctx.stats_enabled) {
+        a32_print_stats(&ctx);
+    }
     if (ctx.auto_aot && !ctx.aot_loaded && ctx.blocks_compiled > 0U) {
         (void)a32_aot_save_cache(&ctx, exec_path);
     }

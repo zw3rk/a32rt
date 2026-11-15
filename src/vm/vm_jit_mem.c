@@ -151,6 +151,9 @@ void a32_jit_reset_cache_locked(a32_ctx_t *ctx)
     }
 #if defined(__APPLE__)
     pthread_jit_write_protect_np(0);
+    if (ctx != NULL && ctx->stats_enabled) {
+        ctx->aprr_toggles++;
+    }
 #else
     if (mprotect(g_code_cache, A32_CODE_CACHE_SIZE, PROT_READ | PROT_WRITE) != 0) {
         fprintf(stderr, "a32rt: reset_cache mprotect(RW) failed: %s\n", strerror(errno));
@@ -192,6 +195,10 @@ void a32_jit_reset_cache_locked(a32_ctx_t *ctx)
 
 int a32_jit_flush_batch_locked(a32_ctx_t *ctx)
 {
+    uint64_t wx_t0 = 0U;
+    if (ctx != NULL && ctx->stats_enabled) {
+        wx_t0 = a32_host_monotonic_ns();
+    }
     size_t used_pages = (g_code_used + A32_PAGE_SIZE - 1U) / A32_PAGE_SIZE;
     if (used_pages > A32_CACHE_PAGES) {
         used_pages = A32_CACHE_PAGES;
@@ -214,6 +221,9 @@ int a32_jit_flush_batch_locked(a32_ctx_t *ctx)
 #else
         if (mprotect(range_start, range_len, PROT_READ | PROT_EXEC) != 0) {
             fprintf(stderr, "a32rt: code cache mprotect(RX) failed: %s\n", strerror(errno));
+            if (ctx != NULL && ctx->stats_enabled) {
+                ctx->ns_wx_flush += a32_host_monotonic_ns() - wx_t0;
+            }
             return -1;
         }
 #endif
@@ -225,6 +235,9 @@ int a32_jit_flush_batch_locked(a32_ctx_t *ctx)
     g_first_rw_page = used_pages;
 #if defined(__APPLE__)
     pthread_jit_write_protect_np(1);
+    if (ctx != NULL && ctx->stats_enabled) {
+        ctx->aprr_toggles++;
+    }
 #endif
 
     if (g_batch_max > g_batch_min) {
@@ -233,6 +246,9 @@ int a32_jit_flush_batch_locked(a32_ctx_t *ctx)
         g_batch_max = 0U;
     }
 
+    if (ctx != NULL && ctx->stats_enabled) {
+        ctx->ns_wx_flush += a32_host_monotonic_ns() - wx_t0;
+    }
     return 0;
 }
 
@@ -265,6 +281,9 @@ uint8_t *a32_jit_allocate_code_space_locked(a32_ctx_t *ctx, size_t code_bytes)
     for (size_t p = p_start; p < p_end; p++) {
 #if defined(__APPLE__)
         pthread_jit_write_protect_np(0);
+        if (ctx != NULL && ctx->stats_enabled) {
+            ctx->aprr_toggles++;
+        }
         if (!g_page_is_rw[p]) {
             g_page_is_rw[p] = true;
             ctx->wx_transitions++;
