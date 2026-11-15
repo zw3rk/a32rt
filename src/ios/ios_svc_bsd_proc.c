@@ -162,6 +162,7 @@ static int do_fork_child(a32_ctx_t *ctx, const sigset_t *saved)
     ctx->pending_signals = 0ULL;
     a32_signals_set_thread_ctx(ctx);
     (void)pthread_sigmask(SIG_SETMASK, saved, NULL);
+    a32_ios_refresh_runtime_pid(ctx);
     /* XNU fork dual-return convention: child sees r0 = 0, r1 = 1. */
     a32_ios_bsd_ok(ctx, 0U, 1U, true);
     return 0;

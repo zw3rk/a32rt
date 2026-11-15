@@ -518,6 +518,13 @@ static bool le_ensure_code_locked(void)
             g_leaf_nwords = 0U;
             return false;
         }
+        {
+            uint32_t cur = A32_IOS_LEAF_STUB_VA + g_leaf_nwords * 4U;
+            if (a32_ios_emit_time_pid_leaf_stubs(NULL, &cur) != 0) {
+                g_leaf_nwords = 0U;
+                return false;
+            }
+        }
         g_leaf_ok = true;
     }
     return true;
@@ -566,6 +573,12 @@ int a32_ios_emit_native_leaf_stubs(a32_ctx_t *ctx)
     base = (uint8_t *)a32_guest_ptr(ctx, A32_IOS_LEAF_STUB_VA);
     memcpy(base, g_leaf_code, (size_t)nwords * 4U);
     (void)pthread_mutex_unlock(&g_leaf_mu);
+    {
+        uint32_t cur = A32_IOS_LEAF_STUB_VA + nwords * 4U;
+        if (a32_ios_emit_time_pid_leaf_stubs(ctx, &cur) != 0) {
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -584,6 +597,8 @@ uint32_t a32_ios_lookup_synth_ext(a32_ctx_t *ctx, const char *sym_name,
     bool *out_found)
 {
     uint32_t i;
+    bool tf = false;
+    uint32_t tv = 0U;
     if (out_found != NULL) {
         *out_found = false;
     }
@@ -592,6 +607,18 @@ uint32_t a32_ios_lookup_synth_ext(a32_ctx_t *ctx, const char *sym_name,
     }
     (void)pthread_mutex_lock(&g_leaf_mu);
     (void)le_ensure_code_locked();
+    tv = a32_ios_lookup_time_pid_leaf(sym_name, &tf);
+    if (tf) {
+        bool is_mach = (strcmp(sym_name, "_mach_absolute_time") == 0 ||
+            strcmp(sym_name, "_mach_timebase_info") == 0);
+        if (!is_mach || !ctx->difftest_mode) {
+            (void)pthread_mutex_unlock(&g_leaf_mu);
+            if (out_found != NULL) {
+                *out_found = true;
+            }
+            return tv;
+        }
+    }
     for (i = 0U; i < g_leaf_count; i++) {
         if (strcmp(sym_name, g_leaf_syms[i].name) == 0) {
             uint32_t va = A32_IOS_LEAF_STUB_VA + g_leaf_syms[i].off * 4U;

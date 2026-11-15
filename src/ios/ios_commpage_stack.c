@@ -262,6 +262,7 @@ static int ios_setup_runtime_data(a32_ctx_t *ctx)
                  "ios_runtime") != 0) {
         return -1;
     }
+    a32_ios_refresh_runtime_pid(ctx);
     return 0;
 }
 
