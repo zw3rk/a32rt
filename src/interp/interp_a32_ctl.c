@@ -191,7 +191,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                     pred = 1U;
                 }
                 if (pred <= 9U) {
-                    if (is_imm_b && rn_b < 15U) {
+                    if (is_imm_b && (pred <= 1U || rn_b < 15U)) {
                         unsigned rot_b = ((insn >> 8) & 0xFU) * 2U;
                         uint32_t imm_b = a32_ror32(insn & 0xFFU, rot_b);
                         if (a32_pred_branchless(b, cond, pred, rd_b, rn_b, 0U,

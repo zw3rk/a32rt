@@ -717,7 +717,7 @@ bool a32_pred_branchless(a64_buf_t *b, unsigned cond, unsigned pred_op,
     if (cond >= 14U) {
         return false;
     }
-    if (rd >= 15U || rn >= 15U || (!is_imm && rm >= 15U)) {
+    if (rd >= 15U || (!is_imm && rm >= 15U)) {
         return false;
     }
     if (pred_op > 9U) {
