@@ -167,6 +167,7 @@ static void cache_flush_alias(a64_buf_t *b, uint8_t kind, uint8_t reg)
 
 static unsigned cache_src(a64_buf_t *b, unsigned scratch, uint8_t kind, unsigned idx)
 {
+    a32_vfp_record_preheader(b, kind, (uint8_t)idx, false);
     int s = a64_vfp_find_exact_slot(b, kind, (uint8_t)idx);
     if (s >= 0) {
         return 8U + (unsigned)s;
@@ -183,6 +184,7 @@ static unsigned cache_src(a64_buf_t *b, unsigned scratch, uint8_t kind, unsigned
 
 static unsigned cache_dst(a64_buf_t *b, unsigned scratch, uint8_t kind, unsigned idx, bool load_old)
 {
+    a32_vfp_record_preheader(b, kind, (uint8_t)idx, true);
     if (b->cond_branch_depth != 0U) {
         if (load_old) {
             if (kind == A64_VFP_KIND_S) {
