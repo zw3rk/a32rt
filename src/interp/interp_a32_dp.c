@@ -7,6 +7,24 @@
 
 #include "interp/decode_priv.h"
 
+extern uint8_t a32_pred_cond_mask(unsigned cond);
+extern bool a32_pred_fold_addsub_imm(a64_buf_t *b, bool is_sub, bool set_flags,
+    unsigned dst, unsigned src_n, uint32_t imm32);
+extern bool a32_pred_try_logical_imm(a64_buf_t *b, unsigned opc,
+    unsigned dst, unsigned src_n, uint32_t eff_imm);
+extern void a32_pred_logical_imm_s1(a64_buf_t *b, a32_ctx_t *ctx, unsigned base_opc,
+    unsigned dst, unsigned src_n, uint32_t eff_imm, bool has_imm_carry,
+    unsigned imm_carry, uint8_t live_out, bool is_test);
+extern void a32_pred_logical_reg_s1(a64_buf_t *b, a32_ctx_t *ctx, unsigned op_class,
+    unsigned dst, unsigned src_n, unsigned src_m, unsigned shift,
+    unsigned amount, bool has_imm_carry, unsigned imm_carry,
+    unsigned shift_carry_reg, uint8_t live_out);
+extern bool a32_pred_fuse_imm_shift(unsigned shift_type, unsigned imm5, bool is_logical,
+    bool want_carry, unsigned *out_shift, unsigned *out_amount);
+extern bool a32_pred_branchless(a64_buf_t *b, unsigned cond, unsigned pred_op,
+    unsigned rd, unsigned rn, unsigned rm, bool is_imm, uint32_t imm32,
+    unsigned shift_type, unsigned shift_amt);
+
 unsigned emit_a32_shifted_reg(a64_buf_t *b, uint32_t insn, uint32_t pc_val,
                               unsigned out_reg, bool want_carry, unsigned *out_carry_reg)
 {
@@ -34,8 +52,8 @@ unsigned emit_a32_shifted_reg(a64_buf_t *b, uint32_t insn, uint32_t pc_val,
     return out_reg;
 }
 
-bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_val,
-                        uint32_t insn, unsigned cond, unsigned op1, bool flags_live,
+bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_val,
+                        uint32_t insn, unsigned cond, unsigned op1, uint8_t live_out,
                         bool *out_ends_block)
 {
     bool handled = false;
@@ -228,7 +246,7 @@ bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_v
             unsigned ra = (insn >> 12) & 0xFU;
             unsigned rm = (insn >> 8) & 0xFU;
             unsigned rn = insn & 0xFU;
-            if (set_flags && !flags_live) {
+            if (set_flags && live_out == 0U) {
                 set_flags = false;
                 ctx->flags_elided++;
             }
@@ -250,7 +268,7 @@ bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_v
         } else if (op1 == 0U && ((insn & 0x0F8000F0U) == 0x00800090U)) {
             /* UMULL / UMLAL / SMULL / SMLAL */
             bool set_flags = ((insn >> 20) & 1U) != 0U;
-            if (set_flags && !flags_live) {
+            if (set_flags && live_out == 0U) {
                 set_flags = false;
                 ctx->flags_elided++;
             }
@@ -356,15 +374,12 @@ bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_v
             unsigned rn    = (insn >> 16) & 0xFU;
             unsigned rd    = (insn >> 12) & 0xFU;
             bool set_flags = s_bit;
-
-            /* Dead-NZCV flag liveness optimization */
             if (s_bit && rd != 15U && !(opc >= 8U && opc <= 11U)) {
-                if (!flags_live) {
+                if (live_out == 0U) {
                     set_flags = false;
                     ctx->flags_elided++;
                 }
             }
-
             unsigned src_n = a32_load_reg(b, rn, pc_val, A64_TMP0);
             unsigned src_m = A64_TMP1;
             bool has_imm_carry = false;
@@ -372,102 +387,333 @@ bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_v
             unsigned shift_carry_reg = A64_ZR;
             bool is_logical_op = (opc == 0x0U || opc == 0x1U || opc == 0x8U || opc == 0x9U ||
                                   opc >= 0xCU);
-
+            uint32_t imm32 = 0U;
+            unsigned fused_shift = 0U;
+            unsigned fused_amt = 0U;
+            bool fused = false;
+            bool is_fusable_reg = false;
             if (is_imm) {
                 unsigned rot = ((insn >> 8) & 0xFU) * 2U;
-                uint32_t imm32 = a32_ror32(insn & 0xFFU, rot);
-                a64_emit_mov_imm32(b, A64_TMP1, imm32);
+                imm32 = a32_ror32(insn & 0xFFU, rot);
                 if (rot != 0U) {
                     has_imm_carry = true;
                     imm_carry = (imm32 >> 31) & 1U;
                 }
+                if (!s_bit || !is_logical_op) {
+                    has_imm_carry = false;
+                }
             } else {
-                src_m = emit_a32_shifted_reg(b, insn, pc_val, A64_TMP1,
-                                             set_flags && is_logical_op, &shift_carry_reg);
+                unsigned rm = insn & 0xFU;
+                bool by_reg = ((insn >> 4) & 1U) != 0U;
+                unsigned st = (insn >> 5) & 3U;
+                unsigned imm5 = (insn >> 7) & 31U;
+                bool is_rsb_adc = (opc == 0x3U || opc == 0x5U || opc == 0x6U || opc == 0x7U);
+                if (!by_reg && rm != 15U && !is_rsb_adc) {
+                    bool want_c = set_flags && is_logical_op && ((live_out & 0x2U) != 0U);
+                    if (opc == 0x2U || opc == 0x4U || opc == 0xAU || opc == 0xBU) {
+                        want_c = false;
+                    }
+                    bool lg = (opc == 0x0U || opc == 0x1U || opc == 0x8U || opc == 0x9U || opc >= 0xCU);
+                    if (a32_pred_fuse_imm_shift(st, imm5, lg, want_c, &fused_shift, &fused_amt)) {
+                        fused = true;
+                        is_fusable_reg = true;
+                        src_m = a32_load_reg(b, rm, pc_val, A64_TMP1);
+                        shift_carry_reg = A64_ZR;
+                        has_imm_carry = false;
+                    }
+                }
+                if (!fused) {
+                    src_m = emit_a32_shifted_reg(b, insn, pc_val, A64_TMP1,
+                                                 set_flags && is_logical_op, &shift_carry_reg);
+                }
             }
-
             unsigned dst = (rd == 15U) ? A64_TMP0 : rd;
             bool is_logical = false;
+            if (is_imm && rd != 15U) {
+                if ((opc == 0x2U || opc == 0x4U || opc == 0xAU || opc == 0xBU)) {
+                    bool is_sub = (opc == 0x2U || opc == 0xAU);
+                    unsigned d2 = (opc == 0xAU || opc == 0xBU) ? (unsigned)A64_ZR : dst;
+                    bool sf2 = (opc == 0xAU || opc == 0xBU) ? true : set_flags;
+                    if (rn == 15U && (opc == 0x2U || opc == 0x4U) && !s_bit) {
+                        uint32_t c = (opc == 0x2U) ? (pc_val - imm32) : (pc_val + imm32);
+                        a64_emit_mov_imm32(b, dst, c);
+                        handled = true;
+                        goto dp_done;
+                    }
+                    if (a32_pred_fold_addsub_imm(b, is_sub, sf2, d2, src_n, imm32)) {
+                        handled = true;
+                        goto dp_done;
+                    }
+                }
+                if (opc == 0x3U && imm32 == 0U && rd != 15U) {
+                    a64_emit_sub_reg_w(b, set_flags, dst, A64_ZR, src_n, A64_SHIFT_LSL, 0U);
+                    handled = true;
+                    goto dp_done;
+                }
+                if ((opc == 0xDU || opc == 0xFU) && rd != 15U) {
+                    uint32_t v = (opc == 0xDU) ? imm32 : ~imm32;
+                    a64_emit_mov_imm32(b, dst, v);
+                    is_logical = true;
+                    if (set_flags) {
+                        if (live_out == 0U) {
+                            ctx->flags_elided++;
+                        } else if ((live_out & 0x3U) == 0U) {
+                            a64_emit_and_reg_w(b, true, A64_ZR, dst, dst, A64_SHIFT_LSL, 0U);
+                        } else {
+                            a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, A64_ZR);
+                        }
+                    }
+                    handled = true;
+                    goto dp_done;
+                }
+                if ((opc == 0x0U || opc == 0x1U || opc == 0x8U || opc == 0x9U || opc == 0xCU || opc == 0xEU)) {
+                    bool is_test = (opc == 0x8U || opc == 0x9U);
+                    unsigned base = (opc == 0x0U || opc == 0x8U) ? 0U : (opc == 0x1U || opc == 0x9U) ? 2U : 1U;
+                    uint32_t eff = imm32;
+                    if (opc == 0xEU) {
+                        eff = ~imm32;
+                        base = 0U;
+                    }
+                    unsigned imms = 0U;
+                    unsigned immr = 0U;
+                    if (a64_encode_logical_imm32(eff, &imms, &immr)) {
+                        if (!set_flags) {
+                            a64_emit_logical_imm_w(b, base, is_test ? A64_TMP0 : dst, src_n, eff);
+                        } else {
+                            a32_pred_logical_imm_s1(b, ctx, base, is_test ? A64_TMP0 : dst,
+                                src_n, eff, has_imm_carry, imm_carry, live_out, is_test);
+                        }
+                        if (!is_test) {
+                            is_logical = false;
+                        } else {
+                            is_logical = false;
+                        }
+                        handled = true;
+                        goto dp_done;
+                    }
+                    a64_emit_mov_imm32(b, A64_TMP1, imm32);
+                    src_m = A64_TMP1;
+                } else {
+                    a64_emit_mov_imm32(b, A64_TMP1, imm32);
+                    src_m = A64_TMP1;
+                }
+            }
             switch (opc) {
-            case 0x0U: /* AND */
-                a64_emit_and_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0x0U:
+                if (set_flags && is_fusable_reg) {
+                    a32_pred_logical_reg_s1(b, ctx, 0U, dst, src_n, src_m, fused_shift, fused_amt,
+                        false, 0U, A64_ZR, live_out);
+                } else if (set_flags && !is_imm) {
+                    a32_pred_logical_reg_s1(b, ctx, 0U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
+                        has_imm_carry, imm_carry, shift_carry_reg, live_out);
+                } else {
+                    a64_emit_and_reg_w(b, false, dst, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                }
+                is_logical = !set_flags;
+                if (set_flags && (is_imm || !is_fusable_reg)) {
+                    is_logical = false;
+                }
                 handled = true;
                 break;
-            case 0x1U: /* EOR */
-                a64_emit_eor_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0x1U:
+                if (set_flags) {
+                    if (is_fusable_reg) {
+                        a32_pred_logical_reg_s1(b, ctx, 4U, dst, src_n, src_m, fused_shift, fused_amt,
+                            false, 0U, A64_ZR, live_out);
+                    } else if (!is_imm) {
+                        a32_pred_logical_reg_s1(b, ctx, 4U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
+                            has_imm_carry, imm_carry, shift_carry_reg, live_out);
+                    } else {
+                        a64_emit_eor_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
+                        a32_pred_logical_reg_s1(b, ctx, 4U, dst, dst, dst, A64_SHIFT_LSL, 0U,
+                            false, 0U, A64_ZR, live_out);
+                        is_logical = false;
+                        handled = true;
+                        break;
+                    }
+                    is_logical = false;
+                } else {
+                    a64_emit_eor_reg_w(b, dst, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                    is_logical = true;
+                }
                 handled = true;
                 break;
-            case 0x2U: /* SUB */
-                a64_emit_sub_reg_w(b, set_flags, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
+            case 0x2U:
+                a64_emit_sub_reg_w(b, set_flags, dst, src_n, src_m,
+                    fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
                 handled = true;
                 break;
-            case 0x3U: /* RSB (dst = src_m - src_n) */
+            case 0x3U:
                 a64_emit_sub_reg_w(b, set_flags, dst, src_m, src_n, A64_SHIFT_LSL, 0U);
                 handled = true;
                 break;
-            case 0x4U: /* ADD */
-                a64_emit_add_reg_w(b, set_flags, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
+            case 0x4U:
+                a64_emit_add_reg_w(b, set_flags, dst, src_n, src_m,
+                    fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
                 handled = true;
                 break;
-            case 0x5U: /* ADC */
+            case 0x5U:
                 a64_emit_adc_w(b, set_flags, dst, src_n, src_m);
                 handled = true;
                 break;
-            case 0x6U: /* SBC */
+            case 0x6U:
                 a64_emit_sbc_w(b, set_flags, dst, src_n, src_m);
                 handled = true;
                 break;
-            case 0x7U: /* RSC (dst = src_m - src_n - !C) */
+            case 0x7U:
                 a64_emit_sbc_w(b, set_flags, dst, src_m, src_n);
                 handled = true;
                 break;
-            case 0x8U: /* TST */
-                a64_emit_and_reg_w(b, false, A64_TMP0, src_n, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0x8U:
+                if (set_flags) {
+                    if (is_fusable_reg) {
+                        a64_emit_and_reg_w(b, false, A64_TMP0, src_n, src_m, fused_shift, fused_amt);
+                        a32_pred_logical_reg_s1(b, ctx, 0U, A64_TMP0, src_n, src_m, fused_shift, fused_amt,
+                            false, 0U, A64_ZR, live_out);
+                    } else if (!is_imm) {
+                        a64_emit_and_reg_w(b, false, A64_TMP0, src_n, src_m, A64_SHIFT_LSL, 0U);
+                        a64_emit_logical_flags(b, A64_TMP0, has_imm_carry, imm_carry, shift_carry_reg);
+                    } else {
+                        a64_emit_and_reg_w(b, false, A64_TMP0, src_n, src_m, A64_SHIFT_LSL, 0U);
+                        a64_emit_logical_flags(b, A64_TMP0, has_imm_carry, imm_carry, shift_carry_reg);
+                    }
+                    is_logical = false;
+                } else {
+                    a64_emit_and_reg_w(b, false, A64_TMP0, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                    is_logical = true;
+                }
                 handled = true;
                 break;
-            case 0x9U: /* TEQ */
-                a64_emit_eor_reg_w(b, A64_TMP0, src_n, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0x9U:
+                if (set_flags) {
+                    a64_emit_eor_reg_w(b, A64_TMP0, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                    if ((live_out & 0x3U) == 0U && live_out != 0U) {
+                        a64_emit_and_reg_w(b, true, A64_ZR, A64_TMP0, A64_TMP0, A64_SHIFT_LSL, 0U);
+                    } else if (live_out != 0U) {
+                        a64_emit_logical_flags(b, A64_TMP0, has_imm_carry, imm_carry, shift_carry_reg);
+                    } else {
+                        ctx->flags_elided++;
+                    }
+                    is_logical = false;
+                } else {
+                    a64_emit_eor_reg_w(b, A64_TMP0, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                    is_logical = true;
+                }
                 handled = true;
                 break;
-            case 0xAU: /* CMP */
-                a64_emit_sub_reg_w(b, true, A64_ZR, src_n, src_m, A64_SHIFT_LSL, 0U);
+            case 0xAU:
+                a64_emit_sub_reg_w(b, true, A64_ZR, src_n, src_m,
+                    fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
                 handled = true;
                 break;
-            case 0xBU: /* CMN */
-                a64_emit_add_reg_w(b, true, A64_ZR, src_n, src_m, A64_SHIFT_LSL, 0U);
+            case 0xBU:
+                a64_emit_add_reg_w(b, true, A64_ZR, src_n, src_m,
+                    fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
                 handled = true;
                 break;
-            case 0xCU: /* ORR */
-                a64_emit_orr_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0xCU:
+                if (set_flags) {
+                    if (is_fusable_reg) {
+                        a32_pred_logical_reg_s1(b, ctx, 2U, dst, src_n, src_m, fused_shift, fused_amt,
+                            false, 0U, A64_ZR, live_out);
+                    } else if (!is_imm) {
+                        a32_pred_logical_reg_s1(b, ctx, 2U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
+                            has_imm_carry, imm_carry, shift_carry_reg, live_out);
+                    } else {
+                        a64_emit_orr_reg_w(b, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
+                        a32_pred_logical_reg_s1(b, ctx, 2U, dst, dst, dst, A64_SHIFT_LSL, 0U,
+                            false, 0U, A64_ZR, live_out);
+                        is_logical = false;
+                        handled = true;
+                        break;
+                    }
+                    is_logical = false;
+                } else {
+                    a64_emit_orr_reg_w(b, dst, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                    is_logical = true;
+                }
                 handled = true;
                 break;
-            case 0xDU: /* MOV */
-                a64_emit_mov_w(b, dst, src_m);
-                is_logical = true;
+            case 0xDU:
+                if (!fused && !is_imm) {
+                    a64_emit_mov_w(b, dst, src_m);
+                } else if (fused) {
+                    a64_emit_orr_reg_w(b, dst, A64_ZR, src_m, fused_shift, fused_amt);
+                } else if (!is_imm) {
+                    a64_emit_mov_w(b, dst, src_m);
+                }
+                if (set_flags && !is_imm) {
+                    if (live_out == 0U) {
+                        ctx->flags_elided++;
+                    } else if ((live_out & 0x3U) == 0U) {
+                        a64_emit_and_reg_w(b, true, A64_ZR, dst, dst, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
+                    }
+                    is_logical = false;
+                } else {
+                    is_logical = !set_flags;
+                }
                 handled = true;
                 break;
-            case 0xEU: /* BIC */
-                a64_emit_bic_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0xEU:
+                if (set_flags) {
+                    if (is_fusable_reg) {
+                        a32_pred_logical_reg_s1(b, ctx, 1U, dst, src_n, src_m, fused_shift, fused_amt,
+                            false, 0U, A64_ZR, live_out);
+                    } else if (!is_imm) {
+                        a32_pred_logical_reg_s1(b, ctx, 1U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
+                            has_imm_carry, imm_carry, shift_carry_reg, live_out);
+                    } else {
+                        a64_emit_bic_reg_w(b, false, dst, src_n, src_m, A64_SHIFT_LSL, 0U);
+                        a32_pred_logical_reg_s1(b, ctx, 1U, dst, dst, dst, A64_SHIFT_LSL, 0U,
+                            false, 0U, A64_ZR, live_out);
+                        is_logical = false;
+                        handled = true;
+                        break;
+                    }
+                    is_logical = false;
+                } else {
+                    a64_emit_bic_reg_w(b, false, dst, src_n, src_m,
+                        fused ? fused_shift : A64_SHIFT_LSL, fused ? fused_amt : 0U);
+                    is_logical = true;
+                }
                 handled = true;
                 break;
-            case 0xFU: /* MVN */
-                a64_emit_mvn_reg_w(b, dst, src_m, A64_SHIFT_LSL, 0U);
-                is_logical = true;
+            case 0xFU:
+                if (!fused && !is_imm) {
+                    a64_emit_mvn_reg_w(b, dst, src_m, A64_SHIFT_LSL, 0U);
+                } else if (fused) {
+                    a64_emit_orn_reg_w(b, dst, A64_ZR, src_m, fused_shift, fused_amt);
+                } else if (!is_imm) {
+                    a64_emit_mvn_reg_w(b, dst, src_m, A64_SHIFT_LSL, 0U);
+                }
+                if (set_flags && !is_imm) {
+                    if (live_out == 0U) {
+                        ctx->flags_elided++;
+                    } else if ((live_out & 0x3U) == 0U) {
+                        a64_emit_and_reg_w(b, true, A64_ZR, dst, dst, A64_SHIFT_LSL, 0U);
+                    } else {
+                        a64_emit_logical_flags(b, dst, has_imm_carry, imm_carry, shift_carry_reg);
+                    }
+                    is_logical = false;
+                } else {
+                    is_logical = !set_flags;
+                }
                 handled = true;
                 break;
             default:
                 break;
             }
-
-            if (is_logical && set_flags) {
-                a64_emit_logical_flags(b, (opc == 0x8U || opc == 0x9U) ? A64_TMP0 : dst,
-                                       has_imm_carry, imm_carry, shift_carry_reg);
+            dp_done:;
+            if (false) {
+                (void)is_logical;
             }
 
             if (handled && cond == A64_COND_AL && rd == 14U && (opc < 0x8U || opc >= 0xCU) &&
@@ -483,4 +729,11 @@ bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_v
         }
     }
     return handled;
+}
+
+bool a32_decode_dp_op01(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_val,
+    uint32_t insn, unsigned cond, unsigned op1, bool flags_live, bool *out_ends_block)
+{
+    uint8_t live = flags_live ? 0xFU : 0U;
+    return a32_decode_dp_op01_nzcv(ctx, b, pc, pc_val, insn, cond, op1, live, out_ends_block);
 }

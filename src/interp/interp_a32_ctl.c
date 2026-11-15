@@ -11,6 +11,20 @@
 
 #define A32_MAX_BLOCK_INSNS 128U
 
+extern uint8_t a32_pred_cond_mask(unsigned cond);
+extern bool a32_pred_fold_addsub_imm(a64_buf_t *b, bool is_sub, bool set_flags,
+    unsigned dst, unsigned src_n, uint32_t imm32);
+extern bool a32_pred_fuse_imm_shift(unsigned shift_type, unsigned imm5, bool is_logical,
+    bool want_carry, unsigned *out_shift, unsigned *out_amount);
+extern uint8_t a32_pred_use_a32(uint32_t insn);
+extern uint8_t a32_pred_kill_a32(uint32_t insn);
+extern bool a32_pred_mergeable_a32(uint32_t insn);
+extern bool a32_pred_branchless(a64_buf_t *b, unsigned cond, unsigned pred_op,
+    unsigned rd, unsigned rn, unsigned rm, bool is_imm, uint32_t imm32,
+    unsigned shift_type, unsigned shift_amt);
+extern bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t pc_val,
+    uint32_t insn, unsigned cond, unsigned op1, uint8_t live_out, bool *out_ends_block);
+
 /*
  * Check if an instruction unconditionally terminates a translation block.
  */
@@ -88,172 +102,8 @@ static bool a32_insn_uncond_ends_block(uint32_t insn)
     return false;
 }
 
-/*
- * Check if an instruction reads NZCV flags (either for condition evaluation,
- * or as a carry consumer / CPSR reader).
- */
-static bool a32_insn_reads_flags(uint32_t insn)
-{
-    unsigned cond = (insn >> 28) & 0xFU;
-    if (cond != 14U && cond != 15U) {
-        /* Any conditional instruction reads NZCV */
-        return true;
-    }
-    if (cond == 15U) {
-        /* ARMv8-A VSEL{EQ,VS,GE,GT}.F32/.F64 reads NZCV despite cond == 15 */
-        if ((insn & 0xFF800E50U) == 0xFE000A00U) {
-            return true;
-        }
-        return false;
-    }
-    if ((insn & 0x0FF000F0U) == 0x07F000F0U) {
-        /* UDF trap must observe architectural NZCV */
-        return true;
-    }
-
-    /* cond == 14 (AL): check carry consumers */
-    unsigned op1 = (insn >> 25) & 7U;
-    if (op1 == 0U || op1 == 1U) {
-        if (op1 == 0U && (insn & 0x0E000090U) == 0x00000090U) {
-            return false;
-        }
-        if (op1 == 0U && (insn & 0x0F8000F0U) == 0x01800090U) {
-            return false;
-        }
-        if (op1 == 0U && (insn & 0x0FBF0FFFU) == 0x010F0000U) {
-            /* MRS Rd, CPSR reads flags */
-            return true;
-        }
-        unsigned opc = (insn >> 21) & 0xFU;
-        if (opc == 5U || opc == 6U || opc == 7U) {
-            /* ADC, SBC, RSC */
-            return true;
-        }
-        /* Check for RRX shift: op1 == 0, bit 4 == 0, shift_type == 3 (ROR), imm5 == 0 */
-        if (op1 == 0U && ((insn & 0x00000FF0U) == 0x00000060U)) {
-            return true;
-        }
-        /* Register-shifted logical ops with S=1 read old_C when Rs[7:0] == 0 */
-        if (op1 == 0U && ((insn & 0x00100090U) == 0x00100010U) &&
-            (opc == 0U || opc == 1U || opc == 8U || opc == 9U || opc >= 12U)) {
-            return true;
-        }
-    } else if (op1 == 3U && ((insn & 0x10U) == 0U)) {
-        /* Single data transfer register offset shifted by RRX */
-        if ((insn & 0x00000FF0U) == 0x00000060U) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * Check if an instruction can take a synchronous exit (fault, UNDEF, SVC,
- * BKPT) whose handler observes the host NZCV state. Such instructions are
- * flag-observation points: flag writes before them must not be eliminated
- * even when a later instruction overwrites the flags (A32-R7-4).
- */
-static bool a32_insn_may_exit_sync(uint32_t insn)
-{
-    /* SVC / BKPT / UDF trap entrances. */
-    if ((insn & 0x0F000000U) == 0x0F000000U) {
-        return true;
-    }
-    if ((insn & 0x0FF000F0U) == 0x01200070U) {
-        return true;
-    }
-    if ((insn & 0x0FF000F0U) == 0x07F000F0U) {
-        return true;
-    }
-    /* SWP / SWPB (atomic swap may fault). */
-    if ((insn & 0x0FB00FF0U) == 0x01000090U) {
-        return true;
-    }
-    /* Exclusives (may fault on mapping or alignment). */
-    if ((insn & 0x0F8000F0U) == 0x01800090U) {
-        return true;
-    }
-    /* VFPv4-D32 / NEON / coprocessor (partial decode, may fault or UNDEF). */
-    if ((insn & 0x0E000000U) == 0x0C000000U) {
-        return true;
-    }
-    if ((insn & 0x0F000000U) == 0x0E000000U) {
-        /* Any CDP/MRC/MRC2/STC/LDC (handled VFP/NEON/CP15 or UNDEF). */
-        return true;
-    }
-    /* Unconditional space: VFP or UDF trap entrances. */
-    if (((insn >> 28) & 0xFU) == 0xFU) {
-        if ((insn & 0xFE000000U) == 0xF2000000U ||
-            (insn & 0xFF100000U) == 0xF4000000U ||
-            (insn & 0xFE000000U) == 0xFE000000U ||
-            (insn & 0x0FFFFFF0U) == 0x07F000F0U) {
-            return true;
-        }
-        return false;
-    }
-    unsigned op1 = (insn >> 25) & 7U;
-    /* Block transfer and single transfer (may fault). */
-    if (op1 == 4U) {
-        return true;
-    }
-    if (op1 == 2U || (op1 == 3U && ((insn & 0x10U) == 0U))) {
-        return true;
-    }
-    /* Media and extra load/store (partial decode, may fault or UNDEF). */
-    if (op1 == 3U) {
-        return true;
-    }
-    /* Data processing, multiply and misc ALU: fully decoded for defined
-     * encodings and fault-free, so not an observation point. */
-    return false;
-}
-
-/*
- * Check if an instruction unconditionally overwrites all 4 NZCV flags.
- */
-static bool a32_insn_overwrites_all_flags(uint32_t insn)
-{
-    unsigned cond = (insn >> 28) & 0xFU;
-    if (cond != 14U) {
-        return false;
-    }
-    unsigned op1 = (insn >> 25) & 7U;
-    if (op1 == 0U || op1 == 1U) {
-        if (op1 == 0U && (insn & 0x0E000090U) == 0x00000090U) {
-            return false;
-        }
-        if (op1 == 0U && (insn & 0x0F8000F0U) == 0x01800090U) {
-            return false;
-        }
-        /* MSR CPSR_f, Rm */
-        if ((insn & 0x0FF0FFF0U) == 0x0120F000U && ((insn >> 19) & 1U) != 0U) {
-            return true;
-        }
-        /* MSR CPSR_f, #imm */
-        if (op1 == 1U && (insn & 0x0FF0F000U) == 0x0320F000U && ((insn >> 19) & 1U) != 0U) {
-            return true;
-        }
-        unsigned opc = (insn >> 21) & 0xFU;
-        bool s_bit = ((insn >> 20) & 1U) != 0U;
-        if (s_bit && (opc == 10U || opc == 11U)) {
-            /* CMP / CMN always set NZCV */
-            return true;
-        }
-        if (s_bit && (opc >= 2U && opc <= 7U)) {
-            /* SUB, RSB, ADD, ADC, SBC, RSC with S=1 */
-            return true;
-        }
-    } else if (op1 == 7U) {
-        /* VMRS APSR_nzcv, FPSCR: 0xEEF1FA10 */
-        if ((insn & 0x0FFFFFFFU) == 0x0EF1FA10U) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
-                            uint32_t insn, bool flags_live, bool *out_ends_block)
+                            uint32_t insn, uint8_t live_out, bool in_run, bool *out_ends_block)
 {
     *out_ends_block = false;
     uint32_t pc_val = pc + 8U;
@@ -310,18 +160,65 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         return true;
     }
 
-    /* Branchless CSEL lowering for conditional MOV Rd, Rm (S=0, unshifted, Rd<15, Rm<15). */
-    if (cond < 14U && (insn & 0x0FF00FF0U) == 0x01A00000U) {
-        unsigned rd = (insn >> 12) & 0xFU;
-        unsigned rm = insn & 0xFU;
-        if (rd < 15U && rm < 15U) {
-            a64_emit_csel_w(b, rd, rm, rd, cond);
-            return true;
+    if (!in_run && cond < 14U) {
+        unsigned op1b = (insn >> 25) & 7U;
+        if (op1b == 0U || op1b == 1U) {
+            unsigned opc = (insn >> 21) & 0xFU;
+            bool s_b = ((insn >> 20) & 1U) != 0U;
+            unsigned rn_b = (insn >> 16) & 0xFU;
+            unsigned rd_b = (insn >> 12) & 0xFU;
+            if (!s_b && rd_b < 15U && opc != 0x5U && opc != 0x6U && opc != 0x7U &&
+                opc != 0x8U && opc != 0x9U && opc != 0xAU && opc != 0xBU) {
+                bool is_imm_b = (op1b == 1U);
+                unsigned pred = 10U;
+                if (opc == 0x0U) {
+                    pred = 5U;
+                } else if (opc == 0x1U) {
+                    pred = 7U;
+                } else if (opc == 0x2U) {
+                    pred = 3U;
+                } else if (opc == 0x3U) {
+                    pred = 4U;
+                } else if (opc == 0x4U) {
+                    pred = 2U;
+                } else if (opc == 0xCU) {
+                    pred = 6U;
+                } else if (opc == 0xDU) {
+                    pred = 0U;
+                } else if (opc == 0xEU) {
+                    pred = 8U;
+                } else if (opc == 0xFU) {
+                    pred = 1U;
+                }
+                if (pred <= 9U) {
+                    if (is_imm_b) {
+                        unsigned rot_b = ((insn >> 8) & 0xFU) * 2U;
+                        uint32_t imm_b = a32_ror32(insn & 0xFFU, rot_b);
+                        if (a32_pred_branchless(b, cond, pred, rd_b, rn_b, 0U,
+                            true, imm_b, 0U, 0U)) {
+                            return true;
+                        }
+                    } else {
+                        bool by_r = ((insn >> 4) & 1U) != 0U;
+                        if (!by_r) {
+                            unsigned rm_b = insn & 0xFU;
+                            unsigned st_b = (insn >> 5) & 3U;
+                            unsigned i5_b = (insn >> 7) & 31U;
+                            if (rm_b < 15U && rn_b < 15U) {
+                                if (a32_pred_branchless(b, cond, pred, rd_b, rn_b, rm_b,
+                                    false, 0U, st_b, i5_b)) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     size_t cond_skip = 0U;
-    if (cond != A64_COND_AL) {
+    if (!in_run && cond != A64_COND_AL) {
         cond_skip = a64_emit_b_cond_placeholder(b, cond ^ 1U);
     }
 
@@ -397,16 +294,45 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
         unsigned base_reg = a32_load_reg(b, rn, pc_val, A64_TMP2);
         uint16_t imm12 = (uint16_t)(insn & 0xFFFU);
         unsigned off_reg = A64_ZR;
-
+        unsigned off_sh = A64_SHIFT_LSL;
+        unsigned off_amt = 0U;
+        bool off_fused = false;
         if (reg_off) {
-            off_reg = emit_a32_shifted_reg(b, insn & ~0x10U, pc_val, A64_TMP1, false, NULL);
-            if (!p_bit && off_reg == rt) {
+            unsigned rm_o = insn & 0xFU;
+            unsigned st_o = (insn >> 5) & 3U;
+            unsigned i5_o = (insn >> 7) & 31U;
+            if (rm_o != 15U) {
+                unsigned fs = 0U;
+                unsigned fa = 0U;
+                if (a32_pred_fuse_imm_shift(st_o, i5_o, false, false, &fs, &fa)) {
+                    off_fused = true;
+                    off_reg = rm_o;
+                    off_sh = fs;
+                    off_amt = fa;
+                }
+            }
+            if (!off_fused) {
+                off_reg = emit_a32_shifted_reg(b, insn & ~0x10U, pc_val, A64_TMP1, false, NULL);
+                off_sh = A64_SHIFT_LSL;
+                off_amt = 0U;
+            }
+            if (!p_bit && off_reg == rt && !off_fused) {
                 a64_emit_mov_w(b, A64_TMP1, off_reg);
                 off_reg = A64_TMP1;
             }
+            if (!p_bit && off_fused && off_reg == rt) {
+                a64_emit_mov_w(b, A64_TMP1, off_reg);
+                off_reg = A64_TMP1;
+                off_sh = A64_SHIFT_LSL;
+                off_amt = 0U;
+                off_fused = false;
+            }
         }
-
-        if (p_bit) {
+        bool pc_fold = (!reg_off && rn == 15U && p_bit && !w_bit);
+        if (pc_fold) {
+            uint32_t tgt = u_bit ? (pc_val + imm12) : (pc_val - imm12);
+            a64_emit_mov_imm32(b, A64_ADDR, tgt);
+        } else if (p_bit) {
             if (!reg_off) {
                 if (u_bit) {
                     a64_emit_add_imm_w(b, false, A64_ADDR, base_reg, imm12, 0U);
@@ -415,9 +341,9 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 }
             } else {
                 if (u_bit) {
-                    a64_emit_add_reg_w(b, false, A64_ADDR, base_reg, off_reg, A64_SHIFT_LSL, 0U);
+                    a64_emit_add_reg_w(b, false, A64_ADDR, base_reg, off_reg, off_sh, off_amt);
                 } else {
-                    a64_emit_sub_reg_w(b, false, A64_ADDR, base_reg, off_reg, A64_SHIFT_LSL, 0U);
+                    a64_emit_sub_reg_w(b, false, A64_ADDR, base_reg, off_reg, off_sh, off_amt);
                 }
             }
         } else {
@@ -449,9 +375,9 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                 }
             } else {
                 if (u_bit) {
-                    a64_emit_add_reg_w(b, false, rn, base_reg, off_reg, A64_SHIFT_LSL, 0U);
+                    a64_emit_add_reg_w(b, false, rn, base_reg, off_reg, off_sh, off_amt);
                 } else {
-                    a64_emit_sub_reg_w(b, false, rn, base_reg, off_reg, A64_SHIFT_LSL, 0U);
+                    a64_emit_sub_reg_w(b, false, rn, base_reg, off_reg, off_sh, off_amt);
                 }
             }
         } else if (p_bit && w_bit && rn != 15U && (rn != rt || !l_bit)) {
@@ -610,8 +536,8 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
     }
     /* 6. Data-Processing, Multiply, Exclusives, Extra Load/Store (op1 == 0 or op1 == 1) */
     else if (op1 == 0U || op1 == 1U) {
-        handled = a32_decode_dp_op01(ctx, b, pc, pc_val, insn, cond, op1,
-                                     flags_live, out_ends_block);
+        handled = a32_decode_dp_op01_nzcv(ctx, b, pc, pc_val, insn, cond, op1,
+                                     live_out, out_ends_block);
     }
 
     if (!handled) {
@@ -623,7 +549,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
             *out_ends_block = true;
         }
     }
-    if (cond != A64_COND_AL) {
+    if (!in_run && cond != A64_COND_AL) {
         a64_patch_b_cond(b, cond_skip, b->count);
     }
     return true;
@@ -633,7 +559,7 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
 {
     uint32_t pc = start_pc & ~3U;
     uint32_t block_insns[A32_MAX_BLOCK_INSNS];
-    bool     flags_live[A32_MAX_BLOCK_INSNS];
+    uint8_t  live_nzcv[A32_MAX_BLOCK_INSNS];
     unsigned num_insns = 0U;
     unsigned max_insns = ctx->single_step ? 1U : A32_MAX_BLOCK_INSNS;
 
@@ -665,23 +591,15 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
         }
     }
 
-    /* Liveness analysis: determine for each instruction whether NZCV flags output is live.
-     * Instructions that can take a synchronous exit observe the host NZCV
-     * state in the fault handler, so they keep earlier flag writes live
-     * even when a later instruction overwrites the flags (A32-R7-4). */
-    bool live = true;
+    uint8_t live = 0xFU;
     for (int i = (int)num_insns - 1; i >= 0; i--) {
         uint32_t insn = block_insns[i];
-        flags_live[i] = live;
-        if (a32_insn_overwrites_all_flags(insn)) {
-            live = false;
-        }
-        if (a32_insn_reads_flags(insn) || a32_insn_may_exit_sync(insn)) {
-            live = true;
-        }
+        live_nzcv[i] = live;
+        uint8_t kill = a32_pred_kill_a32(insn);
+        uint8_t use = a32_pred_use_a32(insn);
+        live = (uint8_t)((live & (uint8_t)~kill) | use);
     }
 
-    /* Translation & emission loop */
     for (unsigned i = 0U; i < num_insns; i++) {
         uint32_t cur_pc = pc + (i * 4U);
         b->cur_insn_pc = cur_pc;
@@ -691,12 +609,65 @@ bool a32_translate_a32_block(a32_ctx_t *ctx, a64_buf_t *b, uint32_t start_pc)
             return true;
         }
         uint32_t insn = block_insns[i];
-
-        /* Side-Table PC Recording */
         a32_jit_record_pc_map((uint32_t)b->count, cur_pc, 0U);
-
+        unsigned cond0 = (insn >> 28) & 0xFU;
         bool ends_block = false;
-        if (!decode_a32_insn(ctx, b, cur_pc, insn, flags_live[i], &ends_block)) {
+        bool is_branchless_dp = false;
+        if (!ctx->single_step && cond0 < 14U) {
+            unsigned op1b = (insn >> 25) & 7U;
+            if (op1b == 0U || op1b == 1U) {
+                unsigned opc = (insn >> 21) & 0xFU;
+                bool s_b = ((insn >> 20) & 1U) != 0U;
+                if (!s_b && opc != 0x5U && opc != 0x6U && opc != 0x7U &&
+                    opc != 0x8U && opc != 0x9U && opc != 0xAU && opc != 0xBU) {
+                    is_branchless_dp = true;
+                }
+            }
+        }
+        if (!is_branchless_dp && !ctx->single_step && cond0 < 14U &&
+            a32_pred_mergeable_a32(insn)) {
+            unsigned run = 1U;
+            while (i + run < num_insns) {
+                uint32_t ni = block_insns[i + run];
+                if (((ni >> 28) & 0xFU) != cond0) {
+                    break;
+                }
+                if (!a32_pred_mergeable_a32(ni)) {
+                    break;
+                }
+                run++;
+                if (run >= 8U) {
+                    break;
+                }
+            }
+            if (run > 1U) {
+                size_t sk = a64_emit_b_cond_placeholder(b, cond0 ^ 1U);
+                for (unsigned k = 0U; k < run; k++) {
+                    uint32_t rpc = pc + ((i + k) * 4U);
+                    b->cur_insn_pc = rpc;
+                    uint32_t ri = block_insns[i + k];
+                    a32_jit_record_pc_map((uint32_t)b->count, rpc, 0U);
+                    bool re = false;
+                    if (!decode_a32_insn(ctx, b, rpc, ri, live_nzcv[i + k], true, &re)) {
+                        if (ctx->trace_enabled) {
+                            fprintf(stderr, "a32rt: unhandled A32 instruction 0x%08x at pc=0x%08x\n", ri, rpc);
+                        }
+                        a64_emit_exit_undef(b, rpc);
+                        b->guest_end_pc = rpc + 4U;
+                        return true;
+                    }
+                    if (re) {
+                        a64_patch_b_cond(b, sk, b->count);
+                        b->guest_end_pc = rpc + 4U;
+                        return true;
+                    }
+                }
+                a64_patch_b_cond(b, sk, b->count);
+                i += run - 1U;
+                continue;
+            }
+        }
+        if (!decode_a32_insn(ctx, b, cur_pc, insn, live_nzcv[i], false, &ends_block)) {
             if (ctx->trace_enabled) {
                 fprintf(stderr, "a32rt: unhandled A32 instruction 0x%08x at pc=0x%08x\n", insn, cur_pc);
             }

@@ -6,6 +6,7 @@
  */
 
 #include "interp/decode_priv.h"
+extern uint8_t a32_pred_cond_mask(unsigned cond);
 
 bool a32_translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t insn,
                             bool in_it, uint32_t itstate, uint32_t next_itstate, bool is_uncond,
@@ -483,5 +484,217 @@ bool a32_translate_t16_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint16_t 
         return true;
     }
 
+    return false;
+}
+
+static bool t32_may_fault_raw(uint16_t hw1, uint16_t hw2, bool is_32bit)
+{
+    if (!is_32bit) {
+        if ((hw1 & 0xFF00U) == 0xDF00U) {
+            return true;
+        }
+        if ((hw1 & 0xFF00U) == 0xDE00U) {
+            return true;
+        }
+        if ((hw1 & 0xFF00U) == 0xBE00U) {
+            return true;
+        }
+        if ((hw1 >> 11) == 0x09U || (hw1 >> 12) == 0x5U) {
+            return true;
+        }
+        if ((hw1 >> 13) == 0x3U || (hw1 >> 12) == 0x8U) {
+            return true;
+        }
+        if ((hw1 >> 12) == 0x9U || (hw1 & 0xF000U) == 0xC000U) {
+            return true;
+        }
+        if ((hw1 & 0xFE00U) == 0xB400U || (hw1 & 0xFE00U) == 0xBC00U) {
+            return true;
+        }
+        return false;
+    }
+    uint8_t h1hi = (uint8_t)(hw1 >> 8);
+    if (h1hi >= 0xECU && h1hi < 0xF0U) {
+        return true;
+    }
+    if (h1hi >= 0xF3U) {
+        return true;
+    }
+    if (h1hi == 0xF2U && (hw2 & 0x8000U) != 0U) {
+        return true;
+    }
+    if ((hw1 & 0xF000U) == 0xE000U && (hw1 & 0x0E00U) == 0x0800U) {
+        return true;
+    }
+    if ((hw1 & 0xFFF0U) == 0xEAC0U && (hw2 & 0x8010U) == 0U) {
+        return true;
+    }
+    return false;
+}
+
+uint8_t a32_pred_use_t32(uint16_t hw1, uint16_t hw2, uint8_t itst, bool is32, bool isit)
+{
+    if (isit) {
+        return 0U;
+    }
+    if (t32_may_fault_raw(hw1, hw2, is32)) {
+        return 0xFU;
+    }
+    bool in_it = (itst & 0x0FU) != 0U;
+    uint8_t use = 0U;
+    if (!is32) {
+        if ((hw1 >> 12) == 0xDU && ((hw1 >> 8) & 0xFU) < 14U) {
+            use |= a32_pred_cond_mask((hw1 >> 8) & 0xFU);
+        }
+        if ((hw1 >> 10) == 0x10U) {
+            unsigned ao = (hw1 >> 6) & 0xFU;
+            if (ao == 0x5U || ao == 0x6U) {
+                use |= 0x2U;
+            }
+        }
+        if (in_it) {
+            use |= a32_pred_cond_mask((itst >> 4) & 0xFU);
+        }
+        return use;
+    }
+    if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U) {
+        unsigned c = (hw1 >> 6) & 0xFU;
+        if (c < 14U) {
+            return a32_pred_cond_mask(c);
+        }
+    }
+    if (in_it) {
+        use |= a32_pred_cond_mask((itst >> 4) & 0xFU);
+    }
+    if ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (op == 0xAU || op == 0xBU) {
+            use |= 0x2U;
+        }
+    }
+    if ((hw1 & 0xFE00U) == 0xEA00U) {
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (op == 0xAU || op == 0xBU) {
+            use |= 0x2U;
+        }
+        bool rrx = (((hw2 >> 4) & 3U) == 3U && (((hw2 >> 12) & 7U) == 0U && ((hw2 >> 6) & 3U) == 0U));
+        if (rrx) {
+            use |= 0x2U;
+        }
+    }
+    return use;
+}
+
+uint8_t a32_pred_kill_t32(uint16_t hw1, uint16_t hw2, uint8_t itst, bool is32, bool isit)
+{
+    if (isit || (itst & 0x0FU) != 0U) {
+        return 0U;
+    }
+    if (!is32) {
+        unsigned top5 = (hw1 >> 11) & 0x1FU;
+        if (top5 == 0x03U || (top5 >= 0x05U && top5 <= 0x07U)) {
+            return 0xFU;
+        }
+        return 0U;
+    }
+    if ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) {
+        bool s = ((hw1 >> 4) & 1U) != 0U;
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (!s) {
+            return 0U;
+        }
+        if (op == 0x8U || op == 0xDU || op == 0xEU) {
+            return 0xFU;
+        }
+        if (op <= 0x4U) {
+            return 0xCU;
+        }
+        return 0U;
+    }
+    if ((hw1 & 0xFE00U) == 0xEA00U) {
+        bool s = ((hw1 >> 4) & 1U) != 0U;
+        unsigned op = (hw1 >> 5) & 0xFU;
+        if (!s) {
+            return 0U;
+        }
+        bool rrx = (((hw2 >> 4) & 3U) == 3U && (((hw2 >> 12) & 7U) == 0U && ((hw2 >> 6) & 3U) == 0U));
+        if (op == 0x8U || op == 0xDU || op == 0xEU) {
+            return rrx ? 0xCU : 0xFU;
+        }
+        if (op <= 0x4U && !rrx) {
+            unsigned st = (hw2 >> 4) & 3U;
+            unsigned imm5 = (((hw2 >> 12) & 7U) << 2) | ((hw2 >> 6) & 3U);
+            if (st == 0U && imm5 == 0U) {
+                return 0xCU;
+            }
+            return 0xEU;
+        }
+        if (op <= 0x4U) {
+            return 0xCU;
+        }
+    }
+    return 0U;
+}
+
+bool a32_pred_mergeable_t32(uint16_t hw1, uint16_t hw2, uint8_t itst, bool is32, bool isit, unsigned *outc)
+{
+    if (isit) {
+        return false;
+    }
+    bool in_it = (itst & 0x0FU) != 0U;
+    unsigned cond = 14U;
+    if (!is32 && !in_it) {
+        return false;
+    }
+    if (in_it) {
+        cond = (itst >> 4) & 0xFU;
+        if (cond >= 14U) {
+            return false;
+        }
+    } else if (is32 && (hw1 & 0xF800U) == 0xF000U && (hw2 & 0xD000U) == 0x8000U) {
+        cond = (hw1 >> 6) & 0xFU;
+        if (cond >= 14U) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    if (a32_pred_kill_t32(hw1, hw2, itst, is32, isit) != 0U) {
+        return false;
+    }
+    if (!is32) {
+        if ((hw1 >> 12) == 0xDU || (hw1 >> 11) == 0x1CU || (hw1 & 0xFF00U) == 0xDF00U) {
+            return false;
+        }
+        if ((hw1 & 0xFF00U) == 0xBE00U || (hw1 & 0xFF00U) == 0xDE00U) {
+            return false;
+        }
+        if (outc != NULL) {
+            *outc = cond;
+        }
+        return true;
+    }
+    if ((hw1 & 0xFE00U) == 0xEA00U || (hw1 & 0xFA00U) == 0xF000U) {
+        return false;
+    }
+    if ((hw1 & 0xFF00U) == 0xF800U) {
+        unsigned rt = (hw2 >> 12) & 0xFU;
+        if (rt == 15U) {
+            return false;
+        }
+        if (outc != NULL) {
+            *outc = cond;
+        }
+        return true;
+    }
+    if ((hw1 & 0xFE00U) == 0xE800U) {
+        if ((hw2 & 0x8000U) != 0U) {
+            return false;
+        }
+        if (outc != NULL) {
+            *outc = cond;
+        }
+        return true;
+    }
     return false;
 }
