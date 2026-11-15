@@ -59,20 +59,7 @@ static void print_stats_if_enabled(const a32_ctx_t *ctx)
     if (!ctx->stats_enabled) {
         return;
     }
-    fprintf(stderr,
-            "[a32rt stats] blocks_compiled=%llu blocks_executed=%llu chain_hits=%llu "
-            "ibtc_hits=%llu ras_hits=%llu flags_elided=%llu syscalls=%llu "
-            "icache_flushes=%llu wx_transitions=%llu window=0x%llx\n",
-            (unsigned long long)ctx->blocks_compiled,
-            (unsigned long long)ctx->blocks_executed,
-            (unsigned long long)ctx->chain_hits,
-            (unsigned long long)ctx->ibtc_hits,
-            (unsigned long long)ctx->ras_hits,
-            (unsigned long long)ctx->flags_elided,
-            (unsigned long long)ctx->syscalls_executed,
-            (unsigned long long)ctx->icache_flushes,
-            (unsigned long long)ctx->wx_transitions,
-            (unsigned long long)ctx->guest_base);
+    a32_print_stats(ctx);
 }
 
 void check_pwait_signals(a32_ctx_t *ctx, uint64_t temp_mask)

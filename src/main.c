@@ -40,7 +40,7 @@ void a32_print_stats(const a32_ctx_t *ctx)
     fprintf(stderr,
         "[a32rt stats] blocks_compiled=%llu blocks_executed=%llu chain_hits=%llu "
         "ibtc_hits=%llu ras_hits=%llu flags_elided=%llu syscalls=%llu "
-        "icache_flushes=%llu wx_transitions=%llu\n",
+        "icache_flushes=%llu wx_transitions=%llu window=0x%llx\n",
         (unsigned long long)ctx->blocks_compiled,
         (unsigned long long)ctx->blocks_executed,
         (unsigned long long)ctx->chain_hits,
@@ -49,7 +49,8 @@ void a32_print_stats(const a32_ctx_t *ctx)
         (unsigned long long)ctx->flags_elided,
         (unsigned long long)ctx->syscalls_executed,
         (unsigned long long)ctx->icache_flushes,
-        (unsigned long long)ctx->wx_transitions);
+        (unsigned long long)ctx->wx_transitions,
+        (unsigned long long)ctx->guest_base);
     fprintf(stderr,
         "[a32rt stats-ext] ns_vm_init=%llu ns_translate=%llu ns_wx_flush=%llu "
         "aprr_toggles=%llu tlb_checks=%llu tlb_groups=%llu tlb_slow=%llu "
