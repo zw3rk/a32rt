@@ -337,7 +337,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
             ctx->regs[15] = pc + 4U;
             return true;
         }
-        if (is_double && ((opc1 & 2U) == 0U) && (((insn >> 5) & 3U) == 0U)) {
+        if (is_double && (opc1 == 0U || opc1 == 1U) && (((insn >> 5) & 3U) == 0U)) {
             unsigned dd = crn | (((insn >> 7) & 1U) << 4);
             uint64_t v = ctx->vfp_d[dd & 31U];
             uint32_t w = (opc1 & 1U) ? (uint32_t)(v >> 32) : (uint32_t)v;
@@ -385,7 +385,7 @@ static bool vfp_mcr_mrc(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
         ctx->regs[15] = pc + 4U;
         return true;
     }
-    if (is_double && ((opc1 & 2U) == 0U) && (((insn >> 5) & 3U) == 0U)) {
+    if (is_double && (opc1 == 0U || opc1 == 1U) && (((insn >> 5) & 3U) == 0U)) {
         unsigned dd = crn | (((insn >> 7) & 1U) << 4);
         uint32_t w = (rd == 15U) ? 0U : ctx->regs[rd];
         uint64_t v = ctx->vfp_d[dd & 31U];
