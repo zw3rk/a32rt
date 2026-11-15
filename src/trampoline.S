@@ -116,7 +116,7 @@ JIT_RUN_BLOCK:
     orr     w21, w21, w17, lsl #1   /* w21 = cand_mask (~1 Thumb, ~3 ARM) */
     and     w23, w15, w21           /* w23 = cand_aligned_pc */
     orr     w30, w23, w17           /* w30 = next_key */
-    ldr     w21, [x28]              /* w21 = cur_epoch */
+    ldar    w21, [x28]              /* w21 = cur_epoch */
     cbz     w21, .Lslow_exit
     orr     x30, x30, x21, lsl #32  /* x30 = next_key | epoch<<32 */
     ldr     x23, [x27, #48]         /* cur_entry->chain_entry[0] */
@@ -195,7 +195,7 @@ JIT_RUN_BLOCK:
     orr     x22, x17, x23
     cbnz    x22, .Lcheck_signals_slow
 .Lsignals_ok:
-    ldr     w21, [x28]              /* cur_epoch = g_cache_epoch */
+    ldar    w21, [x28]              /* cur_epoch = g_cache_epoch */
     mov     w22, #-4
     orr     w22, w22, w26, lsl #1
     and     w30, w15, w22           /* aligned_pc = w15 & align_mask */

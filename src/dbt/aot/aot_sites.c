@@ -193,6 +193,20 @@ typedef struct {
 static _Atomic uint32_t g_site_lock = 0U;
 static a32_aot_site_slot_t g_site_slots[A32_AOT_SITE_TRACK_MAX];
 
+static bool site_lock_acquire(void)
+{
+    /* Bounded a32_spin_trylock retry: never blocks in signal/fork-child. */
+    for (uint32_t i = 0U; i < 100000U; i++) {
+        if (atomic_exchange_explicit(&g_site_lock, 1U, memory_order_acquire) == 0U) {
+            return true;
+        }
+#if defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
+    return false;
+}
+
 int a32_aot_site_track(uint32_t guest_pc_base,
     const a32_vm32_mem_site_t *sites, uint32_t count)
 {
@@ -202,7 +216,9 @@ int a32_aot_site_track(uint32_t guest_pc_base,
     if (sites == NULL || count == 0U || count > A32_AOT_SITE_PER_BLOCK) {
         return -EINVAL;
     }
-    a32_spin_lock(&g_site_lock);
+    if (!site_lock_acquire()) {
+        return -EBUSY;
+    }
     for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
         if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
             memcpy(g_site_slots[i].sites, sites,
@@ -239,7 +255,9 @@ int a32_aot_site_fetch(uint32_t guest_pc_base,
     if (sites == NULL || cap == 0U || out_count == NULL) {
         return -EINVAL;
     }
-    a32_spin_lock(&g_site_lock);
+    if (!site_lock_acquire()) {
+        return -EBUSY;
+    }
     for (i = 0U; i < A32_AOT_SITE_TRACK_MAX; i++) {
         if (g_site_slots[i].used && g_site_slots[i].base == guest_pc_base) {
             if (g_site_slots[i].count > cap) {
@@ -259,7 +277,9 @@ int a32_aot_site_fetch(uint32_t guest_pc_base,
 
 void a32_aot_site_clear(void)
 {
-    a32_spin_lock(&g_site_lock);
+    if (!site_lock_acquire()) {
+        return;
+    }
     memset(g_site_slots, 0, sizeof(g_site_slots));
     a32_spin_unlock(&g_site_lock);
 }

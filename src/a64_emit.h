@@ -27,7 +27,7 @@
  *   w22/x22 : Guest effective address scratch
  *   x23     : Chaining / IBTC / RAS target entry scratch
  *   x24     : Accumulated in-trampoline chain_hits delta
- *   w25     : Guest PC alignment mask (~1U in Thumb, ~3U in ARM)
+ *   w25     : Pinned Soft-TLB base (A64_XTLB) in Regime A2
  *   w26     : Guest Thumb state flag (is_thumb: 0 or 1)
  *   x27     : Current block cache entry pointer (cur_entry)
  *   x28     : Pointer to `g_cache_epoch` (&g_cache_epoch)
