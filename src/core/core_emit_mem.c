@@ -580,7 +580,7 @@ static bool grp_try_word(a64_buf_t *b, unsigned rt, bool is_store) {
             grp_flush(b);
             return grp_start_new(b, rn, off, rt, is_store, cur_pc, cur_it);
         }
-        if (!cold_reserve(b, (size_t)(n + 1U) * 104U, (size_t)(n + 1U) * 4U)) {
+        if (!cold_reserve(b, (size_t)(n + 1U) * (42U + 2U * (size_t)(b->self_loop_vfp_active ? __builtin_popcount(b->vfp_slot_dirty) : 0)), (size_t)(n + 1U) * 4U)) {
             grp_flush(b);
             return false;
         } {

@@ -566,7 +566,14 @@ uint8_t a32_pred_use_t32(uint16_t hw1, uint16_t hw2, uint8_t itst, bool is32, bo
             ((hw1 & 0xFE00U) == 0xEA00U) ||
             ((hw1 & 0xFE00U) == 0xFA00U)) {
             if (((hw2 >> 8) & 0xFU) == 15U) {
-                return 0xFU;
+                bool is_mod_or_sh = ((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) ||
+                                    ((hw1 & 0xFE00U) == 0xEA00U);
+                unsigned op_s = hw1 & 0x01F0U;
+                bool is_cmp_tst = is_mod_or_sh &&
+                    (op_s == 0x0010U || op_s == 0x0090U || op_s == 0x0110U || op_s == 0x01B0U);
+                if (!is_cmp_tst) {
+                    return 0xFU;
+                }
             }
         }
         if ((hw1 & 0xF800U) == 0xE800U || (hw1 & 0xF000U) == 0xE000U) {

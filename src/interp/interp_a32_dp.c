@@ -528,7 +528,6 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                         a32_pred_logical_reg_s1(b, ctx, 4U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, shift_carry_reg, live_out);
                     } else {
-                        a64_emit_mov_imm32(b, A64_TMP1, imm32);
                         a32_pred_logical_reg_s1(b, ctx, 4U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, A64_ZR, live_out);
                         is_logical = false;
@@ -628,7 +627,6 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                         a32_pred_logical_reg_s1(b, ctx, 2U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, shift_carry_reg, live_out);
                     } else {
-                        a64_emit_mov_imm32(b, A64_TMP1, imm32);
                         a32_pred_logical_reg_s1(b, ctx, 2U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, A64_ZR, live_out);
                         is_logical = false;
@@ -674,7 +672,6 @@ bool a32_decode_dp_op01_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint32_t
                         a32_pred_logical_reg_s1(b, ctx, 1U, dst, src_n, src_m, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, shift_carry_reg, live_out);
                     } else {
-                        a64_emit_mov_imm32(b, A64_TMP1, imm32);
                         a32_pred_logical_reg_s1(b, ctx, 1U, dst, src_n, A64_TMP1, A64_SHIFT_LSL, 0U,
                             has_imm_carry, imm_carry, A64_ZR, live_out);
                         is_logical = false;

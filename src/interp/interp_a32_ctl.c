@@ -198,7 +198,7 @@ static bool decode_a32_insn(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc,
                             true, imm_b, 0U, 0U)) {
                             return true;
                         }
-                    } else {
+                    } else if (!is_imm_b) {
                         bool by_r = ((insn >> 4) & 1U) != 0U;
                         if (!by_r) {
                             unsigned rm_b = insn & 0xFU;
