@@ -145,6 +145,10 @@ int a32_ios_emit_time_pid_leaf_stubs(a32_ctx_t *ctx, uint32_t *io_cur_va)
     t_movt(pid_code, &n, 0U, (pid_addr >> 16) & 0xFFFFU);
     pid_code[n++] = 0x6800U;
     pid_code[n++] = 0x4770U;
+    if (!dry_run && !a32_guest_range_ok(ctx, pid_addr, 4U, (uint32_t)(PROT_READ | PROT_WRITE))) {
+        g_pid_va = 0U;
+        return -1;
+    }
     if (!dry_run && !t_emit(ctx, cur, pid_code, n)) {
         return -1;
     }
@@ -156,6 +160,14 @@ int a32_ios_emit_time_pid_leaf_stubs(a32_ctx_t *ctx, uint32_t *io_cur_va)
         s_mach_checked = true;
     }
     if (s_mach_ok) {
+        if (!dry_run &&
+            !a32_guest_range_ok(ctx, A32_IOS_RUNTIME_DATA_VA + TB_NUMER_OFF, 8U,
+                (uint32_t)(PROT_READ | PROT_WRITE))) {
+            g_abs_va = 0U;
+            g_tb_va = 0U;
+            *io_cur_va = cur;
+            return 0;
+        }
         if (!dry_run &&
             a32_guest_range_ok(ctx, A32_IOS_RUNTIME_DATA_VA + TB_NUMER_OFF, 8U,
                 (uint32_t)(PROT_READ | PROT_WRITE))) {

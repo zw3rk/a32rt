@@ -6,6 +6,22 @@
  */
 
 #include "a64_emit.h"
+#include "dbt/jit_priv.h"
+
+/* Hardcoded immediates used below must match a32rt.h / jit_priv.h. */
+_Static_assert(offsetof(a32_ctx_t, pending_signals) == 368, "sig_pending==368");
+_Static_assert(offsetof(a32_ctx_t, cpsr) == 64, "cpsr==64");
+_Static_assert(offsetof(a32_ctx_t, blocks_executed) == 384, "blocks==384");
+_Static_assert(offsetof(a32_ctx_t, chain_hits) == 392, "chain_hits==392");
+_Static_assert(offsetof(a32_ctx_t, ibtc_hits) == 408, "ibtc_hits==408");
+_Static_assert(offsetof(a32_ctx_t, ras_hits) == 416, "ras_hits==416");
+_Static_assert(offsetof(a32_ctx_t, ras_top) == 424, "ras_top==424");
+_Static_assert(offsetof(a32_ctx_t, ras) + offsetof(a32_ibtc_entry_t, entry) == 448, "ras+entry==448");
+_Static_assert(sizeof(a32_ibtc_entry_t) == 32, "ibtc entry stride==32");
+_Static_assert(offsetof(a32_ctx_t, ibtc) + offsetof(a32_ibtc_entry_t, entry) == 2496, "ibtc+entry==2496");
+_Static_assert(offsetof(a32_cache_entry_t, ret_entry) == 96, "ret_entry==96");
+_Static_assert(offsetof(a32_cache_entry_t, slot_entry) == 152, "slot_entry==152");
+_Static_assert(offsetof(a32_ctx_t, trace_enabled) == 376, "trace==376");
 
 void a64_emit_ret(a64_buf_t *b)
 {

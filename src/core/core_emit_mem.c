@@ -24,6 +24,9 @@ static void emit_soft_tlb_fault_itstate(a64_buf_t *b, uint32_t itstate) {
 /* ---- Out-of-line cold stubs (A32-R20-P4) ---- */
 #define COLD_KIND_HOT_CBNZ 0U
 #define COLD_KIND_COLD_B 1U
+#ifndef A64_MAX_COLD_WORDS
+#define A64_MAX_COLD_WORDS 512U
+#endif
 
 static void cold_emit_u32(a64_buf_t *b, uint32_t w) {
     if (b->cold_count < 512U) {
@@ -225,9 +228,9 @@ static void queue_cold_spanN(a64_buf_t *b, unsigned addr_w, uint32_t span,
     {
         size_t src = b->cold_count - 1U;
         size_t dst = b->cold_count + 4U;
-        uint32_t orig = b->cold_words[src];
+        uint32_t orig = (src < A64_MAX_COLD_WORDS) ? b->cold_words[src] : 0U;
         int32_t d = (int32_t)dst - (int32_t)src;
-        b->cold_words[src] = (orig & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
+        if (src < A64_MAX_COLD_WORDS) b->cold_words[src] = (orig & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
     }
     cold_add_imm_w(b, true, 31U, addr_w, (uint16_t)(span - 1U));
     bcs = b->cold_count;
@@ -247,26 +250,20 @@ static void queue_cold_spanN(a64_buf_t *b, unsigned addr_w, uint32_t span,
     bjoin = b->cold_count;
     cold_emit_u32(b, 0x14000000U);
     cold_record(b, (uint32_t)bjoin, (uint32_t)hot_join, COLD_KIND_COLD_B); {
-        size_t dst = b->cold_count;
-        uint32_t orig = b->cold_words[bcs];
-        int32_t d = (int32_t)dst - (int32_t)bcs;
-        b->cold_words[bcs] = 0x54000000U | (((uint32_t)d & 0x7FFFFU) << 5) | 2U;
-        orig = b->cold_words[c2];
-        d = (int32_t)dst - (int32_t)c2;
-        b->cold_words[c2] = (orig & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
-    } {
         size_t f1 = b->cold_count;
         size_t src0 = cold_start + 5U;
-        uint32_t o0 = b->cold_words[src0];
+        uint32_t o0 = (src0 < A64_MAX_COLD_WORDS) ? b->cold_words[src0] : 0U;
         int32_t d0 = (int32_t)f1 - (int32_t)src0;
-        b->cold_words[src0] = (o0 & 0xFF00001FU) | (((uint32_t)d0 & 0x7FFFFU) << 5);
+        if (src0 < A64_MAX_COLD_WORDS) b->cold_words[src0] = (o0 & 0xFF00001FU) | (((uint32_t)d0 & 0x7FFFFU) << 5);
         cold_emit_fault(b, addr_w, cur_pc, itstate, dirty, fpcr, self_loop);
         size_t f2 = b->cold_count;
-        uint32_t o1 = b->cold_words[bcs];
-        (void)o1;
+        int32_t dw = (int32_t)f2 - (int32_t)bcs;
+        if (bcs < A64_MAX_COLD_WORDS) b->cold_words[bcs] = 0x54000000U | (((uint32_t)dw & 0x7FFFFU) << 5) | 2U;
+        int32_t d2 = (int32_t)f2 - (int32_t)c2;
+        uint32_t o2 = (c2 < A64_MAX_COLD_WORDS) ? b->cold_words[c2] : 0U;
+        if (c2 < A64_MAX_COLD_WORDS) b->cold_words[c2] = (o2 & 0xFF00001FU) | (((uint32_t)d2 & 0x7FFFFU) << 5);
         cold_add_imm_w(b, false, 23U, addr_w, (uint16_t)(span - 1U));
         cold_emit_fault(b, 23U, cur_pc, itstate, dirty, fpcr, self_loop);
-        (void)f2;
     }
 }
 
@@ -290,17 +287,38 @@ static void emit_soft_tlb_check(a64_buf_t *b, unsigned addr_w, uint32_t byte_spa
     need_c = (byte_span <= 1U) ? 12U : 48U;
     need_p = (byte_span <= 1U) ? 1U : 2U;
     if (!cold_reserve(b, need_c, need_p)) {
-        emit_hot_check(b, addr_w, byte_span, tag_off); {
-            size_t cbz = b->count;
-            a64_emit(b, 0xB4000017U);
+        if (byte_span <= 1U) {
+            emit_hot_check(b, addr_w, byte_span, tag_off); {
+                size_t cbz = b->count;
+                a64_emit(b, 0xB4000017U);
+                emit_soft_tlb_fault_itstate(b, itstate);
+                a64_emit_str_imm_w(b, addr_w, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fault_addr));
+                a64_emit_mov_pc32(b, 15U, cur_pc); a64_emit_movz_w(b, 16U, 5U, 0U);
+                a64_vfp_emit_exit_flush(b); a64_emit_ret(b); {
+                    int32_t d = (int32_t)b->count - (int32_t)cbz;
+                    b->words[cbz] = (b->words[cbz] & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
+                }
+            }
+            return;
+        }
+        emit_hot_check(b, addr_w, 1U, tag_off); {
+            size_t cbz1 = b->count; a64_emit(b, 0xB4000017U);
             emit_soft_tlb_fault_itstate(b, itstate);
             a64_emit_str_imm_w(b, addr_w, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fault_addr));
-            a64_emit_mov_pc32(b, 15U, cur_pc);
-            a64_emit_movz_w(b, 16U, 5U, 0U);
-            a64_emit_ret(b); {
-                int32_t d = (int32_t)b->count - (int32_t)cbz;
-                uint32_t o = b->words[cbz];
-                b->words[cbz] = (o & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
+            a64_emit_mov_pc32(b, 15U, cur_pc); a64_emit_movz_w(b, 16U, 5U, 0U);
+            a64_vfp_emit_exit_flush(b); a64_emit_ret(b); {
+                int32_t d = (int32_t)b->count - (int32_t)cbz1;
+                b->words[cbz1] = (b->words[cbz1] & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
+            }
+        }
+        a64_emit_add_imm_w(b, false, 17U, addr_w, (uint16_t)(byte_span - 1U), 0U); emit_hot_check(b, 17U, 1U, tag_off); {
+            size_t cbz2 = b->count; a64_emit(b, 0xB4000017U);
+            emit_soft_tlb_fault_itstate(b, itstate);
+            a64_emit_str_imm_w(b, 17U, A64_XCTX, (uint32_t)offsetof(a32_ctx_t, fault_addr));
+            a64_emit_mov_pc32(b, 15U, cur_pc); a64_emit_movz_w(b, 16U, 5U, 0U);
+            a64_vfp_emit_exit_flush(b); a64_emit_ret(b); {
+                int32_t d = (int32_t)b->count - (int32_t)cbz2;
+                b->words[cbz2] = (b->words[cbz2] & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
             }
         }
         return;
@@ -458,21 +476,21 @@ static void grp_emit_grouped(a64_buf_t *b, unsigned rn, int32_t min_off, int32_t
                 cold_emit_u32(b, 0xB8204800U | ((22U & 31U) << 16) | ((20U & 31U) << 5) | (rts[i] & 31U));
             } {
                 int32_t d = (int32_t)per_op_mem[i] - (int32_t)c_same[i];
-                b->cold_words[c_same[i]] = 0x34000000U | (((uint32_t)d & 0x7FFFFU) << 5) | 23U;
+                if (c_same[i] < A64_MAX_COLD_WORDS) b->cold_words[c_same[i]] = 0x34000000U | (((uint32_t)d & 0x7FFFFU) << 5) | 23U;
             }
             f_first[i] = b->cold_count; {
                 int32_t d = (int32_t)f_first[i] - (int32_t)c_first[i];
-                uint32_t o0 = b->cold_words[c_first[i]];
-                b->cold_words[c_first[i]] = (o0 & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
+                uint32_t o0 = (c_first[i] < A64_MAX_COLD_WORDS) ? b->cold_words[c_first[i]] : 0U;
+                if (c_first[i] < A64_MAX_COLD_WORDS) b->cold_words[c_first[i]] = (o0 & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
             }
             cold_emit_fault(b, 22U, pc, it, dirty, fpcr, self_loop);
             f_second[i] = b->cold_count;
             cold_add_imm_w(b, false, 23U, 22U, 3U); {
                 int32_t d = (int32_t)f_second[i] - (int32_t)c_wrap[i];
-                b->cold_words[c_wrap[i]] = 0x54000000U | (((uint32_t)d & 0x7FFFFU) << 5) | 2U;
+                if (c_wrap[i] < A64_MAX_COLD_WORDS) b->cold_words[c_wrap[i]] = 0x54000000U | (((uint32_t)d & 0x7FFFFU) << 5) | 2U;
                 d = (int32_t)f_second[i] - (int32_t)c_second[i];
-                uint32_t o1 = b->cold_words[c_second[i]];
-                b->cold_words[c_second[i]] = (o1 & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
+                uint32_t o1 = (c_second[i] < A64_MAX_COLD_WORDS) ? b->cold_words[c_second[i]] : 0U;
+                if (c_second[i] < A64_MAX_COLD_WORDS) b->cold_words[c_second[i]] = (o1 & 0xFF00001FU) | (((uint32_t)d & 0x7FFFFU) << 5);
             }
             cold_emit_fault(b, 23U, pc, it, dirty, fpcr, self_loop);
         } {
@@ -562,7 +580,7 @@ static bool grp_try_word(a64_buf_t *b, unsigned rt, bool is_store) {
             grp_flush(b);
             return grp_start_new(b, rn, off, rt, is_store, cur_pc, cur_it);
         }
-        if (!cold_reserve(b, 80U, 3U)) {
+        if (!cold_reserve(b, (size_t)(n + 1U) * 104U, (size_t)(n + 1U) * 4U)) {
             grp_flush(b);
             return false;
         } {

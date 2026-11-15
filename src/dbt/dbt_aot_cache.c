@@ -483,6 +483,11 @@ static int deserialize_aot_cache_stream(a32_ctx_t *ctx, FILE *f, uint32_t load_b
             for (uint32_t m = 0U; m < bh.pc_map_count; m++) {
                 pc_map_buf[m].guest_pc += delta;
             }
+            for (uint32_t s = 0U; s < bh.site_count; s++) {
+                /* R1: site_buf[s].guest_pc += delta is a no-op here: records
+                 * hold relative guest_pc_delta, rebased via track() below. */
+                (void)site_buf[s].guest_pc_delta;
+            }
             for (uint32_t w = 0U; w + 1U < bh.word_count; w++) {
                 uint32_t w0 = words_buf[w];
                 uint32_t w1 = words_buf[w + 1U];
