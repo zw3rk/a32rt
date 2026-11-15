@@ -7,6 +7,9 @@
 
 #include "a64_emit.h"
 
+void a32_vfp_record_preheader(a64_buf_t *b, uint8_t kind, uint8_t reg, bool is_write);
+void a64_vfp_preheader_fpcr_check(a64_buf_t *b);
+
 void a64_emit_movz_w(a64_buf_t *b, unsigned rd, uint16_t imm16, unsigned hw)
 {
     a64_emit(b, 0x52800000U | ((hw & 1U) << 21) | ((uint32_t)imm16 << 5) | (rd & 31U));
@@ -533,24 +536,24 @@ void a64_vfp_cache_flush(a64_buf_t *b, bool invalidate)
 
 static unsigned vfp_alloc_slot(a64_buf_t *b, uint8_t kind, uint8_t reg)
 {
-    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+    for (unsigned i = 0U; i < 22U; i++) {
         if (b->vfp_slot_kind[i] == A64_VFP_KIND_NONE) {
             b->vfp_slot_kind[i] = kind;
             b->vfp_slot_reg[i]  = reg;
             return i;
         }
     }
-    for (unsigned step = 0U; step < A64_VFP_CACHE_SLOTS; step++) {
-        unsigned idx = (b->vfp_next_evict + step) % A64_VFP_CACHE_SLOTS;
+    for (unsigned step = 0U; step < 22U; step++) {
+        unsigned idx = (b->vfp_next_evict + step) % 22U;
         if ((b->vfp_slot_dirty & (1U << idx)) == 0U) {
-            b->vfp_next_evict = (uint8_t)((idx + 1U) % A64_VFP_CACHE_SLOTS);
+            b->vfp_next_evict = (uint8_t)((idx + 1U) % 22U);
             b->vfp_slot_kind[idx] = kind;
             b->vfp_slot_reg[idx]  = reg;
             return idx;
         }
     }
-    unsigned idx = b->vfp_next_evict % A64_VFP_CACHE_SLOTS;
-    b->vfp_next_evict = (uint8_t)((idx + 1U) % A64_VFP_CACHE_SLOTS);
+    unsigned idx = b->vfp_next_evict % 22U;
+    b->vfp_next_evict = (uint8_t)((idx + 1U) % 22U);
     vfp_flush_slot(b, idx, true);
     b->vfp_slot_kind[idx] = kind;
     b->vfp_slot_reg[idx]  = reg;
@@ -562,31 +565,54 @@ static inline bool vfp_regs_alias(uint8_t k1, uint8_t r1, uint8_t k2, uint8_t r2
     return (k1 <= k2) ? ((r1 >> (k2 - k1)) == r2) : ((r2 >> (k1 - k2)) == r1);
 }
 
-static void vfp_record_preheader_access(a64_buf_t *b, uint8_t kind, uint8_t reg, bool is_write)
+static inline int vfp_find_slot_parent_d(const a64_buf_t *b, unsigned s_idx)
 {
-    if (b->vfp_preheader_ineligible || b->self_loop_vfp_active) {
-        return;
+    uint8_t want = (uint8_t)(s_idx >> 1);
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] == A64_VFP_KIND_D && b->vfp_slot_reg[i] == want) {
+            return (int)i;
+        }
     }
-    for (unsigned i = 0U; i < b->vfp_preheader_count; i++) {
-        if (b->vfp_preheader_kinds[i] == kind && b->vfp_preheader_regs[i] == reg) {
-            if (is_write) {
-                b->vfp_preheader_written |= (1U << i);
+    return -1;
+}
+
+static inline int vfp_find_slot_parent_q_for_s(const a64_buf_t *b, unsigned s_idx)
+{
+    uint8_t want = (uint8_t)(s_idx >> 2);
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] == A64_VFP_KIND_Q && b->vfp_slot_reg[i] == want) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static inline int vfp_find_slot_parent_q_for_d(const a64_buf_t *b, unsigned d_idx)
+{
+    uint8_t want = (uint8_t)(d_idx >> 1);
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if (b->vfp_slot_kind[i] == A64_VFP_KIND_Q && b->vfp_slot_reg[i] == want) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static inline void vfp_flush_alias_except(a64_buf_t *b, uint8_t kind, uint8_t reg, int except)
+{
+    for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
+        if ((int)i == except) {
+            continue;
+        }
+        if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&
+            vfp_regs_alias(b->vfp_slot_kind[i], b->vfp_slot_reg[i], kind, reg)) {
+            if (b->vfp_slot_kind[i] < kind && b->cond_branch_depth == 0U) {
+                b->vfp_slot_dirty &= ~(1U << i);
+                b->vfp_slot_kind[i] = A64_VFP_KIND_NONE;
+            } else {
+                vfp_flush_slot(b, i, true);
             }
-            return;
         }
-        if (vfp_regs_alias(b->vfp_preheader_kinds[i], b->vfp_preheader_regs[i], kind, reg)) {
-            b->vfp_preheader_ineligible = true;
-            return;
-        }
-    }
-    if (b->vfp_preheader_count >= A64_VFP_CACHE_SLOTS) {
-        return;
-    }
-    unsigned idx = b->vfp_preheader_count++;
-    b->vfp_preheader_kinds[idx] = kind;
-    b->vfp_preheader_regs[idx]  = reg;
-    if (is_write) {
-        b->vfp_preheader_written |= (1U << idx);
     }
 }
 
@@ -613,6 +639,7 @@ void a64_vfp_emit_exit_flush(a64_buf_t *b)
 void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *regs,
                              unsigned count, uint32_t written_mask, bool neon_fpcr_hoist)
 {
+    a64_vfp_preheader_fpcr_check(b);
     b->self_loop_vfp_active = (count > 0U);
     /* A32-IOS-P1: pure-NEON self-loops install Standard FPSCR once in the
      * preheader (before loop_body_offset); the loop body then runs with
@@ -634,11 +661,32 @@ void a64_buf_start_self_loop(a64_buf_t *b, const uint8_t *kinds, const uint8_t *
 /* VFPv4-D32 / NEON context loads/stores */
 static void vfp_ldr_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
 {
-    vfp_record_preheader_access(b, kind, (uint8_t)idx, false);
+    a32_vfp_record_preheader(b, kind, (uint8_t)idx, false);
     if (b->self_loop_vfp_active) {
         for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
             if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
                 vfp_emit_slot_copy(b, kind, vt, 8U + i);
+                return;
+            }
+        }
+        if (kind == A64_VFP_KIND_S) {
+            int pd = vfp_find_slot_parent_d(b, idx);
+            if (pd >= 0) {
+                unsigned lane = idx & 1U;
+                a64_emit(b, 0x5E040400U | (lane << 19) | (((unsigned)8U + (unsigned)pd) << 5) | (vt & 31U));
+                return;
+            }
+            int pq = vfp_find_slot_parent_q_for_s(b, idx);
+            if (pq >= 0) {
+                unsigned lane = idx & 3U;
+                a64_emit(b, 0x5E040400U | (lane << 19) | (((unsigned)8U + (unsigned)pq) << 5) | (vt & 31U));
+                return;
+            }
+        } else if (kind == A64_VFP_KIND_D) {
+            int pq = vfp_find_slot_parent_q_for_d(b, idx);
+            if (pq >= 0) {
+                unsigned lane = idx & 1U;
+                a64_emit(b, 0x5E080400U | (lane << 20) | (((unsigned)8U + (unsigned)pq) << 5) | (vt & 31U));
                 return;
             }
         }
@@ -657,6 +705,27 @@ static void vfp_ldr_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
             return;
         }
     }
+    if (kind == A64_VFP_KIND_S) {
+        int pd = vfp_find_slot_parent_d(b, idx);
+        if (pd >= 0) {
+            unsigned lane = idx & 1U;
+            a64_emit(b, 0x5E040400U | (lane << 19) | (((unsigned)8U + (unsigned)pd) << 5) | (vt & 31U));
+            return;
+        }
+        int pq = vfp_find_slot_parent_q_for_s(b, idx);
+        if (pq >= 0) {
+            unsigned lane = idx & 3U;
+            a64_emit(b, 0x5E040400U | (lane << 19) | (((unsigned)8U + (unsigned)pq) << 5) | (vt & 31U));
+            return;
+        }
+    } else if (kind == A64_VFP_KIND_D) {
+        int pq = vfp_find_slot_parent_q_for_d(b, idx);
+        if (pq >= 0) {
+            unsigned lane = idx & 1U;
+            a64_emit(b, 0x5E080400U | (lane << 20) | (((unsigned)8U + (unsigned)pq) << 5) | (vt & 31U));
+            return;
+        }
+    }
     vfp_emit_raw_ldr(b, kind, vt, idx);
     if (b->cond_branch_depth == 0U) {
         unsigned slot = vfp_alloc_slot(b, kind, (uint8_t)idx);
@@ -666,7 +735,7 @@ static void vfp_ldr_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
 
 static void vfp_str_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
 {
-    vfp_record_preheader_access(b, kind, (uint8_t)idx, true);
+    a32_vfp_record_preheader(b, kind, (uint8_t)idx, true);
     if (b->self_loop_vfp_active) {
         for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
             if (b->vfp_slot_kind[i] == kind && b->vfp_slot_reg[i] == idx) {
@@ -675,8 +744,61 @@ static void vfp_str_ctx(a64_buf_t *b, uint8_t kind, unsigned vt, unsigned idx)
                 return;
             }
         }
+        if (kind == A64_VFP_KIND_S) {
+            int pd = vfp_find_slot_parent_d(b, idx);
+            if (pd >= 0) {
+                unsigned lane = idx & 1U;
+                a64_emit(b, 0x6E040400U | (lane << 19) | ((vt & 31U) << 5) | ((unsigned)8U + (unsigned)pd));
+                b->vfp_slot_dirty |= (1U << (unsigned)pd);
+                return;
+            }
+            int pq = vfp_find_slot_parent_q_for_s(b, idx);
+            if (pq >= 0) {
+                unsigned lane = idx & 3U;
+                a64_emit(b, 0x6E040400U | (lane << 19) | ((vt & 31U) << 5) | ((unsigned)8U + (unsigned)pq));
+                b->vfp_slot_dirty |= (1U << (unsigned)pq);
+                return;
+            }
+        } else if (kind == A64_VFP_KIND_D) {
+            int pq = vfp_find_slot_parent_q_for_d(b, idx);
+            if (pq >= 0) {
+                unsigned lane = idx & 1U;
+                a64_emit(b, 0x6E080400U | (lane << 20) | ((vt & 31U) << 5) | ((unsigned)8U + (unsigned)pq));
+                b->vfp_slot_dirty |= (1U << (unsigned)pq);
+                return;
+            }
+        }
         vfp_emit_raw_str(b, kind, vt, idx);
         return;
+    }
+    if (b->cond_branch_depth == 0U && kind != A64_VFP_KIND_Q) {
+        if (kind == A64_VFP_KIND_S) {
+            int pd = vfp_find_slot_parent_d(b, idx);
+            if (pd >= 0) {
+                unsigned lane = idx & 1U;
+                a64_emit(b, 0x6E040400U | (lane << 19) | ((vt & 31U) << 5) | ((unsigned)8U + (unsigned)pd));
+                b->vfp_slot_dirty |= (1U << (unsigned)pd);
+                vfp_flush_alias_except(b, A64_VFP_KIND_D, (uint8_t)(idx >> 1), pd);
+                return;
+            }
+            int pq = vfp_find_slot_parent_q_for_s(b, idx);
+            if (pq >= 0) {
+                unsigned lane = idx & 3U;
+                a64_emit(b, 0x6E040400U | (lane << 19) | ((vt & 31U) << 5) | ((unsigned)8U + (unsigned)pq));
+                b->vfp_slot_dirty |= (1U << (unsigned)pq);
+                vfp_flush_alias_except(b, A64_VFP_KIND_Q, (uint8_t)(idx >> 2), pq);
+                return;
+            }
+        } else if (kind == A64_VFP_KIND_D) {
+            int pq = vfp_find_slot_parent_q_for_d(b, idx);
+            if (pq >= 0) {
+                unsigned lane = idx & 1U;
+                a64_emit(b, 0x6E080400U | (lane << 20) | ((vt & 31U) << 5) | ((unsigned)8U + (unsigned)pq));
+                b->vfp_slot_dirty |= (1U << (unsigned)pq);
+                vfp_flush_alias_except(b, A64_VFP_KIND_Q, (uint8_t)(idx >> 1), pq);
+                return;
+            }
+        }
     }
     for (unsigned i = 0U; i < A64_VFP_CACHE_SLOTS; i++) {
         if (b->vfp_slot_kind[i] != A64_VFP_KIND_NONE && b->vfp_slot_kind[i] != kind &&

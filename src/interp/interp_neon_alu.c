@@ -7,6 +7,13 @@
 
 #include "interp/decode_priv.h"
 
+unsigned a64_vfp_inout_d(a64_buf_t *b, unsigned scratch_vt, unsigned d_idx);
+unsigned a64_vfp_inout_q(a64_buf_t *b, unsigned scratch_vt, unsigned q_idx);
+void a64_vfp_note_neon_fp(a64_buf_t *b);
+void a64_vfp_note_scalar_fp(a64_buf_t *b);
+void a64_vfp_emit_neon_f32_guarded(a64_buf_t *b, bool is_q, uint32_t a64_op,
+                                   unsigned rd, unsigned r_n, unsigned r_m);
+
 bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
 {
     /* 6. NEON 3-register different length, 2-register + scalar, & 3-register same */
@@ -151,6 +158,7 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                 if ((op == 0x1U || op == 0x5U) && size == 2U) {
                     /* Chained (unfused) VMLA.F32 / VMLS.F32 by scalar.
                      * Standard FPSCR around the FP sequence (A32-R7-24). */
+                    a64_vfp_note_neon_fp(b);
                     neon_fp_fpcr_begin(b);
                     uint32_t fadd_op = vec_q ? 0x4E20D400U : 0x0E20D400U;
                     a64_emit_ldr_d_ctx(b, 2U, dm);
@@ -201,7 +209,12 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                     /* VMUL.F32 by scalar (op 0x9) runs under Standard
                      * FPSCR; integer scalar ops ignore FPCR (A32-R7-24). */
                     bool sc_fp = (op == 0x9U);
-                    if (sc_fp) {
+                    bool sc_guarded = sc_fp && b->fpscr_zero_spec &&
+                                      b->cond_branch_depth == 0U && !b->fpcr_neon_active;
+                    if (sc_guarded) {
+                        a64_vfp_note_neon_fp(b);
+                    } else if (sc_fp) {
+                        a64_vfp_note_neon_fp(b);
                         neon_fp_fpcr_begin(b);
                     }
                     a64_emit_ldr_d_ctx(b, 2U, dm);
@@ -214,7 +227,11 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                         if (sc_acc) {
                             a64_emit_ldr_q_ctx(b, 0U, qd);
                         }
-                        a64_emit(b, sc_op | (2U << 16) | (1U << 5) | 0U);
+                        if (sc_guarded) {
+                            a64_vfp_emit_neon_f32_guarded(b, true, sc_op, 0U, 1U, 2U);
+                        } else {
+                            a64_emit(b, sc_op | (2U << 16) | (1U << 5) | 0U);
+                        }
                         a64_emit_str_q_ctx(b, 0U, qd);
                     } else {
                         unsigned dd = neon_reg_d(insn);
@@ -223,10 +240,14 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                         if (sc_acc) {
                             a64_emit_ldr_d_ctx(b, 0U, dd);
                         }
-                        a64_emit(b, sc_op | (2U << 16) | (1U << 5) | 0U);
+                        if (sc_guarded) {
+                            a64_vfp_emit_neon_f32_guarded(b, false, sc_op, 0U, 1U, 2U);
+                        } else {
+                            a64_emit(b, sc_op | (2U << 16) | (1U << 5) | 0U);
+                        }
                         a64_emit_str_d_ctx(b, 0U, dd);
                     }
-                    if (sc_fp) {
+                    if (sc_fp && !sc_guarded) {
                         neon_fp_fpcr_end(b);
                     }
                     return true;
@@ -433,6 +454,7 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
         /* Chained (unfused) VMLA.F32 / VMLS.F32 (op == 0xD, !u_bit, b4, size == 0 or 2).
          * Standard FPSCR around the FP sequence (A32-R7-24). */
         else if (!u_bit && (size == 0U || size == 2U) && op == 0xDU && b4) {
+            a64_vfp_note_neon_fp(b);
             neon_fp_fpcr_begin(b);
             uint32_t fadd_op = is_q ? 0x4E20D400U : 0x0E20D400U;
             if (is_q) {
@@ -601,35 +623,61 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
              * host FPCR (A32-R7-24). Integer SIMD ignores FPCR. */
             bool fp_env = (op == 0xDU || op == 0xEU || op == 0xFU) ||
                           (op == 0xCU && b4);
-            if (fp_env) {
+            bool is_guarded_f32 = (op == 0xDU && !needs_acc &&
+                                   ((!u_bit && size == 0U && !b4) ||
+                                    (!u_bit && size == 2U && !b4) ||
+                                    (u_bit && size == 2U && !b4) ||
+                                    (u_bit && size == 0U && b4))) &&
+                                  b->fpscr_zero_spec && b->cond_branch_depth == 0U &&
+                                  !b->fpcr_neon_active;
+            if (is_guarded_f32) {
+                a64_vfp_note_neon_fp(b);
+            } else if (fp_env) {
+                a64_vfp_note_neon_fp(b);
                 neon_fp_fpcr_begin(b);
             }
-            uint32_t rn_rm = swap_rn_rm ? ((1U << 16) | (2U << 5))
-                                        : ((2U << 16) | (1U << 5));
             if (is_q) {
                 unsigned qd = neon_reg_d(insn) >> 1;
                 unsigned qn = neon_reg_n(insn) >> 1;
                 unsigned qm = neon_reg_m(insn) >> 1;
-                a64_emit_ldr_q_ctx(b, 1U, qn);
-                a64_emit_ldr_q_ctx(b, 2U, qm);
+                unsigned rn = a64_vfp_src_q(b, 1U, qn);
+                unsigned rm = a64_vfp_src_q(b, 2U, qm);
+                unsigned rd;
                 if (needs_acc) {
-                    a64_emit_ldr_q_ctx(b, 0U, qd);
+                    rd = a64_vfp_inout_q(b, 0U, qd);
+                } else {
+                    rd = a64_vfp_dst_q(b, 0U, qd);
                 }
-                a64_emit(b, a64_op | rn_rm | 0U);
-                a64_emit_str_q_ctx(b, 0U, qd);
+                unsigned r_n = swap_rn_rm ? rm : rn;
+                unsigned r_m = swap_rn_rm ? rn : rm;
+                if (is_guarded_f32) {
+                    a64_vfp_emit_neon_f32_guarded(b, true, a64_op, rd, r_n, r_m);
+                } else {
+                    a64_emit(b, a64_op | (r_m << 16) | (r_n << 5) | (rd & 31U));
+                }
+                a64_vfp_commit_q(b, rd, qd);
             } else {
                 unsigned dd = neon_reg_d(insn);
                 unsigned dn = neon_reg_n(insn);
                 unsigned dm = neon_reg_m(insn);
-                a64_emit_ldr_d_ctx(b, 1U, dn);
-                a64_emit_ldr_d_ctx(b, 2U, dm);
+                unsigned rn = a64_vfp_src_d(b, 1U, dn);
+                unsigned rm = a64_vfp_src_d(b, 2U, dm);
+                unsigned rd;
                 if (needs_acc) {
-                    a64_emit_ldr_d_ctx(b, 0U, dd);
+                    rd = a64_vfp_inout_d(b, 0U, dd);
+                } else {
+                    rd = a64_vfp_dst_d(b, 0U, dd);
                 }
-                a64_emit(b, a64_op | rn_rm | 0U);
-                a64_emit_str_d_ctx(b, 0U, dd);
+                unsigned r_n = swap_rn_rm ? rm : rn;
+                unsigned r_m = swap_rn_rm ? rn : rm;
+                if (is_guarded_f32) {
+                    a64_vfp_emit_neon_f32_guarded(b, false, a64_op, rd, r_n, r_m);
+                } else {
+                    a64_emit(b, a64_op | (r_m << 16) | (r_n << 5) | (rd & 31U));
+                }
+                a64_vfp_commit_d(b, rd, dd);
             }
-            if (fp_env) {
+            if (fp_env && !is_guarded_f32) {
                 neon_fp_fpcr_end(b);
             }
             return true;
