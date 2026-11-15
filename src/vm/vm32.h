@@ -70,30 +70,44 @@ void a32_vm32_set_arena_base(uintptr_t base);
 /* Arena base backing [G, G + 4 GiB) (== G in both regimes). */
 uintptr_t a32_vm32_arena_base(void);
 
-/* ---- 7-instruction Soft-TLB (UNIFICATION-PLAN section 4.3) ---- */
+/* ---- 1-load negated-tag Soft-TLB (A32-R20-D3, 16 B entries) ---- */
 
 /* Full-coverage table: one entry per 4 KiB guest page in the 4 GiB window
- * (1M entries x 32 B = 32 MiB BSS, demand-zero). Direct-mapped aliasing is
+ * (1M entries x 16 B = 16 MiB BSS, demand-zero). Direct-mapped aliasing is
  * unacceptable for the A2 fast path: a miss exits the block with a guest
  * fault, and an eviction-induced miss on a mapped page would deliver a
  * bogus fault with no mid-block resume machinery. Full coverage makes
- * every tag miss a genuine unmapped-or-wrong-permission fault. */
+ * every tag miss a genuine unmapped-or-wrong-permission fault.
+ *
+ * On every mapping host_page_base == G + gva_page, so the addend load in
+ * the fast path is redundant: the hit address is [x20, wAddr, uxtw].
+ * Each entry holds negated page-base tags: valid tag for page idx is
+ * 0ULL - ((uint64_t)idx << 12); invalid is 0ULL for idx >= 1 and
+ * (1ULL << 63) for idx == 0 so untouched BSS (0ULL) is already invalid
+ * for every page. */
 #define A32_VM32_TLB_BITS 20U
 #define A32_VM32_TLB_SIZE (1U << A32_VM32_TLB_BITS) /* 1048576 entries */
-#define A32_VM32_TLB_INVALID_TAG (~UINT64_C(0))
+#define A32_VM32_TLB_PAGE0_INVALID (UINT64_C(1) << 63)
 #define A32_PROT_EOF_CUT 0x80U
 #define A32_PROT_WATCH 0x40U
 
 typedef struct {
-    uint64_t read_tag; /* Offset 0: (gva & ~0xFFF) if readable, else ~0 */
-    uintptr_t addend; /* Offset 8: host_page_base - (gva & ~0xFFF) */
-    uint64_t write_tag; /* Offset 16: (gva & ~0xFFF) iff writable &&
-                         * !cow_clean && !has_code && !has_reservation */
-    uint64_t flags_reserved; /* Offset 24: zero, keeps 32 B alignment */
+    uint64_t read_ntag; /* Offset 0: (0ULL - (vpn << 12)) if readable, else invalid */
+    uint64_t write_ntag; /* Offset 8: (0ULL - (vpn << 12)) if writable, else invalid */
 } a32_vm32_tlb_entry_t;
 
-_Static_assert(sizeof(a32_vm32_tlb_entry_t) == 32,
-    "Soft-TLB entry must be 32 bytes");
+_Static_assert(sizeof(a32_vm32_tlb_entry_t) == 16,
+    "Soft-TLB entry must be 16 bytes");
+
+static inline uint64_t vm32_invalid_ntag(uint32_t idx)
+{
+    return (idx == 0U) ? A32_VM32_TLB_PAGE0_INVALID : 0ULL;
+}
+
+static inline uint64_t vm32_valid_ntag(uint32_t idx)
+{
+    return 0ULL - ((uint64_t)idx << 12);
+}
 
 /* Slow path shared by every .L_tlb_miss_site_k stub (ctx, x1 = gva,
  * x0 = value, block id, 16-bit site index intact). Returns 0 and fills
@@ -126,8 +140,9 @@ int a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut);
 void a32_vm32_mark_code_range(uint32_t start_gva, uint32_t end_gva);
 void a32_vm32_clear_code_watches(void);
 
-/* Soft-TLB base address for the A2 emitter/trampoline (x21). Set by
- * a32_vm32_init: &g_tlb[0] when regime == A2_SOFT_TLB, 0 (unused) in A1. */
+/* Soft-TLB base address for the A2 emitter/trampoline (x25). Set by
+ * a32_vm32_init: &g_tlb_arena.tlb[0] when regime == A2_SOFT_TLB,
+ * 0 (unused) in A1. */
 extern uintptr_t a32_vm32_tlb_base;
 
 /* Regime-aware mprotect. Outside A2 this forwards [addr, addr+len)

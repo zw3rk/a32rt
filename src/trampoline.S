@@ -39,27 +39,24 @@ JIT_RUN_BLOCK:
 
     mov     x19, x0                 /* x19 = xCtx (a32_ctx_t *) */
     ldr     x20, [x19, #72]         /* x20 = xG (ctx->guest_base) */
-    /* x21 = Soft-TLB base for Regime A2 (0 in A1, where x21 stays scratch).
-     * A32-IOS-P4: spill it once at [sp, #160] so every A2 guest access
-     * reloads it with one `ldr x21, [sp, #160]` instead of up to four
-     * MOVZ/MOVK materializations (and stays position-independent). The
-     * host sp is constant for the whole JIT block residency. */
+    /* x25 = pinned Soft-TLB base for Regime A2 (0 in A1). Spill it once
+     * at [sp, #160] for C inspection; translated code uses pinned x25
+     * directly with no reload. x21 stays purely scratch. */
 #if defined(__APPLE__)
-    adrp    x21, VM32_TLB_BASE@PAGE
-    ldr     x21, [x21, VM32_TLB_BASE@PAGEOFF]
+    adrp    x25, VM32_TLB_BASE@PAGE
+    ldr     x25, [x25, VM32_TLB_BASE@PAGEOFF]
 #else
-    adrp    x21, VM32_TLB_BASE
-    ldr     x21, [x21, :lo12:VM32_TLB_BASE]
+    adrp    x25, VM32_TLB_BASE
+    ldr     x25, [x25, :lo12:VM32_TLB_BASE]
 #endif
-    str     x21, [sp, #160]
+    str     x25, [sp, #160]
     mov     x27, x2                 /* x27 = cur_entry (a32_cache_entry_t *) */
     mov     x28, x3                 /* x28 = &g_cache_epoch */
 
-    /* Extract is_thumb (w26) and align_mask (w25), and restore hardware NZCV */
+    /* Extract is_thumb (w26); align masks are computed in scratch w21/w22
+     * on demand so x25 stays pinned to the Soft-TLB base. Restore NZCV. */
     ldr     w16, [x19, #64]
     ubfx    w26, w16, #5, #1        /* w26 = is_thumb (0 or 1) */
-    mov     w25, #-4
-    orr     w25, w25, w26, lsl #1   /* w25 = is_thumb ? ~1u : ~3u */
 
     and     w16, w16, #0xf0000000
     msr     nzcv, x16
@@ -108,8 +105,9 @@ JIT_RUN_BLOCK:
      * inline with the candidate key before paying a full C slow exit.
      * w15 still holds the raw (bit0-intact) target and [x19, #64] is
      * untouched, so a miss falls through to .Lslow_exit exactly as before.
-     * x21/x23/x30 are scratch here (x21 is reloaded per A2 access from
-     * [sp, #160]; x30 is restored from the stack on slow exit). */
+     * x21/x22/x23/x30 are scratch here (x25 holds the pinned TLB base;
+     * [sp, #160] spills it for C inspection; x30 is restored from the
+     * stack on slow exit). */
     ldp     x17, x23, [x19, #368]   /* pending_signals, trace/gdb/single-step/itstate */
     orr     x21, x17, x23
     cbnz    x21, .Lslow_exit        /* signals/flags/single-step/trace: slow path */
@@ -118,7 +116,7 @@ JIT_RUN_BLOCK:
     orr     w21, w21, w17, lsl #1   /* w21 = cand_mask (~1 Thumb, ~3 ARM) */
     and     w23, w15, w21           /* w23 = cand_aligned_pc */
     orr     w30, w23, w17           /* w30 = next_key */
-    ldar    w21, [x28]              /* w21 = cur_epoch */
+    ldr     w21, [x28]              /* w21 = cur_epoch */
     cbz     w21, .Lslow_exit
     orr     x30, x30, x21, lsl #32  /* x30 = next_key | epoch<<32 */
     ldr     x23, [x27, #48]         /* cur_entry->chain_entry[0] */
@@ -185,8 +183,8 @@ JIT_RUN_BLOCK:
     and     w21, w15, #1
     mov     w26, w21
     mov     w21, #-4
-    orr     w25, w21, w26, lsl #1
-    and     w15, w15, w25
+    orr     w21, w21, w26, lsl #1
+    and     w15, w15, w21
     ldr     w21, [x19, #64]
     bic     w21, w21, #0x20
     orr     w21, w21, w26, lsl #5
@@ -197,8 +195,10 @@ JIT_RUN_BLOCK:
     orr     x22, x17, x23
     cbnz    x22, .Lcheck_signals_slow
 .Lsignals_ok:
-    ldar    w21, [x28]              /* cur_epoch = g_cache_epoch (acquire load) */
-    and     w30, w15, w25           /* aligned_pc = w15 & align_mask */
+    ldr     w21, [x28]              /* cur_epoch = g_cache_epoch */
+    mov     w22, #-4
+    orr     w22, w22, w26, lsl #1
+    and     w30, w15, w22           /* aligned_pc = w15 & align_mask */
     cbz     w21, .Lslow_exit
     orr     w30, w30, w26           /* next_key = aligned_pc | is_thumb */
     orr     x30, x30, x21, lsl #32  /* x30 = next_key (lo32) | cur_epoch (hi32) */
