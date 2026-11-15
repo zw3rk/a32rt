@@ -18,14 +18,23 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-static a32_vm32_tlb_entry_t g_tlb[A32_VM32_TLB_SIZE];
+/* Soft-TLB arena: 32-entry PIC helper table immediately below tlb[0]
+ * so [x25, #-8*(i+1)] stays reserved for PIC helpers. tlb[0] sits at
+ * &g_tlb_arena.tlb[0]; 16 B stride per entry. */
+typedef struct {
+    uint64_t helpers[32];
+    a32_vm32_tlb_entry_t tlb[A32_VM32_TLB_SIZE];
+} a32_vm32_tlb_arena_t;
+
+static a32_vm32_tlb_arena_t g_tlb_arena;
+static bool g_tlb_ever_used = false;
 
 /* Per-4 KiB guest permission ground truth (bit0=R, bit1=W, bit2=X),
  * maintained by the sync hooks alongside the TLB. The A2 union mprotect
  * reads neighbour permissions from here. */
 static uint8_t g_prot[A32_VM32_TLB_SIZE];
 
-/* Soft-TLB base for the A2 emitter/trampoline x21 (see vm32.h). */
+/* Soft-TLB base for the A2 emitter/trampoline x25 (see vm32.h). */
 uintptr_t a32_vm32_tlb_base = 0U;
 
 typedef struct {
@@ -68,11 +77,21 @@ int a32_vm32_init(a32_ctx_t *ctx)
     }
     g_regime = a32_vm32_select_regime((size_t)h);
     g_arena_base = (uintptr_t)ctx->guest_base;
-    a32_vm32_tlb_invalidate_all();
+    if (g_regime == A32_VM32_REGIME_A2_SOFT_TLB) {
+        if (!g_tlb_ever_used) {
+            g_tlb_arena.tlb[0].read_ntag =
+                A32_VM32_TLB_PAGE0_INVALID;
+            g_tlb_arena.tlb[0].write_ntag =
+                A32_VM32_TLB_PAGE0_INVALID;
+            g_tlb_ever_used = true;
+        } else {
+            a32_vm32_tlb_invalidate_all();
+        }
+    }
     memset(g_prot, 0, sizeof(g_prot));
     memset(g_ll, 0, sizeof(g_ll));
     a32_vm32_tlb_base = (g_regime == A32_VM32_REGIME_A2_SOFT_TLB)
-        ? (uintptr_t)&g_tlb[0] : 0U;
+        ? (uintptr_t)&g_tlb_arena.tlb[0] : 0U;
     return 0;
 }
 
@@ -92,29 +111,15 @@ uintptr_t a32_vm32_arena_base(void)
     return __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
 }
 
-/* Rebase the arena (RC-U3-r4 #2): point the global window at a new base
- * and shift every valid TLB addend by the same delta so warm entries
- * stay canonical. Entries with both tags invalid are left alone; the
- * next miss refills them. A no-op when base is unchanged. */
+/* Rebase the arena (RC-U3-r4 #2, A32-R20-D3): negated tags are
+ * G-independent (0ULL - (vpn << 12)), so rebasing only publishes the new
+ * base; warm entries stay canonical with no per-entry fixup. A no-op
+ * when base is unchanged. */
 void a32_vm32_set_arena_base(uintptr_t base)
 {
     uintptr_t old = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
-    intptr_t delta;
-    uint32_t i;
-
     if (base == old) {
         return;
-    }
-    delta = (intptr_t)(base - old);
-    for (i = 0u; i < A32_VM32_TLB_SIZE; i++) {
-        uint64_t rtag = __atomic_load_n(&g_tlb[i].read_tag, __ATOMIC_RELAXED);
-        uint64_t wtag = __atomic_load_n(&g_tlb[i].write_tag, __ATOMIC_RELAXED);
-        if (rtag != A32_VM32_TLB_INVALID_TAG ||
-            wtag != A32_VM32_TLB_INVALID_TAG) {
-            uintptr_t old_add = __atomic_load_n(&g_tlb[i].addend, __ATOMIC_RELAXED);
-            __atomic_store_n(&g_tlb[i].addend,
-                (uintptr_t)((intptr_t)old_add + delta), __ATOMIC_RELEASE);
-        }
     }
     __atomic_store_n(&g_arena_base, base, __ATOMIC_RELEASE);
 }
@@ -163,20 +168,35 @@ static void vm32_bump_spanned(uint32_t start_gva, uint64_t len)
     }
 }
 
+static void vm32_tlb_fill_no_bump(uint32_t gva_page,
+    uintptr_t host_page_base, bool readable, bool writable)
+{
+    uint32_t idx;
+    uint8_t pbits;
+    bool cut;
+    bool r;
+    bool w;
+    (void)host_page_base;
+    idx = tlb_index(gva_page);
+    pbits = __atomic_load_n(&g_prot[idx], __ATOMIC_RELAXED);
+    cut = (pbits & A32_PROT_EOF_CUT) != 0U;
+    r = readable;
+    w = writable;
+    if (g_regime == A32_VM32_REGIME_A2_SOFT_TLB && w && !r) {
+        r = true;
+    }
+    __atomic_store_n(&g_tlb_arena.tlb[idx].read_ntag,
+        (!cut && r) ? vm32_valid_ntag(idx) : vm32_invalid_ntag(idx),
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tlb_arena.tlb[idx].write_ntag,
+        (!cut && w) ? vm32_valid_ntag(idx) : vm32_invalid_ntag(idx),
+        __ATOMIC_RELEASE);
+}
+
 void a32_vm32_tlb_fill(uint32_t gva_page, uintptr_t host_page_base,
     bool readable, bool writable)
 {
-    uint32_t idx = tlb_index(gva_page);
-    uint64_t vpn = (uint64_t)(gva_page & ~0xFFFU);
-    uint8_t pbits = __atomic_load_n(&g_prot[idx], __ATOMIC_RELAXED);
-    bool cut = (pbits & A32_PROT_EOF_CUT) != 0U;
-    __atomic_store_n(&g_tlb[idx].addend, host_page_base - (uintptr_t)vpn,
-        __ATOMIC_RELEASE);
-    __atomic_store_n(&g_tlb[idx].read_tag,
-        (!cut && readable) ? vpn : A32_VM32_TLB_INVALID_TAG, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_tlb[idx].write_tag,
-        (!cut && writable) ? vpn : A32_VM32_TLB_INVALID_TAG, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
+    vm32_tlb_fill_no_bump(gva_page, host_page_base, readable, writable);
     /* A remap breaks every LDREX reservation on this page (A32-R9-7). */
     vm32_bump_spanned(gva_page & ~0xFFFU, 0x1000ULL);
 }
@@ -193,11 +213,10 @@ void a32_vm32_tlb_invalidate_range(uint32_t start_gva, uint32_t end_gva)
     }
     for (i = 0ULL; i < pages; i++) {
         uint32_t idx = tlb_index((uint32_t)(start + (i << 12U)));
-        __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
-            __ATOMIC_RELEASE);
-        __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
-            __ATOMIC_RELEASE);
-        __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_tlb_arena.tlb[idx].read_ntag,
+            vm32_invalid_ntag(idx), __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tlb_arena.tlb[idx].write_ntag,
+            vm32_invalid_ntag(idx), __ATOMIC_RELEASE);
     }
 }
 
@@ -205,12 +224,10 @@ void a32_vm32_tlb_invalidate_all(void)
 {
     uint32_t i;
     for (i = 0U; i < A32_VM32_TLB_SIZE; i++) {
-        __atomic_store_n(&g_tlb[i].read_tag, A32_VM32_TLB_INVALID_TAG,
-            __ATOMIC_RELEASE);
-        __atomic_store_n(&g_tlb[i].write_tag, A32_VM32_TLB_INVALID_TAG,
-            __ATOMIC_RELEASE);
-        __atomic_store_n(&g_tlb[i].addend, 0U, __ATOMIC_RELAXED);
-        __atomic_store_n(&g_tlb[i].flags_reserved, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_tlb_arena.tlb[i].read_ntag,
+            vm32_invalid_ntag(i), __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tlb_arena.tlb[i].write_ntag,
+            vm32_invalid_ntag(i), __ATOMIC_RELEASE);
     }
 }
 
@@ -220,6 +237,10 @@ static int vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
     uint32_t hp_start;
     uint32_t hp_end;
     uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
+    bool have_run = false;
+    uintptr_t run_start = 0U;
+    size_t run_len = 0U;
+    int run_host_prot = 0;
     if (g_regime != A32_VM32_REGIME_A2_SOFT_TLB || base == 0U ||
         end_gva <= start_gva) {
         return 0;
@@ -234,6 +255,7 @@ static int vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
     for (uint32_t hp = hp_start; hp < hp_end; hp += (uint32_t)host_page) {
         uint32_t union_prot = 0U;
         uint32_t hp_page_end = hp + (uint32_t)host_page;
+        int host_prot;
         if (hp_page_end < hp) {
             hp_page_end = 0xFFFFFFFFU;
         }
@@ -244,13 +266,34 @@ static int vm32_sync_host_pages_a2(uint32_t start_gva, uint32_t end_gva)
                 break;
             }
         }
-        int hp_rc = a32_backend_protect((void *)(base + (uintptr_t)hp),
-            host_page, a32_host_prot(NULL, union_prot));
-        if (hp_rc != 0) {
-            return hp_rc;
+        host_prot = a32_host_prot(NULL, union_prot);
+        if (!have_run) {
+            run_start = base + (uintptr_t)hp;
+            run_len = host_page;
+            run_host_prot = host_prot;
+            have_run = true;
+        } else if (host_prot == run_host_prot &&
+            run_start + run_len == base + (uintptr_t)hp) {
+            run_len += host_page;
+        } else {
+            int run_rc = a32_backend_protect((void *)run_start, run_len,
+                run_host_prot);
+            if (run_rc != 0) {
+                return run_rc;
+            }
+            run_start = base + (uintptr_t)hp;
+            run_len = host_page;
+            run_host_prot = host_prot;
         }
         if (hp + (uint32_t)host_page < hp) {
             break;
+        }
+    }
+    if (have_run) {
+        int run_rc = a32_backend_protect((void *)run_start, run_len,
+            run_host_prot);
+        if (run_rc != 0) {
+            return run_rc;
         }
     }
     return 0;
@@ -263,20 +306,30 @@ int a32_vm32_sync_region(uint32_t start_gva, uint32_t end_gva,
 {
     uint32_t page;
     uint8_t bits;
+    bool eff_readable = readable;
+    bool eff_writable = writable;
     uintptr_t base = __atomic_load_n(&g_arena_base, __ATOMIC_ACQUIRE);
     if (base == 0U) {
         return 0;
     }
-    bits = (uint8_t)(((readable ? 1U : 0U) | (writable ? 2U : 0U)) |
+    if (g_regime == A32_VM32_REGIME_A2_SOFT_TLB && eff_writable &&
+        !eff_readable) {
+        eff_readable = true;
+    }
+    bits = (uint8_t)(((eff_readable ? 1U : 0U) | (eff_writable ? 2U : 0U)) |
         (executable ? 4U : 0U));
     for (page = start_gva & ~0xFFFU; page < end_gva; page += 0x1000U) {
         uint8_t old_b = __atomic_load_n(&g_prot[page >> 12U], __ATOMIC_RELAXED);
         __atomic_store_n(&g_prot[page >> 12U],
             (uint8_t)((old_b & A32_PROT_EOF_CUT) | bits), __ATOMIC_RELEASE);
-        a32_vm32_tlb_fill(page, base + (uintptr_t)page, readable, writable);
+        vm32_tlb_fill_no_bump(page, base + (uintptr_t)page, eff_readable,
+            eff_writable);
         if (page + 0x1000U < page) {
             break;
         }
+    }
+    if (end_gva > start_gva) {
+        vm32_bump_spanned(start_gva, (uint64_t)end_gva - (uint64_t)start_gva);
     }
     return vm32_sync_host_pages_a2(start_gva & ~0xFFFU, (end_gva + 0xFFFU) & ~0xFFFU);
 }
@@ -288,13 +341,15 @@ int a32_vm32_sync_unmap(uint32_t start_gva, uint32_t end_gva)
     uint32_t end = (end_gva + 0xFFFU) & ~0xFFFU;
     for (uint32_t p = start; p < end; p += 0x1000U) {
         uint32_t idx = tlb_index(p);
-        if (__atomic_load_n(&g_tlb[idx].read_tag, __ATOMIC_RELAXED) == (uint64_t)p ||
-            __atomic_load_n(&g_tlb[idx].write_tag, __ATOMIC_RELAXED) == (uint64_t)p) {
-            __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
-                __ATOMIC_RELEASE);
-            __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
-                __ATOMIC_RELEASE);
-            __atomic_store_n(&g_tlb[idx].flags_reserved, 0U, __ATOMIC_RELAXED);
+        uint64_t valid = vm32_valid_ntag(idx);
+        if (__atomic_load_n(&g_tlb_arena.tlb[idx].read_ntag,
+                __ATOMIC_RELAXED) == valid ||
+            __atomic_load_n(&g_tlb_arena.tlb[idx].write_ntag,
+                __ATOMIC_RELAXED) == valid) {
+            __atomic_store_n(&g_tlb_arena.tlb[idx].read_ntag,
+                vm32_invalid_ntag(idx), __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tlb_arena.tlb[idx].write_ntag,
+                vm32_invalid_ntag(idx), __ATOMIC_RELEASE);
         }
         __atomic_store_n(&g_prot[p >> 12U], 0U, __ATOMIC_RELEASE);
         if (p + 0x1000U < p) {
@@ -370,12 +425,12 @@ int a32_vm32_set_eof_cut(uint32_t gva, uint32_t len, bool cut)
             }
         }
         if (cut) {
-            __atomic_store_n(&g_tlb[idx].read_tag, A32_VM32_TLB_INVALID_TAG,
-                __ATOMIC_RELEASE);
-            __atomic_store_n(&g_tlb[idx].write_tag, A32_VM32_TLB_INVALID_TAG,
-                __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tlb_arena.tlb[idx].read_ntag,
+                vm32_invalid_ntag(idx), __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tlb_arena.tlb[idx].write_ntag,
+                vm32_invalid_ntag(idx), __ATOMIC_RELEASE);
         } else {
-            a32_vm32_tlb_fill(page, base + (uintptr_t)page,
+            vm32_tlb_fill_no_bump(page, base + (uintptr_t)page,
                 (eff & 1U) != 0U, (eff & 2U) != 0U);
         }
     }
@@ -393,6 +448,10 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
     size_t host_page;
     uint32_t hp_start;
     uint32_t hp_end;
+    bool have_run = false;
+    uintptr_t run_start = 0U;
+    size_t run_len = 0U;
+    int run_host_prot = 0;
     if (ctx == NULL || len == 0U) {
         return -EINVAL;
     }
@@ -400,6 +459,7 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
         return a32_backend_protect(a32_vm32_hva(ctx, addr), len,
             a32_host_prot(ctx, guest_prot));
     }
+    vm32_bump_spanned(addr, (uint64_t)len);
     host_page = a32_backend_page_size();
     if (host_page != 16384U && host_page != 65536U) {
         host_page = 16384U;
@@ -410,6 +470,7 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
     for (uint32_t hp = hp_start; hp < hp_end; hp += (uint32_t)host_page) {
         uint32_t union_prot = 0U;
         uint32_t hp_page_end = hp + (uint32_t)host_page;
+        int host_prot;
         if (hp_page_end < hp) {
             hp_page_end = 0xFFFFFFFFU;
         }
@@ -424,14 +485,35 @@ int a32_vm32_protect(a32_ctx_t *ctx, uint32_t addr, size_t len,
                 break;
             }
         }
-        void *hp_addr = (void *)((uintptr_t)ctx->guest_base + (uintptr_t)hp);
-        int rc = a32_backend_protect(hp_addr, host_page,
-            a32_host_prot(ctx, union_prot));
-        if (rc != 0) {
-            return rc;
+        host_prot = a32_host_prot(ctx, union_prot);
+        if (!have_run) {
+            run_start = (uintptr_t)ctx->guest_base + (uintptr_t)hp;
+            run_len = host_page;
+            run_host_prot = host_prot;
+            have_run = true;
+        } else if (host_prot == run_host_prot &&
+            run_start + run_len ==
+                (uintptr_t)ctx->guest_base + (uintptr_t)hp) {
+            run_len += host_page;
+        } else {
+            int run_rc = a32_backend_protect((void *)run_start, run_len,
+                run_host_prot);
+            if (run_rc != 0) {
+                return run_rc;
+            }
+            run_start = (uintptr_t)ctx->guest_base + (uintptr_t)hp;
+            run_len = host_page;
+            run_host_prot = host_prot;
         }
         if (hp + (uint32_t)host_page < hp) {
             break;
+        }
+    }
+    if (have_run) {
+        int run_rc = a32_backend_protect((void *)run_start, run_len,
+            run_host_prot);
+        if (run_rc != 0) {
+            return run_rc;
         }
     }
     return 0;
