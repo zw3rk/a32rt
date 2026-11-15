@@ -313,8 +313,9 @@ static _Thread_local uint16_t g_last_n_neon;
 static _Thread_local uint16_t g_last_n_scalar;
 static _Thread_local bool g_last_saw_neon;
 static _Thread_local bool g_last_saw_scalar;
+static _Thread_local bool g_last_saw_vmsr;
 
-void a64_vfp_note_neon_fp(a64_buf_t *b)
+static void reset_last_if_new_pc(const a64_buf_t *b)
 {
     if (b->guest_start_pc != g_last_pc) {
         g_last_pc = b->guest_start_pc;
@@ -322,7 +323,13 @@ void a64_vfp_note_neon_fp(a64_buf_t *b)
         g_last_n_scalar = 0U;
         g_last_saw_neon = false;
         g_last_saw_scalar = false;
+        g_last_saw_vmsr = false;
     }
+}
+
+void a64_vfp_note_neon_fp(a64_buf_t *b)
+{
+    reset_last_if_new_pc(b);
     if (b->n_neon_fp < 0xFFFFU) {
         b->n_neon_fp++;
     }
@@ -334,13 +341,7 @@ void a64_vfp_note_neon_fp(a64_buf_t *b)
 
 void a64_vfp_note_scalar_fp(a64_buf_t *b)
 {
-    if (b->guest_start_pc != g_last_pc) {
-        g_last_pc = b->guest_start_pc;
-        g_last_n_neon = 0U;
-        g_last_n_scalar = 0U;
-        g_last_saw_neon = false;
-        g_last_saw_scalar = false;
-    }
+    reset_last_if_new_pc(b);
     if (b->n_scalar_fp < 0xFFFFU) {
         b->n_scalar_fp++;
     }
@@ -350,18 +351,29 @@ void a64_vfp_note_scalar_fp(a64_buf_t *b)
     g_last_saw_scalar = true;
 }
 
+void a64_vfp_note_vmsr(a64_buf_t *b)
+{
+    reset_last_if_new_pc(b);
+    g_last_saw_vmsr = true;
+    b->vfp_preheader_ineligible = true;
+    b->fpscr_zero_spec = false;
+}
+
 void a64_vfp_preheader_fpcr_check(a64_buf_t *b)
 {
-    bool saw_neon = b->saw_neon_fp || g_last_saw_neon;
-    bool saw_scalar = b->saw_scalar_vfp || g_last_saw_scalar;
+    bool saw_neon = b->saw_neon_fp;
+    bool saw_scalar = b->saw_scalar_vfp;
+    bool saw_vmsr = false;
     if (b->guest_start_pc == g_last_pc) {
         saw_neon = g_last_saw_neon || b->saw_neon_fp;
         saw_scalar = g_last_saw_scalar || b->saw_scalar_vfp;
+        saw_vmsr = g_last_saw_vmsr;
     }
-    if (!(saw_neon && saw_scalar)) {
+    if (!(saw_neon && saw_scalar) || saw_vmsr) {
         return;
     }
-    if (b->ctx == NULL || ((b->ctx->fpscr & 0x07C00000U) != 0U)) {
+    if (b->ctx == NULL || ((b->ctx->fpscr & 0x07C00000U) != 0U) ||
+        ((b->ctx->cpsr & 0x0600FC00U) != 0U)) {
         return;
     }
     a64_emit_ldr_imm_w(b, 23U, A64_XCTX, (uint32_t)__builtin_offsetof(a32_ctx_t, fpscr));
@@ -372,10 +384,61 @@ void a64_vfp_preheader_fpcr_check(a64_buf_t *b)
     a64_emit_movz_w(b, A64_TMP1, A32_EXIT_UNDEF, 0U);
     a64_emit_ret(b);
     a64_patch_cbz_w(b, cbz, b->count);
-    if (!b->fpcr_neon_active) {
-        a64_emit_fpcr_install_neon(b);
-        b->fpcr_neon_active = true;
-        b->preheader_neon_fpcr = true;
-    }
+    /* Mixed NEON+scalar self-loop with (fpscr & 0x07C00000) == 0: keep host
+     * FPCR == 0 (RN, FZ=0, DN=0) across the whole loop with zero MSR
+     * instructions. Scalar VFP ops observe FPCR == 0 directly; NEON
+     * VADD/VSUB/VABD/VMUL use the range-guarded helper and VCVT.F32.S32/U32
+     * run directly, both bit-identical to Standard FPSCR on the fast path. */
     b->fpscr_zero_spec = true;
+}
+
+void a64_vfp_emit_neon_f32_guarded(a64_buf_t *b, bool is_q, uint32_t a64_op,
+                                   unsigned rd, unsigned r_n, unsigned r_m)
+{
+    uint32_t shl_base = is_q ? 0x4F215400U : 0x0F215400U;
+    uint32_t cmeq_base = is_q ? 0x4EA09800U : 0x0EA09800U;
+    uint32_t sub_base = is_q ? 0x6EA08400U : 0x2EA08400U;
+    uint32_t cmhi_base = is_q ? 0x6EA03400U : 0x2EA03400U;
+    uint32_t bic_base = is_q ? 0x4E601C00U : 0x0E601C00U;
+    uint32_t orr_base = is_q ? 0x4EA01C00U : 0x0EA01C00U;
+    a64_emit(b, is_q ? 0x4F026446U : 0x0F026446U);
+    a64_emit(b, is_q ? 0x4F036747U : 0x0F036747U);
+    a64_emit(b, shl_base | ((r_n & 31U) << 5) | 3U);
+    a64_emit(b, cmeq_base | (3U << 5) | 4U);
+    a64_emit(b, sub_base | (6U << 16) | (3U << 5) | 3U);
+    a64_emit(b, cmhi_base | (7U << 16) | (3U << 5) | 3U);
+    a64_emit(b, bic_base | (4U << 16) | (3U << 5) | 3U);
+    if (r_m != r_n) {
+        a64_emit(b, shl_base | ((r_m & 31U) << 5) | 5U);
+        a64_emit(b, cmeq_base | (5U << 5) | 4U);
+        a64_emit(b, sub_base | (6U << 16) | (5U << 5) | 5U);
+        a64_emit(b, cmhi_base | (7U << 16) | (5U << 5) | 5U);
+        a64_emit(b, bic_base | (4U << 16) | (5U << 5) | 5U);
+        a64_emit(b, orr_base | ((5U) << 16) | (3U << 5) | 3U);
+    }
+    if (is_q) {
+        a64_emit(b, 0x6EA3A463U); /* umaxp v3.4s, v3.4s, v3.4s */
+    }
+    a64_emit(b, 0x9E660075U);
+    size_t cbnz_idx = b->count;
+    a64_emit(b, 0xB5000015U);
+    a64_emit(b, a64_op | ((r_m & 31U) << 16) | ((r_n & 31U) << 5) | (rd & 31U));
+    size_t b_idx = b->count;
+    a64_emit(b, 0x14000000U);
+    size_t slow_idx = b->count;
+    b->words[cbnz_idx] = 0xB5000015U | ((((uint32_t)slow_idx - (uint32_t)cbnz_idx) & 0x7FFFFU) << 5);
+    a64_emit(b, 0x52A06011U);
+    a64_emit(b, 0xD51B4411U);
+    a64_emit(b, a64_op | ((r_m & 31U) << 16) | ((r_n & 31U) << 5) | (rd & 31U));
+    a64_emit(b, 0xD2800011U);
+    a64_emit(b, 0xD51B4411U);
+    if (b->stats_enabled) {
+        a64_emit_mov_imm32(b, 17U, (uint32_t)__builtin_offsetof(a32_ctx_t, fpcr_guard_slow_hits));
+        a64_emit(b, 0x8B110271U);
+        a64_emit(b, 0xF9400237U);
+        a64_emit(b, 0x910006F7U);
+        a64_emit(b, 0xF9000237U);
+    }
+    size_t done_idx = b->count;
+    b->words[b_idx] = 0x14000000U | (((uint32_t)done_idx - (uint32_t)b_idx) & 0x3FFFFFFU);
 }

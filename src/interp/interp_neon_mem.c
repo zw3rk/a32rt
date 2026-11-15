@@ -580,7 +580,6 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             /* VRECPE/VRSQRTE (8..11) and VCVT.F32<->S32/U32 (12..15).
              * Standard FPSCR around the FP op (A32-R7-24). */
             a64_vfp_note_neon_fp(b);
-            neon_fp_fpcr_begin(b);
             uint32_t base = (op5 == 8U)  ? 0x0EA1C800U
                           : (op5 == 9U)  ? 0x2EA1C800U
                           : (op5 == 10U) ? 0x0EA1D800U
@@ -589,6 +588,12 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                           : (op5 == 13U) ? 0x2E21D800U
                           : (op5 == 14U) ? 0x0EA1B800U
                                          : 0x2EA1B800U;
+            if (b->fpscr_zero_spec && b->cond_branch_depth == 0U &&
+                !b->fpcr_neon_active && (op5 == 12U || op5 == 13U)) {
+                neon_emit_unary(b, is_q, d, m, base, false);
+                return true;
+            }
+            neon_fp_fpcr_begin(b);
             neon_emit_unary(b, is_q, d, m, base, false);
             neon_fp_fpcr_end(b);
             return true;
