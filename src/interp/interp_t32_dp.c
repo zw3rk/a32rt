@@ -537,6 +537,16 @@ bool a32_translate_t32_insn_nzcv(a32_ctx_t *ctx, a64_buf_t *b, uint32_t pc, uint
                 }
                 return true;
             }
+            if (fused && set_flags && op <= 0x4U) {
+                unsigned s_n2 = s_n;
+                if ((op == 0x2U || op == 0x3U) && rn == 15U) {
+                    s_n2 = A64_ZR;
+                }
+                unsigned dst2 = (rd == 15U) ? A64_TMP0 : rd;
+                a32_pred_logical_reg_s1(b, ctx, op, dst2, s_n2, s_m,
+                    fused_sh, fused_amt, false, 0U, A64_ZR, live_out);
+                return true;
+            }
             if (emit_t32_dp_op(b, op, set_flags, rd, rn, s_n, s_m,
                                false, 0U, shift_carry_reg, is_uncond, out_ends_block)) {
                 return true;

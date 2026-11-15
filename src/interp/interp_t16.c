@@ -540,6 +540,41 @@ uint8_t a32_pred_use_t32(uint16_t hw1, uint16_t hw2, uint8_t itst, bool is32, bo
     if (t32_may_fault_raw(hw1, hw2, is32)) {
         return 0xFU;
     }
+    if (!is32) {
+        if ((hw1 >> 12) == 0xDU) {
+            return 0xFU;
+        }
+        if ((hw1 >> 11) == 0x1CU) {
+            return 0xFU;
+        }
+        if ((hw1 >> 10) == 0x11U) {
+            unsigned op = (hw1 >> 8) & 3U;
+            unsigned rdn = ((hw1 >> 4) & 8U) | (hw1 & 7U);
+            if (op == 3U || rdn == 15U) {
+                return 0xFU;
+            }
+        }
+        if ((hw1 & 0xF500U) == 0xB100U) {
+            return 0xFU;
+        }
+    } else {
+        if ((hw1 & 0xF800U) == 0xF000U && (hw2 & 0x8000U) != 0U) {
+            return 0xFU;
+        }
+        if (((hw1 & 0xFA00U) == 0xF000U && (hw2 & 0x8000U) == 0U) ||
+            ((hw1 & 0xFA00U) == 0xF200U && (hw2 & 0x8000U) == 0U) ||
+            ((hw1 & 0xFE00U) == 0xEA00U) ||
+            ((hw1 & 0xFE00U) == 0xFA00U)) {
+            if (((hw2 >> 8) & 0xFU) == 15U) {
+                return 0xFU;
+            }
+        }
+        if ((hw1 & 0xF800U) == 0xE800U || (hw1 & 0xF000U) == 0xE000U) {
+            if ((hw1 & 0x0E00U) == 0x0800U) {
+                return 0xFU;
+            }
+        }
+    }
     bool in_it = (itst & 0x0FU) != 0U;
     uint8_t use = 0U;
     if (!is32) {

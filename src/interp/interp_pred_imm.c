@@ -393,6 +393,36 @@ uint8_t a32_pred_use_a32(uint32_t insn)
     if (a32_pred_may_exit_raw(insn)) {
         return 0xFU;
     }
+    {
+        unsigned op1e = (insn >> 25) & 7U;
+        if (op1e == 0U && (insn & 0x90U) == 0x90U && (insn & 0x60U) != 0U) {
+            return 0xFU;
+        }
+        if (op1e == 5U) {
+            return 0xFU;
+        }
+        if (((insn >> 28) & 0xFU) == 0xFU && (insn & 0xFE000000U) == 0xFA000000U) {
+            return 0xFU;
+        }
+        if ((insn & 0x0FFFFFF0U) == 0x012FFF10U ||
+            (insn & 0x0FFFFFF0U) == 0x012FFF20U ||
+            (insn & 0x0FFFFFF0U) == 0x012FFF30U) {
+            return 0xFU;
+        }
+        if (op1e == 4U && ((insn >> 20) & 1U) != 0U && (insn & (1U << 15)) != 0U) {
+            return 0xFU;
+        }
+        if ((op1e == 2U || (op1e == 3U && ((insn & 0x10U) == 0U))) &&
+            (((insn >> 20) & 1U) != 0U) && (((insn >> 12) & 0xFU) == 15U)) {
+            return 0xFU;
+        }
+        if ((op1e == 0U || op1e == 1U) && (((insn >> 12) & 0xFU) == 15U)) {
+            unsigned opc = (insn >> 21) & 0xFU;
+            if (opc < 8U || opc >= 12U) {
+                return 0xFU;
+            }
+        }
+    }
     unsigned cond = (insn >> 28) & 0xFU;
     uint8_t use = 0U;
     if (cond < 14U) {
@@ -437,9 +467,23 @@ uint8_t a32_pred_use_a32(uint32_t insn)
     } else {
         use |= a32_pred_cond_mask(cond);
         unsigned op1 = (insn >> 25) & 7U;
+        if (op1 == 0U && (insn & 0x0FBF0FFFU) == 0x010F0000U) {
+            return (uint8_t)(use | 0xFU);
+        }
         if ((op1 == 0U || op1 == 1U)) {
             unsigned opc = (insn >> 21) & 0xFU;
             if (opc == 5U || opc == 6U || opc == 7U) {
+                use |= 0x2U;
+            }
+            if (op1 == 0U && ((insn & 0x00000FF0U) == 0x00000060U)) {
+                use |= 0x2U;
+            }
+            if (op1 == 0U && ((insn & 0x00100090U) == 0x00100010U) &&
+                (opc == 0U || opc == 1U || opc == 8U || opc == 9U || opc >= 12U)) {
+                use |= 0x2U;
+            }
+        } else if (op1 == 3U && ((insn & 0x10U) == 0U)) {
+            if ((insn & 0x00000FF0U) == 0x00000060U) {
                 use |= 0x2U;
             }
         }
@@ -516,6 +560,10 @@ bool a32_pred_writes_nzcv_a32(uint32_t insn)
     unsigned op1 = (insn >> 25) & 7U;
     if (op1 == 0U || op1 == 1U) {
         if (op1 == 0U && (insn & 0x0E000090U) == 0x00000090U) {
+            if ((insn & 0x0FC000F0U) == 0x00000090U ||
+                (insn & 0x0F8000F0U) == 0x00800090U) {
+                return ((insn & (1U << 20)) != 0U);
+            }
             return false;
         }
         if (op1 == 0U && (insn & 0x0F8000F0U) == 0x01800090U) {
@@ -525,6 +573,10 @@ bool a32_pred_writes_nzcv_a32(uint32_t insn)
         bool s_bit = ((insn >> 20) & 1U) != 0U;
         if (s_bit && (opc <= 15U)) {
             if (op1 == 0U && (insn & 0x0E000090U) == 0x00000090U) {
+                if ((insn & 0x0FC000F0U) == 0x00000090U ||
+                    (insn & 0x0F8000F0U) == 0x00800090U) {
+                    return ((insn & (1U << 20)) != 0U);
+                }
                 return false;
             }
             return true;
@@ -567,6 +619,7 @@ bool a32_pred_writes_pc_a32(uint32_t insn)
         return true;
     }
     if (op1 == 0U && ((insn & 0x0FFFFFF0U) == 0x012FFF10U ||
+        (insn & 0x0FFFFFF0U) == 0x012FFF20U ||
         (insn & 0x0FFFFFF0U) == 0x012FFF30U)) {
         return true;
     }
@@ -664,7 +717,7 @@ bool a32_pred_branchless(a64_buf_t *b, unsigned cond, unsigned pred_op,
     if (cond >= 14U) {
         return false;
     }
-    if (rd >= 15U) {
+    if (rd >= 15U || rn >= 15U || (!is_imm && rm >= 15U)) {
         return false;
     }
     if (pred_op > 9U) {
@@ -680,10 +733,10 @@ bool a32_pred_branchless(a64_buf_t *b, unsigned cond, unsigned pred_op,
     if (needs_rn && rn >= 15U) {
         return false;
     }
-    if (!is_imm && rm >= 15U) {
+    if (!is_imm && shift_type != A64_SHIFT_LSL && shift_amt == 0U) {
         return false;
     }
-    if (!is_imm && shift_type == 3U && shift_amt == 0U) {
+    if (!is_imm && (pred_op == 2U || pred_op == 3U) && shift_type == A64_SHIFT_ROR) {
         return false;
     }
     unsigned inv = cond ^ 1U;
