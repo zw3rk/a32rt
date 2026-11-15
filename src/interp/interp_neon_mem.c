@@ -7,6 +7,10 @@
 
 #include "interp/decode_priv.h"
 
+unsigned a64_vfp_inout_d(a64_buf_t *b, unsigned scratch_vt, unsigned d_idx);
+unsigned a64_vfp_inout_q(a64_buf_t *b, unsigned scratch_vt, unsigned q_idx);
+void a64_vfp_note_neon_fp(a64_buf_t *b);
+
 bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 {
     /* 1. VLD1 / VST1 / VLD2 / VST2 (0xF4...) */
@@ -130,18 +134,29 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
 
             if (nregs > 0U) {
                 unsigned base_reg = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
-                a64_emit_mov_w(b, A64_ADDR, base_reg);
+                a64_emit_guest_addr_x(b, A64_TMP1, base_reg, nregs * 8U, !l_bit);
                 for (unsigned i = 0U; i < nregs; i++) {
                     unsigned reg = (d_start + i) & 31U;
+                    uint32_t off = i * 8U;
                     if (l_bit) {
-                        a64_emit_guest_ldr_d(b, 0U, A64_ADDR);
-                        a64_emit_str_d_ctx(b, 0U, reg);
+                        int s = a64_vfp_find_exact_slot(b, A64_VFP_KIND_D, (uint8_t)reg);
+                        if (s >= 0 && b->cond_branch_depth == 0U) {
+                            unsigned vt = 8U + (unsigned)s;
+                            a64_emit(b, 0xFD400000U | (((off >> 3) & 0xFFFU) << 10) | (A64_TMP1 << 5) | (vt & 31U));
+                            b->vfp_slot_dirty |= (1U << (unsigned)s);
+                        } else {
+                            a64_emit(b, 0xFD400000U | (((off >> 3) & 0xFFFU) << 10) | (A64_TMP1 << 5) | 0U);
+                            a64_emit_str_d_ctx(b, 0U, reg);
+                        }
                     } else {
-                        a64_emit_ldr_d_ctx(b, 0U, reg);
-                        a64_emit_guest_str_d(b, 0U, A64_ADDR);
-                    }
-                    if (i + 1U < nregs) {
-                        a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 8U, 0U);
+                        int s = a64_vfp_find_exact_slot(b, A64_VFP_KIND_D, (uint8_t)reg);
+                        if (s >= 0 && b->cond_branch_depth == 0U) {
+                            unsigned vt = 8U + (unsigned)s;
+                            a64_emit(b, 0xFD000000U | (((off >> 3) & 0xFFFU) << 10) | (A64_TMP1 << 5) | (vt & 31U));
+                        } else {
+                            a64_emit_ldr_d_ctx(b, 0U, reg);
+                            a64_emit(b, 0xFD000000U | (((off >> 3) & 0xFFFU) << 10) | (A64_TMP1 << 5) | 0U);
+                        }
                     }
                 }
                 neon_emit_wb(b, rn, rm, (uint16_t)(nregs * 8U));
@@ -181,7 +196,19 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
                     unsigned step = (type == 0x9U) ? 2U : 1U;
                     unsigned d0 = d_start;
                     unsigned d1 = (d_start + step) & 31U;
-                    if (l_bit) {
+                    if (type == 0x8U && step == 1U && ((d0 + 1U) & 31U) == d1) {
+                        unsigned base2 = a32_load_reg(b, rn, pc + 8U, A64_TMP0);
+                        a64_emit_guest_addr_x(b, A64_TMP1, base2, 16U, !l_bit);
+                        if (l_bit) {
+                            a64_emit(b, 0x0C408000U | (elem_sz << 10) | (A64_TMP1 << 5) | 0U);
+                            a64_emit_str_d_ctx(b, 0U, d0);
+                            a64_emit_str_d_ctx(b, 1U, d1);
+                        } else {
+                            a64_emit_ldr_d_ctx(b, 0U, d0);
+                            a64_emit_ldr_d_ctx(b, 1U, d1);
+                            a64_emit(b, 0x0C008000U | (elem_sz << 10) | (A64_TMP1 << 5) | 0U);
+                        }
+                    } else if (l_bit) {
                         a64_emit_guest_ldr_d(b, 1U, A64_ADDR);
                         a64_emit_add_imm_w(b, false, A64_ADDR, A64_ADDR, 8U, 0U);
                         a64_emit_guest_ldr_d(b, 2U, A64_ADDR);
@@ -455,17 +482,16 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             if (op5 >= 8U && op5 <= 12U && size == 2U) {
                 uint32_t base = ((op5 & 1U) ? 0x2EA00800U : 0x0EA00800U) |
                                 (((8U + (op5 >> 1)) & 0x1FU) << 12);
+                a64_vfp_note_neon_fp(b);
                 neon_fp_fpcr_begin(b);
                 neon_emit_unary(b, is_q, d, m, base, false);
                 neon_fp_fpcr_end(b);
                 return true;
             }
-            /* VABS.F32 (op5 == 14), VNEG.F32 (op5 == 15) */
+            /* VABS.F32 (op5 == 14), VNEG.F32 (op5 == 15): mode-agnostic, no FPCR. */
             if ((op5 == 14U || op5 == 15U) && size == 2U) {
                 uint32_t base = (op5 == 15U) ? 0x2EA0F800U : 0x0EA0F800U;
-                neon_fp_fpcr_begin(b);
                 neon_emit_unary(b, is_q, d, m, base, false);
-                neon_fp_fpcr_end(b);
                 return true;
             }
         }
@@ -534,6 +560,7 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
             /* VCVT.F16.F32 Dd, Qm (op5 == 12) and VCVT.F32.F16 Qd, Dm (op5 == 14).
              * Standard FPSCR around the FP conversion (A32-R7-24). */
             if (size == 1U && !is_q && (op5 == 12U || op5 == 14U)) {
+                a64_vfp_note_neon_fp(b);
                 neon_fp_fpcr_begin(b);
                 if (op5 == 12U) {
                     a64_emit_ldr_q_ctx(b, 1U, m >> 1);
@@ -552,6 +579,7 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         if (opc1 == 3U && size == 2U && op5 >= 8U && op5 <= 15U) {
             /* VRECPE/VRSQRTE (8..11) and VCVT.F32<->S32/U32 (12..15).
              * Standard FPSCR around the FP op (A32-R7-24). */
+            a64_vfp_note_neon_fp(b);
             neon_fp_fpcr_begin(b);
             uint32_t base = (op5 == 8U)  ? 0x0EA1C800U
                           : (op5 == 9U)  ? 0x2EA1C800U
@@ -622,6 +650,7 @@ bool a32_decode_neon(a64_buf_t *b, uint32_t insn, uint32_t pc)
         if ((sh_op == 0xEU || sh_op == 0xFU) && l_sh == 0U && imm6 >= 32U) {
             /* Vector fixed-point VCVT.F32.<S32/U32> (0xE) and VCVT.<S32/U32>.F32 (0xF).
              * Standard FPSCR around the FP conversion (A32-R7-24). */
+            a64_vfp_note_neon_fp(b);
             neon_fp_fpcr_begin(b);
             unsigned d = neon_reg_d(insn);
             unsigned m = neon_reg_m(insn);
