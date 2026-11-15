@@ -775,10 +775,7 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 r = a / b;
             } else if (opc1 == 0U || opc1 == 10U) {
                 if (fused) {
-                    r = fma(a, b, d);
-                    if (op_bit) {
-                        r = -fma(a, b, -d);
-                    }
+                    r = op_bit ? -fma(a, b, -d) : fma(a, b, d);
                 } else {
                     double p = vfp_fz_out_d(ctx, vfp_dn_d(ctx, a * b));
                     r = op_bit ? (d - p) : (d + p);
@@ -787,8 +784,9 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 if (fused) {
                     r = op_bit ? -fma(a, b, d) : fma(a, b, -d);
                 } else {
+                    volatile double nd = -d;
                     double p = vfp_fz_out_d(ctx, vfp_dn_d(ctx, a * b));
-                    r = op_bit ? (-d - p) : (-d + p);
+                    r = op_bit ? (nd - p) : (nd + p);
                 }
             }
             put_d(ctx, vd, vfp_fz_out_d(ctx, vfp_dn_d(ctx, r)));
@@ -805,10 +803,7 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 r = a / b;
             } else if (opc1 == 0U || opc1 == 10U) {
                 if (fused) {
-                    r = fmaf(a, b, d);
-                    if (op_bit) {
-                        r = -fmaf(a, b, -d);
-                    }
+                    r = op_bit ? -fmaf(a, b, -d) : fmaf(a, b, d);
                 } else {
                     float p = vfp_fz_out_f(ctx, vfp_dn_f(ctx, a * b));
                     r = op_bit ? (d - p) : (d + p);
@@ -817,8 +812,9 @@ static bool vfp_cdp(a32_ctx_t *ctx, uint32_t pc, uint32_t insn)
                 if (fused) {
                     r = op_bit ? -fmaf(a, b, d) : fmaf(a, b, -d);
                 } else {
+                    volatile float nd = -d;
                     float p = vfp_fz_out_f(ctx, vfp_dn_f(ctx, a * b));
-                    r = op_bit ? (-d - p) : (-d + p);
+                    r = op_bit ? (nd - p) : (nd + p);
                 }
             }
             put_s(ctx, vd, vfp_fz_out_f(ctx, vfp_dn_f(ctx, r)));
