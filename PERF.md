@@ -86,3 +86,36 @@ Measured on the same Apple Silicon machine with 5 quiet trials per target (`min_
 
 - **Architectural note on `vfp_simd` (`4.82×` in mixed `.f32`+`.f64` vs. `0` `MSR FPCR` in pure-NEON self-loops)**: `bench_suite.c`'s `vfp_simd` kernel interleaves single-precision `float` and double-precision `double` math in the same loop body. On `armv7s-apple-ios9.0`, Clang schedules `float` onto ARMv7 NEON `.f32` instructions (architecturally forcing `FZ=1, DN=1, RMode=RN`) and `double` onto scalar VFP `.f64` instructions (using `ctx->fpscr` `FZ=0, DN=0`) with 6 cross-domain transitions per iteration. Coalescing `FPCR` reduced `MSR FPCR` pipeline flushes from `44`/iter (`1.76M` total) to the architectural minimum of `12`/iter (`480K` total, `4.82×` faster), while pure-NEON self-loops (`saw_neon_fp && !saw_scalar_vfp`) hoist `MSR FPCR` into the loop preheader and execute **zero** `MSR FPCR` instructions in the loop body.
 - **Correctness & Differential Verification**: `make check check-headers test-ios` (`61 / 61` PASS), ELF32 `M1..M7` regressions PASS, and `--difftest` on `bench_ios_v7s --smoke` & `bench_ios_v7s_svc --smoke` (`ALL_PASS`, `0` divergences on both Darwin and Linux).
+
+---
+
+## 4. Round 20: Backend Codegen, Regime A2 Soft-TLB, VFP/NEON & macOS AOT Waves (`master` @ `cc3d3aa`)
+
+### 4.1 Unthrottled P-Core Pre-Wave Baseline (`bench_suite.c --full`, Best of 5 Quiet Trials)
+
+| Target / Guest Binary | `coremark` (`µs`) | `chacha20` (`µs`) | `vfp_simd` (`µs`) | `calls_ibtc` (`µs`) | `syscalls` (`µs`) | `total_us` (`µs`) | vs. Native `arm64` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Native `arm64-apple-darwin`** | `624` | `959` | `371` | `1,774` | `5` | **`3,735`** | `1.00×` |
+| **Darwin DBT — iOS `armv7` (Thumb-2)** | `1,250` | `1,445` | `593` | `2,349` | `148` | **`5,785`** | `1.55×` |
+| **Darwin DBT — ELF32 `thumb` (`-mthumb`)** | `1,281` | `1,491` | `582` | `2,407` | `116` | **`5,877`** | `1.57×` |
+| **Darwin DBT — ELF32 `armhf` (`-marm`)** | `2,009` | `1,839` | `702` | `2,513` | `113` | **`7,176`** | `1.92×` |
+| **Darwin DBT — iOS `armv7s` (mixed NEON+VFP)** | `1,274` | `1,212` | **`5,590`** | `2,351` | `144` | **`10,571`** | `2.83×` |
+
+### 4.2 Round 20 Optimization Checklist (`Step 0` + `Waves A–E`, `A32-R20-P0` .. `A32-R20-P15`)
+
+- [ ] **A32-R20-P0 (`Step 0 — Attribution`)** — Add `--stats` phase timers (`ns_vm_init`, `ns_translate`, `ns_wx_flush`), real APRR toggle count (`aprr_toggles`), inline RAS/IBTC hit discrimination, and codegen/runtime counters (`tlb_checks_emitted`, `tlb_group_guards`, `tlb_slow_hits`, `vfp_cache_copies_emitted`, `fpcr_switches_emitted`, `fpcr_guard_slow_hits`, `aot_abs64_words`, `exits_by_reason[8]`).
+- [ ] **A32-R20-P1 (`Wave A1 — RAS Wiring & Return Gating`)** — Record `caller` in unresolved `ctx->ras[top]` slots, wire `caller->ret_entry` when the return block is compiled on first return (`A32-R20-D1`), and gate inline RAS pop on `b->is_return` (`BX LR`, `MOV PC, LR`, `POP {.., pc}`, `LDR PC, [SP], #4`).
+- [ ] **A32-R20-P2 (`Wave A2 — Forward Chain Signal-Poll Elision`)** — Skip `emit_exit_sig_check` on forward direct chains (`target_pc > cur_insn_pc`), keeping bounded loop-iteration signal delivery via backward edges, indirects, and C exits.
+- [ ] **A32-R20-P3 (`Wave A3 — Relaxed Epoch Load`)** — Replace acquire `ldar w21, [x28]` with plain `ldr` on block-exit/trampoline epoch probes (relying on ARMv8 address dependency for `ldp [x23]` and exec-lease drain before cache mutation).
+- [ ] **A32-R20-P4 (`Wave B1 — 1-Load 16B Soft-TLB & Out-of-Line Cold Stubs`)** — Pin `x25` (`A64_XTLB`) to `a32_vm32_tlb_base` across `.Lrun_loop`, shrink `a32_vm32_tlb_entry_t` to 16-byte `{read_ntag, write_ntag}` negated-page-base entries (`32 MiB -> 16 MiB`), drop the redundant `addend` load (`[x20, wA, uxtw]`), fold tag + cross-page + 32-bit wrap into a single 7–8 insn check, enforce `A32_PROT_WATCH` on translated code pages (`A32-R20-D3`), and emit miss/cross-page stubs out-of-line at block tail.
+- [ ] **A32-R20-P5 (`Wave B2 — Range-Guarded LDP/STP Grouping`)** — Coalesce runs of consecutive unconditional `[rn, #imm]` loads/stores into a single page-range check + native `LDP`/`STP` against `x20 + uxtw(wRn + min_off)` with an exact per-access cold fallback.
+- [ ] **A32-R20-P6 (`Wave B3 — Single-Entry Superblocks`)** — Inline forward unconditional `B` targets and conditional `B<cond>` fallthroughs within read-only exec regions into single-entry superblocks (`dbt_jit_query.c`).
+- [ ] **A32-R20-P7 (`Wave C1 — A32/T32 Immediate Folding`)** — Fold A32/T32 `ADD`/`SUB`/`CMP`/`CMN` (`imm12` / `imm12 << 12`), `RSB #0`, direct `MOVZ`/`MOVN`, and 32-bit bitmask logical immediates directly into A64 ALU instructions instead of materializing into `A64_TMP1`.
+- [ ] **A32-R20-P8 (`Wave C2 — Barrel-Shifter Fusion`)** — Fuse immediate `LSL`/`LSR`/`ASR`/`ROR` operands directly into A64 shifted-register ALU and `[rn, rm, shift #imm]` address calculations.
+- [ ] **A32-R20-P9 (`Wave C3 — Branchless CSEL Predication & Skip Merging`)** — Lower `S=0` predicated ALU ops (A32 `cond < 14` and Thumb `IT` bodies) to branchless `CSEL`/`CSINC`/`CSINV`/`CSNEG`, merge consecutive same-condition non-flag-writing instructions under one `b.!cond` skip, and avoid VFP slot-cache flushes on pure-ALU conditionals.
+- [ ] **A32-R20-P10 (`Wave C4 — 4-Bit NZCV Liveness & PC-Relative Constant Folding`)** — Track per-flag `N|Z|C|V` liveness (with same-page `B<cond>` successor peeking so `TST; BEQ` emits 1-insn `ANDS`) and constant-fold A32 `rn == 15` addressing (`LDR Rt, [PC, #imm]`, `ADD Rd, PC, #imm`).
+- [ ] **A32-R20-P11 (`Wave D1 — Direct v(8+slot) VFP/NEON Operand Resolution`)** — Resolve cached guest `S`/`D`/`Q` operands directly to host `v8..v31` (`src/interp/interp_vfp_cache.c`), eliminating 3 redundant `FMOV`/`ORR` scratch copies per cached VFP/NEON ALU instruction.
+- [ ] **A32-R20-P12 (`Wave D2 — Single-Probe VLDM/VSTM & Multi-Reg VLD1/VLD2`)** — Collapse `VLDM`/`VSTM`/`VPUSH`/`VPOP` from per-register Soft-TLB checks (~48 insns) to 1 range check + `LDP`/`STP` (~12 insns), and lower multi-reg `VLD1` / 2-reg `VLD2`/`VST2` to `LDP q` / `LD2`/`ST2`.
+- [ ] **A32-R20-P13 (`Wave D3 — Widest-Kind VFP Preheader Slot Merging`)** — Replace `vfp_preheader_ineligible` (`A32-R20-D4`) with widest-kind (`S -> D -> Q`) preheader slot merging using bit-exact `MOV`/`INS` lane operations.
+- [ ] **A32-R20-P14 (`Wave D4 — Mixed NEON+VFP FPCR Elimination`)** — Unwrap mode-agnostic ops (`VCVT` int$\rightarrow$fp, `VABS`, `VNEG`, `VMOV`) from `neon_fp_fpcr_begin`, cluster independent NEON/scalar FP ops inside memory-free runs, and specialize `FPSCR == 0` blocks with majority-mode `FPCR` preheader hoist + IEEE-754 normal-range integer-SIMD guard (`|x| in [2^-458, +Inf)`).
+- [ ] **A32-R20-P15 (`Wave E1–E3 — macOS Regime A2 AOT, Zero-RSS tlb[0] Init & Leaf Stubs`)** — Unlock `--aot`/`--auto-aot` on Regime A2 with fail-closed `MOVZ/MOVK hw>=2` check + inline `.bin` site stream + `[x25, #-8*(i+1)]` PIC helper table (`A32-R20-D2`), replace 32 MiB `tlb_invalidate_all` startup walk with 16-byte `tlb[0]` init + range-level `vm32_bump_spanned` + `mprotect`/APRR coalescing (`A32-R20-D3`), and add zero-exit `_getpid` / `CNTVCT_EL0` `_mach_absolute_time` / `CLOCK_MONOTONIC` leaf stubs.

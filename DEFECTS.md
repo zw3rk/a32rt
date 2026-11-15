@@ -1,5 +1,16 @@
 # `a32rt` Defect Ledger (`DEFECTS.md`)
 
+## Round 20 — Backend Dispatch, Soft-TLB, VFP Slot & AOT Audit (`master` @ `cc3d3aa`, In Remediation)
+
+Identified during the 6-subsystem backend performance & correctness deep-dive (`A32-R20-D1`..`A32-R20-D4`), paired with [`PERF.md`](PERF.md) (`A32-R20-P0`..`A32-R20-P15`, Waves A–E).
+
+- [ ] **A32-R20-D1 (`DBT/RAS`, `src/dbt/dbt_jit_run.c:352-468`, `src/core/core_emit_mem.c:630-633, 789-824`, `src/core/core_emit_shared.c:604`)** — `cur_entry->ret_entry` is never wired on the common path (`ras_hits = 0` permanently): on a first `BL callee`, the return block (`LR`) is not yet compiled (`found_e == NULL`), so `set_ht_ret_slot_locked` is skipped while `try_chain_entries` chains the caller directly to `callee` so the caller never exits slow again; `POP {.., pc}` / `LDR pc, [sp], #4` omit the return hint, and inline RAS/IBTC hits only bump `chain_hits`.
+- [ ] **A32-R20-D2 (`AOT`, `src/dbt/dbt_aot_cache.c:133, 316-337, 575, 590`, `src/dbt/aot/aot_sites.c:244`)** — `write_block_cb` silently saves blocks without fault-recovery site records when `a32_aot_site_fetch` returns `-EAGAIN` on `trylock` contention; `compute_elf_hash` folds `ctx->guest_base` into the cache key even though emitted A64 code is parametric in `x20`; stale pre-`A32-IOS-P4` Regime A2 guards disable `--aot` / `--auto-aot` on macOS despite position-independent Soft-TLB addressing.
+- [ ] **A32-R20-D3 (`VM32/SMC`, `src/vm/vm32.c:71, 166-234, 276, 410`)** — `a32_vm32_tlb_fill` sets `write_tag` solely from mapping `writable` without clearing it on `A32_PROT_WATCH` translated code pages; `a32_vm32_tlb_invalidate_all()` unconditionally dirties all 32 MiB of Soft-TLB BSS at process startup (including on Regime A1 where the Soft-TLB is unused); `a32_vm32_tlb_fill` runs `vm32_bump_spanned` (64 atomic RMWs) inside per-page `sync_region` loops (`131,072` atomics on an 8 MiB stack map) and `vm32_sync_host_pages_a2` issues uncoalesced per-page `mprotect` calls.
+- [ ] **A32-R20-D4 (`VFP/DBT`, `src/core/core_emit_alu.c:557`)** — Any `S_k` / `D_{k>>1}` / `Q_{k>>2}` register overlap sets `vfp_preheader_ineligible = true` for the entire block, disabling loop-preheader VFP register promotion for all remaining non-overlapping `D8..D31` registers in mixed-width loops (`armv7s` `vfp_simd`).
+
+---
+
 ## Round 19 — 32-Bit iOS (`armv7`/`armv7s`) & Thumb-2/DBT Audit (`master` @ `8d87576` -> Remediated in `f5e0d35`, `19 / 19` Resolved, 2026-11-14)
 
 Audited across 6 parallel subsystem deep-dives (`../rt-series/lode/reviews/convergence/2026-11-14-a32rt-ios-lane{1..6}-fable.md`), remediated across isolated worker lanes (`8d87576..f5e0d35`), and independently re-verified across 8 post-remediation tracks (`../rt-series/lode/reviews/convergence/2026-11-14-a32rt-ios-verify-{a1,a2a1,a2a2,a2b,b,c1,c2a,c2b}-fable.md`) with `make check check-headers test-ios` (`61 / 61` PASS), ELF32 `M1..M7` regressions PASS, and lock-step `--difftest` (`0` divergences). See [`PERF.md`](PERF.md) for the companion performance optimization ledger (`A32-IOS-P1`..`A32-IOS-P9`, `9 / 9` resolved).
