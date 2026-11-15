@@ -640,12 +640,16 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                 unsigned qd = neon_reg_d(insn) >> 1;
                 unsigned qn = neon_reg_n(insn) >> 1;
                 unsigned qm = neon_reg_m(insn) >> 1;
-                unsigned rn = a64_vfp_src_q(b, 1U, qn);
-                unsigned rm = a64_vfp_src_q(b, 2U, qm);
                 unsigned rd;
+                unsigned rn;
+                unsigned rm;
                 if (needs_acc) {
                     rd = a64_vfp_inout_q(b, 0U, qd);
+                    rn = a64_vfp_src_q(b, 1U, qn);
+                    rm = a64_vfp_src_q(b, 2U, qm);
                 } else {
+                    rn = a64_vfp_src_q(b, 1U, qn);
+                    rm = a64_vfp_src_q(b, 2U, qm);
                     rd = a64_vfp_dst_q(b, 0U, qd);
                 }
                 unsigned r_n = swap_rn_rm ? rm : rn;
@@ -660,12 +664,16 @@ bool a32_decode_neon_alu(a64_buf_t *b, uint32_t insn)
                 unsigned dd = neon_reg_d(insn);
                 unsigned dn = neon_reg_n(insn);
                 unsigned dm = neon_reg_m(insn);
-                unsigned rn = a64_vfp_src_d(b, 1U, dn);
-                unsigned rm = a64_vfp_src_d(b, 2U, dm);
                 unsigned rd;
+                unsigned rn;
+                unsigned rm;
                 if (needs_acc) {
                     rd = a64_vfp_inout_d(b, 0U, dd);
+                    rn = a64_vfp_src_d(b, 1U, dn);
+                    rm = a64_vfp_src_d(b, 2U, dm);
                 } else {
+                    rn = a64_vfp_src_d(b, 1U, dn);
+                    rm = a64_vfp_src_d(b, 2U, dm);
                     rd = a64_vfp_dst_d(b, 0U, dd);
                 }
                 unsigned r_n = swap_rn_rm ? rm : rn;
