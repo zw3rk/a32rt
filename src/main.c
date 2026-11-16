@@ -55,6 +55,27 @@ static bool parse_port(const char *s, int *out_port)
     return true;
 }
 
+/* Known --personality values: darwin-host (canonical G02/hl flag) and
+ * hl-darwin (alias) enter the external Darwin bridge; linux is the default
+ * ELF personality; ios selects embedded 32-bit iOS (embedded builds only).
+ * Unknown or empty values are rejected with exit status 1. */
+static bool personality_known(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+    if (strcmp(name, "darwin-host") == 0 || strcmp(name, "hl-darwin") == 0 ||
+        strcmp(name, "linux") == 0) {
+        return true;
+    }
+#if A32RT_EMBED_IOS
+    if (strcmp(name, "ios") == 0) {
+        return true;
+    }
+#endif
+    return false;
+}
+
 static const char *strip_sysroot_prefix(const char *path, const char *prefix)
 {
     if (prefix == NULL || prefix[0] == '\0') {
@@ -156,7 +177,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--execfn <path>] [--image-fd <fd>] [--no-host] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] [--personality hl-darwin] [--darwin-boot] -- <PATH> [<ARGV0> [ARGS...]]\n"
+            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--execfn <path>] [--image-fd <fd>] [--no-host] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] [--personality darwin-host|hl-darwin|linux|ios] [--darwin-boot] -- <PATH> [<ARGV0> [ARGS...]]\n"
             "  %s <PATH> [ARGS...]\n",
             prog, prog);
 }
@@ -282,12 +303,16 @@ int main(int argc, char **argv, char **envp)
             }
             i += 2;
         } else if (strcmp(argv[i], "--personality") == 0) {
-            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+            if (i + 1 >= argc || !personality_known(argv[i + 1])) {
                 usage(argv[0]);
                 return 1;
             }
             i += 2; /* value re-derived by a32_darwin_cli_wants_bridge */
         } else if (strncmp(argv[i], "--personality=", 14) == 0) {
+            if (!personality_known(argv[i] + 14)) {
+                usage(argv[0]);
+                return 1;
+            }
             i++; /* value re-derived by a32_darwin_cli_wants_bridge */
         } else if (strcmp(argv[i], "--darwin-boot") == 0) {
             i++;
@@ -464,7 +489,7 @@ int main(int argc, char **argv, char **envp)
 
     a32_elf_info_t elf_info;
 #if A32RT_EMBED_IOS
-    if (ctx.is_ios) {
+    if (ctx.is_ios && !ctx.darwin_external) {
         if (a32_ios_load(&ctx, exec_fd, exec_path, &elf_info) != 0 ||
             a32_ios_commpage_setup(&ctx) != 0) {
             free(ctx.ios_fn_starts);
@@ -473,7 +498,7 @@ int main(int argc, char **argv, char **envp)
     } else
 #endif
     {
-        if (ctx.is_ios) {
+        if (ctx.is_ios && !ctx.darwin_external) {
             fprintf(stderr,
                 "a32rt: iOS personality not embedded (slim build)\n");
             return 1;
@@ -486,7 +511,7 @@ int main(int argc, char **argv, char **envp)
 
     uint32_t initial_sp = 0U;
 #if A32RT_EMBED_IOS
-    int stack_rc = ctx.is_ios
+    int stack_rc = (ctx.is_ios && !ctx.darwin_external)
         ? a32_ios_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp)
         : a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp);
 #else

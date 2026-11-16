@@ -205,6 +205,12 @@ typedef struct a32_ctx {
     bool        darwin_external;
     uint32_t    darwin_tid;
     uint64_t    darwin_personality_hash;
+    /* Host-recorded fault attributes (src/signals.c, valid only when
+     * fault_host_valid is set; consumed by the G02 fault classifier).
+     * Appended at the very end so no ABI-locked offset shifts. */
+    uint32_t    fault_is_write; /* AArch64 ESR WnR (bit 6): 1 = store */
+    uint32_t    fault_is_prot; /* 1 = protection fault, 0 = unmapped */
+    uint32_t    fault_host_valid; /* ESR/recorded attributes are current */
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -234,6 +240,15 @@ _Static_assert(offsetof(a32_ctx_t, ras_hits) == 416, "ras_hits must be at offset
 _Static_assert(offsetof(a32_ctx_t, ras_top) == 424, "ras_top must be at offset 424 (0x1a8)");
 _Static_assert(offsetof(a32_ctx_t, ras) == 432, "ras must be at offset 432 (0x1b0)");
 _Static_assert(offsetof(a32_ctx_t, ibtc) == 2480, "ibtc must be at offset 2480 (0x9b0)");
+/* The iOS block and G02 tail must stay above the ABI-locked dispatch
+ * prefix that trampoline.S and the DBT emitters address, so growing
+ * ios_init_va can never shift an assembly-referenced offset. */
+_Static_assert(offsetof(a32_ctx_t, ios_init_va) >
+                   offsetof(a32_ctx_t, ibtc) + sizeof(((a32_ctx_t *)0)->ibtc),
+               "ios_init_va must follow the ABI-locked dispatch prefix");
+_Static_assert(offsetof(a32_ctx_t, darwin_external) >
+                   offsetof(a32_ctx_t, ibtc) + sizeof(((a32_ctx_t *)0)->ibtc),
+               "darwin_external must follow the ABI-locked dispatch prefix");
 
 static inline void a32_spin_lock(_Atomic uint32_t *lock)
 {
@@ -329,7 +344,8 @@ void a32_host_probe(a32_ctx_t *ctx);
  * linked; declared here so call sites stay free of config ifdefs). */
 int  a32_darwin_trap_once(a32_ctx_t *ctx);
 void a32_darwin_enqueue_signal(a32_ctx_t *ctx, int sig);
-uint32_t a32_darwin_sync_exit(int sig);
+uint32_t a32_darwin_sync_exit(a32_ctx_t *ctx, int sig);
+int  a32_darwin_esr_wnr(void *uctx);
 
 /* Attribution timers & stats (A32-R20-P0, `src/host.c`) */
 uint64_t a32_host_monotonic_ns(void);

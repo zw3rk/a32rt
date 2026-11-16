@@ -75,7 +75,7 @@ int a32_vm_init(a32_ctx_t *ctx, uint64_t requested_window)
         ctx->guest_base = 0ULL;
     } else {
         bool found = false;
-        for (uint64_t cand = 0x100000000ULL; cand < 0x1000000000ULL; cand += 0x100000000ULL) {
+        for (uint64_t cand = 0x100000000ULL; cand < 0x4000000000ULL; cand += 0x100000000ULL) {
             if (try_reserve_window(cand) == 0) {
                 ctx->guest_base = cand;
                 found = true;

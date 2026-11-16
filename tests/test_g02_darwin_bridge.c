@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,6 +46,10 @@
 #define SVC_WAIT  0x2001U
 #define SVC_FPU   0x2002U
 #define SVC_FLUSH 0x2004U
+#define SVC_UNMAP 0x2005U /* SYNC_VM_PROT with prot_flags == 0 (munmap) */
+#define SVC_TEXIT 0x2006U /* reply DACT_EXIT_THREAD (exit_status = 7) */
+
+#define G_TMP 0x00900000U
 
 #define PERSON_HASH 0x12345678ABCDEF01ULL
 #define D0_PATTERN  0x1122334455667788ULL
@@ -119,6 +124,14 @@ typedef struct {
     unsigned fault_unmapped;
     unsigned fault_prot;
     unsigned full_seen;
+    /* Mini-guest runs (svc-storm, exit-thread, unmap): program selection
+     * for mini_boot plus regression counters. */
+    const uint32_t *prog;
+    size_t nprog;
+    const uint32_t *prog2;
+    size_t nprog2;
+    unsigned svc_unmap;
+    int rec_is_prot;
 } mock_t;
 
 static uint64_t mock_hash_trap(const a32h_darwin_trap_t *t,
@@ -231,6 +244,7 @@ static int mock_trap_svc(mock_t *m, a32h_darwin_trap_t *t,
     if ((int32_t)cpu->gpr[12] < 0) {
         cpu->gpr[0] = 0x12345678U; /* Mach trap: negative r12 */
         cpu->cpsr_or_cr &= ~A32_CPSR_C;
+        cpu->pc = cpu->next_pc;
         m->svc_mach++;
         return 0;
     }
@@ -239,11 +253,13 @@ static int mock_trap_svc(mock_t *m, a32h_darwin_trap_t *t,
     case SVC_OK:
         cpu->gpr[0] = 0x11111111U;
         cpu->cpsr_or_cr &= ~A32_CPSR_C;
+        cpu->pc = cpu->next_pc;
         m->svc_ok++;
         return 0;
     case SVC_ERR:
         cpu->gpr[0] = 2U;
         cpu->cpsr_or_cr |= A32_CPSR_C;
+        cpu->pc = cpu->next_pc;
         m->svc_err++;
         return 0;
     case SVC_EXIT:
@@ -259,6 +275,7 @@ static int mock_trap_svc(mock_t *m, a32h_darwin_trap_t *t,
         t->spawn_sp = G_STACK_TOP - 0x800U;
         t->spawn_r0 = WORKER_R0;
         t->spawn_tls = WORKER_TLS;
+        cpu->pc = cpu->next_pc;
         m->svc_spawn++;
         return 0;
     case SVC_WAIT: {
@@ -274,6 +291,7 @@ static int mock_trap_svc(mock_t *m, a32h_darwin_trap_t *t,
             fprintf(stderr, "mock: worker wait timed out\n");
             return 1;
         }
+        cpu->pc = cpu->next_pc;
         return 0;
     }
     case SVC_FPU:
@@ -292,6 +310,7 @@ static int mock_trap_svc(mock_t *m, a32h_darwin_trap_t *t,
             cpu->fpr[i] = D0_PATTERN + (uint64_t)i;
         }
         cpu->fpscr = FPSCR_PATTERN;
+        cpu->pc = cpu->next_pc;
         t->reply_action |= A32H_DACT_DELIVER_SIGNAL;
         m->svc_fpu++;
         return 0;
@@ -304,7 +323,20 @@ static int mock_trap_svc(mock_t *m, a32h_darwin_trap_t *t,
         t->prot_va = cpu->gpr[0] & ~0xFFFU;
         t->prot_len = 0x1000U;
         t->prot_flags = PROT_READ | PROT_EXEC;
+        cpu->pc = cpu->next_pc;
         m->svc_flush++;
+        return 0;
+    case SVC_UNMAP:
+        t->reply_action |= A32H_DACT_SYNC_VM_PROT;
+        t->prot_va = cpu->gpr[0] & ~0xFFFU;
+        t->prot_len = 0x1000U;
+        t->prot_flags = 0U; /* unmap: later faults report is_prot == 0 */
+        cpu->pc = cpu->next_pc;
+        m->svc_unmap++;
+        return 0;
+    case SVC_TEXIT:
+        t->reply_action |= A32H_DACT_EXIT_THREAD;
+        t->exit_status = 7;
         return 0;
     default:
         fprintf(stderr, "mock: unknown svc r7=0x%x\n", r7);
@@ -344,6 +376,13 @@ static int mock_trap_fault(mock_t *m, a32h_darwin_trap_t *t)
         t->prot_len = 0x1000U;
         t->prot_flags = PROT_READ | PROT_WRITE;
         m->fault_prot++;
+        return 0;
+    }
+    if (mock_in_range(t->fault_va, G_TMP, 0x1000U)) {
+        /* Unmap regression: record is_prot, then end the guest. */
+        m->rec_is_prot = (int)t->fault_is_prot;
+        t->reply_action |= A32H_DACT_EXIT_PROCESS;
+        t->exit_status = 42;
         return 0;
     }
     fprintf(stderr, "mock: unexpected fault va=0x%x kind=%u prot=%u\n",
@@ -409,6 +448,263 @@ static int mock_handler(void *opaque, unsigned long req, void *arg)
     return rc;
 }
 
+/* Forward declarations: defined below the mini regression tests. */
+static void mock_init(mock_t *m);
+static void mock_fini(mock_t *m);
+static int run_case(mock_t *m, a32_ctx_t *ctx, bool use_dbt, bool difftest,
+    const char *label);
+
+/* Shared harness for the mini regression guests: maps m->prog at G_ARM
+ * (entry), an optional worker at G_WORK, plus scratch/stack pages. */
+static int mini_boot(mock_t *m, a32h_darwin_boot_t *b)
+{
+    unsigned n = 0U;
+    (void)b->abi_minor;
+    m->window_base = b->window_base;
+    mock_map_fill(b->window_base, G_ARM, m->prog, m->nprog);
+    mock_map_fill(b->window_base, G_WORK, m->prog2, m->nprog2);
+    mock_map_fill(b->window_base, G_TMP, NULL, 0U);
+    mock_map_fill(b->window_base, G_STACK, NULL, 0U);
+    mock_set_vmap(b, n++, G_ARM, 0x1000U, PROT_READ | PROT_EXEC);
+    mock_set_vmap(b, n++, G_WORK, 0x1000U, PROT_READ | PROT_EXEC);
+    mock_set_vmap(b, n++, G_TMP, 0x1000U, PROT_READ | PROT_WRITE);
+    mock_set_vmap(b, n++, G_STACK, 0x4000U, PROT_READ | PROT_WRITE);
+    b->vmap_count = n;
+    b->entry_pc = G_ARM;
+    b->entry_sp = G_STACK_TOP;
+    b->entry_r0 = 0U;
+    b->entry_cpsr_or_msr = 0U;
+    b->initial_tid = 1U;
+    b->aot_personality_hash = PERSON_HASH;
+    return 0;
+}
+
+static int mini_handler(void *opaque, unsigned long req, void *arg)
+{
+    mock_t *m = (mock_t *)opaque;
+    int rc;
+    pthread_mutex_lock(&m->mu);
+    if (req == (unsigned long)A32H_DARWIN_BOOT) {
+        rc = mini_boot(m, (a32h_darwin_boot_t *)arg);
+    } else if (req == (unsigned long)A32H_DARWIN_TRAP) {
+        rc = mock_trap(m, (a32h_darwin_trap_t *)arg);
+    } else {
+        rc = 1;
+    }
+    pthread_mutex_unlock(&m->mu);
+    return rc;
+}
+
+/* 1. >300 svc traps from the same pc must never trip the trap-loop kill:
+ * the unrecovered-fault detector only counts identical *faults*. */
+static const uint32_t g_storm_fn[] = {
+    0xE3002190U, 0xE3017000U, 0xEF000080U, 0xE2522001U, 0x1AFFFFFBU,
+    0xE3A0002AU, 0xE3017FFFU, 0xEF000080U,
+};
+
+static void test_svc_storm(void)
+{
+    static a32_ctx_t ctx;
+    mock_t m;
+    mock_init(&m);
+    m.prog = g_storm_fn;
+    m.nprog = sizeof(g_storm_fn) / sizeof(g_storm_fn[0]);
+    int rc = a32_run_darwin_ctx_with_handler(&ctx, mini_handler, &m, true, false);
+    CHECK(rc == 42, "storm: rc %d", rc);
+    CHECK(m.svc_ok == 400U, "storm: svc_ok %u", m.svc_ok);
+    CHECK(m.saw_exit && m.exit_status == 42, "storm: no clean EXIT");
+    printf("PASS g02 svc-storm (400 same-pc svc, exit=%d)\n", rc);
+    mock_fini(&m);
+}
+
+/* 2a. DACT_EXIT_THREAD ends the run via the THREAD_EXIT rendezvous. */
+static const uint32_t g_texit_fn[] = {
+    0xE3027006U, 0xEF000080U, 0xE3A00009U, 0xE3017FFFU, 0xEF000080U,
+};
+
+static void test_exit_thread(void)
+{
+    static a32_ctx_t ctx;
+    mock_t m;
+    mock_init(&m);
+    m.prog = g_texit_fn;
+    m.nprog = sizeof(g_texit_fn) / sizeof(g_texit_fn[0]);
+    int rc = a32_run_darwin_ctx_with_handler(&ctx, mini_handler, &m, false, false);
+    CHECK(rc == 7, "texit: rc %d", rc);
+    CHECK(m.saw_thread_exit, "texit: no THREAD_EXIT rendezvous");
+    printf("PASS g02 exit-thread (rc=%d)\n", rc);
+    mock_fini(&m);
+}
+
+/* 2b. A worker's EXIT_PROCESS terminates the whole guest: the child must
+ * exit 42 (worker's status), never 7 (main's wrong-path status). Runs in
+ * a forked child because worker propagation ends the process via _exit. */
+static const uint32_t g_wexit_main[] = {
+    0xE3027000U, 0xEF000080U, 0xE3027001U, 0xEF000080U,
+    0xE3A00007U, 0xE3017FFFU, 0xEF000080U,
+};
+static const uint32_t g_wexit_worker[] = {
+    0xE3A0002AU, 0xE3017FFFU, 0xEF000080U,
+};
+
+static void test_worker_exit_process(void)
+{
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        CHECK(0, "wexit: fork failed");
+        return;
+    }
+    if (pid == 0) {
+        static a32_ctx_t ctx;
+        mock_t m;
+        mock_init(&m);
+        m.prog = g_wexit_main;
+        m.nprog = sizeof(g_wexit_main) / sizeof(g_wexit_main[0]);
+        m.prog2 = g_wexit_worker;
+        m.nprog2 = sizeof(g_wexit_worker) / sizeof(g_wexit_worker[0]);
+        int rc = a32_run_darwin_ctx_with_handler(&ctx, mini_handler, &m, false, false);
+        _exit(rc); /* correct path never returns: worker _exit(42)s */
+    }
+    int st = 0;
+    pid_t w;
+    do {
+        w = waitpid(pid, &st, 0);
+    } while (w < 0 && errno == EINTR);
+    CHECK(w == pid && WIFEXITED(st) && WEXITSTATUS(st) == 42,
+        "wexit: status %d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    printf("PASS g02 worker-exit-process (status=42)\n");
+}
+
+/* 3. Thumb IT state marshaling across a DELIVER_SIGNAL-style host reply,
+ * plus ARM/Thumb store-vs-load fault classification. */
+static void test_it_str(void)
+{
+    a32_ctx_t ctx;
+    a32h_darwin_cpu_state_t cpu;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.cpsr = A32_CPSR_N | A32_CPSR_T;
+    ctx.itstate = 0xB4U;
+    ctx.regs[13] = 0xBBBBBBBBU;
+    ctx.regs[14] = 0xAAAAAAAAU;
+    a32_darwin_fill_cpu(&ctx, &cpu, false);
+    CHECK((((cpu.cpsr_or_cr >> 8) & 0xFCU) | ((cpu.cpsr_or_cr >> 25) & 0x03U)) == 0xB4U,
+        "it fill");
+    CHECK((cpu.cpsr_or_cr & A32_CPSR_T) != 0U, "t fill");
+    CHECK(cpu.gpr[14] == 0xAAAAAAAAU, "lr fill");
+    /* Host signal reply: stale lr echo, fresh gpr[14], advanced IT, FP. */
+    cpu.gpr[14] = 0xCCCCCCCCU;
+    cpu.cpsr_or_cr = (cpu.cpsr_or_cr & ~(A32_CPSR_IT_MASK | A32_CPSR_T)) |
+        (((0xC8U & 0xFCU) << 8) | ((0xC8U & 0x03U) << 25));
+    cpu.state_flags |= A32H_DSTATE_FP_DIRTY;
+    for (unsigned i = 0U; i < 32U; i++) {
+        cpu.fpr[i] = D0_PATTERN + (uint64_t)i;
+    }
+    cpu.fpscr = FPSCR_PATTERN;
+    a32_ctx_t out;
+    memset(&out, 0, sizeof(out));
+    a32_darwin_apply_cpu(&out, &cpu);
+    CHECK(out.itstate == 0xC8U, "it across deliver 0x%x", out.itstate);
+    CHECK((out.cpsr & A32_CPSR_T) == 0U, "t cleared by even pc");
+    CHECK(out.regs[14] == 0xCCCCCCCCU, "gpr14 authoritative");
+    CHECK(out.vfp_d[1] == D0_PATTERN + 1ULL, "fp across deliver");
+    CHECK(out.fpscr == FPSCR_PATTERN, "fpscr across deliver");
+
+    static uint8_t mem[0x3000];
+    a32_ctx_t c2;
+    memset(&c2, 0, sizeof(c2));
+    c2.guest_base = (uint64_t)(uintptr_t)mem - 0x1000U;
+    c2.regions[0].start = 0x1000U;
+    c2.regions[0].end = 0x2000U;
+    c2.regions[0].prot = (uint32_t)(PROT_READ | PROT_WRITE);
+    c2.region_count = 1U;
+    c2.regs[15] = 0x1000U;
+    c2.fault_addr = 0x1400U;
+    static const struct {
+        uint32_t code;
+        uint32_t cpsr;
+        uint32_t want;
+    } vec[] = {
+        { 0x7008U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T STRB imm */
+        { 0x8008U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T STRH imm */
+        { 0x9008U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T STR sp-rel */
+        { 0x5488U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T STRB reg-off */
+        { 0x6808U, A32_CPSR_T, A32H_DFAULT_READ },  /* T LDR imm */
+        { 0x0002E8A0U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T2 STMIA.W */
+        { 0x0002E8B0U, A32_CPSR_T, A32H_DFAULT_READ },  /* T2 LDMIA.W */
+        { 0x2110F843U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T3 STR.W */
+        { 0x2310F853U, A32_CPSR_T, A32H_DFAULT_READ },  /* T3 LDR.W */
+        { 0xE5C01000U, 0U, A32H_DFAULT_WRITE }, /* ARM STRB */
+        { 0xE18100B0U, 0U, A32H_DFAULT_WRITE }, /* ARM STRH */
+        { 0xE5910000U, 0U, A32H_DFAULT_READ },  /* ARM LDR */
+    };
+    for (unsigned k = 0U; k < sizeof(vec) / sizeof(vec[0]); k++) {
+        size_t len = (vec[k].cpsr & A32_CPSR_T) ? (vec[k].code > 0xFFFFU ? 4U : 2U) : 4U;
+        memcpy(mem, &vec[k].code, len);
+        c2.cpsr = vec[k].cpsr | A32_CPSR_N;
+        CHECK(a32_darwin_fault_kind_for(&c2) == vec[k].want,
+            "classify #%u kind=%u", k, a32_darwin_fault_kind_for(&c2));
+    }
+    printf("PASS g02 it-str (itstate + 12 classifier vectors)\n");
+}
+
+/* 4. SYNC_VM_PROT with prot_flags == 0 unmaps: a later fault must report
+ * fault_is_prot == 0 (SIGSEGV), not protection (SIGBUS). */
+static const uint32_t g_unmap_fn[] = {
+    0xE3000000U, 0xE3400090U, 0xE3A01042U, 0xE5801000U, 0xE3027005U,
+    0xEF000080U, 0xE5902000U, 0xE3A00007U, 0xE3017FFFU, 0xEF000080U,
+};
+
+static void test_unmap_prot(void)
+{
+    static a32_ctx_t ctx;
+    mock_t m;
+    mock_init(&m);
+    m.prog = g_unmap_fn;
+    m.nprog = sizeof(g_unmap_fn) / sizeof(g_unmap_fn[0]);
+    m.rec_is_prot = -1;
+    int rc = a32_run_darwin_ctx_with_handler(&ctx, mini_handler, &m, false, false);
+    CHECK(rc == 42, "unmap: rc %d", rc);
+    CHECK(m.svc_unmap == 1U, "unmap: svc %u", m.svc_unmap);
+    CHECK(m.rec_is_prot == 0, "unmap: is_prot=%d", m.rec_is_prot);
+    printf("PASS g02 unmap-prot (is_prot=0, exit=%d)\n", rc);
+    mock_fini(&m);
+}
+
+/* 5. Genuine interp-vs-dbt difftest: the lockstep run must observe exactly
+ * the traps of the interp-only and dbt-only runs with zero divergences. */
+static void test_difftest_genuine(void)
+{
+    static a32_ctx_t ci, cd, cf;
+    mock_t mi, md, mf;
+    int fails_before = g_failures;
+    mock_init(&mi);
+    int ri = run_case(&mi, &ci, false, false, "dt-interp");
+    mock_init(&md);
+    int rd = run_case(&md, &cd, true, false, "dt-dbt");
+    mock_init(&mf);
+    int rf = run_case(&mf, &cf, true, true, "dt-lockstep");
+    CHECK(ri == 42 && rd == 42 && rf == 42, "dt: rc %d/%d/%d", ri, rd, rf);
+    CHECK(mi.nlog == md.nlog && md.nlog == mf.nlog && mi.nlog > 0U,
+        "dt: counts %zu/%zu/%zu", mi.nlog, md.nlog, mf.nlog);
+    if (mi.nlog == mf.nlog && mi.nlog > 0U) {
+        CHECK(memcmp(mi.log, mf.log, mi.nlog * sizeof(mi.log[0])) == 0,
+            "dt: lockstep vs interp log diverges");
+        CHECK(memcmp(md.log, mf.log, md.nlog * sizeof(md.log[0])) == 0,
+            "dt: lockstep vs dbt log diverges");
+        CHECK(memcmp((const void *)(uintptr_t)(mi.window_base + (uint64_t)G_DATA),
+                (const void *)(uintptr_t)(mf.window_base + (uint64_t)G_DATA),
+                256U) == 0, "dt: guest memory diverges");
+    }
+    if (g_failures == fails_before) {
+        printf("PASS g02 difftest-genuine (%zu traps)\n", mi.nlog);
+    }
+    mock_fini(&mi);
+    mock_fini(&md);
+    mock_fini(&mf);
+}
+
 static uint32_t mock_data(mock_t *m, uint32_t off)
 {
     uint32_t v = 0U;
@@ -425,6 +721,10 @@ static void mock_init(mock_t *m)
 
 static void mock_fini(mock_t *m)
 {
+    if (m->window_base != 0ULL) {
+        (void)munmap((void *)(uintptr_t)m->window_base, 0x100000000ULL);
+        m->window_base = 0ULL;
+    }
     pthread_mutex_destroy(&m->mu);
     pthread_cond_destroy(&m->cv);
 }
@@ -502,12 +802,22 @@ static void test_units(void)
     char *argv2[] = { (char *)"a32rt", (char *)"--darwin-boot", (char *)"x" };
     char *argv3[] = { (char *)"a32rt", (char *)"--personality=hl-darwin" };
     char *argv4[] = { (char *)"a32rt", (char *)"x" };
+    char *argv5[] = { (char *)"a32rt", (char *)"--personality", (char *)"darwin-host", (char *)"x" };
+    char *argv6[] = { (char *)"a32rt", (char *)"--personality", (char *)"bogus", (char *)"x" };
+    char *argv7[] = { (char *)"a32rt", (char *)"--", (char *)"--darwin-boot", (char *)"x" };
+    char *argv8[] = { (char *)"a32rt", (char *)"prog", (char *)"--darwin-boot" };
+    char *argv9[] = { (char *)"a32rt", (char *)"--personality=darwin-host" };
     uint64_t h = 0xCBF29CE484222325ULL;
     a32_ctx_t c;
     CHECK(a32_darwin_cli_wants_bridge(4, argv1, &boot) && !boot, "cli hl-darwin");
     CHECK(a32_darwin_cli_wants_bridge(3, argv2, &boot) && boot, "cli darwin-boot");
     CHECK(a32_darwin_cli_wants_bridge(2, argv3, NULL), "cli personality=");
     CHECK(!a32_darwin_cli_wants_bridge(2, argv4, NULL), "cli negative");
+    CHECK(a32_darwin_cli_wants_bridge(4, argv5, &boot) && !boot, "cli darwin-host");
+    CHECK(!a32_darwin_cli_wants_bridge(4, argv6, NULL), "cli bogus personality");
+    CHECK(!a32_darwin_cli_wants_bridge(4, argv7, NULL), "cli stops at --");
+    CHECK(!a32_darwin_cli_wants_bridge(3, argv8, NULL), "cli stops at positional");
+    CHECK(a32_darwin_cli_wants_bridge(2, argv9, NULL), "cli darwin-host=");
     CHECK(!a32_darwin_is_macho_fd(-1), "macho fd -1");
     CHECK(!a32_darwin_is_macho_fd(999999), "macho fd bad");
     CHECK(a32_darwin_mix_hash(h, PERSON_HASH) != h, "mix changes key");
@@ -537,6 +847,12 @@ int main(void)
     int rc_interp, rc_dbt, rc_diff;
     int fails_before;
     test_units();
+    test_it_str(); /* before any bridge run initializes the vm arena */
+    test_svc_storm();
+    test_exit_thread();
+    test_worker_exit_process();
+    test_unmap_prot();
+    test_difftest_genuine();
     mock_init(&mi);
     rc_interp = run_case(&mi, &ctx_interp, false, false, "interp");
     mock_init(&md);

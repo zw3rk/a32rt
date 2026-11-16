@@ -95,6 +95,7 @@ BASE_SRCS := src/main.c \
         src/os/os_sys_sock.c \
         src/os/os_sys_fs_arm.c \
         src/signals.c \
+        src/signals_frame.c \
         src/gdb.c \
         src/interp/interp.c \
         src/interp/interp_a32.c \
@@ -119,6 +120,7 @@ BASE_SRCS := src/main.c \
         src/dbt/aot/aot_sites.c \
         src/os/backend_sync.c \
         src/os/darwin_host_bridge.c \
+        src/os/darwin_host_cpu.c \
         $(A32_BACKEND_SRC)
 IOS_SRCS := src/ios/ios_macho.c \
         src/ios/ios_dylib.c \
@@ -142,7 +144,7 @@ else
 SRCS := $(BASE_SRCS) $(IOS_SRCS)
 endif
 ASM_SRCS := src/trampoline.S
-HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
+HDRS := include/a32host.h src/a32rt.h src/a64_emit.h src/signals_frame.h \
         src/interp/interp.h src/interp/interp_priv.h src/interp/decode_priv.h \
         src/dbt/difftest.h src/dbt/jit_priv.h \
         src/vm/vm32.h src/vm/vm_priv.h src/os/backend.h src/os/sys_priv.h \
@@ -212,7 +214,7 @@ build: $(A32RT_BIN) ## Build static-PIE aarch64-linux a32rt binary
 build-darwin: ## Build native darwin-arm64 binary (Backend 2) with host cc
 	@$(MAKE) $(BUILD_DIR)/a32rt-darwin CC=cc OBJ_DIR=$(BUILD_DIR)/darwin-obj \
 		A32RT_BIN=$(BUILD_DIR)/a32rt-darwin \
-		CFLAGS="$(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=1" \
+		CFLAGS="$(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=$(A32RT_EMBED_IOS)" \
 		LDFLAGS=""
 
 build-slim: ## Build static-PIE aarch64-linux a32rt-slim binary (no src/ios/*)
@@ -388,7 +390,7 @@ endef
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-armhf,test_m8_cpp_ehabi.cpp,-marm))
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-thumb,test_m8_cpp_ehabi.cpp,-mthumb))
 
-check: check-line-limits ## Host-runnable structural checks (line limits, x18/push/VLA/unity-include bans)
+check: check-line-limits build-darwin-slim ## Host-runnable structural checks (line limits, x18/push/VLA/unity-include bans) + slim link check
 	@bad=$$(grep -rnE '(^|[^0-9A-Za-z_])x18([^0-9A-Za-z_]|$$)' src --include='*.c' --include='*.h' --include='*.S' || true); \
 	if [ -n "$$bad" ]; then echo "ERROR: x18 platform register used:"; echo "$$bad"; exit 1; fi
 	@bad=$$(grep -rniE '^[[:space:]]*(push|pop)([[:space:]]|$$)' src --include='*.S' || true); \
