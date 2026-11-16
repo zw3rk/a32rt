@@ -9,6 +9,7 @@
 #include "a32rt.h"
 #include "dbt/difftest.h"
 #include "ios/ios.h"
+#include "os/darwin_host_bridge.h"
 #include "vm/vm32.h"
 
 #include <errno.h>
@@ -18,63 +19,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #if defined(__linux__)
 #include <sys/auxv.h>
 #endif
 #include <sys/syscall.h>
 #include <unistd.h>
-
-uint64_t a32_host_monotonic_ns(void)
-{
-    struct timespec ts;
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-void a32_print_stats(const a32_ctx_t *ctx)
-{
-    if (ctx == NULL) {
-        return;
-    }
-    fprintf(stderr,
-        "[a32rt stats] blocks_compiled=%llu blocks_executed=%llu chain_hits=%llu "
-        "ibtc_hits=%llu ras_hits=%llu flags_elided=%llu syscalls=%llu "
-        "icache_flushes=%llu wx_transitions=%llu window=0x%llx\n",
-        (unsigned long long)ctx->blocks_compiled,
-        (unsigned long long)ctx->blocks_executed,
-        (unsigned long long)ctx->chain_hits,
-        (unsigned long long)ctx->ibtc_hits,
-        (unsigned long long)ctx->ras_hits,
-        (unsigned long long)ctx->flags_elided,
-        (unsigned long long)ctx->syscalls_executed,
-        (unsigned long long)ctx->icache_flushes,
-        (unsigned long long)ctx->wx_transitions,
-        (unsigned long long)ctx->guest_base);
-    fprintf(stderr,
-        "[a32rt stats-ext] ns_vm_init=%llu ns_translate=%llu ns_wx_flush=%llu "
-        "aprr_toggles=%llu tlb_checks=%llu tlb_groups=%llu tlb_slow=%llu "
-        "vfp_copies=%llu fpcr_sw=%llu fpcr_slow=%llu aot_abs64=%llu "
-        "exits=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-        (unsigned long long)ctx->ns_vm_init,
-        (unsigned long long)ctx->ns_translate,
-        (unsigned long long)ctx->ns_wx_flush,
-        (unsigned long long)ctx->aprr_toggles,
-        (unsigned long long)ctx->tlb_checks_emitted,
-        (unsigned long long)ctx->tlb_group_guards,
-        (unsigned long long)ctx->tlb_slow_hits,
-        (unsigned long long)ctx->vfp_cache_copies_emitted,
-        (unsigned long long)ctx->fpcr_switches_emitted,
-        (unsigned long long)ctx->fpcr_guard_slow_hits,
-        (unsigned long long)ctx->aot_abs64_words,
-        (unsigned long long)ctx->exits_by_reason[1],
-        (unsigned long long)ctx->exits_by_reason[2],
-        (unsigned long long)ctx->exits_by_reason[3],
-        (unsigned long long)ctx->exits_by_reason[4],
-        (unsigned long long)ctx->exits_by_reason[5],
-        (unsigned long long)ctx->exits_by_reason[6],
-        (unsigned long long)ctx->exits_by_reason[7]);
-}
 
 static bool getenv_bool(const char *name)
 {
@@ -104,6 +53,27 @@ static bool parse_port(const char *s, int *out_port)
     }
     *out_port = (int)port;
     return true;
+}
+
+/* Known --personality values: darwin-host (canonical G02/hl flag) and
+ * hl-darwin (alias) enter the external Darwin bridge; linux is the default
+ * ELF personality; ios selects embedded 32-bit iOS (embedded builds only).
+ * Unknown or empty values are rejected with exit status 1. */
+static bool personality_known(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+    if (strcmp(name, "darwin-host") == 0 || strcmp(name, "hl-darwin") == 0 ||
+        strcmp(name, "linux") == 0) {
+        return true;
+    }
+#if A32RT_EMBED_IOS
+    if (strcmp(name, "ios") == 0) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 static const char *strip_sysroot_prefix(const char *path, const char *prefix)
@@ -207,7 +177,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--execfn <path>] [--image-fd <fd>] [--no-host] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] -- <PATH> [<ARGV0> [ARGS...]]\n"
+            "  %s [--window <hex>] [--sysroot <path>] [--cache <dir>] [--execfn <path>] [--image-fd <fd>] [--no-host] [--stats] [--trace] [--aot] [--auto-aot] [--gdb <port>] [--interp | --dbt | --difftest] [--personality darwin-host|hl-darwin|linux|ios] [--darwin-boot] -- <PATH> [<ARGV0> [ARGS...]]\n"
             "  %s <PATH> [ARGS...]\n",
             prog, prog);
 }
@@ -332,6 +302,20 @@ int main(int argc, char **argv, char **envp)
                 return 1;
             }
             i += 2;
+        } else if (strcmp(argv[i], "--personality") == 0) {
+            if (i + 1 >= argc || !personality_known(argv[i + 1])) {
+                usage(argv[0]);
+                return 1;
+            }
+            i += 2; /* value re-derived by a32_darwin_cli_wants_bridge */
+        } else if (strncmp(argv[i], "--personality=", 14) == 0) {
+            if (!personality_known(argv[i] + 14)) {
+                usage(argv[0]);
+                return 1;
+            }
+            i++; /* value re-derived by a32_darwin_cli_wants_bridge */
+        } else if (strcmp(argv[i], "--darwin-boot") == 0) {
+            i++;
         } else if (strcmp(argv[i], "--aot") == 0) {
             ctx.aot_mode = true;
             i++;
@@ -427,9 +411,47 @@ int main(int argc, char **argv, char **envp)
     }
 
     ctx.exec_path = exec_path;
+#if A32RT_EMBED_IOS
     ctx.is_ios    = a32_ios_is_macho_fd(exec_fd, exec_path, &ctx);
+#else
+    ctx.is_ios    = a32_darwin_is_macho_fd(exec_fd);
+    if (!ctx.is_ios && exec_fd < 0) {
+        int mfd = a32_open_guest_ro(&ctx, exec_path);
+        ctx.is_ios = a32_darwin_is_macho_fd(mfd);
+        if (mfd >= 0) {
+            close(mfd);
+        }
+    }
+#endif
 
     a32_host_probe(&ctx);
+
+    /* Narrow G02 external Darwin personality (A32H_ABI 1.2): the host owns
+     * Mach-O/dyld and every trap; the bridge only moves register/VMA/exit
+     * state across A32H_DARWIN_BOOT / A32H_DARWIN_TRAP. */
+    {
+        bool darwin_boot = false;
+        bool cli_bridge =
+            a32_darwin_cli_wants_bridge(argc, argv, &darwin_boot);
+        bool auto_bridge =
+            a32_darwin_auto_bridge(&ctx, ctx.is_ios, darwin_boot);
+        if (cli_bridge || auto_bridge) {
+#if A32RT_EMBED_IOS
+            ctx.is_ios = true;
+#else
+            if (!ctx.is_ios && !darwin_boot) {
+                fprintf(stderr,
+                    "a32rt: slim build needs a Mach-O target or --darwin-boot "
+                    "for hl-darwin\n");
+                return 1;
+            }
+            ctx.is_ios = true;
+#endif
+            return a32_darwin_boot_and_run(&ctx,
+                exec_mode != A32_EXEC_INTERP,
+                exec_mode == A32_EXEC_DIFFTEST);
+        }
+    }
 
     /* A32-R4-7: install host handlers BEFORE applying the captured
      * execve-class state so a32_signals_init() does not overwrite
@@ -466,13 +488,21 @@ int main(int argc, char **argv, char **envp)
     }
 
     a32_elf_info_t elf_info;
-    if (ctx.is_ios) {
+#if A32RT_EMBED_IOS
+    if (ctx.is_ios && !ctx.darwin_external) {
         if (a32_ios_load(&ctx, exec_fd, exec_path, &elf_info) != 0 ||
             a32_ios_commpage_setup(&ctx) != 0) {
             free(ctx.ios_fn_starts);
             return 1;
         }
-    } else {
+    } else
+#endif
+    {
+        if (ctx.is_ios && !ctx.darwin_external) {
+            fprintf(stderr,
+                "a32rt: iOS personality not embedded (slim build)\n");
+            return 1;
+        }
         if (a32_elf_load(&ctx, exec_fd, exec_path, &elf_info) != 0 ||
             a32_kuser_setup(&ctx) != 0) {
             return 1;
@@ -480,9 +510,14 @@ int main(int argc, char **argv, char **envp)
     }
 
     uint32_t initial_sp = 0U;
-    int stack_rc = ctx.is_ios
+#if A32RT_EMBED_IOS
+    int stack_rc = (ctx.is_ios && !ctx.darwin_external)
         ? a32_ios_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp)
         : a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv, clean_envp, &initial_sp);
+#else
+    int stack_rc = a32_stack_setup(&ctx, &elf_info, guest_argc, guest_argv,
+        clean_envp, &initial_sp);
+#endif
     if (stack_rc != 0) {
         free(ctx.ios_fn_starts);
         return 1;

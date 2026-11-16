@@ -171,7 +171,7 @@ static int ios_setup_tramp(a32_ctx_t *ctx)
         *p++ = 0x3704u;
         *p++ = 0x2800u;
         *p++ = 0xD1FBu;
-        for (k = 0; k < ctx->ios_init_count && k < 64u; k++) {
+        for (k = 0; k < ctx->ios_init_count && k < A32_IOS_INIT_CAP; k++) {
             if ((size_t)(crt0_end - p) < 9u) {
                 return -1;
             }

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build build-darwin test tests check check-line-limits check-headers test-ios \
+.PHONY: help all build build-darwin build-slim build-darwin-slim test tests test-g02 check check-line-limits check-headers test-ios \
         test-hello-hl test-hello-lima \
         test-m1-hl test-m1-lima \
         test-m2-hl test-m2-lima \
@@ -21,6 +21,11 @@ BUILD_DIR := _build
 HL_DIR    ?= ../hyper-linux
 HL_BIN    ?= $(HL_DIR)/_build/hl
 LIMA_VM   ?= hl-rosetta
+
+# G02 slim builds compile src/ios/* out (A32RT_EMBED_IOS=0): the external
+# Darwin personality stays available through src/os/darwin_host_bridge.c
+# while Linux ELF32 support is unchanged.
+A32RT_EMBED_IOS ?= 1
 
 # Locate aarch64-unknown-linux-musl-gcc (from PATH or cached /nix/store wrapper)
 A64_CC_CACHED := /nix/store/h4svaqanhy15x4c3mwx5rp6kcjm4d1hp-aarch64-unknown-linux-musl-gcc-wrapper-15.3.0/bin/aarch64-unknown-linux-musl-gcc
@@ -45,7 +50,8 @@ LIMACTL        ?= $(shell command -v limactl 2>/dev/null || ([ -x $(LIMACTL_CACH
 A32RT_WARN_C := -std=c11 -Werror -Werror=vla -pedantic -Wall -Wextra
 A32RT_WARN_CXX := -std=c++17 -Werror -Wall -Wextra
 CFLAGS := $(A32RT_WARN_C) -O2 -fPIE \
-          -fno-stack-protector -Iinclude -Isrc
+          -fno-stack-protector -Iinclude -Isrc \
+          -DA32RT_EMBED_IOS=$(A32RT_EMBED_IOS)
 LDFLAGS := -static-pie -Wl,-z,max-page-size=4096
 
 # Wave U3 A32-4: platform backend (dual-backend build). Selected from the
@@ -59,7 +65,7 @@ A32_BACKEND_SRC := src/os/backend_darwin.c
 else
 A32_BACKEND_SRC := src/os/backend_linux.c
 endif
-SRCS := src/main.c \
+BASE_SRCS := src/main.c \
         src/host.c \
         src/vm.c \
         src/elf32.c \
@@ -89,6 +95,7 @@ SRCS := src/main.c \
         src/os/os_sys_sock.c \
         src/os/os_sys_fs_arm.c \
         src/signals.c \
+        src/signals_frame.c \
         src/gdb.c \
         src/interp/interp.c \
         src/interp/interp_a32.c \
@@ -111,7 +118,11 @@ SRCS := src/main.c \
         src/vm/vm_mremap.c \
         src/vm/vm_window.c \
         src/dbt/aot/aot_sites.c \
-        src/ios/ios_macho.c \
+        src/os/backend_sync.c \
+        src/os/darwin_host_bridge.c \
+        src/os/darwin_host_cpu.c \
+        $(A32_BACKEND_SRC)
+IOS_SRCS := src/ios/ios_macho.c \
         src/ios/ios_dylib.c \
         src/ios/ios_export.c \
         src/ios/ios_bind.c \
@@ -126,14 +137,18 @@ SRCS := src/main.c \
         src/ios/ios_threads.c \
         src/ios/ios_stubs.c \
         src/ios/ios_stubs_ext.c \
-        src/ios/ios_stubs_time.c \
-        src/os/backend_sync.c \
-        $(A32_BACKEND_SRC)
+        src/ios/ios_stubs_time.c
+ifeq ($(A32RT_EMBED_IOS),0)
+SRCS := $(BASE_SRCS)
+else
+SRCS := $(BASE_SRCS) $(IOS_SRCS)
+endif
 ASM_SRCS := src/trampoline.S
-HDRS := include/a32host.h src/a32rt.h src/a64_emit.h \
+HDRS := include/a32host.h src/a32rt.h src/a64_emit.h src/signals_frame.h \
         src/interp/interp.h src/interp/interp_priv.h src/interp/decode_priv.h \
         src/dbt/difftest.h src/dbt/jit_priv.h \
         src/vm/vm32.h src/vm/vm_priv.h src/os/backend.h src/os/sys_priv.h \
+        src/os/darwin_host_bridge.h \
         src/dbt/aot/aot.h src/ios/ios.h
 
 A32RT_BIN := $(BUILD_DIR)/a32rt
@@ -199,7 +214,19 @@ build: $(A32RT_BIN) ## Build static-PIE aarch64-linux a32rt binary
 build-darwin: ## Build native darwin-arm64 binary (Backend 2) with host cc
 	@$(MAKE) $(BUILD_DIR)/a32rt-darwin CC=cc OBJ_DIR=$(BUILD_DIR)/darwin-obj \
 		A32RT_BIN=$(BUILD_DIR)/a32rt-darwin \
-		CFLAGS="$(A32RT_WARN_C) -O2 -Iinclude -Isrc" \
+		CFLAGS="$(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=$(A32RT_EMBED_IOS)" \
+		LDFLAGS=""
+
+build-slim: ## Build static-PIE aarch64-linux a32rt-slim binary (no src/ios/*)
+	@$(MAKE) $(BUILD_DIR)/a32rt-slim A32RT_EMBED_IOS=0 \
+		OBJ_DIR=$(BUILD_DIR)/obj-slim \
+		A32RT_BIN=$(BUILD_DIR)/a32rt-slim
+
+build-darwin-slim: ## Build native darwin-arm64 a32rt-darwin-slim binary (no src/ios/*)
+	@$(MAKE) $(BUILD_DIR)/a32rt-darwin-slim CC=cc A32RT_EMBED_IOS=0 \
+		OBJ_DIR=$(BUILD_DIR)/darwin-slim-obj \
+		A32RT_BIN=$(BUILD_DIR)/a32rt-darwin-slim \
+		CFLAGS="$(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0" \
 		LDFLAGS=""
 
 $(A32RT_BIN): $(OBJS) | $(BUILD_DIR)
@@ -363,7 +390,7 @@ endef
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-armhf,test_m8_cpp_ehabi.cpp,-marm))
 $(eval $(call BUILD_ARM32_GLIBC_CPP_FIXTURE,test-m8-cpp-glibc-thumb,test_m8_cpp_ehabi.cpp,-mthumb))
 
-check: check-line-limits ## Host-runnable structural checks (line limits, x18/push/VLA/unity-include bans)
+check: check-line-limits build-darwin-slim ## Host-runnable structural checks (line limits, x18/push/VLA/unity-include bans) + slim link check
 	@bad=$$(grep -rnE '(^|[^0-9A-Za-z_])x18([^0-9A-Za-z_]|$$)' src --include='*.c' --include='*.h' --include='*.S' || true); \
 	if [ -n "$$bad" ]; then echo "ERROR: x18 platform register used:"; echo "$$bad"; exit 1; fi
 	@bad=$$(grep -rniE '^[[:space:]]*(push|pop)([[:space:]]|$$)' src --include='*.S' || true); \
@@ -384,8 +411,18 @@ check-line-limits: ## Fail if any src/include/tests .c/.h/.S exceeds 900 lines
 	fi; \
 	echo "line limits OK (all src/include/tests .c/.h/.S <= 900 lines)"
 
-check-headers: ## Verify include/a32host.h matches $(HL_DIR)/src/a32host.h
-	@cmp -s include/a32host.h $(HL_DIR)/src/a32host.h || (echo "ERROR: include/a32host.h out of sync with $(HL_DIR)/src/a32host.h" && exit 1)
+# A32H_ABI 1.2 lives in ../hyper-linux-darwin32 and ../rt-series; only an
+# explicit `make HL_DIR=...` (command line) checks against that HL_DIR copy.
+ifeq ($(origin HL_DIR),command line)
+CHECK_HDR := $(HL_DIR)/src/a32host.h
+else ifneq ($(wildcard ../hyper-linux-darwin32/src/a32host.h ../rt-series/include/a32host.h),)
+CHECK_HDR := ../rt-series/include/a32host.h
+else
+CHECK_HDR := $(HL_DIR)/src/a32host.h
+endif
+
+check-headers: ## Verify include/a32host.h matches $(CHECK_HDR)
+	@cmp -s include/a32host.h $(CHECK_HDR) || (echo "ERROR: include/a32host.h out of sync with $(CHECK_HDR)" && exit 1)
 	@echo "=== check-headers: PASS ==="
 
 test-hello-hl: $(A32RT_BIN) $(BUILD_DIR)/hello-armhf-static $(BUILD_DIR)/hello-thumb-static ## Run M0-hl smoke test under hyper-linux (primary target)
@@ -673,3 +710,27 @@ clean: ## Remove build artifacts
 
 test-ios: check build-darwin build ## Run 32-bit iOS (armv7/armv7s) qualification suite (Darwin + Linux Docker)
 	./tools/run_ios_suite.sh
+
+# The G02 test runs on the build host, so it always uses the host backend
+# (Backend 2 on Darwin) even when the default CC is the cross compiler.
+G02_HOST_BACKEND := $(if $(findstring darwin,$(shell cc -dumpmachine 2>/dev/null)),src/os/backend_darwin.c,src/os/backend_linux.c)
+G02_TEST_OBJDIR := $(BUILD_DIR)/g02-obj
+G02_TEST_SRCS := $(filter-out src/main.c $(A32_BACKEND_SRC),$(BASE_SRCS)) $(G02_HOST_BACKEND)
+G02_TEST_COBJS := $(patsubst src/%.c,$(G02_TEST_OBJDIR)/%.o,$(G02_TEST_SRCS))
+G02_TEST_OBJS := $(G02_TEST_COBJS) $(G02_TEST_OBJDIR)/trampoline.o
+
+$(G02_TEST_OBJDIR)/%.o: src/%.c $(HDRS) | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -c $< -o $@
+
+$(G02_TEST_OBJDIR)/%.o: src/%.S $(HDRS) | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -c $< -o $@
+
+$(BUILD_DIR)/test-g02: $(G02_TEST_OBJS) tests/test_g02_darwin_bridge.c | $(BUILD_DIR)
+	@printf "\033[32m▸ Building\033[0m $@ (slim objects, mock handler)\n"
+	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -c tests/test_g02_darwin_bridge.c -o $(BUILD_DIR)/g02-test.o
+	cc $(G02_TEST_OBJS) $(BUILD_DIR)/g02-test.o -o $@
+
+test-g02: $(BUILD_DIR)/test-g02 ## Run G02 Darwin bridge suite (slim A32RT_EMBED_IOS=0 objects, no src/ios)
+	timeout --kill-after=30s 120s $(BUILD_DIR)/test-g02

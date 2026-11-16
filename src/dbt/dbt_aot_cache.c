@@ -9,6 +9,7 @@
 #include "a32rt.h"
 
 #include "dbt/aot/aot.h"
+#include "os/darwin_host_bridge.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -122,19 +123,44 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path,
         return 0ULL;
     }
     int fd = a32_open_guest_ro(ctx, elf_path);
+    uint64_t fd_hash;
     if (fd < 0) {
-        return 0ULL;
-    }
-    uint64_t fd_hash = compute_fd_hash(fd);
-    close(fd);
-    if (fd_hash == 0ULL) {
-        return 0ULL;
+        /* Host-loaded image (A32H_DARWIN_BOOT): hash the personality tag,
+         * ABI minor, and all mapped executable guest regions (excluding
+         * the CommPage) so distinct binaries never collide regardless of
+         * where beyond page 0 they differ. */
+        if (ctx == NULL || ctx->darwin_personality_hash == 0ULL) {
+            return 0ULL;
+        }
+        fd_hash = ctx->darwin_personality_hash;
+        uint32_t abi_minor = A32H_ABI_MINOR_DARWIN;
+        fd_hash = fnv1a_64_step(fd_hash, &abi_minor, sizeof(abi_minor));
+        for (size_t ri = 0U; ri < ctx->region_count; ri++) {
+            const a32_region_t *r = &ctx->regions[ri];
+            if ((r->prot & 0x4U) == 0U || r->end <= r->start ||
+                strcmp(r->name, "darwin-commpage") == 0) {
+                continue;
+            }
+            fd_hash = fnv1a_64_step(fd_hash, &r->start, sizeof(r->start));
+            fd_hash = fnv1a_64_step(fd_hash, &r->end, sizeof(r->end));
+            fd_hash = fnv1a_64_step(fd_hash, a32_guest_ptr(ctx, r->start),
+                (size_t)(r->end - r->start));
+        }
+    } else {
+        fd_hash = compute_fd_hash(fd);
+        close(fd);
+        if (fd_hash == 0ULL) {
+            return 0ULL;
+        }
     }
     if (out_fd_hash != NULL) {
         *out_fd_hash = fd_hash;
     }
     uint64_t h = fd_hash;
     if (ctx != NULL) {
+        if (ctx->darwin_personality_hash != 0ULL) {
+            h = a32_darwin_mix_hash(h, ctx->darwin_personality_hash);
+        }
         h = fnv1a_64_step(h, &ctx->elf_base, sizeof(ctx->elf_base));
         h = fnv1a_64_step(h, &ctx->interp_base, sizeof(ctx->interp_base));
         h = fnv1a_64_step(h, &ctx->elf_entry, sizeof(ctx->elf_entry));

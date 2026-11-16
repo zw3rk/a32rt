@@ -422,7 +422,7 @@ int a32_aot_generate(a32_ctx_t *ctx, const a32_elf_info_t *elf_info, const char 
         if (ctx->ios_main_va != 0U) {
             aot_try_add_target(&sb, ctx->ios_main_va & ~1U, true, 2U);
         }
-        for (uint32_t i = 0U; i < ctx->ios_init_count && i < 64U; i++) {
+        for (uint32_t i = 0U; i < ctx->ios_init_count && i < A32_IOS_INIT_CAP; i++) {
             if (ctx->ios_init_va[i] != 0U) {
                 aot_try_add_target(&sb, ctx->ios_init_va[i] & ~1U, true, 2U);
             }
