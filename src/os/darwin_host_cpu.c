@@ -174,7 +174,10 @@ static uint32_t thumb32_is_store(uint32_t w)
     if (top == 0xF8U) { /* LDR/STR imm12/imm8/reg */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xF9U) { /* Thumb Advanced SIMD VSTn/VLDn (L at bit 21) */
+    if (top == 0xF9U) { /* LDRSB/LDRSH/PLI (L=bit 20) vs SIMD VSTn/VLDn (L=bit 21) */
+        if ((w & 0x00100000U) != 0U) {
+            return 0U;
+        }
         return ((w & 0x00200000U) != 0U) ? 0U : 1U;
     }
     if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR */
@@ -190,25 +193,28 @@ static uint32_t thumb32_is_store(uint32_t w)
 static uint32_t arm_is_store(uint32_t w)
 {
     uint32_t top = w >> 24U;
+    if (top == 0xF4U || top == 0xF5U) { /* Advanced SIMD VSTn vs VLDn (L == bit 21) */
+        return ((w & 0x00200000U) != 0U) ? 0U : 1U;
+    }
+    if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR, LDC/STC */
+        return ((w & 0x00100000U) != 0U) ? 0U : 1U;
+    }
+    if ((top >> 4U) == 0xFU) { /* Other unconditional space (PLD/PLI/etc.): no store */
+        return 0U;
+    }
     if (((w & 0x0FB000F0U) == 0x01000090U) || /* SWP/SWPB */
         ((w & 0x0FB000F0U) == 0x01800090U)) { /* STREX{B,H,D} */
         return 1U;
     }
-    if (((w & 0x0E000090U) == 0x00000090U) && /* STRH/STRD group */
-        ((w & 0x00100000U) == 0U)) { /* L == 0 */
+    if (((w & 0x0E000090U) == 0x00000090U) && /* Extra load/store: STRH (op2=01) & STRD (op2=11) */
+        ((w & 0x00100020U) == 0x00000020U)) { /* L == 0 && H (bit 5) == 1 (excludes LDRD op2=10) */
         return 1U;
     }
     if (((w & 0x0C000000U) == 0x04000000U) || /* STR/LDR single */
         ((w & 0x0C000000U) == 0x08000000U)) { /* STM/LDM */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR, LDC/STC */
-        return ((w & 0x00100000U) != 0U) ? 0U : 1U;
-    }
-    if (top == 0xF4U || top == 0xF5U) { /* Advanced SIMD VSTn vs VLDn (L == bit 21) */
-        return ((w & 0x00200000U) != 0U) ? 0U : 1U;
-    }
-    return 0U; /* LDREX{B,H,D}, MUL, arithmetic: no store */
+    return 0U; /* LDREX{B,H,D}, LDRD, MUL, arithmetic: no store */
 }
 
 /* DEXIT_FAULT classifier: EXEC when VA is the PC, else the host ESR WnR
