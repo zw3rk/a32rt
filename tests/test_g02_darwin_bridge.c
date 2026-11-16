@@ -647,6 +647,8 @@ static void test_it_str(void)
         { 0x0000F991U, A32_CPSR_T, A32H_DFAULT_READ },  /* T2 LDRSB imm12 */
         { 0x070FF901U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T2 VST1.8 */
         { 0x070FF921U, A32_CPSR_T, A32H_DFAULT_READ },  /* T2 VLD1.8 */
+        { 0x1D800B00U, 0U, A32H_DFAULT_WRITE }, /* ARM VSTRNE d0,[r0] */
+        { 0x1D900B00U, 0U, A32H_DFAULT_READ },  /* ARM VLDRNE d0,[r0] */
         { 0xE5910000U, 0U, A32H_DFAULT_READ },  /* ARM LDR */
     };
     for (unsigned k = 0U; k < sizeof(vec) / sizeof(vec[0]); k++) {
@@ -656,7 +658,8 @@ static void test_it_str(void)
         CHECK(a32_darwin_fault_kind_for(&c2) == vec[k].want,
             "classify #%u kind=%u", k, a32_darwin_fault_kind_for(&c2));
     }
-    printf("PASS g02 it-str (itstate + 12 classifier vectors)\n");
+    printf("PASS g02 it-str (itstate + %zu classifier vectors)\n",
+        sizeof(vec) / sizeof(vec[0]));
 }
 
 /* 4. SYNC_VM_PROT with prot_flags == 0 unmaps: a later fault must report

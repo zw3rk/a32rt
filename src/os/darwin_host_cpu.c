@@ -193,11 +193,11 @@ static uint32_t arm_is_store(uint32_t w)
     if (top == 0xF4U && (w & 0x00100000U) == 0U) { /* Advanced SIMD VSTn vs VLDn (L == bit 21) */
         return ((w & 0x00200000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR, LDC/STC */
-        return ((w & 0x00100000U) != 0U) ? 0U : 1U;
-    }
-    if ((top >> 4U) == 0xFU) { /* Other unconditional space (PLD/PLI/etc.): no store */
+    if ((top >> 4U) == 0xFU) { /* Other unconditional space (PLD/PLI/STC2/etc.): no store */
         return 0U;
+    }
+    if ((w & 0x0E000000U) == 0x0C000000U) { /* Conditional LDC/STC, VLDR/VSTR, VLDM/VSTM */
+        return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
     if (((w & 0x0FB000F0U) == 0x01000090U) || /* SWP/SWPB */
         ((w & 0x0F9000F0U) == 0x01800090U)) { /* STREX/STREXB/STREXH/STREXD */
@@ -206,6 +206,9 @@ static uint32_t arm_is_store(uint32_t w)
     if (((w & 0x0E000090U) == 0x00000090U) && /* Extra load/store: STRH (op2=01) & STRD (op2=11) */
         ((w & 0x00100020U) == 0x00000020U)) { /* L == 0 && H (bit 5) == 1 (excludes LDRD op2=10) */
         return 1U;
+    }
+    if ((w & 0x0E000010U) == 0x06000010U) { /* Media instructions: never memory ops */
+        return 0U;
     }
     if (((w & 0x0C000000U) == 0x04000000U) || /* STR/LDR single */
         ((w & 0x0C000000U) == 0x08000000U)) { /* STM/LDM */
