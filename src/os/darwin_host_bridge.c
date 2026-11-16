@@ -118,12 +118,19 @@ bool a32_darwin_cli_wants_bridge(int argc, char **argv, bool *out_darwin_boot)
         } else if (strcmp(s, "--darwin-boot") == 0) {
             boot = true;
             want = true;
-        } else if (strcmp(s, "--personality") == 0 && i + 1 < argc &&
-                   is_bridge_personality(argv[i + 1])) {
-            want = true;
+        } else if (strcmp(s, "--personality") == 0 && i + 1 < argc) {
+            if (is_bridge_personality(argv[++i])) {
+                want = true;
+            }
         } else if (strncmp(s, "--personality=", 14) == 0 &&
                    is_bridge_personality(s + 14)) {
             want = true;
+        } else if ((strcmp(s, "--engine") == 0 || strcmp(s, "--cache") == 0 ||
+                    strcmp(s, "--cache-dir") == 0 || strcmp(s, "--sysroot") == 0 ||
+                    strcmp(s, "--rootfs") == 0 || strcmp(s, "--trace") == 0 ||
+                    strcmp(s, "--image-fd") == 0 || strcmp(s, "--execfn") == 0 ||
+                    strcmp(s, "--gdb") == 0) && i + 1 < argc) {
+            i++; /* skip option argument */
         }
     }
     if (is_bridge_personality(getenv("A32RT_PERSONALITY"))) {
@@ -335,13 +342,8 @@ static int send_trap(a32_ctx_t *ctx, a32h_darwin_handler_fn fn, void *opaque,
     return 0;
 }
 
-/* Stage [s, e) for registration. Pages the provider already populated
- * (real /dev/a32host, or the mock handler's own maps) are left untouched
- * (contents kept): MAP_FIXED_NOREPLACE fails with EEXIST when occupied.
- * Only genuinely absent pages get fresh anonymous backing. Never forces
- * PROT_READ|PROT_WRITE: host-populated MAP_SHARED read-only provider
- * pages would fail mprotect(RW) and MAP_FIXED anon would zero loaded
- * Mach-O bytes. Final protections are applied by register_range. */
+/* Stage [s, e): occupied provider pages stay untouched (EEXIST), absent
+ * pages get fresh RW anonymous backing; register_range sets final prot. */
 static int stage_map(a32_ctx_t *ctx, uint32_t s, uint32_t e)
 {
     void *hva = (void *)(uintptr_t)(ctx->guest_base + (uint64_t)s);
@@ -405,6 +407,11 @@ static void send_thread_exit(a32_ctx_t *ctx, a32h_darwin_handler_fn fn,
 static void *worker_main(void *arg)
 {
     a32_ctx_t *c = (a32_ctx_t *)arg;
+#if defined(__linux__)
+    c->host_tid = (int)syscall(SYS_gettid);
+#else
+    c->host_tid = (int)getpid();
+#endif
     a32_signals_set_thread_ctx(c);
     (void)run_loop(c, g_fn, g_opaque, g_use_dbt, false, c->darwin_tid, true);
     a32_signals_set_thread_ctx(NULL);
@@ -508,11 +515,7 @@ static int apply_reply(a32_ctx_t *ctx, uint32_t tid,
         child->regs[14] = 0U; /* return lands on VA 0 -> thread exit */
         child->tls_tp = trap->spawn_tls;
         child->darwin_tid = trap->spawn_tid;
-#if defined(__linux__)
-        child->host_tid = (int)syscall(SYS_gettid);
-#else
-        child->host_tid = (int)getpid();
-#endif
+        child->host_tid = 0; /* populated on worker pthread in worker_main */
         child->is_thread_clone = true;
         child->last_exec_entry = NULL;
         if (pthread_create(&th, NULL, worker_main, child) != 0) {
@@ -635,31 +638,30 @@ static int run_loop(a32_ctx_t *ctx, a32h_darwin_handler_fn fn, void *opaque,
             send_thread_exit(ctx, fn, opaque, tid);
             return 0;
         }
-        /* Queued async signals are drained by the host: at every block
-         * boundary with unmasked pending signals, issue a poll trap so
-         * the host can answer with DELIVER_SIGNAL. A spinning guest
-         * without traps would otherwise never observe SIGINT/SIGALRM. */
+        /* Consume unmasked pending signals atomically so each queued bit
+         * triggers at most one poll round-trip (masked bits stay queued). */
         if ((__atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) &
                 ~ctx->sig_mask) != 0ULL) {
+            __atomic_fetch_and(&ctx->pending_signals, ctx->sig_mask,
+                __ATOMIC_SEQ_CST);
             build_trap(ctx, tid, A32H_DEXIT_NONE, false, &cpu, &trap);
             if (send_trap(ctx, fn, opaque, &cpu, &trap, tid,
-                    A32H_DEXIT_NONE) != 0) {
-                return is_worker ? worker_bail(ctx, fn, opaque, tid) : 1;
+                    A32H_DEXIT_NONE) == 0) {
+                ar = apply_reply(ctx, tid, &cpu, &trap);
+                aa = apply_action(ctx, fn, opaque, ar, &trap, tid, is_worker,
+                    &exit_status);
+                if (aa < 0) {
+                    return is_worker ? worker_bail(ctx, fn, opaque, tid) : 1;
+                }
+                if (aa == 2) {
+                    return is_worker ? 0 : exit_status;
+                }
+                if (aa > 0) {
+                    break;
+                }
+                have_last_fault = false;
+                pc = ctx->regs[15];
             }
-            ar = apply_reply(ctx, tid, &cpu, &trap);
-            aa = apply_action(ctx, fn, opaque, ar, &trap, tid, is_worker,
-                &exit_status);
-            if (aa < 0) {
-                return is_worker ? worker_bail(ctx, fn, opaque, tid) : 1;
-            }
-            if (aa == 2) {
-                return is_worker ? 0 : exit_status;
-            }
-            if (aa > 0) {
-                break;
-            }
-            have_last_fault = false;
-            pc = ctx->regs[15];
         }
         if (have_dut) {
             /* Step the shadow under its own thread ctx so a dut fault

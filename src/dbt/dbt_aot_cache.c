@@ -125,28 +125,26 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path,
     int fd = a32_open_guest_ro(ctx, elf_path);
     uint64_t fd_hash;
     if (fd < 0) {
-        /* Host-loaded image (A32H_DARWIN_BOOT): no file to hash, so the
-         * key mixes the host personality tag, A32H_ABI_MINOR_DARWIN, and
-         * up to the first 4 KiB of mapped executable bytes at
-         * entry_pc & ~1u (clamped to the registered RX VMA), so two
-         * distinct 0x4000-based Mach-O binaries never collide. */
+        /* Host-loaded image (A32H_DARWIN_BOOT): hash the personality tag,
+         * ABI minor, and all mapped executable guest regions (excluding
+         * the CommPage) so distinct binaries never collide regardless of
+         * where beyond page 0 they differ. */
         if (ctx == NULL || ctx->darwin_personality_hash == 0ULL) {
             return 0ULL;
         }
         fd_hash = ctx->darwin_personality_hash;
         uint32_t abi_minor = A32H_ABI_MINOR_DARWIN;
         fd_hash = fnv1a_64_step(fd_hash, &abi_minor, sizeof(abi_minor));
-        if (ctx->elf_entry != 0U) {
-            uint32_t base  = ctx->elf_entry & ~1U;
-            uint32_t avail = 0U;
-            while (avail < 4096U && base + avail >= base &&
-                   a32_jit_range_executable(ctx, base + avail, 1U)) {
-                avail++;
+        for (size_t ri = 0U; ri < ctx->region_count; ri++) {
+            const a32_region_t *r = &ctx->regions[ri];
+            if ((r->prot & 0x4U) == 0U || r->end <= r->start ||
+                strcmp(r->name, "darwin-commpage") == 0) {
+                continue;
             }
-            if (avail > 0U) {
-                fd_hash = fnv1a_64_step(fd_hash,
-                    a32_guest_ptr(ctx, base), avail);
-            }
+            fd_hash = fnv1a_64_step(fd_hash, &r->start, sizeof(r->start));
+            fd_hash = fnv1a_64_step(fd_hash, &r->end, sizeof(r->end));
+            fd_hash = fnv1a_64_step(fd_hash, a32_guest_ptr(ctx, r->start),
+                (size_t)(r->end - r->start));
         }
     } else {
         fd_hash = compute_fd_hash(fd);

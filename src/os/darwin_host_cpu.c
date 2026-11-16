@@ -157,28 +157,31 @@ static uint32_t thumb16_is_store(uint16_t hw)
     default:
         break;
     }
-    if ((hw & 0xFF00U) == 0xB400U) { /* PUSH */
+    if ((hw & 0xFE00U) == 0xB400U) { /* PUSH {.., [lr]} (0xB4xx / 0xB5xx) */
         return 1U;
     }
     return 0U; /* POP, ADR, CBZ/CBNZ, arithmetic: no store */
 }
 
-/* 32-bit Thumb-2 store classifier on the full word (L == bit 20, except
- * NEON VSTn/VLDn which use bit 21 + single-lane bit 8). */
+/* 32-bit Thumb-2 store classifier on the full word (L == bit 20 for integer
+ * and VFP, L == bit 21 for Advanced SIMD VSTn/VLDn at 0xF9/0xF4/0xF5). */
 static uint32_t thumb32_is_store(uint32_t w)
 {
     uint32_t top = w >> 24U;
     if (top == 0xE8U || top == 0xE9U) { /* LDM/STM + LDREX/STREX */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xF8U || top == 0xF9U) { /* LDR/STR imm12/imm8 */
+    if (top == 0xF8U) { /* LDR/STR imm12/imm8/reg */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
+    }
+    if (top == 0xF9U) { /* Thumb Advanced SIMD VSTn/VLDn (L at bit 21) */
+        return ((w & 0x00200000U) != 0U) ? 0U : 1U;
     }
     if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xF4U || top == 0xF5U) { /* VSTn (bits clear) vs VLDn */
-        return ((w & 0x00200100U) != 0U) ? 0U : 1U;
+    if (top == 0xF4U || top == 0xF5U) { /* VSTn vs VLDn (L at bit 21) */
+        return ((w & 0x00200000U) != 0U) ? 0U : 1U;
     }
     return 0U;
 }
@@ -202,8 +205,8 @@ static uint32_t arm_is_store(uint32_t w)
     if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR, LDC/STC */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xF4U || top == 0xF5U) { /* VSTn vs VLDn */
-        return ((w & 0x00200100U) != 0U) ? 0U : 1U;
+    if (top == 0xF4U || top == 0xF5U) { /* Advanced SIMD VSTn vs VLDn (L == bit 21) */
+        return ((w & 0x00200000U) != 0U) ? 0U : 1U;
     }
     return 0U; /* LDREX{B,H,D}, MUL, arithmetic: no store */
 }
