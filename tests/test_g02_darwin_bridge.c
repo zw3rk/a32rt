@@ -637,6 +637,16 @@ static void test_it_str(void)
         { 0x2310F853U, A32_CPSR_T, A32H_DFAULT_READ },  /* T3 LDR.W */
         { 0xE5C01000U, 0U, A32H_DFAULT_WRITE }, /* ARM STRB */
         { 0xE18100B0U, 0U, A32H_DFAULT_WRITE }, /* ARM STRH */
+        { 0xE1C100F0U, 0U, A32H_DFAULT_WRITE }, /* ARM STRD */
+        { 0xE1C100D0U, 0U, A32H_DFAULT_READ },  /* ARM LDRD */
+        { 0xE1E12F90U, 0U, A32H_DFAULT_WRITE }, /* ARM STREXH */
+        { 0xE1A12F90U, 0U, A32H_DFAULT_WRITE }, /* ARM STREXD */
+        { 0xE1B12F9FU, 0U, A32H_DFAULT_READ },  /* ARM LDREXD */
+        { 0xF401070FU, 0U, A32H_DFAULT_WRITE }, /* ARM VST1.8 */
+        { 0xF421070FU, 0U, A32H_DFAULT_READ },  /* ARM VLD1.8 */
+        { 0x0000F991U, A32_CPSR_T, A32H_DFAULT_READ },  /* T2 LDRSB imm12 */
+        { 0x070FF901U, A32_CPSR_T, A32H_DFAULT_WRITE }, /* T2 VST1.8 */
+        { 0x070FF921U, A32_CPSR_T, A32H_DFAULT_READ },  /* T2 VLD1.8 */
         { 0xE5910000U, 0U, A32H_DFAULT_READ },  /* ARM LDR */
     };
     for (unsigned k = 0U; k < sizeof(vec) / sizeof(vec[0]); k++) {

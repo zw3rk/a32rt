@@ -164,7 +164,7 @@ static uint32_t thumb16_is_store(uint16_t hw)
 }
 
 /* 32-bit Thumb-2 store classifier on the full word (L == bit 20 for integer
- * and VFP, L == bit 21 for Advanced SIMD VSTn/VLDn at 0xF9/0xF4/0xF5). */
+ * and VFP, L == bit 21 for Advanced SIMD VSTn/VLDn at 0xF9). */
 static uint32_t thumb32_is_store(uint32_t w)
 {
     uint32_t top = w >> 24U;
@@ -183,9 +183,6 @@ static uint32_t thumb32_is_store(uint32_t w)
     if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR */
         return ((w & 0x00100000U) != 0U) ? 0U : 1U;
     }
-    if (top == 0xF4U || top == 0xF5U) { /* VSTn vs VLDn (L at bit 21) */
-        return ((w & 0x00200000U) != 0U) ? 0U : 1U;
-    }
     return 0U;
 }
 
@@ -193,7 +190,7 @@ static uint32_t thumb32_is_store(uint32_t w)
 static uint32_t arm_is_store(uint32_t w)
 {
     uint32_t top = w >> 24U;
-    if (top == 0xF4U || top == 0xF5U) { /* Advanced SIMD VSTn vs VLDn (L == bit 21) */
+    if (top == 0xF4U && (w & 0x00100000U) == 0U) { /* Advanced SIMD VSTn vs VLDn (L == bit 21) */
         return ((w & 0x00200000U) != 0U) ? 0U : 1U;
     }
     if (top == 0xECU || top == 0xEDU) { /* VSTM/VLDM/VSTR/VLDR, LDC/STC */
@@ -203,7 +200,7 @@ static uint32_t arm_is_store(uint32_t w)
         return 0U;
     }
     if (((w & 0x0FB000F0U) == 0x01000090U) || /* SWP/SWPB */
-        ((w & 0x0FB000F0U) == 0x01800090U)) { /* STREX{B,H,D} */
+        ((w & 0x0F9000F0U) == 0x01800090U)) { /* STREX/STREXB/STREXH/STREXD */
         return 1U;
     }
     if (((w & 0x0E000090U) == 0x00000090U) && /* Extra load/store: STRH (op2=01) & STRD (op2=11) */
