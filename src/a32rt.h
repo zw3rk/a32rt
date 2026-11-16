@@ -42,6 +42,14 @@
 #define A32_MAX_REGIONS    512U
 #define A32_RAS_SIZE       64U
 #define A32_IBTC_SIZE      1024U
+/* Mach-O __mod_init_func constructor capacity (miseipad/mi2seipad need 100+). */
+#define A32_IOS_INIT_CAP   256U
+
+/* Compile-time iOS personality embedding: 1 (default) links src/ios,
+ * 0 builds the slim external-personality binary (G02 bridge only). */
+#ifndef A32RT_EMBED_IOS
+#define A32RT_EMBED_IOS 1
+#endif
 #define A32_PAGE_SIZE      4096U
 #define A32_LOW_GUARD_SIZE 0x00010000U
 #define A32_KUSER_BASE_32  0xFFFF0000U
@@ -174,7 +182,7 @@ typedef struct a32_ctx {
     uint32_t    ios_threadstart_va;
     uint32_t    ios_wqthread_va;
     uint32_t    ios_init_count;
-    uint32_t    ios_init_va[64];
+    uint32_t    ios_init_va[A32_IOS_INIT_CAP];
     uint32_t    ios_thr_slot_plus1;
     uint32_t    ios_fn_starts_count;
     uint32_t   *ios_fn_starts;
@@ -192,6 +200,11 @@ typedef struct a32_ctx {
     uint64_t    fpcr_guard_slow_hits;
     uint64_t    aot_abs64_words;
     uint64_t    exits_by_reason[8];
+    /* Narrow G02 external Darwin personality (src/os/darwin_host_bridge.c).
+     * Appended after all ABI-locked offsets; safe for trampoline.S. */
+    bool        darwin_external;
+    uint32_t    darwin_tid;
+    uint64_t    darwin_personality_hash;
 } a32_ctx_t;
 
 #define A32_CTX_VFP_OFFSET   0x60U
@@ -312,7 +325,13 @@ static inline int a32_host_prot(const a32_ctx_t *ctx, uint32_t guest_prot)
 /* Host handshake (`src/host.c`) */
 void a32_host_probe(a32_ctx_t *ctx);
 
-/* Attribution timers & stats (A32-R20-P0, `src/main.c`) */
+/* Narrow G02 external Darwin hooks (`src/os/darwin_host_bridge.c`, always
+ * linked; declared here so call sites stay free of config ifdefs). */
+int  a32_darwin_trap_once(a32_ctx_t *ctx);
+void a32_darwin_enqueue_signal(a32_ctx_t *ctx, int sig);
+uint32_t a32_darwin_sync_exit(int sig);
+
+/* Attribution timers & stats (A32-R20-P0, `src/host.c`) */
 uint64_t a32_host_monotonic_ns(void);
 void a32_print_stats(const a32_ctx_t *ctx);
 

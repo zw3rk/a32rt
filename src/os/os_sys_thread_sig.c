@@ -805,9 +805,20 @@ static int dispatch_thread_sig(a32_ctx_t *ctx)
 
 int a32_handle_syscall(a32_ctx_t *ctx)
 {
+    if (ctx->darwin_external) {
+        return a32_darwin_trap_once(ctx);
+    }
+#if A32RT_EMBED_IOS
     if (ctx->is_ios) {
         return a32_ios_handle_svc(ctx);
     }
+#else
+    if (ctx->is_ios) {
+        fprintf(stderr, "a32rt: iOS personality not embedded (slim build)\n");
+        ctx->regs[0] = 1U;
+        return 1;
+    }
+#endif
     uint32_t nr = ctx->regs[7];
     if (ctx->trace_enabled) {
         fprintf(stderr, "[a32rt] syscall nr=%u (0x%x) args=(0x%x, 0x%x, 0x%x, 0x%x)\n",

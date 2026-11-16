@@ -9,6 +9,7 @@
 #include "a32rt.h"
 
 #include "dbt/aot/aot.h"
+#include "os/darwin_host_bridge.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -122,19 +123,29 @@ static uint64_t compute_elf_hash(const a32_ctx_t *ctx, const char *elf_path,
         return 0ULL;
     }
     int fd = a32_open_guest_ro(ctx, elf_path);
+    uint64_t fd_hash;
     if (fd < 0) {
-        return 0ULL;
-    }
-    uint64_t fd_hash = compute_fd_hash(fd);
-    close(fd);
-    if (fd_hash == 0ULL) {
-        return 0ULL;
+        /* G02 bridge has no ELF file: the host personality tag seeds the
+         * hash instead so Darwin caches never collide with Linux ones. */
+        if (ctx == NULL || ctx->darwin_personality_hash == 0ULL) {
+            return 0ULL;
+        }
+        fd_hash = ctx->darwin_personality_hash;
+    } else {
+        fd_hash = compute_fd_hash(fd);
+        close(fd);
+        if (fd_hash == 0ULL) {
+            return 0ULL;
+        }
     }
     if (out_fd_hash != NULL) {
         *out_fd_hash = fd_hash;
     }
     uint64_t h = fd_hash;
     if (ctx != NULL) {
+        if (ctx->darwin_personality_hash != 0ULL) {
+            h = a32_darwin_mix_hash(h, ctx->darwin_personality_hash);
+        }
         h = fnv1a_64_step(h, &ctx->elf_base, sizeof(ctx->elf_base));
         h = fnv1a_64_step(h, &ctx->interp_base, sizeof(ctx->interp_base));
         h = fnv1a_64_step(h, &ctx->elf_entry, sizeof(ctx->elf_entry));

@@ -411,7 +411,7 @@ static int ios_collect_inits(a32_ctx_t *ctx, a32_ios_image_t *images,
         if (img->is_synthetic) {
             continue;
         }
-        if (ctx->ios_init_count >= 64u) {
+        if (ctx->ios_init_count >= A32_IOS_INIT_CAP) {
             return -1;
         }
         if (a32_ios_pread_full(img->fd, &mh, sizeof mh, img->slice_off) != 0) {
@@ -472,7 +472,7 @@ static int ios_collect_inits(a32_ctx_t *ctx, a32_ios_image_t *images,
                             return -1;
                         }
                         if ((uint64_t)ctx->ios_init_count +
-                            (uint64_t)(size / 4u) > 64u) {
+                            (uint64_t)(size / 4u) > (uint64_t)A32_IOS_INIT_CAP) {
                             free(cmds);
                             return -1;
                         }
@@ -480,7 +480,7 @@ static int ios_collect_inits(a32_ctx_t *ctx, a32_ios_image_t *images,
                     for (w = 0; w + 4u <= size; w += 4u) {
                         uint32_t va = addr + img->slide + w;
                         uint32_t val;
-                        if (ctx->ios_init_count >= 64u) {
+                        if (ctx->ios_init_count >= A32_IOS_INIT_CAP) {
                             free(cmds);
                             return -1;
                         }

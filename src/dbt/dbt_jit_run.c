@@ -671,6 +671,8 @@ uint32_t a32_dbt_single_step(a32_ctx_t *ctx)
          * block A32_EXIT_BKPT exit instead of an unhandled stop. */
         if (ctx->gdb_enabled) {
             (void)a32_gdb_handle_stop(ctx, SIGTRAP);
+        } else if (ctx->darwin_external) {
+            /* G02 bridge routes BKPT through A32H_DARWIN_TRAP itself. */
         } else if (!a32_signals_deliver_sync(ctx, SIGTRAP, ctx->regs[15])) {
             raise(SIGTRAP);
         }

@@ -432,11 +432,11 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
     bool is_sync_trap = (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL ||
                          sig == SIGFPE  || sig == SIGTRAP);
     if (!is_sync_trap || sig_code_is_user_sent(sig, info)) {
-        if (ctx->is_ios) {
-            a32_ios_signals_enqueue_host(ctx, sig, info);
-        } else {
-            enqueue_async_signal(ctx, sig, info);
-        }
+        if (ctx->darwin_external) a32_darwin_enqueue_signal(ctx, sig);
+#if A32RT_EMBED_IOS
+        else if (ctx->is_ios) a32_ios_signals_enqueue_host(ctx, sig, info);
+#endif
+        else enqueue_async_signal(ctx, sig, info);
         return;
     }
 
@@ -492,7 +492,11 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
         uint32_t exit_code = A32_EXIT_INTERWORK;
         if (ctx->difftest_trap_fault && (sig == SIGSEGV || sig == SIGBUS)) {
             exit_code = A32_EXIT_FAULT;
-        } else if (ctx->is_ios) {
+        } else if (ctx->darwin_external) {
+            exit_code = a32_darwin_sync_exit(sig);
+        }
+#if A32RT_EMBED_IOS
+        else if (ctx->is_ios) {
             /* Same XNU rule as handle_guest_fault: a fault inside a valid
              * mapping (even PROT_NONE) is SIGBUS, an unmapped VA SIGSEGV. */
             int ios_sig = (a32_guest_range_ok(ctx, ctx->fault_addr, 1U, 0U) &&
@@ -501,7 +505,9 @@ static void host_sig_handler(int sig, siginfo_t *info, void *ucontext)
                 write_unhandled_sig_msg(ios_sig, guest_pc, ctx->fault_addr);
                 _exit(128 + ios_sig);
             }
-        } else {
+        }
+#endif
+        else {
             guest_sigaction_t *act = &g_guest_sigactions[sig];
             if (act->handler == A32_SIG_IGN) {
                 if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) {
@@ -645,8 +651,10 @@ int a32_signals_init(a32_ctx_t *ctx)
 
 void a32_signals_check_pending(a32_ctx_t *ctx)
 {
-    if (!ctx) return;
+    if (!ctx || ctx->darwin_external) return; /* host drains via traps */
+#if A32RT_EMBED_IOS
     if (ctx->is_ios) { a32_ios_signals_check_pending(ctx); return; }
+#endif
     uint64_t unmasked = __atomic_load_n(&ctx->pending_signals, __ATOMIC_SEQ_CST) & ~ctx->sig_mask;
     while (unmasked != 0ULL) {
         int sig = __builtin_ctzll(unmasked) + 1;
@@ -667,8 +675,10 @@ void a32_signals_check_pending(a32_ctx_t *ctx)
 
 bool a32_signals_deliver_sync(a32_ctx_t *ctx, int sig, uint32_t fault_addr)
 {
-    if (!ctx || sig < 1 || sig > 64) return false;
+    if (!ctx || sig < 1 || sig > 64 || ctx->darwin_external) return false;
+#if A32RT_EMBED_IOS
     if (ctx->is_ios) return a32_ios_signals_deliver_sync(ctx, sig, fault_addr);
+#endif
     ctx->fault_addr = fault_addr;
     guest_sigaction_t *act = &g_guest_sigactions[sig];
     if (act->handler == A32_SIG_DFL || act->handler == A32_SIG_IGN) return false;
