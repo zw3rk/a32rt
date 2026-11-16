@@ -652,7 +652,8 @@ static void test_it_str(void)
         { 0xE5910000U, 0U, A32H_DFAULT_READ },  /* ARM LDR */
     };
     for (unsigned k = 0U; k < sizeof(vec) / sizeof(vec[0]); k++) {
-        size_t len = (vec[k].cpsr & A32_CPSR_T) ? (vec[k].code > 0xFFFFU ? 4U : 2U) : 4U;
+        uint16_t hw0 = (uint16_t)(vec[k].code & 0xFFFFU);
+        size_t len = (vec[k].cpsr & A32_CPSR_T) ? (hw0 >= 0xE800U ? 4U : 2U) : 4U;
         memcpy(mem, &vec[k].code, len);
         c2.cpsr = vec[k].cpsr | A32_CPSR_N;
         CHECK(a32_darwin_fault_kind_for(&c2) == vec[k].want,
