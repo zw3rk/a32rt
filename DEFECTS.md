@@ -1,5 +1,27 @@
 # `a32rt` Defect Ledger (`DEFECTS.md`)
 
+## Round 22 — Regime A2 Grouped Soft-TLB Cold-Path & Pre-Indexed Writeback Fixes (`master` @ `a53ee27` -> Remediated in `5959599`, `3 / 3` Resolved, 2026-11-19)
+
+Identified in Regime A2 `grp_emit_grouped` word load/store grouping (`test-m8-glibc-armhf` `ld-linux-armhf.so.3` and `test-m7-armhf --dbt` `ld-musl-armhf.so.1` failures), remediated in `5959599`, and re-verified with `45 / 45` parity restored.
+
+- [x] **A32-R22-D1 (`DBT/Soft-TLB`, `src/core/core_emit_mem.c:467-493`)** — `grp_emit_grouped` Regime A2 cross-4KiB-page cold slow path omitted an unconditional `B next_op` jump after `per_op_mem` (`LDR`/`STR`), falling straight through into `cold_emit_fault` whenever a grouped word load/store crossed a 4 KiB page boundary (causing `ld-linux-armhf.so.3` in `test-m8-glibc-armhf` and `ld-musl-armhf.so.1` in `test-m7-armhf` to abort at `0xdfff...` with `rc=139`). Fixed by emitting `b_next` (`B next_op`) and bumping `grp_try_word` `cold_reserve` budget (`42U -> 43U`).
+- [x] **A32-R22-D2 (`DBT/Addr`, `src/core/core_emit_mem.c:429`)** — `grp_emit_grouped` hot path left `w22 = rn + min_off` instead of restoring `w22 = rn + offs[n - 1U]` before `hot_join`, causing pre-indexed writeback instructions (`ldr r1, [r4, #4]!` -> `mov w4, w22`) merged at the end of a group to write `rn + min_off` back to `rn` and spin forever in `ld-musl` (`test-m7-armhf --dbt`). Fixed by adding `(offs[n - 1U] - min_off)` to `w22` when `offs[n - 1U] != min_off`.
+- [x] **A32-R22-D3 (`BUILD`, `Makefile`)** — Added `-MMD -MP` auto-generated `.d` header dependency tracking across `OBJ_DIR` (`obj`, `darwin-obj`, `obj-slim`, `darwin-slim-obj`) and `g02-obj` so `src/*.h` struct layout changes always recompile affected objects.
+
+---
+
+## Round 21 — A32H_ABI 1.2 `G02` External Darwin Bridge & `a32rt-slim` Audit (`master` @ `6bf6d76` -> Remediated in `a53ee27`, `5 / 5` Resolved, 2026-11-17)
+
+Introduced the A32H_ABI 1.2 `G02` external Darwin host bridge (`71a1cd7`, plus `369bcf6` frozen `a32host.h` sync) with `a32rt-slim` build decoupling, audited across RC4 (`a001b01`, `0387553`) plus store-classifier follow-ups (`2e7699e`, `7acddf0`, `5013c52`, `9f17ff5`), and merged in `a53ee27`.
+
+- [x] **A32-R21-D1 (`G02/CPU`, `src/os/darwin_host_cpu.c`)** — Thumb-2/ARM store-fault opcode classifier missed `PUSH {.., lr}` (`0xB5xx`), `VSTn`/`VLDn` (L at bit 21, not 20), `STREXH`/`STREXD` and SIMD store fault masks, plus conditional ARM VFP stores and media ops. Tightened across `2e7699e`, `7acddf0`, `5013c52`, and `0387553`.
+- [x] **A32-R21-D2 (`G02/VM`, `src/os/darwin_host_bridge.c`, `src/vm/vm_window.c`)** — Soft-TLB region sync left provider-populated pages clobbered or mis-protected on registration, and unmap-vs-`mprotect` replies were misclassified. Fixed via stage-then-`register_range` mapping and `is_prot` classification (`a001b01`).
+- [x] **A32-R21-D3 (`G02/Threads`, `src/os/darwin_host_bridge.c`)** — Spawned worker threads inherited the spawner's `host_tid`, and queued async signals re-polled every block boundary instead of being consumed atomically. Fixed by populating `host_tid` on the worker pthread (`child->host_tid = 0` at spawn) and `fetch_and`-consuming unmasked `pending_signals` before the `A32H_DARWIN_TRAP` poll (`0387553`).
+- [x] **A32-R21-D4 (`G02/AOT+CLI`, `src/dbt/dbt_aot_cache.c`, `src/os/darwin_host_bridge.c`, `src/main.c`)** — Host-loaded (`A32H_DARWIN_BOOT`) AOT cache key hashed only the personality tag plus the first 4 KiB at `entry_pc`, so distinct Mach-O binaries collided; `--personality` accepted unknown values and `--engine`/`--cache` option arguments confused bridge detection. Fixed with region-spanning executable hash (excluding `darwin-commpage`), `personality_known` CLI validation (`darwin-host|hl-darwin|linux|ios`), and option-argument skipping (`a001b01`, `0387553`).
+- [x] **A32-R21-D5 (`G02/Tests`, `tests/test_g02_darwin_bridge.c`)** — Thumb test-vector length was hardcoded instead of derived from the first halfword, miscounting 32-bit Thumb-2 instructions. Fixed in `9f17ff5`.
+
+---
+
 ## Round 20 — Backend Dispatch, Soft-TLB, VFP/NEON & AOT Audit (`master` @ `cc3d3aa` -> Remediated in `100af25`, `6 / 6` Resolved + Pre-Merge RC Hardening, 2026-11-15)
 
 Identified during the 6-subsystem backend performance & precision deep-dive (`A32-R20-D1`..`A32-R20-D4`) plus lock-step `--difftest` verification (`A32-R20-D5`..`A32-R20-D6`), remediated across isolated worker waves (`b4cee33..100af25`), and re-verified across 6 post-wave code-review slices (`RC-1`..`RC-4`) with `make check check-headers build-darwin build`, `./tools/run_ios_suite.sh` (`61 / 61` PASS), Regime A1 & Regime A2 `--auto-aot` warm reload (`blocks_compiled=0`), `test-m4` DBT PASS, and lock-step `--difftest` (`0` divergences). Paired with [`PERF.md`](PERF.md) (`A32-R20-P0`..`A32-R20-P15`, `16 / 16` resolved).
