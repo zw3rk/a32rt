@@ -27,7 +27,7 @@ parity_init "a32rt"
 
 RT_DARWIN="$ROOT/_build/a32rt-darwin"
 RT_LINUX="$ROOT/_build/a32rt"
-HL_BIN="$ROOT/../hyper-linux/_build/hl"
+HL_BIN="${HL:-$ROOT/../hyper-linux/_build/hl}"
 GOLDEN_DIR="$ROOT/tests/golden"
 BENCH_ARMHF="$ROOT/../rt-series/_build/bench/bench-armhf"
 
@@ -49,6 +49,13 @@ norm_bench() {
 # with stack placement); the faulting PC and exit reasons are exact.
 norm_difftest_err() {
     sed -E -e 's/step=[0-9]+/step=N/g' "$1" > "$2"
+}
+
+# Normalize guest-fault addresses (host-ASLR-dependent stack placement
+# varies run to run, e.g. test-m7-armhf dbt); the fault itself and the
+# exit code are the deterministic signals.
+norm_fault_err() {
+    sed -E -e 's/guest fault at 0x[0-9a-fA-F]+/guest fault at 0xADDR/g' "$1" > "$2"
 }
 
 # run_guest <abi> <host> <case> <engine-flag> <engine-name> <guest> <golden-base> [guest-arg]
@@ -99,7 +106,7 @@ run_guest() {
     parity_norm_stderr "$_tmp_err" "$_tmp_nerr.tmp"
     case "$_eng" in
         difftest) norm_difftest_err "$_tmp_nerr.tmp" "$_tmp_nerr" ;;
-        *) cp "$_tmp_nerr.tmp" "$_tmp_nerr" ;;
+        *) norm_fault_err "$_tmp_nerr.tmp" "$_tmp_nerr" ;;
     esac
     rm -f "$_tmp_nerr.tmp"
     printf '%s' "$_rc" > "$_tmp_code"
@@ -189,12 +196,11 @@ for _g in test-m3-armhf; do
     done
 done
 # Uniform libc guests (A32 static musl, `make guests-libc`): p3_torture +
-# tcg smoke from ../rt-series/tests.  Interp dies in musl startup (A32
-# startup-code gap, silent UNDEF/132).  DBT survives startup but faults in
-# signal test 1 (wild PC into rodata — open signal-path gap, native
-# ALL_OK).  tcg-smoke hangs past the banner under dbt (bounded below with
-# a 10 s alarm; native finishes in 0.01 s).  No difftest rows:
-# threaded+signals do not compose with lockstep (same rationale as m3).
+# tcg smoke from ../rt-series/tests.  Both run to completion under both
+# engines (dbt ALL_OK; interp pins one llsc-signal-invalidate FAIL and
+# tcg-smoke is ALL_OK both ways — native finishes in 0.01 s).
+# No difftest rows: threaded+signals do not compose with lockstep
+# (same rationale as m3).
 if [ -x "$ROOT/_build/p3-torture-a32" ]; then
     TORTURE_ALLOW_SKIP=1 run_guest "armhf" "darwin" "p3-torture-a32" "--dbt" "dbt" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
     run_guest "armhf" "darwin" "p3-torture-a32" "--interp" "interp" "$ROOT/_build/p3-torture-a32" "p3-torture-a32"
@@ -251,9 +257,8 @@ run_alarm_guest() {
 }
 if [ -x "$ROOT/_build/tcg-smoke-a32" ]; then
     run_guest "armhf" "darwin" "tcg-smoke-a32" "--interp" "interp" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
-    # tcg-smoke dbt hangs: bound with a 2 s alarm, golden pins the
-    # partial (banner-only) output + alarm rc.
-    run_alarm_guest "armhf" "darwin" "tcg-smoke-a32" "2" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
+    # tcg-smoke dbt now runs to ALL_OK (grp hot-path w22 fix); plain row.
+    run_guest "armhf" "darwin" "tcg-smoke-a32" "--dbt" "dbt" "$ROOT/_build/tcg-smoke-a32" "tcg-smoke-a32" "4096"
 else
     parity_row "armhf" "darwin" "tcg-smoke-a32" "dbt" "GAP" "0" "missing guest (make guests-libc)"
 fi
@@ -267,12 +272,12 @@ if [ -x "$ROOT/_build/test-h1-armhf" ]; then
 else
     parity_row "armhf" "darwin" "h1_smc" "dbt" "GAP" "0" "missing guest test-h1-armhf"
 fi
-# p2_libc dynamic leg (m7, musl) via A32RT_SYSROOT: interp golden pins the
-# ldso-startup UNDEF (132); dbt hangs after musl-thread-startup faults
-# (open thread-startup gap) — 2 s alarm row.  No difftest (threads).
+# p2_libc dynamic leg (m7, musl) via A32RT_SYSROOT: both engines run the
+# full suite to PASS (the grp hot-path w22 writeback fix closed the dbt
+# musl-loop spin).  No difftest (threads).
 if [ -x "$ROOT/_build/test-m7-armhf" ]; then
     A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m7-armhf" "--interp" "interp" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
-    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_alarm_guest "armhf" "darwin" "test-m7-armhf" "2" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
+    A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m7-armhf" "--dbt" "dbt" "$ROOT/_build/test-m7-armhf" "test-m7-armhf"
 else
     parity_row "armhf" "darwin" "test-m7-armhf" "dbt" "GAP" "0" "missing guest test-m7-armhf"
 fi
@@ -284,9 +289,9 @@ if [ -x "$ROOT/_build/test-m8-glibc-armhf" ]; then
 else
     parity_row "armhf" "darwin" "test-m8-glibc-armhf" "dbt" "GAP" "0" "missing guest test-m8-glibc-armhf"
 fi
-# h4_cxx (m8 C++17 ARM EHABI, musl): dbt faults in runtime init (open
-# libstdc++-init gap, native PASS); interp 132 (ldso-startup gap).
-# No difftest (std::thread).
+# h4_cxx (m8 C++17 ARM EHABI, musl): both engines PASS (the grp hot-path
+# w22 writeback fix closed the dbt runtime-init spin).  No difftest
+# (std::thread).
 if [ -x "$ROOT/_build/test-m8-cpp-armhf" ]; then
     A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m8-cpp-armhf" "--dbt" "dbt" "$ROOT/_build/test-m8-cpp-armhf" "test-m8-cpp-armhf"
     A32RT_SYSROOT="$ROOT/_build/sysroot-armv7" run_guest "armhf" "darwin" "test-m8-cpp-armhf" "--interp" "interp" "$ROOT/_build/test-m8-cpp-armhf" "test-m8-cpp-armhf"
@@ -368,18 +373,21 @@ rm -rf "$_AOTDIR" "$_AOT1" "$_AOT2"
 
 # --- P3 cached-GPR/FPR signal-frame check ---
 # Structural: side-table recovery (saved_regs/saved_vfp_d) plus VFP
-# sigframe (fpregs/fpscr) in src/signals.c.  Behavioral parity lives in
-# the test-m3-armhf run_engine interp/dbt rows below (dbt currently
-# outruns interp: open futex wait-queues + NEON interp gaps; the lockstep
-# difftest cannot gate threaded+signalled guests, so m3 has goldens but
-# no difftest row — cf. the catalogue's "where single-thread/supported").
+# sigframe (fpregs/fpscr) in src/signals.c + src/signals_frame.c.
+# Behavioral parity lives in the test-m3-armhf interp/dbt rows above
+# (both engines agree through test 12; they stop at test 13a, whose
+# FUTEX_WAIT_BITSET mismatch expects Linux -EAGAIN (-11) while the
+# Darwin backend returns host -EAGAIN (-35) untranslated — pinned as
+# exit 113 until the errno convention is fixed.  The lockstep
+# difftest cannot gate threaded+signalled guests, so m3 has goldens
+# but no difftest row — cf. the catalogue's "where single-thread/supported").
 _t0=$(parity_now_ms)
 _P3DET=""
-if ! grep -q "saved_regs" "$ROOT/src/signals.c"; then
+if ! grep -q "saved_regs" "$ROOT/src/signals.c" "$ROOT/src/signals_frame.c"; then
     _P3DET="signals.c lacks saved_regs"
-elif ! grep -q "saved_vfp_d" "$ROOT/src/signals.c"; then
+elif ! grep -q "saved_vfp_d" "$ROOT/src/signals.c" "$ROOT/src/signals_frame.c"; then
     _P3DET="signals.c lacks saved_vfp_d"
-elif ! grep -q "fpregs" "$ROOT/src/signals.c"; then
+elif ! grep -q "fpregs" "$ROOT/src/signals.c" "$ROOT/src/signals_frame.c"; then
     _P3DET="signals.c lacks VFP fpregs"
 fi
 _t1=$(parity_now_ms)

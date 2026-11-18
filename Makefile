@@ -203,11 +203,15 @@ $(OBJ_DIR):
 
 $(OBJ_DIR)/%.o: src/%.c $(HDRS) | $(OBJ_DIR)
 	@mkdir -p $(dir $@)
-	@$(CC) $(CFLAGS) -c $< -o $@
+	@$(CC) $(CFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
 $(OBJ_DIR)/%.o: src/%.S $(HDRS) | $(OBJ_DIR)
 	@mkdir -p $(dir $@)
-	@$(CC) $(CFLAGS) -c $< -o $@
+	@$(CC) $(CFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
+
+# Auto-generated header dependencies (supplement the explicit $(HDRS)
+# prerequisites so newly added headers are tracked without edits here).
+-include $(C_OBJS:.o=.d) $(ASM_OBJS:.o=.d)
 
 build: $(A32RT_BIN) ## Build static-PIE aarch64-linux a32rt binary
 
@@ -721,11 +725,13 @@ G02_TEST_OBJS := $(G02_TEST_COBJS) $(G02_TEST_OBJDIR)/trampoline.o
 
 $(G02_TEST_OBJDIR)/%.o: src/%.c $(HDRS) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -c $< -o $@
+	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 
 $(G02_TEST_OBJDIR)/%.o: src/%.S $(HDRS) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -c $< -o $@
+	cc $(A32RT_WARN_C) -O2 -Iinclude -Isrc -DA32RT_EMBED_IOS=0 -MMD -MP -MF $(@:.o=.d) -c $< -o $@
+
+-include $(G02_TEST_COBJS:.o=.d)
 
 $(BUILD_DIR)/test-g02: $(G02_TEST_OBJS) tests/test_g02_darwin_bridge.c | $(BUILD_DIR)
 	@printf "\033[32m▸ Building\033[0m $@ (slim objects, mock handler)\n"
